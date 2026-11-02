@@ -1,0 +1,538 @@
+<template>
+  <div class="login-page">
+    <div class="login-topbar" aria-hidden="true" />
+    <div class="login-theme-toggle">
+      <div class="theme-toggle" role="button" :aria-label="themeTooltip" @click="toggleTheme">
+        <el-icon :size="16">
+          <Sunrise v-if="theme === 'auto'" />
+          <Moon v-else-if="theme === 'light'" />
+          <Sunny v-else />
+        </el-icon>
+      </div>
+    </div>
+
+    <div class="login-card">
+      <div class="login-header">
+        <img :src="appIcon" alt="Mao" class="login-logo-img" />
+        <h2 class="login-title">Mao</h2>
+      </div>
+
+      <el-form
+        v-if="mode === 'password'"
+        ref="formRef"
+        :model="form"
+        :rules="formRules"
+        class="login-form"
+        @submit.prevent="handleLogin"
+      >
+        <el-form-item prop="username">
+          <el-input
+            ref="usernameInputRef"
+            v-model="form.username"
+            placeholder="用户名"
+            prefix-icon="User"
+            size="large"
+            @keyup.enter="handleLogin"
+          />
+        </el-form-item>
+        <el-form-item prop="password">
+          <el-input
+            ref="passwordInputRef"
+            v-model="form.password"
+            type="password"
+            placeholder="密码"
+            prefix-icon="Lock"
+            show-password
+            size="large"
+            @keyup.enter="handleLogin"
+          />
+        </el-form-item>
+        <el-form-item class="remember-item">
+          <el-checkbox v-model="rememberUsername">记住用户名</el-checkbox>
+        </el-form-item>
+        <el-form-item class="submit-item">
+          <el-button
+            type="primary"
+            native-type="submit"
+            :loading="passwordLoading"
+            class="login-btn"
+          >
+            登录
+          </el-button>
+        </el-form-item>
+        <el-form-item
+          v-if="authStore.features.feishuEnabled || authStore.features.ecpEnabled"
+          class="feishu-actions-item"
+        >
+          <div class="feishu-actions">
+            <el-button
+              v-if="authStore.features.feishuEnabled"
+              class="feishu-entry"
+              plain
+              :loading="feishuLoading && activeFeishuProvider === 'mao'"
+              @click="startFeishuLogin('mao')"
+            >
+              飞书登录
+            </el-button>
+            <el-button
+              v-if="authStore.features.ecpEnabled"
+              class="feishu-entry"
+              plain
+              :loading="feishuLoading && activeFeishuProvider === 'ecp'"
+              @click="startFeishuLogin('ecp')"
+            >
+              ECP 飞书登录
+            </el-button>
+          </div>
+        </el-form-item>
+      </el-form>
+
+      <div v-else-if="mode === 'feishu'" class="feishu-panel">
+        <el-icon class="feishu-icon" :size="48"><Connection /></el-icon>
+        <p class="feishu-status">{{ feishuStatusText }}</p>
+        <el-button
+          type="primary"
+          :loading="feishuLoading"
+          @click="startFeishuLogin(activeFeishuProvider)"
+        >
+          {{ activeFeishuProvider === 'ecp' ? 'ECP 飞书登录' : '飞书登录' }}
+        </el-button>
+        <el-button class="password-entry" link @click="backToPasswordLogin">
+          返回密码登录
+        </el-button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
+import { Sunrise, Moon, Sunny } from '@element-plus/icons-vue'
+import type { FormInstance, FormRules, InputInstance } from 'element-plus'
+import { api } from '../../api'
+import { useAuthStore } from '../../stores/auth'
+import appIcon from '../../assets/app-icon-small.png'
+import { useTheme } from '../../utils/theme'
+import { readRedirectQuery, safeRedirect } from '../../utils/login-redirect'
+import { openExternalUrl } from '../../utils/capacitor'
+import { safeRemoveItem, safeSetItem } from '../../utils/safe-storage'
+
+type LoginMode = 'password' | 'feishu'
+type FeishuProvider = 'mao' | 'ecp'
+
+const authStore = useAuthStore()
+const route = useRoute()
+const router = useRouter()
+const { theme, toggleTheme } = useTheme()
+
+const themeTooltip = computed(() => {
+  if (theme.value === 'auto') return '跟随系统（点击切换浅色）'
+  if (theme.value === 'light') return '浅色（点击切换深色）'
+  return '深色（点击跟随系统）'
+})
+
+const mode = ref<LoginMode>('password')
+const activeFeishuProvider = ref<FeishuProvider>('mao')
+const passwordLoading = ref(false)
+const feishuLoading = ref(false)
+const feishuStatusText = ref('')
+const rememberUsername = ref(localStorage.getItem('rememberMe') === '1')
+const formRef = ref<FormInstance>()
+const usernameInputRef = ref<InputInstance>()
+const passwordInputRef = ref<InputInstance>()
+const form = ref({
+  username: localStorage.getItem('rememberedUsername') ?? '',
+  password: ''
+})
+
+const formRules: FormRules = {
+  username: [{ required: true, message: '请输入用户名', trigger: 'blur' }],
+  password: [{ required: true, message: '请输入密码', trigger: 'blur' }]
+}
+
+let pollTimer: number | null = null
+let polling = false
+let feishuState = ''
+/** 飞书轮询取消标志：返回密码登录/卸载时终止仍在进行的 pollFeishuResult 循环 */
+let pollCancelled = false
+/** 飞书状态轮询连续失败计数：达到阈值才停止，瞬时网络错误继续重试 */
+let feishuPollFailures = 0
+
+onMounted(() => {
+  void authStore.fetchAuthFeatures().catch(() => {
+    authStore.features.feishuEnabled = false
+    authStore.features.ecpEnabled = false
+  })
+})
+
+onMounted(() => {
+  document.title = 'Mao'
+})
+
+/** 登录成功后的统一出口：回跳 redirect 或首页（已登录访问 /login 的守卫也会走这里）。 */
+async function finishLogin() {
+  const target = safeRedirect(readRedirectQuery(route.query))
+  await router.replace(target)
+}
+
+async function handleLogin() {
+  if (passwordLoading.value) return
+  const valid = await formRef.value?.validate().catch(() => false)
+  if (!valid) {
+    await nextTick()
+    if (!form.value.username.trim()) {
+      usernameInputRef.value?.focus()
+    } else if (!form.value.password) {
+      passwordInputRef.value?.focus()
+    }
+    return
+  }
+
+  passwordLoading.value = true
+  try {
+    await authStore.login(form.value.username, form.value.password)
+    saveRememberedUsername()
+    form.value.username = ''
+    form.value.password = ''
+    formRef.value?.clearValidate()
+    await finishLogin()
+  } catch (error: any) {
+    // /auth/login 的 401 拦截器不弹 toast，这里兜底展示失败原因
+    ElMessage.error(error?.response?.data?.message || error?.message || '登录失败，请检查用户名和密码')
+  } finally {
+    passwordLoading.value = false
+  }
+}
+
+function saveRememberedUsername() {
+  if (rememberUsername.value) {
+    safeSetItem('rememberMe', '1')
+    safeSetItem('rememberedUsername', form.value.username.trim())
+  } else {
+    safeRemoveItem('rememberMe')
+    safeRemoveItem('rememberedUsername')
+  }
+}
+
+const isEcpProvider = () => activeFeishuProvider.value === 'ecp'
+
+async function startFeishuLogin(provider: FeishuProvider) {
+  if (provider === 'mao' && !authStore.features.feishuEnabled) return
+  if (provider === 'ecp' && !authStore.features.ecpEnabled) return
+  activeFeishuProvider.value = provider
+  mode.value = 'feishu'
+  feishuStatusText.value = '正在打开飞书授权页面…'
+  feishuLoading.value = true
+
+  try {
+    const qr = isEcpProvider()
+      ? await authStore.startEcpFeishuLogin()
+      : await authStore.startFeishuLogin()
+    const authUrl = qr.authUrl || qr.qrCodeUrl
+    feishuState = qr.state
+
+    if (window.electronAPI?.openFeishuAuthWindow) {
+      // Electron: 内嵌窗口打开飞书授权页
+      feishuStatusText.value = '请在打开的飞书授权窗口中完成登录'
+      const callbackPath = isEcpProvider() ? '/auth/ecp/feishu-callback' : undefined
+      const result = await window.electronAPI.openFeishuAuthWindow(authUrl, callbackPath)
+      if (isEcpProvider() && result.state && result.code) {
+        feishuStatusText.value = '登录成功，正在获取用户信息…'
+        const { data } = await api.post('/auth/ecp/feishu/callback', { state: result.state, code: result.code })
+        await authStore.applyLogin(data)
+        await finishLogin()
+      } else if (result.state) {
+        feishuStatusText.value = '登录成功，正在获取用户信息…'
+        await pollFeishuResult(feishuState)
+      } else {
+        feishuStatusText.value = '授权窗口已关闭'
+        backToPasswordLogin()
+      }
+    } else {
+      // Web / 安卓: 新窗口打开飞书授权页，轮询状态
+      feishuStatusText.value = '请在打开的飞书授权页面中完成登录'
+      const opened = await openExternalUrl(authUrl)
+      if (!opened) {
+        feishuStatusText.value = '授权页面被浏览器拦截，请允许弹窗后重试'
+        ElMessage.error('授权页面被浏览器拦截，请允许弹窗后重试')
+        backToPasswordLogin()
+        return
+      }
+      startPolling(qr.pollInterval || 2)
+    }
+  } catch (error) {
+    feishuStatusText.value = '飞书登录启动失败'
+    showError(error, '飞书登录启动失败')
+  } finally {
+    feishuLoading.value = false
+  }
+}
+
+function startPolling(intervalSeconds: number) {
+  clearPollTimer()
+  pollCancelled = false
+  feishuPollFailures = 0
+  pollTimer = window.setInterval(() => {
+    void checkFeishuStatus()
+  }, Math.max(1, intervalSeconds) * 1000)
+}
+
+async function checkFeishuStatus() {
+  if (!feishuState || polling) return
+  polling = true
+  try {
+    const result = isEcpProvider()
+      ? await authStore.pollEcpFeishuLogin(feishuState)
+      : await authStore.pollFeishuLogin(feishuState)
+    feishuPollFailures = 0
+    if (result.status === 'PENDING') {
+      feishuStatusText.value = '等待飞书确认'
+      return
+    }
+    clearPollTimer()
+    if (result.status === 'SUCCESS') {
+      feishuStatusText.value = '登录成功'
+      feishuState = ''
+      await finishLogin()
+      return
+    }
+    feishuStatusText.value = result.message || statusText(result.status)
+  } catch (error) {
+    // 瞬时网络错误不应永久停止轮询；连续失败达到阈值才停止并提示
+    feishuPollFailures += 1
+    if (feishuPollFailures >= 5) {
+      clearPollTimer()
+      feishuStatusText.value = '登录状态获取失败'
+      showError(error, '飞书登录状态获取失败')
+    }
+  } finally {
+    polling = false
+  }
+}
+
+async function pollFeishuResult(state: string) {
+  // Wait for the server-side callback to complete, then poll for result
+  pollCancelled = false
+  await new Promise(resolve => setTimeout(resolve, 1500))
+  if (pollCancelled) return
+  let attempts = 0
+  const maxAttempts = 30
+  while (attempts < maxAttempts) {
+    if (pollCancelled) return
+    attempts++
+    try {
+      const result = isEcpProvider()
+        ? await authStore.pollEcpFeishuLogin(state)
+        : await authStore.pollFeishuLogin(state)
+      if (pollCancelled) return
+      if (result.status === 'SUCCESS') {
+        feishuStatusText.value = '登录成功'
+        await finishLogin()
+        return
+      }
+      if (result.status === 'FAILED' || result.status === 'EXPIRED') {
+        feishuStatusText.value = result.message || statusText(result.status)
+        showError(new Error(feishuStatusText.value), '飞书登录失败')
+        backToPasswordLogin()
+        return
+      }
+    } catch {
+      // continue polling
+    }
+    await new Promise(resolve => setTimeout(resolve, 2000))
+  }
+  feishuStatusText.value = '登录超时'
+  backToPasswordLogin()
+}
+
+function backToPasswordLogin() {
+  pollCancelled = true
+  clearPollTimer()
+  mode.value = 'password'
+  feishuState = ''
+  feishuStatusText.value = ''
+}
+
+function clearPollTimer() {
+  if (pollTimer) {
+    window.clearInterval(pollTimer)
+    pollTimer = null
+  }
+  polling = false
+}
+
+function statusText(status: string) {
+  if (status === 'EXPIRED') return '二维码已过期'
+  if (status === 'FAILED') return '飞书登录失败'
+  return '飞书登录未完成'
+}
+
+function showError(error: unknown, fallback: string) {
+  if ((error as { toastShown?: boolean } | undefined)?.toastShown) return
+  ElMessage.error(error instanceof Error ? error.message : fallback)
+}
+
+onBeforeUnmount(() => {
+  pollCancelled = true
+  clearPollTimer()
+})
+</script>
+
+<style scoped>
+.login-page {
+  position: relative;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 100vh;
+  min-height: 100dvh;
+  background: var(--aw-canvas);
+  padding: 16px;
+  box-sizing: border-box;
+}
+
+/* Electron 红绿灯避让 + 可拖拽顶栏；Web/安卓为透明占位 */
+.login-topbar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--aw-nav-height);
+  -webkit-app-region: drag;
+}
+
+.login-theme-toggle {
+  position: absolute;
+  top: 6px;
+  right: 12px;
+  z-index: 10;
+  -webkit-app-region: no-drag;
+}
+
+.theme-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--aw-radius-xs);
+  cursor: pointer;
+  color: var(--aw-nav-text-muted);
+  transition: color 0.15s, background 0.15s;
+}
+
+.theme-toggle:hover {
+  color: var(--aw-nav-text);
+  background: rgba(0, 0, 0, 0.06);
+}
+
+[data-theme="dark"] .theme-toggle:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.login-card {
+  width: 380px;
+  max-width: 100%;
+  padding: 40px 32px 24px;
+  background: var(--aw-surface);
+  border: 1px solid var(--aw-border);
+  border-radius: var(--aw-radius-lg);
+  box-sizing: border-box;
+}
+
+.login-header {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 32px;
+}
+
+.login-logo-img {
+  width: 64px;
+  height: 64px;
+  object-fit: contain;
+  border-radius: var(--aw-radius-lg);
+}
+
+.login-title {
+  margin: 0;
+  font-family: var(--aw-font-display);
+  font-size: var(--aw-text-tagline);
+  font-weight: 600;
+  color: var(--aw-ink);
+}
+
+.login-form :deep(.el-input__wrapper) {
+  border-radius: var(--aw-radius-pill);
+  padding: 4px 16px;
+}
+
+.login-form :deep(.el-form-item) {
+  margin-bottom: 20px;
+}
+
+.remember-item {
+  margin-bottom: 12px !important;
+}
+
+.submit-item {
+  margin-bottom: 0 !important;
+}
+
+.feishu-actions-item {
+  margin-bottom: 0 !important;
+  margin-top: 8px;
+}
+
+.feishu-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+
+/* 登录页 CTA 保持醒目的大按钮：自设度量，优先级高于全站 small 统一规则 */
+.login-btn,
+.feishu-entry,
+.feishu-panel .el-button[type="primary"] {
+  width: 100%;
+  margin: 0;
+  border-radius: var(--aw-radius-pill) !important;
+  font-size: var(--aw-text-body);
+  font-weight: 400;
+  padding: 11px 22px;
+  height: auto;
+}
+
+.login-btn:active,
+.feishu-entry:active {
+  transform: scale(0.95);
+}
+
+.feishu-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+}
+
+.feishu-icon {
+  color: var(--aw-muted);
+}
+
+.feishu-status {
+  min-height: 22px;
+  margin: 0;
+  color: var(--aw-muted);
+  font-size: var(--aw-text-caption);
+  line-height: 22px;
+  text-align: center;
+}
+
+.password-entry {
+  padding: 0;
+}
+</style>

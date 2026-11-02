@@ -1,0 +1,407 @@
+import Fastify from 'fastify';
+import { describe, expect, it, vi } from 'vitest';
+import { handleError } from '../common/http-error.js';
+import { registerAgentRoutes } from './agent.routes.js';
+import { registerModelRoutes } from '../model/model.routes.js';
+import { registerCommandRoutes } from '../command/command.routes.js';
+import { registerUserRoutes } from '../user/user.routes.js';
+import { registerAdminAnalyticsRoutes, registerAdminRuntimeRoutes } from '../admin/admin.routes.js';
+import { registerMcpServerRoutes } from '../harness/mcp/controller/mcp-server.routes.js';
+import { HttpToolValidatorImpl } from '../http-tool/http-tool-validator.js';
+
+async function appWithUser(register: (app: ReturnType<typeof Fastify>) => void) {
+  const fastify = Fastify();
+  fastify.setErrorHandler(handleError);
+  fastify.addHook('preHandler', (req, _r, done) => {
+    req.userId = 7;
+    done();
+  });
+  register(fastify);
+  return fastify;
+}
+
+describe('CRUD routes', () => {
+  it('protects prompt history and rollback, validates versions and records the operator', async () => {
+    const agent = { id: 1, name: 'A', systemPrompt: 'old' };
+    const versions = [{ id: 1, agentId: 1, version: 1, systemPrompt: 'old' }];
+    const service = {
+      listPromptVersions: vi.fn(async () => versions),
+      rollbackPrompt: vi.fn(async () => agent),
+      getAgentExperiences: vi.fn(async () => []),
+      getAgentSuggestedQuestions: vi.fn(async () => []),
+    };
+    const permissionService = { hasPermission: vi.fn(async () => false) };
+    const app = await appWithUser(f => registerAgentRoutes(f, {
+      agentService: service as never, experienceService: {} as never,
+      suggestedQuestionService: {} as never,
+      userRepo: {} as never, mcpServerValidator: {} as never, httpToolValidator: {} as never, permissionService,
+    }));
+    try {
+      expect((await app.inject({ method: 'GET', url: '/v1/agents/1/prompt-versions' })).statusCode).toBe(403);
+      expect((await app.inject({ method: 'POST', url: '/v1/agents/1/prompt-versions/1/rollback' })).statusCode).toBe(403);
+      expect(service.listPromptVersions).not.toHaveBeenCalled();
+      expect(service.rollbackPrompt).not.toHaveBeenCalled();
+      expect(permissionService.hasPermission).toHaveBeenCalledWith(7, 'agent:write');
+      permissionService.hasPermission.mockResolvedValue(true);
+      const history = await app.inject({ method: 'GET', url: '/v1/agents/1/prompt-versions' });
+      expect(history.json().data).toEqual(versions);
+      expect(service.listPromptVersions).toHaveBeenCalledWith(1);
+      for (const version of ['0', '-1', '1.5', 'abc']) {
+        const invalid = await app.inject({ method: 'POST', url: `/v1/agents/1/prompt-versions/${version}/rollback` });
+        expect(invalid.json().code).not.toBe(0);
+      }
+      expect(service.rollbackPrompt).not.toHaveBeenCalled();
+      const restored = await app.inject({ method: 'POST', url: '/v1/agents/1/prompt-versions/1/rollback' });
+      expect(restored.json().data).toMatchObject(agent);
+      expect(service.rollbackPrompt).toHaveBeenCalledWith(1, 1, 7);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('agent routes list get create update delete and experiences', async () => {
+    const agent = { id: 1, name: 'A', systemPrompt: 'p', creatorId: 7, isDefault: 0, avatarUrl: '/uploads/12345678-1234-1234-1234-123456789abc.png' };
+    const agentService = {
+      listAgents: vi.fn(async () => [agent]),
+      getAgent: vi.fn(async () => agent),
+      createAgent: vi.fn(async () => agent),
+      updateAgent: vi.fn(async () => agent),
+      deleteAgent: vi.fn(),
+      getAgentExperiences: vi.fn(async () => [{ id: 1, content: 'c', sortOrder: 0, enabled: 1 }]),
+      getAgentSuggestedQuestions: vi.fn(async () => [{ id: 1, content: 'q', sortOrder: 0 }]),
+    };
+    const experienceService = {
+      listByAgentId: vi.fn(async () => [{ id: 1, content: 'c', sortOrder: 0, enabled: 1 }]),
+      create: vi.fn(async () => ({ id: 2, content: 'n', sortOrder: 1, enabled: 1 })),
+      update: vi.fn(async () => ({ id: 1, content: 'u', sortOrder: 1, enabled: 1 })),
+      delete: vi.fn(),
+    };
+    const suggestedQuestionService = {
+      listByAgentId: vi.fn(async () => [{ id: 1, content: 'q', sortOrder: 0 }]),
+    };
+    const userRepo = { findById: vi.fn(async () => ({ id: 7, username: 'ada', displayName: 'Ada' })) };
+    const mcpServerValidator = { validateForAgent: vi.fn(async (ids: number[]) => ids) };
+    const permissionService = { hasPermission: vi.fn(async () => true) };
+    const app = await appWithUser((f) => registerAgentRoutes(f, {
+      agentService: agentService as never,
+      experienceService: experienceService as never,
+      suggestedQuestionService: suggestedQuestionService as never,
+      userRepo: userRepo as never,
+      mcpServerValidator: mcpServerValidator as never,
+      httpToolValidator: { validateForAgent: vi.fn(async (ids: number[]) => ids) } as never,
+      permissionService,
+    }));
+    expect((await app.inject({ method: 'GET', url: '/v1/agents' })).json().data[0].avatarUrl).toBe(agent.avatarUrl);
+    expect((await app.inject({ method: 'GET', url: '/v1/agents' })).json().data[0].clientVisible).toBe(true);
+    expect((await app.inject({ method: 'GET', url: '/v1/agents/1' })).json().data.avatarUrl).toBe(agent.avatarUrl);
+    expect((await app.inject({
+      method: 'POST', url: '/v1/agents', payload: { name: 'A', systemPrompt: 'p', avatarUrl: agent.avatarUrl },
+    })).json().data.avatarUrl).toBe(agent.avatarUrl);
+    expect(agentService.createAgent.mock.calls[0]?.at(-3)).toBe(agent.avatarUrl);
+    expect(agentService.createAgent.mock.calls[0]?.at(-1)).toBeUndefined();
+    expect((await app.inject({
+      method: 'PUT', url: '/v1/agents/1', payload: { name: 'B', avatarUrl: null },
+    })).statusCode).toBe(200);
+    expect(agentService.updateAgent.mock.calls[0]?.at(-3)).toBeNull();
+    expect((await app.inject({ method: 'DELETE', url: '/v1/agents/1' })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'GET', url: '/v1/agents/1/experiences' })).statusCode).toBe(200);
+    expect((await app.inject({
+      method: 'POST', url: '/v1/agents/1/experiences', payload: { content: 'n' },
+    })).statusCode).toBe(200);
+    expect((await app.inject({
+      method: 'PUT', url: '/v1/agents/1/experiences/1', payload: { content: 'u' },
+    })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'DELETE', url: '/v1/agents/1/experiences/1' })).statusCode).toBe(200);
+    expect(agentService.listAgents).toHaveBeenCalledWith(7, undefined, false, false);
+    await app.close();
+  });
+
+  it('passes an empty mcpServerIds array through to updateAgent so clearing works', async () => {
+    const agent = { id: 1, name: 'A', systemPrompt: 'p', isDefault: 0 };
+    const agentService = {
+      getAgent: vi.fn(async () => agent),
+      createAgent: vi.fn(async () => agent),
+      updateAgent: vi.fn(async () => agent),
+      getAgentExperiences: vi.fn(async () => []),
+      getAgentSuggestedQuestions: vi.fn(async () => []),
+    };
+    const mcpServerValidator = { validateForAgent: vi.fn(async (ids: number[]) => ids) };
+    const httpToolValidator = { validateForAgent: vi.fn(async (ids: number[]) => ids) };
+    const permissionService = { hasPermission: vi.fn(async () => true) };
+    const app = await appWithUser(f => registerAgentRoutes(f, {
+      agentService: agentService as never,
+      experienceService: {} as never,
+      suggestedQuestionService: {} as never,
+      userRepo: { findById: vi.fn(async () => null) } as never,
+      mcpServerValidator: mcpServerValidator as never,
+      httpToolValidator: httpToolValidator as never,
+      permissionService,
+    }));
+    try {
+      // 编辑页删掉最后一个 MCP 后提交空数组，清空意图必须透传到 updateAgent
+      const cleared = await app.inject({ method: 'PUT', url: '/v1/agents/1', payload: { mcpServerIds: [] } });
+      expect(cleared.statusCode).toBe(200);
+      expect(agentService.updateAgent).toHaveBeenCalledWith(
+        7, 1, undefined, undefined, undefined, undefined, [], undefined, null, null, undefined, undefined, undefined, undefined, undefined,
+      );
+      expect(mcpServerValidator.validateForAgent).not.toHaveBeenCalled();
+
+      // 自定义 HTTP 工具关联同理：空数组清空、非空走校验
+      const clearedTools = await app.inject({ method: 'PUT', url: '/v1/agents/1', payload: { httpToolIds: [] } });
+      expect(clearedTools.statusCode).toBe(200);
+      expect(agentService.updateAgent.mock.calls.at(-1)?.at(7)).toEqual([]);
+      const associated = await app.inject({ method: 'PUT', url: '/v1/agents/1', payload: { httpToolIds: [3, 4] } });
+      expect(associated.statusCode).toBe(200);
+      expect(httpToolValidator.validateForAgent).toHaveBeenCalledWith([3, 4], []);
+      expect(agentService.updateAgent.mock.calls.at(-1)?.at(7)).toEqual([3, 4]);
+
+      // 未带 mcpServerIds 时保持“不改动”
+      const untouched = await app.inject({ method: 'PUT', url: '/v1/agents/1', payload: { name: 'B' } });
+      expect(untouched.statusCode).toBe(200);
+      expect(agentService.updateAgent.mock.calls.at(-1)?.at(6)).toBeUndefined();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('lists disabled agents only with agent read permission and toggles enabled', async () => {
+    const agent = { id: 1, name: 'A', systemPrompt: 'p', isDefault: 0, enabled: 1 };
+    const agentService = {
+      listAgents: vi.fn(async () => [agent]),
+      getAgentExperiences: vi.fn(async () => []),
+      getAgentSuggestedQuestions: vi.fn(async () => []),
+      setEnabled: vi.fn(async () => ({ ...agent, enabled: 0 })),
+    };
+    const userRepo = { findById: vi.fn(async () => null) };
+    const permissionService = { hasPermission: vi.fn(async () => false) };
+    const app = await appWithUser((f) => registerAgentRoutes(f, {
+      agentService: agentService as never,
+      experienceService: {} as never,
+      suggestedQuestionService: {} as never,
+      userRepo: userRepo as never,
+      mcpServerValidator: {} as never,
+      httpToolValidator: {} as never,
+      permissionService,
+    }));
+    try {
+      await app.inject({ method: 'GET', url: '/v1/agents?includeDisabled=true' });
+      expect(agentService.listAgents).toHaveBeenCalledWith(7, undefined, false, false);
+      expect((await app.inject({ method: 'PATCH', url: '/v1/agents/1/enabled', payload: { enabled: false } })).statusCode).toBe(403);
+      expect(agentService.setEnabled).not.toHaveBeenCalled();
+
+      permissionService.hasPermission.mockImplementation(async (_userId: number, code: string) => code === 'agent:read' || code === 'agent:write');
+      await app.inject({ method: 'GET', url: '/v1/agents?includeDisabled=true&keyword=coder' });
+      expect(agentService.listAgents).toHaveBeenLastCalledWith(7, 'coder', true, false);
+
+      // 客户端新建会话：只取客户端可见的 Agent
+      await app.inject({ method: 'GET', url: '/v1/agents?scope=client' });
+      expect(agentService.listAgents).toHaveBeenLastCalledWith(7, undefined, false, true);
+
+      // 非法 scope 直接拒绝，避免拼写错误静默退化成全量（项目约定：业务错误 HTTP 200 + code≠0）
+      const badScope = await app.inject({ method: 'GET', url: '/v1/agents?scope=admin' });
+      expect(badScope.json().code).not.toBe(0);
+
+      const invalid = await app.inject({ method: 'PATCH', url: '/v1/agents/1/enabled', payload: { enabled: 'no' } });
+      expect(invalid.json().code).not.toBe(0);
+      expect(agentService.setEnabled).not.toHaveBeenCalled();
+
+      const toggled = await app.inject({ method: 'PATCH', url: '/v1/agents/1/enabled', payload: { enabled: false } });
+      expect(toggled.json().data.enabled).toBe(false);
+      expect(agentService.setEnabled).toHaveBeenCalledWith(1, false);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('model command user admin and mcp preference routes', async () => {
+    const model = { id: 3, name: 'gpt', provider: 'openai', modelId: 'g', status: 1 };
+    const modelService = {
+      listModels: vi.fn(async () => ({ records: [model], total: 1, page: 1, size: 10 })),
+      listActiveModels: vi.fn(async () => [model]),
+      listProviders: vi.fn(async () => ['openai']),
+      getDefaultModel: vi.fn(async () => model),
+      getModel: vi.fn(async () => model),
+      createModel: vi.fn(async () => model),
+      updateModel: vi.fn(async () => model),
+      updateStatus: vi.fn(async () => model),
+      deleteModel: vi.fn(),
+      testConnection: vi.fn(async () => ({ ok: true })),
+    };
+    const commandService = {
+      listByUserId: vi.fn(async () => [{ id: 1, name: 'c', content: 'x' }]),
+      create: vi.fn(async () => ({ id: 1, name: 'c', content: 'x' })),
+      update: vi.fn(async () => ({ id: 1, name: 'c', content: 'y' })),
+      delete: vi.fn(),
+      listAvailableForUser: vi.fn(async () => [{ name: 'c', content: 'x' }]),
+    };
+    const userService = {
+      updateOwnProfile: vi.fn(),
+      listUsers: vi.fn(async () => ({ records: [{ id: 7, username: 'ada' }], total: 1 })),
+      createUser: vi.fn(async () => ({ id: 8, username: 'b' })),
+      updateUser: vi.fn(),
+      disableUser: vi.fn(),
+    };
+    const userRepo = {
+      findById: vi.fn(async () => ({ id: 7, username: 'ada', displayName: 'Ada', status: 1 })),
+    };
+    const permission = {
+      hasPermission: vi.fn(async () => true),
+      isAdmin: vi.fn(async () => true),
+      getUserPermissionCodes: vi.fn(async () => ['user:read']),
+    };
+    const jwt = {
+      getUserIdFromToken: vi.fn(() => 7),
+      validateToken: vi.fn(() => true),
+      validateAccessToken: vi.fn(() => true),
+    };
+    const analytics = { summary: vi.fn(async () => ({ overview: {} })) };
+    const mcpServerService = {
+      listEnabled: vi.fn(async () => [{ id: 1, name: 's', status: 'ENABLED' }]),
+      listMine: vi.fn(async () => []),
+      list: vi.fn(async () => []),
+      get: vi.fn(async () => ({ id: 1, name: 's' })),
+      create: vi.fn(async () => ({ id: 1, name: 's' })),
+      update: vi.fn(async () => ({ id: 1 })),
+      updateStatus: vi.fn(),
+      delete: vi.fn(),
+    };
+    const mcpPref = {
+      getDisabledServerIds: vi.fn(async () => []),
+      save: vi.fn(),
+    };
+
+    const app = await appWithUser((f) => {
+      registerModelRoutes(f, { modelService: modelService as never, permissionService: permission });
+      registerCommandRoutes(f, {
+        userCommandService: commandService as never,
+        agentService: { getAgent: vi.fn(async () => ({ id: 1, skillNames: '["java"]' })) } as never,
+        skillLoader: { getAllDocuments: () => [{ name: 'java', description: 'j' }] } as never,
+        skillSyncService: { getUserSkillDocuments: async () => [] } as never,
+      });
+      registerUserRoutes(f, userService as never, userRepo as never, permission as never);
+      registerAdminAnalyticsRoutes(f, {
+        jwt: jwt as never, analytics: analytics as never, userRepo: userRepo as never,
+        passwordHasher: { hash: async (s: string) => s, matches: async () => true },
+        rootDir: '/tmp',
+        permissionService: permission,
+      });
+      registerAdminRuntimeRoutes(f, {
+        jwt: jwt as never, analytics: analytics as never, userRepo: userRepo as never,
+        passwordHasher: { hash: async (s: string) => s, matches: async () => true },
+        rootDir: '/tmp',
+        permissionService: permission,
+      });
+      registerMcpServerRoutes(f, {
+        mcpServerService: mcpServerService as never,
+        mcpClientManager: { disconnectSession: vi.fn() } as never,
+        userMcpPreferenceService: mcpPref as never,
+        permissionService: permission,
+      });
+    });
+
+    const hits = [
+      ['GET', '/v1/models'],
+      ['GET', '/v1/models/active'],
+      ['GET', '/v1/models/providers'],
+      ['GET', '/v1/models/default'],
+      ['GET', '/v1/models/3'],
+      ['GET', '/v1/user-commands'],
+      ['GET', '/v1/user-commands/system'],
+      ['GET', '/v1/quick-commands'],
+      ['GET', '/v1/users/me'],
+      ['GET', '/v1/mcp-servers/preferences'],
+      ['GET', '/v1/admin/analytics/summary'],
+      ['GET', '/v1/admin/runtime/sessions'],
+    ] as const;
+    for (const [method, url] of hits) {
+      const res = await app.inject({ method, url, headers: { authorization: 'Bearer test-token' } });
+      expect(res.statusCode, `${method} ${url} ${res.body}`).toBe(200);
+    }
+    await app.close();
+  });
+
+  it('keeps editing possible when an associated http tool was disabled or deleted', async () => {
+    const agent = { id: 1, name: 'A', systemPrompt: 'p', isDefault: 0, httpToolIds: '[3]' };
+    let tool: { id: number; name: string; enabled: number } | null = { id: 3, name: 'orders', enabled: 0 };
+    const lookup = {
+      findById: vi.fn(async (id: number) => (tool && tool.id === id ? tool as never : null)),
+    };
+    const agentService = {
+      getAgent: vi.fn(async () => agent),
+      updateAgent: vi.fn(async () => agent),
+      getAgentExperiences: vi.fn(async () => []),
+      getAgentSuggestedQuestions: vi.fn(async () => []),
+    };
+    const app = await appWithUser(f => registerAgentRoutes(f, {
+      agentService: agentService as never,
+      experienceService: {} as never,
+      suggestedQuestionService: {} as never,
+      userRepo: { findById: vi.fn(async () => null) } as never,
+      mcpServerValidator: {} as never,
+      httpToolValidator: new HttpToolValidatorImpl(lookup as never),
+      permissionService: { hasPermission: vi.fn(async () => true) },
+    }));
+    try {
+      // 存量关联已停用：编辑 Agent 其它字段必须成功，关联 id 保留（装配侧会跳过）
+      const disabled = await app.inject({
+        method: 'PUT', url: '/v1/agents/1', payload: { name: 'A2', httpToolIds: [3] },
+      });
+      expect(disabled.json().code).toBe(0);
+      expect(agentService.updateAgent).toHaveBeenCalled();
+      expect(agentService.updateAgent.mock.calls.at(-1)?.at(7)).toEqual([3]);
+
+      // 存量关联的工具已删除：同样不阻塞
+      tool = null;
+      const deleted = await app.inject({
+        method: 'PUT', url: '/v1/agents/1', payload: { name: 'A3', httpToolIds: [3] },
+      });
+      expect(deleted.json().code).toBe(0);
+      expect(agentService.updateAgent.mock.calls.at(-1)?.at(7)).toEqual([3]);
+
+      // 对没有存量关联的 Agent 新关联停用工具仍然拒绝（设计：停用工具不允许新关联）
+      tool = { id: 3, name: 'orders', enabled: 0 };
+      agentService.getAgent.mockResolvedValue({ ...agent, httpToolIds: '[]' });
+      const callsBefore = agentService.updateAgent.mock.calls.length;
+      const rejected = await app.inject({
+        method: 'PUT', url: '/v1/agents/1', payload: { name: 'A4', httpToolIds: [3] },
+      });
+      expect(rejected.json().code).not.toBe(0);
+      expect(agentService.updateAgent.mock.calls.length).toBe(callsBefore);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('rejects malformed httpToolIds with a business error instead of 500 or silent loss', async () => {
+    const agent = { id: 1, name: 'A', systemPrompt: 'p', isDefault: 0 };
+    const agentService = {
+      getAgent: vi.fn(async () => agent),
+      updateAgent: vi.fn(async () => agent),
+      getAgentExperiences: vi.fn(async () => []),
+      getAgentSuggestedQuestions: vi.fn(async () => []),
+    };
+    const validator = { validateForAgent: vi.fn(async (ids: number[]) => ids) };
+    const app = await appWithUser(f => registerAgentRoutes(f, {
+      agentService: agentService as never,
+      experienceService: {} as never,
+      suggestedQuestionService: {} as never,
+      userRepo: { findById: vi.fn(async () => null) } as never,
+      mcpServerValidator: {} as never,
+      httpToolValidator: validator as never,
+      permissionService: { hasPermission: vi.fn(async () => true) },
+    }));
+    try {
+      for (const httpToolIds of [3, ['3'], [0], [1.5], [null]] as unknown[]) {
+        const res = await app.inject({
+          method: 'PUT', url: '/v1/agents/1', payload: { name: 'B', httpToolIds },
+        });
+        expect(res.statusCode, `payload=${JSON.stringify(httpToolIds)}`).toBe(200);
+        expect(res.json().code, `payload=${JSON.stringify(httpToolIds)}`).not.toBe(0);
+      }
+      expect(agentService.updateAgent).not.toHaveBeenCalled();
+      expect(validator.validateForAgent).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+});

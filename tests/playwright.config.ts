@@ -1,0 +1,40 @@
+import { defineConfig } from '@playwright/test'
+
+export default defineConfig({
+  testDir: '.',
+  timeout: 30_000,
+  retries: 0,
+  // 桌面用例共享 e2e 种子库状态（如分组别名），并行 worker 会互相污染，串行执行。
+  workers: 1,
+  // global-setup.ts：幂等拉起隔离后端(:9180) + admin(:5200) + desktop(:5201)。
+  // 环境准备见 scripts/e2e-setup.sh。
+  globalSetup: './global-setup.ts',
+  use: {
+    baseURL: 'http://localhost:5200',
+    headless: true,
+    viewport: { width: 1280, height: 800 },
+    screenshot: 'only-on-failure',
+    // 服务器已装系统 Chrome（/opt/google/chrome）。固定 chrome channel 复用系统内核，
+    // 避免下载 640MB 自带 chromium；root 下必须 --no-sandbox 才能启动。
+    channel: 'chrome',
+    launchOptions: { args: ['--no-sandbox', '--disable-dev-shm-usage'] },
+  },
+  projects: [
+    {
+      name: 'admin',
+      testMatch: /admin.*\.spec\.ts$/,
+      use: { baseURL: 'http://localhost:5200' },
+    },
+    {
+      name: 'desktop',
+      testMatch: 'desktop.spec.ts',
+      use: { baseURL: 'http://localhost:5201' },
+    },
+    {
+      // 度量契约：页面级 mock，不连隔离后端，只校验渲染几何。
+      name: 'desktop-visual',
+      testMatch: /desktop-.*\.spec\.ts$/,
+      use: { baseURL: 'http://localhost:5201' },
+    },
+  ],
+})

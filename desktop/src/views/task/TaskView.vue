@@ -1,0 +1,1611 @@
+<template>
+  <div class="task-layout">
+    <TaskIndexPanel
+      :collapsed="panelCollapsed"
+      :list-mode="listMode"
+      @update:list-mode="listMode = $event"
+      @toggle="panelCollapsed = !panelCollapsed"
+      @new-task="handleNewTask"
+      @new-task-from-group="handleNewTaskFromGroup"
+    />
+
+    <div class="task-container">
+      <CenterTabBar
+        v-if="tabs.length > 1"
+        :agent-id="isNewTaskMode ? null : (agentId || null)"
+        :agent-name="agentName || null"
+        :tabs="tabs"
+        :active-tab-id="activeTabId"
+        @activate="activateTab"
+        @close="closeTab"
+        @close-all="closeAllFileTabs"
+        @close-others="closeOtherTabs"
+      />
+      <CenterTabContainer
+        :tabs="tabs"
+        :active-tab-id="activeTabId"
+        :session-id="sessionIdForTabs"
+        :file-provider="fileProvider"
+        :git-provider="gitProvider"
+        :execution-mode="executionMode"
+        :workspace="workspace"
+        @open-file="handleOpenFile"
+        @add-file-to-chat="handleAddFileToChat"
+        @paths-changed="applyWorkspacePathChange"
+        @tree-refresh="refreshFileTree"
+        @locate-in-tree="revealInFileTree"
+        @open-git-diff="handleOpenGitDiff"
+        @open-commit-diff="handleOpenCommitDiff"
+        @open-branch-diff="handleOpenBranchDiff"
+        @use-for-new-task="handleUseForNewTask"
+        @open-file-manager="openWorkspaceFileManagerTab"
+      />
+    </div>
+
+    <TaskInspector
+      ref="inspectorRef"
+      :todos="inspectorTodos"
+      :side-tasks="sideTasks"
+      :subagents="subagents"
+      :title="inspectorTitle"
+      :agent-id="inspectorAgentId"
+      :agent-name="inspectorAgentName"
+      :workspace="workspace"
+      :project-key="projectKey"
+      :execution-mode="executionMode"
+      :session-id="inspectorSessionId"
+      :file-provider="fileProvider"
+      :git-provider="gitProvider"
+      :phase="inspectorPhase"
+      :panel-collapsed="rightCollapsed"
+      :context-window="inspectorContextWindow"
+      :view-type="inspectorViewType"
+      :model-id="inspectorModelId"
+      :list-mode="listMode"
+      @toggle-panel="toggleRight"
+      @todo-update="handleTodoUpdate"
+      @rename="handleRename"
+      @open-file="handleOpenFile"
+      @add-file-to-chat="handleAddFileToChat"
+      @paths-changed="applyWorkspacePathChange"
+      @open-side-task="handleOpenSideTask"
+      @open-subagent="handleOpenSubagent"
+      @open-trace="handleOpenTrace"
+      @edit-title="handleEditSideTaskTitle"
+      @delete-side-task="handleDeleteSideTask"
+      @promote-side-task="handlePromoteSideTask"
+      @open-git-diff="handleOpenGitDiff"
+      @open-git="openGitTab"
+      @open-manager="openFileManagerTab"
+      @select-agent="handleAgentSwitch"
+    />
+
+    <!-- 首启向导 / 环境未就绪降级页：仅对新用户（PENDING）出现，存量用户零打扰 -->
+    <ReadinessPending
+      v-if="readinessPendingVisible"
+      :reason="readinessPendingReason"
+      @retry="readinessStore.fetch(true)"
+    />
+    <OnboardingOverlay
+      v-else-if="onboardingVisible"
+      :agents="agentStore.agents"
+      :agents-loading="agentStore.loading"
+      @complete="handleOnboardingComplete"
+      @skip="handleOnboardingSkip"
+    />
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, computed, provide, onMounted, onUnmounted, watch, nextTick, h } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { useAgentStore } from '../../stores/agent'
+import { useSessionStore, type TaskPhase, type SubagentItem } from '../../stores/session'
+import { persistedContextWindow } from '../../stores/session/context-window'
+import { useDraftStore } from '../../stores/draft'
+import { usePanelLayout } from '../../composables/usePanelLayout'
+import { resetNewTaskTabs, useCenterTabs } from '../../composables/useCenterTabs'
+import { getPersistedActiveTab, resolveSideTaskRestoreIds, resolveSubagentRestoreId } from '../../utils/center-active-tab'
+import { useWorkspaceFileProvider } from '../../composables/workspace-file-provider'
+import { useWorkspaceGitProvider } from '../../composables/workspace-git-provider'
+import { useTaskPanelPrefs } from '../../composables/useTaskPanelPrefs'
+import type { GitChangedFile } from '../../types/git'
+import type { FileChange } from '../../types/chat'
+import type { FileRangeQuotePayload } from '../../utils/selection-quote'
+import type { SideTaskContextMode } from '../../types/file-browser'
+import type { SideTaskEntryOptions } from '../../composables/useCenterTabs'
+import { getToken } from '../../utils/auth-storage'
+import { nowDateTime } from '../../utils/datetime'
+import { cloudProjectKeyForNewTask, newTaskWorkspacePrefill } from '../../utils/cloud-project'
+import { resolveInspectorTarget, type InspectorTarget, type InspectorViewType } from '../../utils/inspector-target'
+import { api, fetchWorkspaceOverview } from '../../api'
+import TaskIndexPanel from '../../components/task/TaskIndexPanel.vue'
+import TaskInspector from '../../components/task/TaskInspector.vue'
+import type { WorkspaceOverviewEntry } from '../../types/workspace-overview'
+import CenterTabBar from '../../components/center/CenterTabBar.vue'
+import CenterTabContainer from '../../components/center/CenterTabContainer.vue'
+import OnboardingOverlay from '../../components/onboarding/OnboardingOverlay.vue'
+import ReadinessPending from '../../components/onboarding/ReadinessPending.vue'
+import { useReadinessStore } from '../../stores/readiness'
+
+const route = useRoute()
+const router = useRouter()
+const agentStore = useAgentStore()
+const sessionStore = useSessionStore()
+const draftStore = useDraftStore()
+const { loadPrefs } = useTaskPanelPrefs()
+const { leftCollapsed: panelCollapsed, rightCollapsed, toggleRight } = usePanelLayout()
+
+const sessionIdParam = computed(() => route.params.sessionId as string)
+const agentId = ref('')
+const executionMode = ref('CLOUD')
+const initialLoading = ref(true)
+const NEW_TASK_QUERY = 'newTask'
+
+/** 任务面板列表模式（标准分组 / 聚焦平铺）：TaskView 单一事实源，每次挂载默认标准。 */
+const listMode = ref<'standard' | 'focus'>('standard')
+
+// Task state
+const currentPhase = ref<TaskPhase>('IDLE')
+const projectKey = ref('')
+const permissionLevel = ref('READ_ONLY')
+
+// New task config state
+const newTaskAgentId = ref<string | null>(null)
+const newTaskMode = ref<'CLOUD' | 'LOCAL'>('CLOUD')
+const newTaskWorkspace = ref('')
+const newTaskCloudProjectKey = ref('')
+const newTaskWorkspaceMode = ref<string>('new')
+const newTaskGitCloneUrl = ref('')
+const newTaskGitBranch = ref('')
+const newTaskCloudProjects = ref<Array<{ name: string; path: string; isGit: boolean }>>([])
+const newTaskModelId = ref<number | undefined>()
+const lastViewedSession = ref<{ agentId: string; executionMode: string; workspace?: string; cloudProjectKey?: string; permissionLevel?: string; modelId?: number } | null>(null)
+const isNewTaskMode = computed(() => !sessionIdParam.value && !initialLoading.value)
+const isExplicitNewTaskRoute = computed(() => !sessionIdParam.value && getQueryString(NEW_TASK_QUERY) === '1')
+
+// Shared refs — must be declared before provide()
+const workspace = ref('')
+const agentName = ref('')
+const chatTodos = ref<any[]>([])
+const chatContextWindow = ref<any>(null)
+const chatSending = ref(false)
+const chatPendingApprovals = ref<any[]>([])
+const chatFocusInput = ref<(() => void) | null>(null)
+
+// Provide shared refs for ChatPanel
+provide('agentId', agentId)
+provide('executionMode', executionMode)
+provide('workspace', workspace)
+provide('newTaskModelId', newTaskModelId)
+provide('permissionLevel', permissionLevel)
+provide('isNewTaskMode', isNewTaskMode)
+provide('newTaskAgentId', newTaskAgentId)
+provide('newTaskMode', newTaskMode)
+provide('newTaskWorkspace', newTaskWorkspace)
+provide('newTaskCloudProjectKey', newTaskCloudProjectKey)
+provide('newTaskWorkspaceMode', newTaskWorkspaceMode)
+provide('newTaskGitCloneUrl', newTaskGitCloneUrl)
+provide('newTaskGitBranch', newTaskGitBranch)
+provide('newTaskCloudProjects', newTaskCloudProjects)
+provide('initialLoading', initialLoading)
+provide('currentPhase', currentPhase)
+
+/**
+ * 新建态（会话未创建）：选择器里的工作区/项目/模式是右侧边栏与文件 provider 的事实源。
+ * TaskView 的 workspace/executionMode/projectKey 在新建态跟随 newTask* 三兄弟，
+ * 真实会话的这三个值由 loadSession / enterNewTaskMode / syncChatState 拥有，互不越写。
+ */
+watch(
+  [isNewTaskMode, newTaskMode, newTaskWorkspace, newTaskCloudProjectKey],
+  () => {
+    if (!isNewTaskMode.value) return
+    // 作废上次新建态的 Tab 状态：占位键无会话 id 可依，不清会在「新建态 → 会话 →
+    // 新建态」之间复活陈旧文件页签并保持激活，把居中 Composer 顶掉；切换工作区
+    // 选择时同样要作废，否则会用新 provider 读旧工作区的路径
+    resetNewTaskTabs()
+    executionMode.value = newTaskMode.value
+    workspace.value = newTaskMode.value === 'LOCAL' ? newTaskWorkspace.value : ''
+    projectKey.value = newTaskMode.value === 'CLOUD' ? newTaskCloudProjectKey.value : ''
+  },
+  { immediate: true },
+)
+
+function syncChatState(state: {
+  workspace?: string
+  agentName?: string
+  todos?: any[]
+  contextWindow?: any
+  sending?: boolean
+  pendingApprovals?: any[]
+}) {
+  // 新建态 workspace 由上方 newTask* 回写 watch 拥有：ChatPanel 上报的是 useChat 的
+  // 占位空串（首发前不赋值），不守卫会把用户刚选的工作区擦掉
+  if (state.workspace !== undefined && !isNewTaskMode.value) workspace.value = state.workspace
+  if (state.agentName !== undefined) agentName.value = state.agentName
+  if (state.todos !== undefined) chatTodos.value = state.todos
+  if (state.contextWindow !== undefined) chatContextWindow.value = state.contextWindow
+  if (state.sending !== undefined) chatSending.value = state.sending
+  if (state.pendingApprovals !== undefined) chatPendingApprovals.value = state.pendingApprovals
+}
+
+provide('syncChatState', syncChatState)
+provide('chatFocusInput', chatFocusInput)
+// 向导「开始任务」把示例文案填进新建态 Composer 的通道（与 chatFocusInput 同一注入惯例）
+const chatPrefillInput = ref<((text: string) => void) | null>(null)
+provide('chatPrefillInput', chatPrefillInput)
+
+// ── 首启向导（首次成功体验）───────────────────────────────────────────────
+const readinessStore = useReadinessStore()
+
+/** 仅新用户（PENDING）可见：模型或 Agent 未配置时先看降级提示页，不弹向导。 */
+const readinessPendingVisible = computed(() => {
+  const r = readinessStore.readiness
+  return readinessStore.loaded && r != null && r.onboarding === 'PENDING'
+    && (r.modelsConfigured === 0 || r.agentsEnabled === 0)
+})
+const readinessPendingReason = computed<'models' | 'agents'>(() => {
+  const r = readinessStore.readiness
+  return r != null && r.modelsConfigured === 0 ? 'models' : 'agents'
+})
+const onboardingVisible = computed(() => {
+  const r = readinessStore.readiness
+  return readinessStore.loaded && r != null && r.onboarding === 'PENDING'
+    && r.modelsConfigured > 0 && r.agentsEnabled > 0
+})
+
+/** 完成语义一旦成立不再出现（无重进入口）；存量用户（AUTO_DONE）由服务端判定，天然不弹。 */
+async function handleOnboardingComplete(payload: { chosenAgentId: string | null; sampleText: string }) {
+  try {
+    await readinessStore.completeOnboarding({
+      chosenAgentId: payload.chosenAgentId != null ? Number(payload.chosenAgentId) : null,
+    })
+  } catch {
+    // 完成标记写失败：覆盖层保持显示（store 未翻转），用户可再点一次；不做预填避免重复插入
+    return
+  }
+  await startSampleTask(payload)
+}
+
+async function handleOnboardingSkip() {
+  try {
+    await readinessStore.completeOnboarding({ skipped: true })
+  } catch {
+    // 忽略：跳过失败时覆盖层仍在，用户可再点一次跳过
+  }
+}
+
+/** 向导结束后的起步路径：进新建态并预填示例文案（草稿机制 + 聚焦），发送仍由用户手点。 */
+async function startSampleTask(payload: { chosenAgentId: string | null; sampleText: string }) {
+  const text = payload.sampleText.trim()
+  // 向导所选 Agent 必须落到 newTaskAgentId：首条消息发送以它为准（两条路径都要设，
+  // 已在新建态时尤其如此——挂载时 enterNewTaskMode 已把它预置成默认 Agent）
+  if (payload.chosenAgentId) {
+    newTaskAgentId.value = payload.chosenAgentId
+  }
+  if (!isNewTaskMode.value) {
+    // 先写草稿再进新建态：ChatInput 挂载时 restoreDraft('new') 自动带上
+    if (text) {
+      draftStore.setDraft('new', { html: `<p>${escapeHtml(text)}</p>`, text, files: [] })
+    }
+    await navigateToNewTask(payload.chosenAgentId ? { agentId: payload.chosenAgentId, executionMode: 'CLOUD' } : undefined)
+    await nextTick()
+  } else if (text) {
+    // 已在新建态：编辑器已挂载且为空（覆盖层挡住了输入），直接程序化插入
+    chatPrefillInput.value?.(text)
+  }
+  await nextTick()
+  chatFocusInput.value?.()
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+// Chat input registration for file tree context menu
+// 按 tab 维度注册输入框 handle：主会话 key='chat'，边路任务 key=tabId（如 'side:123'）。
+// CenterTabContainer 用 KeepAlive 缓存全部面板，主会话与各边路任务的 ChatInput 同时挂载，
+// 若用单例覆盖式注册，后挂载的边路任务会把主会话 handle 顶掉，导致「添加到聊天」插错对话框。
+interface ChatInputHandle {
+  insertFileReference: (filePath: string) => void
+  addReplyQuote: (text: string) => void
+  insertFileRangeQuote: (quote: FileRangeQuotePayload) => void
+}
+const chatInputHandles = ref<Record<string, ChatInputHandle>>({})
+function registerChatInput(key: string, handle: ChatInputHandle) {
+  chatInputHandles.value = { ...chatInputHandles.value, [key]: handle }
+}
+function unregisterChatInput(key: string) {
+  const next = { ...chatInputHandles.value }
+  delete next[key]
+  chatInputHandles.value = next
+}
+provide('registerChatInput', registerChatInput)
+provide('unregisterChatInput', unregisterChatInput)
+// 供聊天区深层组件（如文件变更面板右键菜单「添加到聊天」）复用，与右侧栏 add-file-to-chat 同一入口
+provide('addFileToChat', handleAddFileToChat)
+
+function withChatInput(apply: (handle: ChatInputHandle) => void) {
+  const tabId = activeTabId.value
+  const handle = chatInputHandles.value[tabId]
+  if (handle) {
+    nextTick(() => apply(handle))
+    return
+  }
+  activateTab('chat')
+  nextTick(() => {
+    const main = chatInputHandles.value['chat']
+    if (main) apply(main)
+  })
+}
+
+function handleAddFileToChat(filePath: string) {
+  withChatInput(handle => handle.insertFileReference(filePath))
+}
+
+function quoteReplyToChat(text: string) {
+  withChatInput(handle => handle.addReplyQuote(text))
+}
+
+function quoteFileRangeToChat(quote: FileRangeQuotePayload) {
+  withChatInput(handle => handle.insertFileRangeQuote(quote))
+}
+
+provide('quoteReplyToChat', quoteReplyToChat)
+provide('quoteFileRangeToChat', quoteFileRangeToChat)
+
+// Center tabs
+const activeSessionIdRef = computed(() => sessionStore.activeSessionId ?? '')
+const { tabs, activeTab, activeTabId, openFileTab, openDiffTab, closeTab, closeAllFileTabs, closeOtherTabs, activateTab, openSideTaskTab, setSideTaskFork, openSubagentTab, openTraceTab, openFileManagerTab, openWorkspaceFileManagerTab, openGitTab, updateSideTaskTab, restoreSideTaskTabs, restoreSubagentTabs, restoreTraceTab, restoreActiveTab, applyWorkspacePathChange } = useCenterTabs(activeSessionIdRef)
+
+/** 总览页签「用于新任务」：项目目录带 cloudProjectKey（下拉/复用链路同形态），临时 / 其他目录直接预填路径 */
+function handleUseForNewTask(entry: WorkspaceOverviewEntry) {
+  if (entry.kind === 'project') {
+    void navigateToNewTask({ executionMode: 'CLOUD', workspace: entry.path, reuseWorkspace: true, cloudProjectKey: entry.name })
+    return
+  }
+  void navigateToNewTask({ executionMode: 'CLOUD', workspace: entry.path, reuseWorkspace: true })
+}
+
+/** 新建任务下拉富化：overview 按 path 合并大小 / 会话数到 cloud-projects 条目（仅 kind='project' 有对应目录）。 */
+async function enrichCloudProjectsWithOverview(generation: number) {
+  try {
+    const result = await fetchWorkspaceOverview()
+    if (generation !== newTaskModeGeneration) return
+    const byPath = new Map((result.entries ?? []).map(e => [e.path, e]))
+    newTaskCloudProjects.value = newTaskCloudProjects.value.map(p => {
+      const info = byPath.get(p.path)
+      if (info == null) return p
+      return { ...p, sizeBytes: info.sizeBytes, activeSessions: info.activeSessions, archivedSessions: info.archivedSessions }
+    })
+  } catch { /* 静默回落纯目录名 */ }
+}
+
+// Derived state
+const sessionId = computed(() => sessionIdParam.value)
+const todos = computed(() => chatTodos.value)
+const contextWindow = computed(() => chatContextWindow.value)
+const sideTasks = computed(() => sessionStore.getSideTasks(activeSessionIdRef.value || ''))
+// 子代理列表：聚合主会话 + 各边路任务名下的子代理。
+// 边路任务触发的子代理挂在其会话名下，若只取主会话则右侧边栏看不到。
+const subagents = computed(() => {
+  const active = activeSessionIdRef.value || ''
+  if (!active) return []
+  const scopeIds = [active, ...sessionStore.getSideTasks(active).map(s => String(s.id))]
+  const seen = new Set<number>()
+  const result: SubagentItem[] = []
+  for (const sid of scopeIds) {
+    for (const sa of sessionStore.getSubagents(sid)) {
+      if (seen.has(sa.id)) continue
+      seen.add(sa.id)
+      result.push(sa)
+    }
+  }
+  return result
+})
+
+const sessionIdForTabs = computed(() => sessionId.value || sessionIdParam.value || '')
+
+/**
+ * 右侧边栏展示对象：由当前中心 Tab 归属解析得出（utils/inspector-target.ts）。
+ * 边路 / 子代理 / 轨迹 Tab 各自展示自己那个会话；文件 / Diff / 文件管理是浏览工具，
+ * 无独立会话，保持主会话视角。轨迹 Tab 此前不参与判定，导致从边路任务点开运行轨迹后
+ * 边栏悄悄退回主会话，排查时看到的是另一个会话的信息。
+ */
+const inspectorTarget = computed<InspectorTarget>(() => resolveInspectorTarget(activeTab.value, {
+  mainSessionId: sessionIdForTabs.value,
+  sideTasks: sideTasks.value,
+  subagents: subagents.value,
+}))
+const inspectorViewType = computed<InspectorViewType>(() => inspectorTarget.value.viewType)
+const inspectorSessionId = computed(() => inspectorTarget.value.sessionId)
+/** 子会话数字 id：边路任务 / 子代理 Tab 与对应轨迹 Tab 下非空，主会话与占位态为 null */
+const inspectorSubSessionId = computed(() => inspectorTarget.value.subSessionId)
+
+const sessionTitle = computed(() => {
+  const session = sessionStore.activeSession
+  return session?.summary || session?.title || agentName.value || '新任务'
+})
+
+// 右侧边栏标题：子会话优先取列表缓存 title，缺失回退主会话标题
+const inspectorTitle = computed(() => {
+  const sid = inspectorSubSessionId.value
+  if (sid != null) {
+    if (inspectorViewType.value === 'side_task') {
+      const item = sideTasks.value.find(t => t.id === sid)
+      if (item?.title) return item.title
+    } else if (inspectorViewType.value === 'subagent') {
+      const item = subagents.value.find(sa => sa.id === sid)
+      if (item?.title) return item.title
+    }
+  }
+  return sessionTitle.value
+})
+
+// 右侧边栏状态：子会话优先取 phase 缓存（WS 实时），缺失回退主会话 phase
+const inspectorPhase = computed<TaskPhase>(() => {
+  if (inspectorViewType.value === 'chat') return currentPhase.value
+  const sid = inspectorSubSessionId.value
+  if (sid == null) return currentPhase.value
+  const phase = sessionStore.getSessionPhase(String(sid))
+  if (phase) return phase
+  if (inspectorViewType.value === 'side_task') {
+    const item = sideTasks.value.find(t => t.id === sid)
+    if (item?.phase) return item.phase
+  } else {
+    const item = subagents.value.find(sa => sa.id === sid)
+    if (item?.phase) return item.phase
+  }
+  return currentPhase.value
+})
+
+// 右侧边栏进度：子会话取对应会话 todos，缺失回退主会话
+const inspectorTodos = computed(() => {
+  if (inspectorViewType.value === 'chat') return todos.value
+  const sid = inspectorSubSessionId.value
+  if (sid == null) return todos.value
+  return sessionStore.getTodos(String(sid))
+})
+
+// 右侧边栏上下文：子会话取对应会话 context_window，缺失回退主会话。
+// 子代理例外：缺失时不回退——只读徽标展示的是它自己的占用，拿主会话水位冒充会误报。
+const inspectorContextWindow = computed(() => {
+  if (inspectorViewType.value === 'chat') return contextWindow.value
+  const sid = inspectorSubSessionId.value
+  if (sid == null) return contextWindow.value
+  const own = sessionStore.getContextWindow(String(sid)) ?? null
+  if (own) return own
+  return inspectorViewType.value === 'subagent' ? null : contextWindow.value
+})
+
+// 右侧边栏智能体：边路任务展示自己的绑定，主会话与子代理视图仍用主会话的。
+// 子代理不提供切换，这里不改它的展示来源。
+const inspectorAgentId = computed(() => {
+  if (isNewTaskMode.value) return null
+  if (inspectorViewType.value === 'side_task') {
+    const sid = inspectorSubSessionId.value
+    const item = sid != null ? sideTasks.value.find(t => t.id === sid) : undefined
+    return item?.agentId || null
+  }
+  return agentId.value || null
+})
+const inspectorAgentName = computed(() => {
+  if (isNewTaskMode.value) return ''
+  if (inspectorViewType.value === 'side_task') {
+    const sid = inspectorSubSessionId.value
+    const item = sid != null ? sideTasks.value.find(t => t.id === sid) : undefined
+    return item?.agentName || ''
+  }
+  return agentName.value
+})
+
+// 右侧边栏模型：子会话优先使用自己的 modelId，避免上下文是否已回填影响模型解析。
+const inspectorModelId = computed<number | undefined>(() => {
+  if (inspectorViewType.value === 'chat') return undefined
+  const sid = inspectorSubSessionId.value
+  if (sid == null) return undefined
+  if (inspectorViewType.value === 'side_task') {
+    return sideTasks.value.find(t => t.id === sid)?.modelId ?? sessionStore.activeSession?.modelId
+  }
+  return subagents.value.find(sa => sa.id === sid)?.modelId ?? sessionStore.activeSession?.modelId
+})
+
+/**
+ * 子会话元数据补拉：
+ * - 成功才记账（fetchedInspector*），失败允许下次切入时重试；
+ * - pendingInspector* 用 Map<sid, Promise>，pending 期间重入复用同一请求；
+ * - 请求失败时若用户仍停留在此子会话，受控自动重试一次（autoRetried* 防循环）；
+ * - meta 与 todos 相互独立，单接口失败不阻断另一个。
+ * 请求前由调用方固定 viewType 与 parentId，响应写缓存不依赖当时的响应式状态。
+ */
+const fetchedInspectorMeta = new Set<string>()
+const fetchedInspectorTodos = new Set<string>()
+const pendingInspectorMeta = new Map<string, Promise<void>>()
+const pendingInspectorTodos = new Map<string, Promise<void>>()
+const autoRetriedMeta = new Set<string>()
+const autoRetriedTodos = new Set<string>()
+/** 组件卸载后置 true：重试 sleep 返回后不再发起请求 */
+let disposed = false
+
+function ensureInspectorMeta(sid: string, viewType: 'side_task' | 'subagent', parentId: string): Promise<void> {
+  if (fetchedInspectorMeta.has(sid)) return Promise.resolve()
+  const existing = pendingInspectorMeta.get(sid)
+  if (existing) return existing
+  const p = (async () => {
+    const numAtRequest = Number(sid)
+    const agentAtRequest = viewType === 'side_task'
+      ? sessionStore.getSideTasks(parentId).find(t => t.id === numAtRequest)?.agentId
+      : undefined
+    try {
+      const { data: meta } = await api.get(`/sessions/${sid}`)
+      // 补拉可能读到执行启动前的旧 phase（IDLE）：WS 已登记实时 phase 时不得回退，
+      // 否则刚开始运行的边路任务/子代理会被打回空闲态（徽标与圆点一起消失）。
+      const effectivePhase = meta?.phase
+        ? sessionStore.applySnapshotPhase(String(sid), meta.phase)
+        : undefined
+      // 补拉上下文占用：context_window 事件仅在该会话执行期间经 WS 推送，
+      // 页面刷新或会话已停止后 store 缓存缺失，会回退显示主会话上下文。
+      // 仅当无实时缓存时写入，避免覆盖执行中的实时值。
+      const persisted = persistedContextWindow(meta?.contextTokens, meta?.contextManifest)
+      if (persisted && !sessionStore.getContextWindow(sid)) {
+        sessionStore.setContextWindow(sid, persisted)
+      }
+      const num = Number(sid)
+      if (viewType === 'side_task') {
+        const cur = sessionStore.getSideTasks(parentId).find(t => t.id === num)
+        if ((meta?.title && !cur?.title) || meta?.modelId != null) {
+          sessionStore.updateSideTaskTitle(
+            parentId,
+            num,
+            meta.title || cur?.title || '任务',
+            meta.modelId
+          )
+        }
+        if (meta?.agentId != null) {
+          // 请求在途时用户可能已经切过智能体，迟到的详情不能把新绑定盖回去。
+          const agentNow = sessionStore.getSideTasks(parentId).find(t => t.id === num)?.agentId
+          if (agentNow === agentAtRequest) {
+            sessionStore.updateSideTaskAgent(
+              num,
+              String(meta.agentId),
+              typeof meta.agentName === 'string' ? meta.agentName : undefined,
+            )
+          }
+        }
+      } else {
+        sessionStore.updateSubagentMeta(num, {
+          title: meta?.title,
+          // 实时 phase 已登记时保留实时值，不回退补拉旧值
+          phase: effectivePhase ?? meta?.phase,
+          modelId: meta?.modelId,
+        })
+      }
+      fetchedInspectorMeta.add(sid)
+    } catch (e) {
+      console.warn(`[inspector] Failed to fetch meta for sub-session ${sid}:`, e)
+      pendingInspectorMeta.delete(sid)
+      // inspectorSessionId === sid 已保证当前展示对象仍是该子会话（chat 时为主会话 id，不可能相等）
+      if (!autoRetriedMeta.has(sid) && inspectorSessionId.value === sid) {
+        autoRetriedMeta.add(sid)
+        await new Promise(resolve => setTimeout(resolve, 600))
+        if (disposed) return
+        if (inspectorSessionId.value === sid) {
+          await ensureInspectorMeta(sid, viewType, parentId)
+        }
+      }
+    } finally {
+      pendingInspectorMeta.delete(sid)
+    }
+  })()
+  pendingInspectorMeta.set(sid, p)
+  return p
+}
+
+function ensureInspectorTodos(sid: string): Promise<void> {
+  if (fetchedInspectorTodos.has(sid)) return Promise.resolve()
+  const existing = pendingInspectorTodos.get(sid)
+  if (existing) return existing
+  const p = (async () => {
+    try {
+      const { data } = await api.get(`/sessions/${sid}/todos`)
+      if (Array.isArray(data)) sessionStore.setTodos(sid, data)
+      fetchedInspectorTodos.add(sid)
+    } catch (e) {
+      console.warn(`[inspector] Failed to fetch todos for sub-session ${sid}:`, e)
+      pendingInspectorTodos.delete(sid)
+      if (!autoRetriedTodos.has(sid) && inspectorSessionId.value === sid) {
+        autoRetriedTodos.add(sid)
+        await new Promise(resolve => setTimeout(resolve, 600))
+        if (disposed) return
+        if (inspectorSessionId.value === sid) {
+          await ensureInspectorTodos(sid)
+        }
+      }
+    } finally {
+      pendingInspectorTodos.delete(sid)
+    }
+  })()
+  pendingInspectorTodos.set(sid, p)
+  return p
+}
+
+watch(inspectorSessionId, (sid) => {
+  const viewType = inspectorViewType.value
+  if (viewType === 'chat') return
+  if (!sid || sid === String(sessionIdForTabs.value)) return
+  // 固定本次请求的上下文，防止 await 期间用户切换 Tab / 主会话导致写错缓存
+  const parentId = activeSessionIdRef.value || ''
+  void ensureInspectorMeta(sid, viewType, parentId)
+  void ensureInspectorTodos(sid)
+}, { immediate: true })
+
+const fileProvider = useWorkspaceFileProvider(executionMode, workspace, activeSessionIdRef, projectKey)
+const gitProvider = useWorkspaceGitProvider(executionMode, workspace, activeSessionIdRef)
+provide('fileProvider', fileProvider)
+
+// Terminal
+
+// Ctrl+` 终端快捷键已移至 TopNav 常驻注册
+
+// Handle side_session_created window event (from useStreamWS)
+function handleSideSessionCreated(e: Event) {
+  const detail = (e as CustomEvent).detail
+  if (!detail || !detail.sideSessionId) return
+
+  const title = detail.title || '任务'
+  const evtParent = detail.parentSessionId != null ? String(detail.parentSessionId) : ''
+  // 占位 Tab 精确匹配：按预置来源会话对齐事件键（边路来源创建时事件键是边路会话 id）。
+  // 无预置来源的旧占位只认当前主会话的事件，防止已切到别的主会话时错配占位。
+  const placeholder = tabs.value.find((t) => {
+    if (t.type !== 'side_task') return false
+    if (t.sideSessionId != null && t.sideSessionId > 0) return false
+    if (t.sourceSessionId != null) return evtParent !== '' && String(t.sourceSessionId) === evtParent
+    return evtParent === String(activeSessionIdRef.value || '')
+  })
+  if (placeholder) {
+    updateSideTaskTab(placeholder.id, detail.sideSessionId, title)
+  }
+
+  // 回写边路缓存一律用主会话缓存键（递归平铺口径）：事件键在边路来源创建时是
+  // 边路会话 id，直接写入会落进主会话口径永远读不到的死缓存槽。
+  // 仅当事件属于当前主会话的树（来源即主会话，或占位在本视图匹配成功）时才回写，
+  // 其余情况（创建期间已切走）交给树信号触发的 refreshSideTasks 收敛。
+  const mainKey = String(activeSessionIdRef.value || '')
+  const belongsToCurrentTree = evtParent === mainKey || placeholder != null
+  if (mainKey && belongsToCurrentTree) {
+    // 服务端复制的是来源会话当时的智能体。来源是主会话用主会话的，来源是边路则用那一条的。
+    const sourceIsMain = evtParent === mainKey
+    const sourceSide = sourceIsMain ? undefined : sessionStore.getSideTasks(mainKey).find(t => String(t.id) === evtParent)
+    const sourceAgentId = sourceIsMain ? (agentId.value || undefined) : sourceSide?.agentId
+    sessionStore.addSideTask(mainKey, {
+      id: detail.sideSessionId,
+      title: title || detail.title || '任务',
+      phase: 'RUNNING',
+      createdAt: new Date().toISOString(),
+      ...(sourceAgentId ? { agentId: sourceAgentId, agentName: sourceIsMain ? (agentName.value || undefined) : sourceSide?.agentName } : {}),
+    })
+  }
+}
+
+// Ctrl+` 终端快捷键已移至 TopNav 常驻注册（TopNav tooltip 对所有页面可见），
+// 注册在 TaskView 作用域时切到 Settings 后快捷键失效，与提示文案不一致
+
+onMounted(() => {
+  window.addEventListener('side_session_created', handleSideSessionCreated)
+  window.addEventListener('subagent_session_created', handleSubagentSessionCreated)
+})
+
+function handleSubagentSessionCreated(e: Event) {
+  const detail = (e as CustomEvent).detail
+  if (!detail || !detail.childSessionId) return
+
+  const parentId = String(detail.parentSessionId || activeSessionIdRef.value || '')
+  const childId = String(detail.childSessionId)
+  const title = detail.title || '子代理'
+  if (parentId) {
+    sessionStore.addSubagent(parentId, {
+      id: detail.childSessionId,
+      title,
+      phase: 'RUNNING',
+      createdAt: new Date().toISOString(),
+      agentType: detail.agentType || undefined,
+      taskDescription: detail.task || undefined,
+    })
+  }
+  if (detail.toolCallId) {
+    sessionStore.bindDelegateToolCall(String(detail.toolCallId), detail.childSessionId)
+  }
+  // 预置 USER 任务消息，避免首包流式到达前空白
+  if (detail.task && sessionStore.getMessages(childId).length === 0) {
+    sessionStore.addUserMessage(childId, {
+      id: `subagent-user-${detail.childSessionId}`,
+      role: 'user',
+      content: String(detail.task),
+      createdAt: nowDateTime(),
+    })
+  }
+  // 自动打开 Tab：事件属于当前主会话，或属于当前主会话的边路任务（边路任务触发子代理同样自动跳转）
+  const activeParent = String(activeSessionIdRef.value || '')
+  if (parentId && parentId === activeParent) {
+    openSubagentTab(detail.childSessionId, title)
+  } else if (parentId && activeParent) {
+    const sideIds = new Set(sessionStore.getSideTasks(activeParent).map(s => String(s.id)))
+    if (sideIds.has(parentId)) {
+      openSubagentTab(detail.childSessionId, title)
+    }
+  }
+}
+
+// Open file from TaskInspector's file tree
+function handleOpenFile(payload: { path: string; title: string; workspaceRoot?: string }) {
+  openFileTab(payload.path, payload.title, payload.workspaceRoot)
+}
+
+/** 右侧边栏实例：文件管理器写操作后刷新文件树、定位目标路径 */
+interface TaskInspectorInstance {
+  revealInFileTree(relPath: string): Promise<void>
+  refreshFileTree(): void
+}
+const inspectorRef = ref<TaskInspectorInstance | null>(null)
+
+/** 点右侧智能体信息切换：确认后下一轮生效，聊天留在当前会话。边路任务只改这一条。 */
+async function handleAgentSwitch(nextAgentId: string) {
+  if (inspectorViewType.value === 'side_task') {
+    await switchSideTaskAgent(nextAgentId)
+    return
+  }
+  if (inspectorViewType.value !== 'chat') return
+  const session = sessionStore.activeSession
+  if (!session || String(session.agentId) === String(nextAgentId)) return
+  const agent = agentStore.agents.find(a => String(a.id) === String(nextAgentId))
+  const modelNote = session.modelId != null
+    ? '会话已显式选择模型，切换后模型保持不变'
+    : '会话未显式选模型，切换后自动跟随新智能体的默认模型'
+  try {
+    await confirmAgentSwitch(
+      `确认切换到智能体「${agent?.name ?? nextAgentId}」？`,
+      [modelNote, 'Skill / MCP / 经验库 / 子代理预设自下一轮起按新智能体配置，会话级审批放行规则保留。'],
+    )
+  } catch {
+    return
+  }
+  try {
+    await sessionStore.updateSessionAgent(String(session.id), Number(nextAgentId))
+    const updated = sessionStore.activeSession
+    if (updated?.agentId) agentId.value = String(updated.agentId)
+    if (updated?.agentName) agentName.value = updated.agentName
+    ElMessage.success(`已切换到「${agent?.name ?? nextAgentId}」，下一轮生效`)
+  } catch {
+    ElMessage.error('智能体切换失败，请重试')
+  }
+}
+
+async function switchSideTaskAgent(nextAgentId: string) {
+  const sid = inspectorSubSessionId.value
+  if (sid == null) return
+  const item = sideTasks.value.find(t => t.id === sid)
+  if (item?.agentId && String(item.agentId) === String(nextAgentId)) return
+  const agent = agentStore.agents.find(a => String(a.id) === String(nextAgentId))
+  const modelNote = item?.modelId != null
+    ? '这条边路任务已显式选择模型，切换后模型保持不变'
+    : '这条边路任务若已显式选择模型，切换后保持不变；否则跟随新智能体的默认模型'
+  try {
+    await confirmAgentSwitch(
+      `确认把当前边路任务切换到智能体「${agent?.name ?? nextAgentId}」？`,
+      [
+        '只影响这一条边路任务，下一轮生效。主会话和其他边路任务不变。',
+        modelNote,
+        'Skill / MCP / 经验库 / 子代理预设自下一轮起按新智能体配置，这条边路任务的审批放行规则保留。',
+      ],
+    )
+  } catch {
+    return
+  }
+  try {
+    await sessionStore.updateSessionAgent(String(sid), Number(nextAgentId))
+    const updated = sessionStore.getSessionEntity(String(sid))
+    sessionStore.updateSideTaskAgent(
+      sid,
+      String(updated?.agentId ?? nextAgentId),
+      updated?.agentName ?? agent?.name,
+    )
+    ElMessage.success(`这条边路任务已切换到「${agent?.name ?? nextAgentId}」，下一轮生效`)
+  } catch {
+    ElMessage.error('智能体切换失败，请重试')
+  }
+}
+
+function confirmAgentSwitch(title: string, notes: string[]) {
+  return ElMessageBox.confirm(
+    h('div', { class: 'agent-switch-confirm' }, [
+      h('p', { style: 'margin: 0 0 8px' }, title),
+      ...notes.map((note, index) => h('p', {
+        style: index === notes.length - 1
+          ? 'margin: 0; color: var(--aw-ink-muted-80); font-size: 13px'
+          : 'margin: 0 0 4px; color: var(--aw-ink-muted-80); font-size: 13px',
+      }, note)),
+    ]),
+    '切换智能体',
+    { confirmButtonText: '切换', cancelButtonText: '取消', type: 'warning' },
+  )
+}
+
+function refreshFileTree() {
+  inspectorRef.value?.refreshFileTree()
+}
+
+function revealInFileTree(relPath: string) {
+  void inspectorRef.value?.revealInFileTree(relPath)
+}
+
+async function handleOpenGitDiff(file: GitChangedFile, repoPath?: string) {
+  const provider = gitProvider.value
+  if (!provider) return
+  const diff = await provider.getFileDiff(file.path, repoPath)
+  const change: FileChange = {
+    path: diff.path,
+    type: diff.changeType,
+    linesAdded: file.insertions ?? 0,
+    linesDeleted: file.deletions ?? 0,
+    diffMode: diff.binary || diff.unavailableReason ? 'UNSUPPORTED' : 'SNAPSHOT',
+    beforeContent: diff.beforeContent,
+    afterContent: diff.afterContent,
+    diffUnavailableReason: diff.unavailableReason
+      || (diff.truncated ? '内容已截断，仅显示部分文本' : undefined),
+  }
+  const fileName = diff.path.split(/[/\\]/).pop() || diff.path
+  if (repoPath) {
+    // 多仓库模式：path 带仓库前缀，保证 diff tab id / 展示唯一，避免同名文件冲突
+    change.path = `${repoPath}/${diff.path}`
+    openDiffTab(change, `${repoPath} · ${fileName} (Git)`, { source: 'git' })
+  } else {
+    openDiffTab(change, `${fileName} (Git)`, { source: 'git' })
+  }
+}
+
+/**
+ * 历史视图的提交 diff：拉该提交对单文件的前后内容，落到独立 id 前缀的 diff Tab。
+ * idPrefix 用 `git-commit-diff:<hash>:`：与工作区变更的 `git-diff:<path>` 隔离，
+ * 不同提交的同路径文件也互不覆盖（技术方案 §5.1 P2 硬前置）。
+ */
+async function handleOpenCommitDiff(payload: { hash: string; file: GitChangedFile; repoPath?: string }) {
+  const provider = gitProvider.value
+  if (!provider) return
+  let diff
+  try {
+    // 改名提交的 before 取自父提交的旧路径：不传会把改名显示成「整份新增」
+    // （与同屏「改名」徽章矛盾）。只对 RENAMED 传 oldPath——复制文件的 before 本就是空
+    const oldPath = payload.file.changeType === 'RENAMED' ? payload.file.oldPath : undefined
+    diff = await provider.getCommitFileDiff(payload.hash, payload.file.path, payload.repoPath, oldPath)
+  } catch (e: any) {
+    ElMessage.error(e?.message || '读取提交文件内容失败')
+    return
+  }
+  const change: FileChange = {
+    path: diff.path,
+    type: diff.changeType,
+    linesAdded: payload.file.insertions ?? 0,
+    linesDeleted: payload.file.deletions ?? 0,
+    diffMode: diff.binary || diff.unavailableReason ? 'UNSUPPORTED' : 'SNAPSHOT',
+    beforeContent: diff.beforeContent,
+    afterContent: diff.afterContent,
+    diffUnavailableReason: diff.unavailableReason
+      || (diff.truncated ? '内容已截断，仅显示部分文本' : undefined),
+  }
+  const fileName = diff.path.split(/[/\\]/).pop() || diff.path
+  const shortHash = payload.hash.slice(0, 7)
+  const idPrefix = `git-commit-diff:${payload.hash}:`
+  if (payload.repoPath) {
+    change.path = `${payload.repoPath}/${diff.path}`
+    openDiffTab(change, `${shortHash} · ${payload.repoPath} · ${fileName} (Git)`, { source: 'git', idPrefix })
+  } else {
+    openDiffTab(change, `${shortHash} · ${fileName} (Git)`, { source: 'git', idPrefix })
+  }
+}
+
+/**
+ * 分支对比的单文件 diff：内容由 provider 按「base → target」两点语义取（before 取
+ * base 侧、after 取 target 侧，与文件清单同源同向），落到独立 id 前缀的 diff Tab。
+ * idPrefix 用 `git-branch-diff:<base>-><target>:`：与工作区变更 `git-diff:` / 提交
+ * `git-commit-diff:` 隔离，交换基准与目标后也不会互相覆盖。
+ */
+async function handleOpenBranchDiff(payload: { base: string; target: string; file: GitChangedFile; repoPath?: string }) {
+  const provider = gitProvider.value
+  if (!provider) return
+  let diff
+  try {
+    // 改名行的 before 取 base 侧旧路径：不传会把改名显示成「整份新增」
+    const oldPath = payload.file.changeType === 'RENAMED' ? payload.file.oldPath : undefined
+    diff = await provider.compareBranchFileDiff(payload.base, payload.target, payload.file.path, payload.repoPath, oldPath)
+  } catch (e: any) {
+    ElMessage.error(e?.message || '读取分支对比文件内容失败')
+    return
+  }
+  const change: FileChange = {
+    path: diff.path,
+    type: diff.changeType,
+    linesAdded: payload.file.insertions ?? 0,
+    linesDeleted: payload.file.deletions ?? 0,
+    diffMode: diff.binary || diff.unavailableReason ? 'UNSUPPORTED' : 'SNAPSHOT',
+    beforeContent: diff.beforeContent,
+    afterContent: diff.afterContent,
+    diffUnavailableReason: diff.unavailableReason
+      || (diff.truncated ? '内容已截断，仅显示部分文本' : undefined),
+  }
+  const fileName = diff.path.split(/[/\\]/).pop() || diff.path
+  const rangeLabel = `${payload.base} → ${payload.target}`
+  const idPrefix = `git-branch-diff:${payload.base}->${payload.target}:`
+  if (payload.repoPath) {
+    change.path = `${payload.repoPath}/${diff.path}`
+    openDiffTab(change, `${rangeLabel} · ${payload.repoPath} · ${fileName} (Git)`, { source: 'git', idPrefix })
+  } else {
+    openDiffTab(change, `${rangeLabel} · ${fileName} (Git)`, { source: 'git', idPrefix })
+  }
+}
+
+function handleTodoUpdate() {
+  // ChatPanel handles todo updates internally via useChat
+}
+
+function handleRename(title: string) {
+  // 右侧边栏重命名按当前展示对象分流：边路任务走独立 PATCH；子代理只读（双保险不处理）
+  const subSessionId = inspectorSubSessionId.value
+  if (inspectorViewType.value === 'side_task') {
+    if (subSessionId != null) {
+      void handleEditSideTaskTitle({ sideSessionId: subSessionId, title })
+    }
+    return
+  }
+  if (inspectorViewType.value === 'subagent') return
+  if (sessionStore.activeSessionId) {
+    sessionStore.renameSession(sessionStore.activeSessionId, title)
+  }
+}
+
+function handleOpenSideTask(payload: { sideSessionId: number; title: string }) {
+  openSideTaskTab(payload.sideSessionId, payload.title)
+}
+
+function handleOpenSubagent(payload: { childSessionId: number; title: string }) {
+  openSubagentTab(payload.childSessionId, payload.title)
+}
+
+/**
+ * 打开轨迹 Tab：主会话用单例 'trace'，边路 / 子代理会话按 'trace:{sid}' 另开一个，
+ * 标题带来源任务名，避免 Tab 条上两个「轨迹」分不清。stateKeySid 显式传主会话 id，
+ * 不依赖 currentSessionId 的 watch 同步时机。
+ */
+function handleOpenTrace(traceSessionId?: string) {
+  const key = sessionIdForTabs.value
+  if (!key) return
+  const traceSid = traceSessionId || key
+  openTraceTab(traceSid, {
+    stateKeySid: key,
+    title: traceSid === key ? undefined : `轨迹 · ${inspectorTitle.value}`,
+  })
+}
+
+provide('openSubagent', (payload: { childSessionId: number; title?: string }) => {
+  openSubagentTab(payload.childSessionId, payload.title || '子代理')
+})
+
+async function handleEditSideTaskTitle(payload: { sideSessionId: number; title: string }) {
+  // 请求前固定父会话 ID：PATCH 返回时可能已切换主会话，需用发起时的父会话更新缓存
+  const parentSessionId = activeSessionIdRef.value || ''
+  try {
+    const { data } = await api.patch(`/sessions/${payload.sideSessionId}`, { title: payload.title })
+    if (data) {
+      const newTitle = data.summary || data.title || payload.title
+      sessionStore.updateSideTaskTitle(parentSessionId, payload.sideSessionId, newTitle)
+      // 标签状态基于当前主会话的 useCenterTabs 单例：仅当仍停留原父会话时才更新，避免改到别的会话
+      if (parentSessionId && parentSessionId === activeSessionIdRef.value) {
+        updateSideTaskTab('side:' + payload.sideSessionId, payload.sideSessionId, newTitle)
+      }
+    }
+  } catch (e) {
+    console.warn('[side-task] Failed to rename side task:', e)
+    ElMessage.error('重命名失败，请稍后重试')
+  }
+}
+
+async function handleDeleteSideTask(sideSessionId: number) {
+  // 同样固定父会话 ID，避免删除返回时已切换主会话导致用错 ID 移除缓存
+  const parentSessionId = activeSessionIdRef.value || ''
+  try {
+    await ElMessageBox.confirm('删除后该边路任务的会话记录将删除且不可恢复；其下层边路任务将从树中移除显示（数据保留）。确认删除？', '删除边路任务', {
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+      type: 'warning'
+    })
+  } catch {
+    return
+  }
+  try {
+    await api.delete(`/sessions/${sideSessionId}`)
+  } catch (e) {
+    // API 失败不动本地状态：否则 UI 已移除、刷新后任务「复活」
+    console.warn('[side-task] Failed to delete side task:', e)
+    ElMessage.error('删除失败，请稍后重试')
+    return
+  }
+  const tab = tabs.value.find(t =>
+    t.type === 'side_task' && (t.sideSessionId === sideSessionId || t.id === 'side:' + sideSessionId)
+  )
+  if (tab) {
+    closeTab(tab.id)
+    draftStore.clearDraftAndMark(tab.id)
+  }
+  sessionStore.removeSideTask(parentSessionId, sideSessionId)
+  // 递归口径下被删任务的深层后代成为孤儿（仍残留在平铺缓存里），按服务端为准整体刷新剔除
+  if (parentSessionId) {
+    void sessionStore.refreshSideTasks(parentSessionId)
+  }
+}
+
+async function handlePromoteSideTask(sideSessionId: number) {
+  const parentSessionId = activeSessionIdRef.value || ''
+  try {
+    await ElMessageBox.confirm(
+      '升级后会创建一个新的主会话，并从当前主会话的边路任务列表中移除该边路任务。是否继续？',
+      '升级为主会话',
+      { confirmButtonText: '升级', cancelButtonText: '取消', type: 'info' }
+    )
+  } catch {
+    return
+  }
+  try {
+    const { data } = await api.post(`/sessions/${sideSessionId}/promote-side-task`)
+    const tab = tabs.value.find(t =>
+      t.type === 'side_task' && (t.sideSessionId === sideSessionId || t.id === 'side:' + sideSessionId)
+    )
+    if (tab) {
+      closeTab(tab.id)
+      draftStore.clearDraftAndMark(tab.id)
+    }
+    sessionStore.removeSideTask(parentSessionId, sideSessionId)
+    // 提升后其边路子树跟随新主会话、从旧树消失：按服务端为准刷新旧根的平铺列表剔除子树
+    if (parentSessionId) {
+      void sessionStore.refreshSideTasks(parentSessionId)
+    }
+    if (data?.id != null) {
+      await router.push(`/tasks/${data.id}`)
+    }
+  } catch (e) {
+    console.warn('[side-task] Failed to promote side task:', e)
+    ElMessage.error('升级失败，请稍后重试')
+  }
+}
+
+type NewTaskDefaults = {
+  agentId?: string | null
+  executionMode?: string
+  workspace?: string
+  /** 显式复用该工作区（总览「用于新任务」）：只有带此标记时 CLOUD 才预填 workspace，
+   *  其余入口（上次查看的会话、分组新建、路由直开）的 workspace 只对 LOCAL 生效 */
+  reuseWorkspace?: boolean
+  cloudProjectKey?: string
+  permissionLevel?: string
+  modelId?: number
+}
+
+function getQueryString(key: string): string {
+  const value = route.query[key]
+  if (Array.isArray(value)) return value[0] ?? ''
+  return value ?? ''
+}
+
+function normalizeNewTaskMode(mode?: string): 'CLOUD' | 'LOCAL' {
+  return mode === 'LOCAL' ? 'LOCAL' : 'CLOUD'
+}
+
+function getCurrentNewTaskDefaults(): NewTaskDefaults | null {
+  const active = sessionStore.activeSession
+    || (sessionIdParam.value ? sessionStore.sessions.find(s => String(s.id) === String(sessionIdParam.value)) : null)
+
+  if (active) {
+    return {
+      agentId: active.agentId ? String(active.agentId) : null,
+      executionMode: active.executionMode || 'CLOUD',
+      workspace: active.executionMode === 'LOCAL' ? active.workspace : undefined,
+      cloudProjectKey: cloudProjectKeyForNewTask(active),
+      permissionLevel: active.permissionLevel,
+      modelId: active.modelId
+    }
+  }
+
+  return lastViewedSession.value
+}
+
+function getRouteNewTaskDefaults(): NewTaskDefaults {
+  const modelId = Number(getQueryString('modelId'))
+  return {
+    agentId: getQueryString('agentId') || null,
+    executionMode: getQueryString('mode') || 'CLOUD',
+    workspace: getQueryString('workspace') || '',
+    reuseWorkspace: getQueryString('reuse') === '1',
+    cloudProjectKey: getQueryString('cloudProjectKey') || '',
+    permissionLevel: getQueryString('permissionLevel') || 'READ_ONLY',
+    modelId: Number.isFinite(modelId) && modelId > 0 ? modelId : undefined
+  }
+}
+
+function buildNewTaskRoute(defaults?: NewTaskDefaults | null) {
+  const query: Record<string, string> = { [NEW_TASK_QUERY]: '1' }
+  if (defaults?.agentId) query.agentId = String(defaults.agentId)
+  if (defaults?.executionMode) query.mode = normalizeNewTaskMode(defaults.executionMode)
+  if (defaults?.workspace) query.workspace = defaults.workspace
+  if (defaults?.reuseWorkspace) query.reuse = '1'
+  if (defaults?.cloudProjectKey) query.cloudProjectKey = defaults.cloudProjectKey
+  if (defaults?.permissionLevel) query.permissionLevel = defaults.permissionLevel
+  if (defaults?.modelId) query.modelId = String(defaults.modelId)
+  return { name: 'Home', query }
+}
+
+function isSameNewTaskRoute(target: ReturnType<typeof buildNewTaskRoute>) {
+  if (route.name !== target.name) return false
+  return Object.entries(target.query).every(([key, value]) => getQueryString(key) === value)
+}
+
+let newTaskModeGeneration = 0
+
+async function resolveNewTaskDefaults(defaults?: NewTaskDefaults | null): Promise<NewTaskDefaults> {
+  const resolved: NewTaskDefaults = {
+    agentId: defaults?.agentId || null,
+    executionMode: defaults?.executionMode || 'CLOUD',
+    workspace: defaults?.workspace,
+    reuseWorkspace: defaults?.reuseWorkspace,
+    cloudProjectKey: defaults?.cloudProjectKey,
+    permissionLevel: defaults?.permissionLevel || 'READ_ONLY',
+    modelId: defaults?.modelId
+  }
+
+  if (!resolved.agentId) {
+    if (agentStore.agents.length === 0) {
+      await agentStore.fetchAgents()
+    }
+    const defaultAgent = agentStore.agents.find(a => a.isDefault)
+    const fallbackAgent = defaultAgent || agentStore.agents[0]
+    if (fallbackAgent) {
+      resolved.agentId = String(fallbackAgent.id)
+    }
+  }
+
+  return resolved
+}
+
+async function enterNewTaskMode(defaults?: NewTaskDefaults | null) {
+  const generation = ++newTaskModeGeneration
+  // Apply known defaults synchronously BEFORE any await so the input model selector
+  // does not briefly show a stale newTaskModelId from a previous draft/session.
+  const earlyMode = defaults?.executionMode ? normalizeNewTaskMode(defaults.executionMode) : newTaskMode.value
+  if (defaults?.modelId) {
+    newTaskModelId.value = defaults.modelId
+  }
+  if (defaults?.agentId) {
+    newTaskAgentId.value = String(defaults.agentId)
+  }
+  if (defaults?.executionMode) {
+    newTaskMode.value = earlyMode
+    executionMode.value = earlyMode
+  }
+  // 工作区/项目选择一并同步复位：isNewTaskMode 随路由立即转真，若等 await 之后再写，
+  // 窗口内回写 watch 会用上一个新建态草稿的残留值建文件 provider，闪一下旧文件树。
+  // CLOUD 只在「显式复用」（总览「用于新任务」带 reuseWorkspace 标记）时预填
+  // workspace；其余入口一律 ''，新建会话由后端自动建目录。
+  newTaskWorkspace.value = newTaskWorkspacePrefill(earlyMode, defaults) || ''
+  newTaskCloudProjectKey.value = earlyMode === 'CLOUD' ? (defaults?.cloudProjectKey || '') : ''
+  // 进入新建态一律从干净工作台开始：作废上次新建态遗留的中心 Tab（见 resetNewTaskTabs）
+  resetNewTaskTabs()
+  if (defaults?.permissionLevel) {
+    permissionLevel.value = defaults.permissionLevel
+  }
+
+  const resolved = await resolveNewTaskDefaults(defaults)
+  if (generation !== newTaskModeGeneration) return
+
+  const mode = normalizeNewTaskMode(resolved.executionMode)
+  newTaskAgentId.value = resolved.agentId ? String(resolved.agentId) : null
+  newTaskMode.value = mode
+  newTaskWorkspace.value = newTaskWorkspacePrefill(mode, resolved) || ''
+  newTaskCloudProjectKey.value = mode === 'CLOUD' ? (resolved.cloudProjectKey || '') : ''
+  newTaskWorkspaceMode.value = 'new'
+  newTaskGitCloneUrl.value = ''
+  newTaskGitBranch.value = ''
+  // Load cloud projects for workspace source selection
+  sessionStore.fetchCloudProjects().then(projects => {
+    if (generation === newTaskModeGeneration) {
+      newTaskCloudProjects.value = projects
+      // 带入了显式工作区（总览「用于新任务」）时不抢默认模式：existing 下拉没有
+      // 对应条目，会让配置区显示与将要创建的工作区不符
+      if (projects.length > 0 && !newTaskWorkspace.value) {
+        newTaskWorkspaceMode.value = 'existing'
+      }
+      // 下拉富化（技术方案 2026-10-29 §2.1-4）：按 path 合并大小 / 会话数；失败静默回落纯目录名
+      void enrichCloudProjectsWithOverview(generation)
+    }
+  })
+  permissionLevel.value = resolved.permissionLevel || 'READ_ONLY'
+  newTaskModelId.value = resolved.modelId
+
+  initialLoading.value = false
+  executionMode.value = mode
+  currentPhase.value = 'IDLE'
+  projectKey.value = resolved.cloudProjectKey || ''
+  sessionStore.setActiveSession(null)
+  workspace.value = newTaskWorkspace.value
+  agentName.value = ''
+  chatTodos.value = []
+  chatContextWindow.value = null
+  chatSending.value = false
+  chatPendingApprovals.value = []
+
+  if (!newTaskModelId.value) {
+    await loadDefaultModel()
+    if (generation !== newTaskModeGeneration) return
+  }
+  if (generation !== newTaskModeGeneration) return
+  await nextTick()
+  chatFocusInput.value?.()
+}
+
+async function applyExplicitNewTaskRoute() {
+  if (!isExplicitNewTaskRoute.value) return
+  await enterNewTaskMode(getRouteNewTaskDefaults())
+}
+
+async function navigateToNewTask(defaults?: NewTaskDefaults | null) {
+  const target = buildNewTaskRoute(defaults)
+  if (isSameNewTaskRoute(target)) {
+    await enterNewTaskMode(defaults ?? getRouteNewTaskDefaults())
+  } else {
+    await router.push(target)
+  }
+}
+
+function getRouteWatchState() {
+  return {
+    sessionId: sessionIdParam.value || '',
+    explicitNewTask: isExplicitNewTaskRoute.value,
+    newTaskSignature: isExplicitNewTaskRoute.value ? JSON.stringify(getRouteNewTaskDefaults()) : ''
+  }
+}
+
+let loadGeneration = 0
+
+async function loadSession(sid: string) {
+  const gen = ++loadGeneration
+  newTaskAgentId.value = null
+  const phaseAtRequest = sessionStore.getSessionEntity(sid)?.phase
+
+  try {
+    const { data } = await api.get(`/sessions/${sid}`)
+    if (gen !== loadGeneration) return
+    if (data) {
+      // Preserve locally derived title (avoids race with deriveTitle in sendMessage)
+      const existing = sessionStore.sessions.find(s => String(s.id) === String(sid))
+      if (existing?.title && existing.title !== '未命名会话') {
+        data.title = existing.title
+      }
+      // Update store BEFORE setActiveSession so ChatPanel's watcher reads correct data.
+      // Keep a newer WS phase when this REST request started before the transition.
+      // 返回值是合并后的最终 phase（实时 WS phase 优先）：新建会话首条消息的执行态常在
+      // GET 在途时就经 session_status 落地，而快照读于执行启动前（IDLE）。currentPhase
+      // 驱动右侧「执行中」徽标，直接采用 data.phase 会把徽标打回空态。
+      const effectivePhase = sessionStore.updateSessionFromSnapshot(sid, data, phaseAtRequest)
+      const normalizedAgentId = String(data.agentId)
+      // Set shared refs — ChatPanel reads these for useChat
+      agentId.value = normalizedAgentId
+      executionMode.value = data.executionMode || 'CLOUD'
+      currentPhase.value = effectivePhase ?? (data.phase || 'IDLE')
+      projectKey.value = data.projectKey || ''
+      permissionLevel.value = data.permissionLevel || 'READ_ONLY'
+      workspace.value = data.workspace || ''
+      // Trigger ChatPanel watcher AFTER store and refs are updated
+      sessionStore.setActiveSession(sid)
+      // 用户正在查看此会话：清除后端未读标记，避免页面刷新后仍显示未读圆点
+      if (data.unread) {
+        void sessionStore.markAsRead(sid)
+      }
+      // workspace and agentName will be synced from ChatPanel's useChat
+      await agentStore.fetchAgent(normalizedAgentId)
+      lastViewedSession.value = {
+        agentId: normalizedAgentId,
+        executionMode: data.executionMode || 'CLOUD',
+        workspace: data.workspace,
+        cloudProjectKey: cloudProjectKeyForNewTask(data),
+        permissionLevel: data.permissionLevel,
+        modelId: data.modelId
+      }
+    } else {
+      sessionStore.setActiveSession(sid)
+    }
+  } catch {
+    sessionStore.setActiveSession(sid)
+  }
+
+  // Restore open side task tabs (excluding user-closed ones)
+  // 激活态读一次，边路任务与子代理两个还原块共用（两者都按 sideSessionId 锚定）
+  const persistedActive = getPersistedActiveTab(sid)
+  try {
+    // recursive=1：检查器平铺主会话全部后代边路任务；Tab 恢复过滤回直接子级口径
+    const res = await api.get(`/sessions/${sid}/side-tasks`, { params: { recursive: 1 } })
+    if (gen !== loadGeneration) return
+    const sideTasksData = res?.data
+    const items = Array.isArray(sideTasksData)
+      ? sideTasksData.map((st: { id: number; title: string; modelId?: number; parentSessionId?: number; permissionLevel?: string; phase?: string; createdAt?: string; unread?: boolean }) => ({
+          id: st.id,
+          title: st.title || '任务',
+          modelId: st.modelId,
+          parentSessionId: st.parentSessionId,
+          permissionLevel: st.permissionLevel,
+          phase: (st.phase || 'IDLE') as TaskPhase,
+          createdAt: st.createdAt,
+          unread: st.unread,
+        }))
+      : []
+    sessionStore.setSideTasks(sid, items)
+    // Tab 恢复维持直接子级口径：深层任务的 Tab 刷新后不自动重建，从检查器列表重新打开。
+    // 唯一例外是「上次正停在其上」的那个（持久化激活态指向它）：不重建的话
+    // restoreActiveTab 找不到目标，退出重开只能停在主会话，还得手动点一次边栏标题。
+    // 传全量 items（带 parentSessionId），由 restoreSideTaskTabs 自己按口径过滤。
+    const restoreIds = resolveSideTaskRestoreIds(persistedActive, items)
+    if (items.length > 0) {
+      restoreSideTaskTabs(
+        sid,
+        items.map((st) => ({ id: st.id, title: st.title || '任务', parentSessionId: st.parentSessionId })),
+        { restoreIds },
+      )
+      // Tab 重建完再还原激活态：上次停在边路任务 / 子代理 Tab 时，刷新后直接回到那个 Tab
+      restoreActiveTab(sid)
+    }
+  } catch (e) {
+    console.warn('[side-task] Failed to restore side task tabs:', e)
+    sessionStore.setSideTasks(sid, [])
+  }
+
+  // Restore subagent list (tabs opened on demand / via live event)
+  try {
+    const res = await api.get(`/sessions/${sid}/subagents`)
+    if (gen !== loadGeneration) return
+    const subagentsData = res?.data
+    const items = Array.isArray(subagentsData)
+      ? subagentsData.map((sa: {
+          id: number
+          title?: string
+          phase?: string
+          createdAt?: string
+          agentType?: string
+          taskDescription?: string
+        }) => ({
+          id: sa.id,
+          title: sa.title || '子代理',
+          phase: (sa.phase || 'IDLE') as TaskPhase,
+          createdAt: sa.createdAt,
+          agentType: sa.agentType,
+          taskDescription: sa.taskDescription,
+        }))
+      : []
+    sessionStore.setSubagents(sid, items)
+    // 上次正停在某个子代理 Tab：点名补建那一个并还原激活，否则 restoreActiveTab
+    // 找不到目标、退出重开只能停在主会话。其余子代理仍不自动重建（避免刷新刷屏），
+    // 与深层边路任务的点名还原同一口径（restoreSubagentTabs 首个生产调用方）。
+    const subagentId = resolveSubagentRestoreId(persistedActive, items)
+    const namedSubagent = subagentId != null ? items.find((sa) => sa.id === subagentId) : undefined
+    if (namedSubagent) {
+      restoreSubagentTabs(sid, [{ id: namedSubagent.id, title: namedSubagent.title || '子代理' }], { openAll: true })
+      restoreActiveTab(sid)
+    }
+  } catch (e) {
+    console.warn('[subagent] Failed to load subagent list:', e)
+    sessionStore.setSubagents(sid, [])
+  }
+
+  // 还原轨迹 tab（上次停在轨迹 tab 时刷新后直接回去）。与边路任务还原相互独立：
+  // 没有边路任务的会话同样可能停在轨迹 tab。
+  if (gen !== loadGeneration) return
+  restoreTraceTab(sid)
+
+  if (gen === loadGeneration) {
+    initialLoading.value = false
+  }
+}
+
+async function navigateToLatestSession(): Promise<string | null> {
+  // 优先恢复持久化的最后查看会话（刷新 / 安卓 WebView 冷启动后仍回到上次会话）
+  const lastId = sessionStore.getLastSessionId()
+  if (lastId) {
+    // 侧栏仅含每组预览，最后会话可能不在列表中：先查本地列表，命中直接恢复；
+    // 否则用 /sessions/{id} 验证（可能位于组内预览之外）
+    const inList = sessionStore.sessions.some(s => String(s.id) === String(lastId))
+    const sid = inList ? String(lastId) : await (async () => {
+      const detail = await sessionStore.fetchSession(lastId)
+      return detail ? String(detail.id) : null
+    })()
+    if (sid) {
+      await router.replace(`/tasks/${sid}`)
+      return sid
+    }
+    // 会话已删除/失效：遗忘并回退列表首项
+    sessionStore.forgetLastSession()
+  }
+  const latest = sessionStore.sessions[0]
+  if (!latest) return null
+  const sid = String(latest.id)
+  await router.replace(`/tasks/${sid}`)
+  return sid
+}
+
+async function handleNewTask() {
+  await navigateToNewTask(getCurrentNewTaskDefaults())
+}
+
+async function handleNewTaskFromGroup(payload: { agentId: string; executionMode: string; workspace?: string; cloudProjectKey?: string; permissionLevel?: string; modelId?: number }) {
+  await navigateToNewTask(payload)
+}
+
+function handleNewSideTask(
+  contextMode: SideTaskContextMode = 'none',
+  fork?: { messageId: string; label: string },
+) {
+  // 来源会话决策：边路任务 Tab 内发起 → 来源是该边路会话（新边路的父会话）；
+  // 占位 Tab（会话未建）→ 沿用占位预置的来源；chat / 文件 / Diff / 子代理 Tab → 主会话视角（缺省）。
+  const activeTabValue = activeTab.value
+  let sourceSessionId: number | undefined
+  if (activeTabValue?.type === 'side_task') {
+    if (activeTabValue.sideSessionId != null && activeTabValue.sideSessionId > 0) {
+      sourceSessionId = activeTabValue.sideSessionId
+    } else if (activeTabValue.sourceSessionId != null && activeTabValue.sourceSessionId > 0) {
+      sourceSessionId = activeTabValue.sourceSessionId
+    }
+  }
+  const opts: SideTaskEntryOptions = {
+    contextMode,
+    ...(fork ? { fork } : {}),
+    ...(sourceSessionId != null ? { sourceSessionId } : {}),
+  }
+  const placeholder = tabs.value.find(t => t.type === 'side_task' && (t.sideSessionId == null || t.sideSessionId <= 0))
+  if (placeholder) {
+    // 复用已存在的占位 Tab：整体覆写预置（含来源会话），避免上一次入口的 fork / 来源残留到本次新建
+    setSideTaskFork(placeholder.id, opts)
+    activateTab(placeholder.id)
+    return
+  }
+  const tempId = -Date.now()
+  openSideTaskTab(tempId, '任务', opts)
+}
+
+provide('openSideTask', handleNewSideTask)
+
+async function loadDefaultModel() {
+  try {
+    const { data } = await api.get('/models/default')
+    if (data) {
+      newTaskModelId.value = data.id
+    }
+  } catch {
+    // ignore
+  }
+}
+
+async function loadTaskIndex() {
+  if (!getToken()) {
+    await loadPrefs()
+    initialLoading.value = false
+    return false
+  }
+
+  try {
+    await sessionStore.fetchSessions()
+    await loadPrefs()
+    return true
+  } catch {
+    initialLoading.value = false
+    return false
+  }
+}
+
+async function resolveInitialRoute() {
+  const sid = sessionIdParam.value
+  if (sid) {
+    await loadSession(sid)
+  } else if (isExplicitNewTaskRoute.value) {
+    await enterNewTaskMode(getRouteNewTaskDefaults())
+  } else {
+    const latestSid = await navigateToLatestSession()
+    if (latestSid) {
+      await loadSession(latestSid)
+    } else {
+      await enterNewTaskMode()
+    }
+  }
+}
+
+// Keep lastViewedSession.modelId in sync when user switches model mid-conversation
+watch(
+  () => sessionStore.activeSession?.modelId,
+  (modelId) => {
+    if (modelId != null && lastViewedSession.value) {
+      lastViewedSession.value = { ...lastViewedSession.value, modelId }
+    }
+  }
+)
+
+// Session switching — single watcher avoids duplicate enterNewTaskMode on route transitions
+watch(getRouteWatchState, async (state, prev) => {
+  const prevState = prev ?? { sessionId: '', explicitNewTask: false, newTaskSignature: '' }
+
+  if (state.sessionId && state.sessionId !== prevState.sessionId) {
+    await loadSession(state.sessionId)
+    nextTick(() => chatFocusInput.value?.())
+    return
+  }
+
+  if (!state.sessionId && prevState.sessionId) {
+    sessionStore.setActiveSession(null)
+    if (state.explicitNewTask) {
+      await applyExplicitNewTaskRoute()
+      return
+    }
+
+    initialLoading.value = false
+    const isNewTaskFromGroup = !!newTaskAgentId.value
+    if (!isNewTaskFromGroup) {
+      const previous = lastViewedSession.value
+      if (previous) {
+        newTaskAgentId.value = previous.agentId ? String(previous.agentId) : null
+        newTaskMode.value = (previous.executionMode as 'CLOUD' | 'LOCAL') || 'CLOUD'
+        newTaskWorkspace.value = previous.executionMode === 'LOCAL' ? (previous.workspace || '') : ''
+        newTaskCloudProjectKey.value = previous.cloudProjectKey || ''
+        permissionLevel.value = previous.permissionLevel || 'READ_ONLY'
+        if (previous.modelId) {
+          newTaskModelId.value = previous.modelId
+        } else {
+          loadDefaultModel()
+        }
+      } else {
+        await enterNewTaskMode()
+      }
+    }
+    return
+  }
+
+  if (!state.sessionId && state.explicitNewTask && state.newTaskSignature !== prevState.newTaskSignature) {
+    await applyExplicitNewTaskRoute()
+  }
+})
+
+onMounted(async () => {
+  // 首启向导判定：就绪数据与任务索引并行拉取，先到先渲染
+  void readinessStore.fetch()
+  if (!await loadTaskIndex()) return
+  await resolveInitialRoute()
+})
+
+onUnmounted(() => {
+  disposed = true
+  window.removeEventListener('side_session_created', handleSideSessionCreated)
+  window.removeEventListener('subagent_session_created', handleSubagentSessionCreated)
+})
+</script>
+
+<style scoped>
+.task-layout {
+  display: flex;
+  height: 100%;
+  overflow: hidden;
+}
+
+.task-container {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
+}
+</style>

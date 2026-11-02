@@ -1,0 +1,1295 @@
+import type { Db } from '../db/db.js';
+import { fulltextStopwordTableName, notDeleted } from '../db/db.js';
+import { sep } from 'node:path';
+import { toSnakeRow } from '../common/case.js';
+import { nowSql } from '../common/datetime.js';
+import { escapeLike, messageRoleClause } from './message-search.js';
+import type { MessageSearchScope } from './message-search.js';
+import { ACTIVE_PHASE_SQL_LIST } from './util/session-group-key.js';
+import type { FileChange, Message, Session, SessionGroupPage } from './types.js';
+
+// 'signal' 只能由哨兵触发经 openRun 产生：POST /v1/sessions 的路由层白名单是显式
+// ['web','embed']（不读本数组），用户不能手工建 signal 会话（防伪造分组归属）。
+// 系统来源（feishu/dingtalk/weixin/openapi）由各通道创建会话的内部调用方写入；
+// 契约联合在 shared/contracts/src/session.ts 的 SessionSource，两端须逐值一致。
+export const SESSION_SOURCE_VALUES = [
+  'web', 'embed', 'feishu', 'dingtalk', 'weixin', 'signal', 'openapi',
+] as const;
+export type SessionSource = (typeof SESSION_SOURCE_VALUES)[number];
+
+export const isSessionSource = (value: unknown): value is SessionSource =>
+  typeof value === 'string' && (SESSION_SOURCE_VALUES as readonly string[]).includes(value);
+
+/**
+ * 用户可手工创建/设置的会话来源：仅 web/embed。
+ * 'signal' 等系统来源只能由哨兵触发经 openRun 产生，用户入口（POST /v1/sessions、
+ * PUT /v1/sessions/:id/source）一律走本守卫，不读 SESSION_SOURCE_VALUES——
+ * 否则加了系统来源后用户可手工把会话挪进对应分组（防伪造分组归属）。
+ */
+export const USER_SETTABLE_SESSION_SOURCES = ['web', 'embed'] as const satisfies readonly SessionSource[];
+
+export const isUserSettableSessionSource = (value: unknown): value is 'web' | 'embed' =>
+  typeof value === 'string' && (USER_SETTABLE_SESSION_SOURCES as readonly string[]).includes(value);
+
+export interface MessageSearchSqlFilter {
+  mode: 'FULLTEXT' | 'LIKE';
+  userId: number;
+  match: string;
+  agentId: number | null;
+  createdFrom: string | null;
+  createdToExclusive: string | null;
+  sessionType: 'NORMAL' | 'SIDE_TASK' | null;
+  limit: number;
+  offset: number;
+}
+
+export interface MessageSearchSessionRow {
+  sessionId: number;
+  hitCount: number;
+  maxScore: number;
+}
+
+export interface MessageSearchHitRow {
+  sessionId: number;
+  messageId: number;
+  role: string;
+  content: string | null;
+  createdAt: string | null;
+  score: number;
+}
+
+function searchWhere(filter: MessageSearchSqlFilter): { where: string; params: unknown[] } {
+  const params: unknown[] = [];
+  const clauses = [
+    'm.deleted = 0',
+    `m.role IN ('USER', 'ASSISTANT')`,
+    's.user_id = ?',
+    's.deleted = 0',
+    `s.session_type IN ('NORMAL', 'SIDE_TASK')`,
+    `(s.session_type = 'NORMAL' OR EXISTS (
+      SELECT 1 FROM session p
+      WHERE p.id = s.parent_session_id AND p.user_id = s.user_id AND p.deleted = 0
+    ))`,
+  ];
+  params.push(filter.userId);
+  if (filter.mode === 'FULLTEXT') {
+    clauses.push('MATCH(m.content) AGAINST (? IN BOOLEAN MODE)');
+    params.push(filter.match);
+  } else {
+    clauses.push(`m.content LIKE CONCAT('%', ?, '%') ESCAPE '\\\\'`);
+    params.push(filter.match);
+  }
+  if (filter.agentId != null) {
+    clauses.push('s.agent_id = ?');
+    params.push(filter.agentId);
+  }
+  if (filter.createdFrom != null) {
+    clauses.push('m.created_at >= ?');
+    params.push(filter.createdFrom);
+  }
+  if (filter.createdToExclusive != null) {
+    clauses.push('m.created_at < ?');
+    params.push(filter.createdToExclusive);
+  }
+  if (filter.sessionType != null) {
+    clauses.push('s.session_type = ?');
+    params.push(filter.sessionType);
+  }
+  return { where: clauses.join(' AND '), params };
+}
+
+function runSearchQuery<T>(db: Db, mode: 'FULLTEXT' | 'LIKE', sql: string, params: unknown[]): Promise<T[]> {
+  const table = fulltextStopwordTableName();
+  if (mode === 'FULLTEXT' && table != null && typeof db.queryAfterSession === 'function') {
+    return db.queryAfterSession<T>('SET SESSION innodb_ft_user_stopword_table = ?', [table], sql, params);
+  }
+  return db.query<T>(sql, params);
+}
+
+function num(value: unknown): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+export interface SessionListFilter {
+  userId: number;
+  agentId?: number | null;
+  source?: SessionSource | null;
+}
+
+export class SessionRepository {
+  constructor(private readonly db: Db) {}
+
+  transaction<T>(fn: (db: Db) => Promise<T>): Promise<T> {
+    return this.db.transaction(fn);
+  }
+
+  findById(id: number): Promise<Session | null> {
+    return this.db.queryOne<Session>(`SELECT * FROM \`session\` WHERE id = ? AND ${notDeleted()}`, [id]);
+  }
+
+  /** 该用户是否存在任意会话历史（readiness 存量用户静默判定用）。 */
+  async existsByUserId(userId: number): Promise<boolean> {
+    const row = await this.db.queryOne<{ one: number }>(
+      `SELECT 1 AS one FROM \`session\` WHERE user_id = ? AND ${notDeleted()} LIMIT 1`,
+      [userId],
+    );
+    return row != null;
+  }
+
+  findByIdForUpdate(id: number): Promise<Session | null> {
+    return this.db.queryOne<Session>(`SELECT * FROM \`session\` WHERE id = ? AND ${notDeleted()} FOR UPDATE`, [id]);
+  }
+
+  selectById(id: number): Promise<Session | null> {
+    return this.findById(id);
+  }
+
+  selectByPhase(phase: string): Promise<Session[]> {
+    return this.list('phase = ?', [phase], '');
+  }
+
+  listSideTasks(parentSessionId: number): Promise<Session[]> {
+    return this.list(
+      `parent_session_id = ? AND session_type = 'SIDE_TASK' AND (status IS NULL OR status <> 'ARCHIVED')`,
+      [parentSessionId],
+      '',
+    );
+  }
+
+  /**
+   * 递归列出 rootIds 各自主会话树下的全部后代边路任务（不含 rootIds 自身）。
+   * BFS 逐层按 parent_session_id IN 批量下钻，返回 rootId -> 后代列表（无序，由调用方排序）。
+   * 归档节点不入结果且不向其下钻（归档子树整体隐藏）；父已删除的孤儿链因断链天然不可达。
+   * depthLimit 仅防病态数据（环 / 超深链），正常树 1-3 层即收敛。
+   */
+  async listDescendantSideTasksByRoots(
+    rootIds: number[],
+    userId?: number,
+    depthLimit = 10,
+  ): Promise<Map<number, Session[]>> {
+    const byRoot = new Map<number, Session[]>();
+    if (rootIds.length === 0) return byRoot;
+    // frontier: 待下钻的节点 id -> 所属根；visited 防环（正常树不会命中）
+    let frontier = new Map<number, number>();
+    const visited = new Set<number>();
+    for (const rootId of rootIds) {
+      frontier.set(rootId, rootId);
+      visited.add(rootId);
+    }
+    for (let depth = 0; depth < depthLimit && frontier.size > 0; depth++) {
+      const ids = [...frontier.keys()];
+      const placeholders = ids.map(() => '?').join(',');
+      const userClause = userId != null ? ' AND user_id = ?' : '';
+      const children = await this.db.query<Session>(
+        `SELECT * FROM \`session\`
+         WHERE parent_session_id IN (${placeholders})
+           AND session_type = 'SIDE_TASK'
+           AND (status IS NULL OR status <> 'ARCHIVED')
+           AND ${notDeleted()}${userClause}`,
+        userId != null ? [...ids, userId] : ids,
+      );
+      const next = new Map<number, number>();
+      for (const child of children) {
+        const id = child.id;
+        const parentKey = child.parentSessionId;
+        if (id == null || parentKey == null || visited.has(id)) continue;
+        const rootId = frontier.get(parentKey);
+        if (rootId == null) continue;
+        visited.add(id);
+        const list = byRoot.get(rootId) ?? [];
+        list.push(child);
+        byRoot.set(rootId, list);
+        next.set(id, rootId);
+      }
+      frontier = next;
+    }
+    return byRoot;
+  }
+
+  /** 单根递归列出全部后代边路任务（按 updated_at 降序、id 降序平铺）。 */
+  async listDescendantSideTasks(rootId: number, userId?: number): Promise<Session[]> {
+    const byRoot = await this.listDescendantSideTasksByRoots([rootId], userId);
+    const list = byRoot.get(rootId) ?? [];
+    list.sort((a, b) => {
+      const ta = a.updatedAt ?? '';
+      const tb = b.updatedAt ?? '';
+      if (ta !== tb) return ta < tb ? 1 : -1;
+      return (b.id ?? 0) - (a.id ?? 0);
+    });
+    return list;
+  }
+
+  findActiveByUserAndProjectKey(userId: number, projectKey: string): Promise<Session | null> {
+    return this.db.queryOne<Session>(
+      `SELECT * FROM \`session\` WHERE user_id = ? AND project_key = ? AND status = 'ACTIVE' AND ${notDeleted()} LIMIT 1`,
+      [userId, projectKey],
+    );
+  }
+
+  /** 用户历史会话出现过的 (project_key, workspace) 去重集合，供记忆项目下拉与抽取渠道判定。 */
+  listProjectKeyRows(userId: number): Promise<Array<{ projectKey: string; workspace: string | null }>> {
+    return this.db.query(
+      `SELECT project_key AS projectKey, MAX(workspace) AS workspace
+       FROM \`session\` WHERE user_id = ? AND ${notDeleted()} AND project_key IS NOT NULL AND project_key <> ''
+       GROUP BY project_key`,
+      [userId],
+    );
+  }
+
+  /**
+   * 用户全部未删除会话使用过的工作区绝对路径去重集合（容器挂载清单用，N-2）。
+   * 按 user_id 过滤即归属校验：只可能返回该用户自己的会话工作区（含飞书/钉钉
+   * 通道会话越出每用户根的工作区），由调用方再按通道根前缀筛选后挂进容器。
+   */
+  listWorkspacesByUser(userId: number): Promise<string[]> {
+    return this.db.query<{ workspace: string | null }>(
+      `SELECT DISTINCT workspace FROM \`session\`
+       WHERE user_id = ? AND ${notDeleted()} AND workspace IS NOT NULL AND workspace <> ''`,
+      [userId],
+    ).then((rows) => rows.map((r) => r.workspace).filter((w): w is string => typeof w === 'string' && w.length > 0));
+  }
+
+  async lockActiveSessionById(sessionId: number): Promise<number | null> {
+    const row = await this.db.queryOne<{ id: number }>(
+      `SELECT id FROM \`session\` WHERE id = ? AND ${notDeleted()} FOR UPDATE`,
+      [sessionId],
+    );
+    return row?.id ?? null;
+  }
+
+  async insert(session: Session): Promise<number> {
+    const id = await this.db.insert('session', {
+      userId: session.userId,
+      agentId: session.agentId,
+      title: session.title,
+      status: session.status ?? 'ACTIVE',
+      executionMode: session.executionMode,
+      workspace: session.workspace,
+      permissionLevel: session.permissionLevel,
+      modelId: session.modelId,
+      isGit: session.isGit == null ? null : session.isGit ? 1 : 0,
+      platform: session.platform,
+      shellPath: session.shellPath,
+      osVersion: session.osVersion,
+      phase: session.phase ?? 'IDLE',
+      summary: session.summary,
+      startedAt: session.startedAt,
+      elapsedMs: session.elapsedMs ?? 0,
+      stepsJson: session.stepsJson,
+      projectKey: session.projectKey,
+      lastActivityAt: session.lastActivityAt,
+      contextTokens: session.contextTokens,
+      lastPromptTokens: session.lastPromptTokens,
+      contextAnchorMsgId: session.contextAnchorMsgId,
+      unread: session.unread ?? 0,
+      parentSessionId: session.parentSessionId,
+      sessionType: session.sessionType ?? 'NORMAL',
+      source: session.source ?? 'web',
+      runtimeStatusJson: session.runtimeStatusJson,
+      deleted: 0,
+    });
+    session.id = id;
+    return id;
+  }
+
+  async updateById(session: Session): Promise<void> {
+    if (session.id == null) {
+      return;
+    }
+    await this.db.updateById('session', session.id, {
+      userId: session.userId,
+      agentId: session.agentId,
+      title: session.title,
+      status: session.status,
+      executionMode: session.executionMode,
+      workspace: session.workspace,
+      permissionLevel: session.permissionLevel,
+      modelId: session.modelId,
+      isGit: session.isGit == null ? null : session.isGit ? 1 : 0,
+      platform: session.platform,
+      shellPath: session.shellPath,
+      osVersion: session.osVersion,
+      phase: session.phase,
+      summary: session.summary,
+      startedAt: session.startedAt,
+      elapsedMs: session.elapsedMs,
+      stepsJson: session.stepsJson,
+      projectKey: session.projectKey,
+      lastActivityAt: session.lastActivityAt,
+      contextTokens: session.contextTokens,
+      lastPromptTokens: session.lastPromptTokens,
+      contextAnchorMsgId: session.contextAnchorMsgId,
+      unread: session.unread,
+      parentSessionId: session.parentSessionId,
+      sessionType: session.sessionType,
+      runtimeStatusJson: session.runtimeStatusJson,
+    });
+  }
+
+  async updateFields(id: number, fields: Record<string, unknown>): Promise<number> {
+    const keys = Object.keys(fields).filter((k) => fields[k] !== undefined);
+    if (keys.length === 0) {
+      return 0;
+    }
+    await this.db.updateById('session', id, fields);
+    return 1;
+  }
+
+  async updateWhere(fields: Record<string, unknown>, whereSql: string, params: unknown[]): Promise<number> {
+    const row = toSnakeRow(fields);
+    const keys = Object.keys(row);
+    if (keys.length === 0) {
+      return 0;
+    }
+    const sql = `UPDATE \`session\` SET ${keys.map((k) => `\`${k}\` = ?`).join(', ')} WHERE ${whereSql}`;
+    const result = await this.db.execute(sql, [...Object.values(row), ...params]);
+    return Number(result.affectedRows ?? 0);
+  }
+
+  /** 子代理追问的 CAS 语义：phase <> 'RUNNING' OR phase IS NULL。 */
+  claimRunningIfIdle(sessionId: number): Promise<number> {
+    return this.updateWhere(
+      { phase: 'RUNNING' },
+      "id = ? AND (phase <> 'RUNNING' OR phase IS NULL) AND deleted = 0",
+      [sessionId],
+    );
+  }
+
+  /**
+   * CAS：仅当 phase 落在他值集合内才改写（并刷新 last_activity_at）。
+   *
+   * 停机收尾必须用它而不是"先读后写"：执行线程可能在读完之后写入终态，
+   * 无条件写会把 COMPLETED/FAILED 覆盖回运行态，使已完成的会话被当成孤儿重新执行。
+   */
+  markPhaseIfIn(sessionId: number, phase: string, expected: string[]): Promise<number> {
+    if (expected.length === 0) return Promise.resolve(0);
+    const placeholders = expected.map(() => '?').join(', ');
+    return this.updateWhere(
+      { phase, lastActivityAt: nowSql() },
+      `id = ? AND deleted = 0 AND phase IN (${placeholders})`,
+      [sessionId, ...expected],
+    );
+  }
+
+  updateTitleIfPlaceholder(
+    sessionId: number,
+    sessionType: string,
+    placeholder: string,
+    title: string,
+    updatedAt: string,
+  ): Promise<number> {
+    return this.updateWhere(
+      { title, updatedAt },
+      "id = ? AND session_type = ? AND (title = ? OR title IS NULL OR TRIM(title) = '') AND deleted = 0",
+      [sessionId, sessionType, placeholder],
+    );
+  }
+
+  async logicalDelete(id: number): Promise<void> {
+    await this.db.execute(`UPDATE \`session\` SET deleted = 1 WHERE id = ? AND ${notDeleted()}`, [id]);
+  }
+
+  /** 把 oldParentId 的全部未删除子会话重挂到 newParentId 名下（提升边路任务时子树跟随新主会话用）。 */
+  async reparentChildrenTo(oldParentId: number, newParentId: number): Promise<void> {
+    await this.db.execute(
+      `UPDATE \`session\` SET parent_session_id = ? WHERE parent_session_id = ? AND ${notDeleted()}`,
+      [newParentId, oldParentId],
+    );
+  }
+
+  list(whereSql: string, params: unknown[], orderSql: string): Promise<Session[]> {
+    return this.db.query<Session>(
+      `SELECT * FROM \`session\` WHERE ${whereSql} AND ${notDeleted()} ${orderSql}`,
+      params,
+    );
+  }
+
+  /** Embed SDK 历史列表：user + agent + source 过滤，主会话，updated_at 倒序分页 */
+  async pageSessionsByFilter(filter: SessionListFilter, offset: number, limit: number): Promise<SessionGroupPage> {
+    const clauses = ['user_id = ?', `session_type NOT IN ('SUBAGENT', 'SIDE_TASK')`, 'status = ?', 'source = ?'];
+    const params: unknown[] = [filter.userId, 'ACTIVE', filter.source ?? 'web'];
+    if (filter.agentId != null) {
+      clauses.push('agent_id = ?');
+      params.push(filter.agentId);
+    }
+    const whereSql = clauses.join(' AND ');
+    const total = await this.count(whereSql, params);
+    const items = await this.list(whereSql, params, `ORDER BY updated_at DESC, id DESC LIMIT ${limit} OFFSET ${offset}`);
+    return { items, total, offset, limit, hasMore: offset + items.length < total };
+  }
+
+  async count(whereSql: string, params: unknown[]): Promise<number> {
+    const row = await this.db.queryOne<{ cnt: number }>(
+      `SELECT COUNT(*) AS cnt FROM \`session\` WHERE ${whereSql} AND ${notDeleted()}`,
+      params,
+    );
+    return Number(row?.cnt ?? 0);
+  }
+
+  async selectPage(
+    page: number,
+    size: number,
+    whereSql: string,
+    params: unknown[],
+    orderSql: string,
+  ): Promise<{ records: Session[]; total: number }> {
+    const total = await this.count(whereSql, params);
+    const offset = (page - 1) * size;
+    const records = await this.db.query<Session>(
+      `SELECT * FROM \`session\` WHERE ${whereSql} AND ${notDeleted()} ${orderSql} LIMIT ? OFFSET ?`,
+      [...params, size, offset],
+    );
+    return { records, total };
+  }
+
+  selectMessageSearchCandidates(userId: number, escapedKeyword: string): Promise<Session[]> {
+    return this.db.query<Session>(
+      `SELECT DISTINCT s.id, s.title, s.session_type, s.parent_session_id, s.phase, s.status, s.updated_at, s.agent_id
+       FROM session s
+       JOIN message m ON m.session_id = s.id AND m.deleted = 0
+       WHERE s.user_id = ? AND s.deleted = 0
+         AND s.session_type IN ('NORMAL', 'SIDE_TASK')
+         AND m.role = 'USER'
+         AND m.content LIKE CONCAT('%', ?, '%') ESCAPE '\\\\'
+         AND (
+           s.session_type = 'NORMAL'
+           OR EXISTS (
+             SELECT 1 FROM session p
+             WHERE p.id = s.parent_session_id
+               AND p.user_id = s.user_id
+               AND p.deleted = 0
+           )
+         )
+       ORDER BY s.updated_at DESC, s.id DESC
+       LIMIT 20`,
+      [userId, escapedKeyword],
+    );
+  }
+
+  selectByIds(ids: number[]): Promise<Session[]> {
+    if (ids.length === 0) return Promise.resolve([]);
+    const placeholders = ids.map(() => '?').join(',');
+    return this.db.query<Session>(
+      `SELECT * FROM \`session\` WHERE id IN (${placeholders}) AND ${notDeleted()}`,
+      ids,
+    );
+  }
+
+  async selectMatchingSessions(filter: MessageSearchSqlFilter): Promise<MessageSearchSessionRow[]> {
+    const { where, params } = searchWhere(filter);
+    const scoreSql = filter.mode === 'FULLTEXT'
+      ? 'MAX(MATCH(m.content) AGAINST (? IN BOOLEAN MODE))'
+      : '0';
+    const scoreParams = filter.mode === 'FULLTEXT' ? [filter.match] : [];
+    const order = filter.mode === 'FULLTEXT'
+      ? 'ORDER BY maxScore DESC, MAX(s.updated_at) DESC, m.session_id DESC'
+      : 'ORDER BY MAX(s.updated_at) DESC, m.session_id DESC';
+    const rows = await runSearchQuery<MessageSearchSessionRow>(
+      this.db,
+      filter.mode,
+      `SELECT m.session_id AS sessionId, COUNT(*) AS hitCount, ${scoreSql} AS maxScore
+       FROM message m
+       JOIN session s ON s.id = m.session_id
+       WHERE ${where}
+       GROUP BY m.session_id
+       ${order}
+       LIMIT ? OFFSET ?`,
+      [...scoreParams, ...params, filter.limit, filter.offset],
+    );
+    return rows.map((row) => ({
+      sessionId: num(row.sessionId),
+      hitCount: num(row.hitCount),
+      maxScore: num(row.maxScore),
+    }));
+  }
+
+  async countMatchingSessions(filter: MessageSearchSqlFilter): Promise<number> {
+    const { where, params } = searchWhere(filter);
+    const rows = await runSearchQuery<{ cnt: number }>(
+      this.db,
+      filter.mode,
+      `SELECT COUNT(*) AS cnt FROM (
+         SELECT m.session_id
+         FROM message m
+         JOIN session s ON s.id = m.session_id
+         WHERE ${where}
+         GROUP BY m.session_id
+       ) t`,
+      params,
+    );
+    return num(rows[0]?.cnt);
+  }
+
+  /**
+   * 按工作区绝对路径聚合会话使用情况（工作区总览，技术方案 2026-10-29 §3 D7）：
+   * 一次分组查询出每个 workspace 的总会话数 / 活跃相位数（ACTIVE_PHASE_SQL_LIST
+   * 唯一口径派生）/ 归档数 / 最近使用时间；JS 侧由调用方按目录前缀归并。
+   */
+  async aggregateWorkspaceUsage(userId: number): Promise<Map<string, { total: number; active: number; archived: number; lastUsedAt: string | null }>> {
+    const rows = await this.db.query<{ workspace: string; total: number; active: number; archived: number; lastUsedAt: string | null }>(
+      `SELECT workspace,
+              COUNT(*) AS total,
+              SUM(CASE WHEN phase IN (${ACTIVE_PHASE_SQL_LIST}) THEN 1 ELSE 0 END) AS active,
+              SUM(CASE WHEN status = 'ARCHIVED' THEN 1 ELSE 0 END) AS archived,
+              MAX(updated_at) AS lastUsedAt
+       FROM \`session\`
+       WHERE user_id = ? AND workspace IS NOT NULL AND deleted = 0
+       GROUP BY workspace`,
+      [userId],
+    );
+    const map = new Map<string, { total: number; active: number; archived: number; lastUsedAt: string | null }>();
+    for (const row of rows) {
+      map.set(row.workspace, {
+        total: Number(row.total),
+        active: Number(row.active),
+        archived: Number(row.archived),
+        lastUsedAt: row.lastUsedAt,
+      });
+    }
+    return map;
+  }
+
+  /** 目录的进行中引用清单（删除守卫 D4③ 与确认弹层共用）：workspace 精确或前缀命中活跃相位会话。 */
+  async listActiveWorkspaceReferences(userId: number, path: string): Promise<Array<{ id: number; title: string | null; phase: string | null }>> {
+    const rows = await this.db.query<{ id: number; title: string | null; phase: string | null }>(
+      `SELECT id, title, phase FROM \`session\`
+       WHERE user_id = ? AND deleted = 0 AND phase IN (${ACTIVE_PHASE_SQL_LIST})
+         AND (workspace = ? OR workspace LIKE CONCAT(?, '%') ESCAPE '\\\\')`,
+      [userId, path, escapeLike(path + sep)],
+    );
+    return rows;
+  }
+
+  /**
+   * 跨用户按工作区聚合（工作区总览·机器人通道，技术方案 2026-11-02）：
+   * 群聊通道工作区由同群多个 mao 用户的会话按设计共享，按 user_id 过滤会少计，
+   * 故对给定目录前缀集合（调用方已按可见性收窄）做不带用户过滤的同口径聚合。
+   * 前缀为空集合时跳过查询返回空 Map。
+   */
+  async aggregateWorkspaceUsageAnyUser(prefixes: string[]): Promise<Map<string, { total: number; active: number; archived: number; lastUsedAt: string | null }>> {
+    if (prefixes.length === 0) return new Map();
+    const clauses: string[] = [];
+    const params: Array<string> = [];
+    for (const prefix of prefixes) {
+      clauses.push('workspace = ?', `workspace LIKE CONCAT(?, '%') ESCAPE '\\\\'`);
+      params.push(prefix, escapeLike(prefix + sep));
+    }
+    const rows = await this.db.query<{ workspace: string; total: number; active: number; archived: number; lastUsedAt: string | null }>(
+      `SELECT workspace,
+              COUNT(*) AS total,
+              SUM(CASE WHEN phase IN (${ACTIVE_PHASE_SQL_LIST}) THEN 1 ELSE 0 END) AS active,
+              SUM(CASE WHEN status = 'ARCHIVED' THEN 1 ELSE 0 END) AS archived,
+              MAX(updated_at) AS lastUsedAt
+       FROM \`session\`
+       WHERE workspace IS NOT NULL AND deleted = 0 AND (${clauses.join(' OR ')})
+       GROUP BY workspace`,
+      params,
+    );
+    const map = new Map<string, { total: number; active: number; archived: number; lastUsedAt: string | null }>();
+    for (const row of rows) {
+      map.set(row.workspace, {
+        total: Number(row.total),
+        active: Number(row.active),
+        archived: Number(row.archived),
+        lastUsedAt: row.lastUsedAt,
+      });
+    }
+    return map;
+  }
+
+  /**
+   * 用户在指定工作区（精确或前缀命中）是否已有未删除会话（技术方案 2026-11-02）：
+   * 群聊通道工作区的「参与」判定——本人有会话（含归档）落在该目录才算受管，
+   * 未参与的群目录不出现在总览、也不能作为自建会话的工作区。
+   */
+  async existsSessionUnderWorkspace(userId: number, path: string): Promise<boolean> {
+    const row = await this.db.queryOne<{ id: number }>(
+      `SELECT id FROM \`session\`
+       WHERE user_id = ? AND deleted = 0
+         AND (workspace = ? OR workspace LIKE CONCAT(?, '%') ESCAPE '\\\\')
+       LIMIT 1`,
+      [userId, path, escapeLike(path + sep)],
+    );
+    return row != null;
+  }
+}
+
+/**
+ * 管理端 compact 投影：列表接口不返回附件里的图片 base64（data_uri），只留 mime/path/下标，
+ * 字节由 `GET /v1/admin/sessions/:id/messages/:messageId/attachments/:index` 按需取。
+ *
+ * 一条 1800×1200 截图约 350–500KB，5 轮对话能撑到 13MB；投影后同样一页约 0.6MB。
+ * 这里只选 toMessageVO 需要的列 —— message 新增列且管理端要展示时，必须同步补进来。
+ * JSON_REMOVE 只处理前 5 个附件（实际几乎都是 1 个），其余由 compactMetadata 在 JS 侧兜底。
+ */
+const COMPACT_MESSAGE_COLUMNS = `id, session_id, role, content, thinking_content, tool_call_id, tool_calls,
+  token_count, model_id, source_session_id, created_at, updated_at,
+  CASE WHEN metadata IS NULL THEN NULL ELSE JSON_REMOVE(metadata,
+    '$.attachments[0].data_uri', '$.attachments[1].data_uri', '$.attachments[2].data_uri',
+    '$.attachments[3].data_uri', '$.attachments[4].data_uri') END AS metadata`;
+
+export class MessageRepository {
+  constructor(private readonly db: Db) {}
+
+  findById(id: number): Promise<Message | null> {
+    return this.db.queryOne<Message>(`SELECT * FROM \`message\` WHERE id = ? AND ${notDeleted()}`, [id]);
+  }
+
+  async insert(message: Message): Promise<number> {
+    const id = await this.db.insert('message', {
+      sessionId: message.sessionId,
+      role: message.role,
+      content: message.content,
+      thinkingContent: message.thinkingContent,
+      toolCallId: message.toolCallId,
+      toolCalls: message.toolCalls,
+      tokenCount: message.tokenCount ?? 0,
+      modelId: message.modelId,
+      metadata: message.metadata,
+      sourceSessionId: message.sourceSessionId,
+      deleted: 0,
+    });
+    message.id = id;
+    return id;
+  }
+
+  async updateById(message: Message): Promise<void> {
+    if (message.id == null) {
+      return;
+    }
+    await this.db.updateById('message', message.id, {
+      content: message.content,
+      thinkingContent: message.thinkingContent,
+      toolCallId: message.toolCallId,
+      toolCalls: message.toolCalls,
+      tokenCount: message.tokenCount,
+      modelId: message.modelId,
+      metadata: message.metadata,
+      updatedAt: message.updatedAt,
+    });
+  }
+
+  listBySession(sessionId: number): Promise<Message[]> {
+    return this.db.query<Message>(
+      `SELECT * FROM \`message\` WHERE session_id = ? AND ${notDeleted()} ORDER BY created_at ASC, id ASC`,
+      [sessionId],
+    );
+  }
+
+  selectMessagesAfterId(sessionId: number, afterMessageId: number): Promise<Message[]> {
+    return this.db.query<Message>(
+      `SELECT * FROM \`message\` WHERE session_id = ? AND ${notDeleted()} AND id > ? ORDER BY id ASC`,
+      [sessionId, afterMessageId],
+    );
+  }
+
+  /**
+   * 取会话内截止到指定消息的全部内容（fork 预览口径：切点即被点击那一轮的助手最终回复 id，
+   * 含边界）。不传 cutMessageId 时等价于 listBySession。
+   */
+  selectThroughMessage(sessionId: number, cutMessageId: number | null): Promise<Message[]> {
+    if (cutMessageId == null) return this.listBySession(sessionId);
+    return this.db.query<Message>(
+      `SELECT * FROM \`message\` WHERE session_id = ? AND ${notDeleted()} AND id <= ? ORDER BY created_at ASC, id ASC`,
+      [sessionId, cutMessageId],
+    );
+  }
+
+  /**
+   * 轮次分页的「用户消息起点」，上界含切点。
+   * 与 selectUserStarts 的区别只在边界：切点是那一轮的助手最终回复，该轮的用户消息 id 必然
+   * 小于它；用 selectUserStarts 的排他边界（beforeId）会把那一整轮漏掉，预览就看不见来源轮次。
+   * beforeMessageId 用于向上翻页，与 selectUserStarts 同义。
+   */
+  selectUserStartsThrough(
+    sessionId: number,
+    cutMessageId: number,
+    beforeMessageId: number | null,
+    limit: number,
+  ): Promise<Message[]> {
+    if (beforeMessageId != null) {
+      return this.db.query<Message>(
+        `SELECT * FROM \`message\` WHERE session_id = ? AND ${notDeleted()} AND role = 'USER'
+          AND id <= ? AND id < ? ORDER BY id DESC LIMIT ?`,
+        [sessionId, cutMessageId, beforeMessageId, limit],
+      );
+    }
+    return this.db.query<Message>(
+      `SELECT * FROM \`message\` WHERE session_id = ? AND ${notDeleted()} AND role = 'USER' AND id <= ? ORDER BY id DESC LIMIT ?`,
+      [sessionId, cutMessageId, limit],
+    );
+  }
+
+  /**
+   * 页内助手声明了工具调用、但对应 TOOL 行的 id 落在页外（补写占位追加到当时的末尾）时，
+   * 按 tool_call_id 把这些行取回来，交给归一化贴回助手后面。maxMessageId 用于分享水位 / 分叉切点。
+   * compactMedia：与 selectRange 同款的管理端紧凑投影——补抓的 TOOL 行常带截图附件，
+   * 走 `SELECT *` 会把 base64 data_uri 带回响应，抵消 compact 列表的体积优化。
+   */
+  selectToolMessagesByCallIds(
+    sessionId: number,
+    toolCallIds: string[],
+    maxMessageId?: number | null,
+    excludeSourceSessionId?: number | null,
+    compactMedia = false,
+  ): Promise<Message[]> {
+    if (toolCallIds.length === 0) return Promise.resolve([]);
+    const placeholders = toolCallIds.map(() => '?').join(', ');
+    const cap = maxMessageId == null ? '' : ' AND id <= ?';
+    const capParams = maxMessageId == null ? [] : [maxMessageId];
+    const src = sourceExcludeSql(excludeSourceSessionId);
+    const columns = compactMedia ? COMPACT_MESSAGE_COLUMNS : '*';
+    return this.db.query<Message>(
+      `SELECT ${columns} FROM \`message\` WHERE session_id = ? AND ${notDeleted()} AND role = 'TOOL'
+        AND tool_call_id IN (${placeholders})${cap}${src.sql}
+       ORDER BY id ASC`,
+      [sessionId, ...toolCallIds, ...capParams, ...src.params],
+    );
+  }
+
+  /** selectRange 的含切点上界版本：`id >= startId AND id <= cutMessageId`。 */
+  selectRangeThrough(sessionId: number, startId: number, cutMessageId: number): Promise<Message[]> {
+    return this.db.query<Message>(
+      `SELECT * FROM \`message\` WHERE session_id = ? AND ${notDeleted()} AND id >= ? AND id <= ? ORDER BY created_at ASC, id ASC`,
+      [sessionId, startId, cutMessageId],
+    );
+  }
+
+  selectValidBoundaryMessage(sessionId: number, messageId: number): Promise<Message | null> {
+    return this.db.queryOne<Message>(
+      `SELECT * FROM \`message\` WHERE id = ? AND session_id = ? AND ${notDeleted()}`,
+      [messageId, sessionId],
+    );
+  }
+
+  async selectMaxMessageId(sessionId: number): Promise<number> {
+    const row = await this.db.queryOne<{ mx: number }>(
+      `SELECT COALESCE(MAX(id), 0) AS mx FROM \`message\` WHERE session_id = ? AND ${notDeleted()}`,
+      [sessionId],
+    );
+    return Number(row?.mx ?? 0);
+  }
+
+  /**
+   * 首条用户消息判定（标题生成用）：该消息之前是否还有本会话**自己发**的用户消息。
+   * 复制来的消息（source_session_id 非空）不算——分叉边路任务的历史用户消息全是复制来的，
+   * 只有用户在边路面板发的那条才该触发命名。
+   */
+  async hasOwnEarlierUserMessage(sessionId: number, messageId: number): Promise<boolean> {
+    const row = await this.db.queryOne<{ id: number }>(
+      `SELECT id FROM \`message\` WHERE session_id = ? AND role = 'USER' AND source_session_id IS NULL
+        AND id < ? AND ${notDeleted()} LIMIT 1`,
+      [sessionId, messageId],
+    );
+    return row != null;
+  }
+
+  selectUserStarts(
+    sessionId: number,
+    beforeId: number | null,
+    limit: number,
+    maxMessageId?: number | null,
+    excludeSourceSessionId?: number | null,
+  ): Promise<Message[]> {
+    const cap = maxMessageId == null ? '' : ' AND id <= ?';
+    const capParams = maxMessageId == null ? [] : [maxMessageId];
+    const src = sourceExcludeSql(excludeSourceSessionId);
+    if (beforeId != null) {
+      return this.db.query<Message>(
+        `SELECT * FROM \`message\` WHERE session_id = ? AND ${notDeleted()} AND role = 'USER' AND id < ?${cap}${src.sql} ORDER BY id DESC LIMIT ?`,
+        [sessionId, beforeId, ...capParams, ...src.params, limit],
+      );
+    }
+    return this.db.query<Message>(
+      `SELECT * FROM \`message\` WHERE session_id = ? AND ${notDeleted()} AND role = 'USER'${cap}${src.sql} ORDER BY id DESC LIMIT ?`,
+      [sessionId, ...capParams, ...src.params, limit],
+    );
+  }
+
+  /**
+   * 会话全部现存用户消息的时钟戳（run 轨迹用）：一条查询供翻页外的全局判定复用——
+   * run 时间窗上界（下一条更新的用户消息 created_at）、编辑重发的「编辑前」切点、
+   * 以及第一页的「未归属」边界，都不按页各查一遍。
+   */
+  selectUserStamps(sessionId: number): Promise<Array<Pick<Message, 'id' | 'createdAt' | 'updatedAt'>>> {
+    return this.db.query<Pick<Message, 'id' | 'createdAt' | 'updatedAt'>>(
+      `SELECT id, created_at, updated_at FROM \`message\` WHERE session_id = ? AND ${notDeleted()} AND role = 'USER' ORDER BY id ASC`,
+      [sessionId],
+    );
+  }
+
+  /**
+   * 全会话现存助手消息声明的工具调用（run 轨迹用）：工具活动是异步落库的，created_at
+   * 可能晚到下一条用户消息之后，落进下一个 run 的时间窗。归属要以 tool_call_id 对准的
+   * 消息为准，本页对不上时靠它判断该活动归属的 run 是否在本页，不能按时间窗改挂。
+   *
+   * created_at 一并带出：记录详情抽屉的「本轮工具」清单按 llm_call 时间窗归属
+   * （技术方案 2026-10-22-run-trace-deep-dive §5.3），没有时钟就退化成全会话清单。
+   *
+   * `lowerCreatedAtInclusive` / `upperCreatedAtExclusive`（`llm_call.created_at` 原样字符串）：
+   * 下界取本轮调用的结束时刻——本轮助手消息在工具跑完后才落库，必然晚于该时刻；上一轮
+   * 助手消息则必然早于本轮调用开始，因此不会混入。上界取下一轮 agent 调用的结束时刻，
+   * 排除下一轮助手消息。窗口下推 SQL，避免抽屉每次点开都全量 JSON.parse 会话消息。
+   * 任一侧传 null 表示该侧开放；两侧都 null 保持全会话扫描（run-trace.service 的归属判定用）。
+   * DATETIME(3) 的字典序与时间序一致，可直接比。
+   */
+  selectAssistantToolCalls(
+    sessionId: number,
+    upperCreatedAtExclusive?: string | null,
+    lowerCreatedAtInclusive?: string | null,
+  ): Promise<Array<Pick<Message, 'id' | 'createdAt' | 'toolCalls'>>> {
+    const upper = upperCreatedAtExclusive ?? null;
+    const lower = lowerCreatedAtInclusive ?? null;
+    const conditions: string[] = [];
+    const params: unknown[] = [sessionId];
+    if (lower != null) {
+      conditions.push('created_at >= ?');
+      params.push(lower);
+    }
+    if (upper != null) {
+      conditions.push('created_at < ?');
+      params.push(upper);
+    }
+    const where = conditions.length === 0 ? '' : ` AND ${conditions.join(' AND ')}`;
+    return this.db.query<Pick<Message, 'id' | 'createdAt' | 'toolCalls'>>(
+      `SELECT id, created_at AS createdAt, tool_calls AS toolCalls FROM \`message\`
+       WHERE session_id = ? AND ${notDeleted()} AND role = 'ASSISTANT' AND tool_calls IS NOT NULL${where} ORDER BY id ASC`,
+      params,
+    );
+  }
+
+  /**
+   * 按 tool_call_id 反查声明该调用的助手消息（运行轨迹记录详情下钻用）。
+   * `tool_calls` 是 MySQL JSON 列：取出来是 `"id": "call_x"`（冒号后有空格），
+   * 不能按紧凑 JSON 的 `"id":"call_x"` 做 LIKE；用 JSON_CONTAINS 精确匹配对象，
+   * 既不依赖 JSON 文本格式，也不受 LIKE 通配符影响。
+   * 单次点开抽屉才查，session_id 过滤后行数可控；同 id 多条时取最早一条。
+   */
+  selectAssistantByToolCallId(sessionId: number, toolCallId: string): Promise<Message | null> {
+    if (toolCallId === '') return Promise.resolve(null);
+    return this.db.queryOne<Message>(
+      `SELECT * FROM \`message\` WHERE session_id = ? AND ${notDeleted()} AND role = 'ASSISTANT'
+        AND JSON_CONTAINS(tool_calls, JSON_OBJECT('id', ?)) ORDER BY id ASC LIMIT 1`,
+      [sessionId, toolCallId],
+    );
+  }
+
+  /**
+   * 按 tool_call_id 取 TOOL 行（运行轨迹记录详情下钻用）。
+   * 与 selectToolMessagesByCallIds 的区别：单条精确取，不带消息 id 上界。
+   */
+  selectToolMessageByCallId(sessionId: number, toolCallId: string): Promise<Message | null> {
+    if (toolCallId === '') return Promise.resolve(null);
+    return this.db.queryOne<Message>(
+      `SELECT * FROM \`message\` WHERE session_id = ? AND ${notDeleted()} AND role = 'TOOL'
+        AND tool_call_id = ? ORDER BY id ASC LIMIT 1`,
+      [sessionId, toolCallId],
+    );
+  }
+
+  /**
+   * 窗口内的助手消息，含正文与思考（轮次抽屉「回复」tab 用，技术方案
+   * 2026-10-25-run-trace-content-and-prompt §5.3）。窗口语义与 selectAssistantToolCalls
+   * 完全一致：下界含同刻（本轮助手消息在工具跑完后落库，必然晚于本轮 llm_call 结束
+   * 时刻），上界排他（下一轮 agent 调用的结束时刻）；任一侧 null 表示该侧开放
+   * （最后一轮 / 时钟缺失由调用方决定传法）。id 升序，通常一条，重试 / 补发可能多条。
+   */
+  selectAssistantMessagesBetween(
+    sessionId: number,
+    lowerCreatedAtInclusive: string | null,
+    upperCreatedAtExclusive: string | null,
+  ): Promise<Array<Pick<Message, 'id' | 'content' | 'thinkingContent' | 'tokenCount' | 'createdAt'>>> {
+    const conditions: string[] = [];
+    const params: unknown[] = [sessionId];
+    if (lowerCreatedAtInclusive != null) {
+      conditions.push('created_at >= ?');
+      params.push(lowerCreatedAtInclusive);
+    }
+    if (upperCreatedAtExclusive != null) {
+      conditions.push('created_at < ?');
+      params.push(upperCreatedAtExclusive);
+    }
+    const where = conditions.length === 0 ? '' : ` AND ${conditions.join(' AND ')}`;
+    return this.db.query<Pick<Message, 'id' | 'content' | 'thinkingContent' | 'tokenCount' | 'createdAt'>>(
+      `SELECT id, content, thinking_content AS thinkingContent, token_count AS tokenCount, created_at AS createdAt
+       FROM \`message\` WHERE session_id = ? AND ${notDeleted()} AND role = 'ASSISTANT'${where} ORDER BY id ASC`,
+      params,
+    );
+  }
+
+  /** 按 id 取单条消息（用户消息抽屉用，技术方案 2026-10-25 §5.3）：会话内主键直查，跨会话查不到即空。 */
+  selectMessageById(sessionId: number, messageId: number): Promise<Message | null> {
+    return this.db.queryOne<Message>(
+      `SELECT * FROM \`message\` WHERE session_id = ? AND ${notDeleted()} AND id = ? LIMIT 1`,
+      [sessionId, messageId],
+    );
+  }
+
+  selectRange(
+    sessionId: number,
+    startId: number,
+    beforeId: number | null,
+    maxMessageId?: number | null,
+    excludeSourceSessionId?: number | null,
+    compactMedia = false,
+  ): Promise<Message[]> {
+    const cap = maxMessageId == null ? '' : ' AND id <= ?';
+    const capParams = maxMessageId == null ? [] : [maxMessageId];
+    const src = sourceExcludeSql(excludeSourceSessionId);
+    const columns = compactMedia ? COMPACT_MESSAGE_COLUMNS : '*';
+    if (beforeId != null) {
+      return this.db.query<Message>(
+        `SELECT ${columns} FROM \`message\` WHERE session_id = ? AND ${notDeleted()} AND id >= ? AND id < ?${cap}${src.sql} ORDER BY created_at ASC, id ASC`,
+        [sessionId, startId, beforeId, ...capParams, ...src.params],
+      );
+    }
+    return this.db.query<Message>(
+      `SELECT ${columns} FROM \`message\` WHERE session_id = ? AND ${notDeleted()} AND id >= ?${cap}${src.sql} ORDER BY created_at ASC, id ASC`,
+      [sessionId, startId, ...capParams, ...src.params],
+    );
+  }
+
+  async logicalDeleteById(id: number): Promise<void> {
+    await this.db.execute(`UPDATE \`message\` SET deleted = 1 WHERE id = ? AND ${notDeleted()}`, [id]);
+  }
+
+  /** 限会话范围的按 id 逻辑删除：id 落在其他会话时不误删（微信入站消息被取代时回滚用）。 */
+  async logicalDeleteByIdInSession(sessionId: number, id: number): Promise<void> {
+    await this.db.execute(
+      `UPDATE \`message\` SET deleted = 1 WHERE id = ? AND session_id = ? AND ${notDeleted()}`,
+      [id, sessionId],
+    );
+  }
+
+  deleteById(id: number): Promise<void> {
+    return this.logicalDeleteById(id);
+  }
+
+  async logicalDeleteBySession(sessionId: number): Promise<void> {
+    await this.db.execute(`UPDATE \`message\` SET deleted = 1 WHERE session_id = ? AND ${notDeleted()}`, [sessionId]);
+  }
+
+  async logicalDeleteAfter(sessionId: number, messageId: number): Promise<void> {
+    await this.db.execute(
+      `UPDATE \`message\` SET deleted = 1 WHERE session_id = ? AND id > ? AND ${notDeleted()}`,
+      [sessionId, messageId],
+    );
+  }
+
+  selectLast(sessionId: number): Promise<Message | null> {
+    return this.db.queryOne<Message>(
+      `SELECT * FROM \`message\` WHERE session_id = ? AND ${notDeleted()} ORDER BY id DESC LIMIT 1`,
+      [sessionId],
+    );
+  }
+
+  /** 按 id 单调序取最后一条用户消息，不受 created_at 时钟偏移影响。 */
+  selectLastUserMessage(sessionId: number): Promise<Message | null> {
+    return this.db.queryOne<Message>(
+      `SELECT * FROM \`message\` WHERE session_id = ? AND role = 'USER' AND ${notDeleted()} ORDER BY id DESC LIMIT 1`,
+      [sessionId],
+    );
+  }
+
+  /**
+   * 按 id 倒序取最近 N 条用户消息（可传 beforeId 游标继续向前取更早的一批）。
+   * 「真实用户消息」判定（排除压缩摘要与 `<system-notice>` 注入）含内容前缀规则，
+   * 由调用方在内存过滤后决定是否继续向前扫描。
+   */
+  selectRecentUserMessages(sessionId: number, limit: number, beforeId: number | null = null): Promise<Message[]> {
+    if (beforeId != null) {
+      return this.db.query<Message>(
+        `SELECT * FROM \`message\` WHERE session_id = ? AND role = 'USER' AND ${notDeleted()} AND id < ? ORDER BY id DESC LIMIT ?`,
+        [sessionId, beforeId, limit],
+      );
+    }
+    return this.db.query<Message>(
+      `SELECT * FROM \`message\` WHERE session_id = ? AND role = 'USER' AND ${notDeleted()} ORDER BY id DESC LIMIT ?`,
+      [sessionId, limit],
+    );
+  }
+
+  /**
+   * 会话首条（id 最小）现存用户消息的时钟戳（技术方案 2026-10-12 §4）：系统提示 current-date
+   * 节的日期锚点。首条被软删后下一轮自动切到下一条，无需持久化锚点。
+   */
+  selectFirstUserStamp(sessionId: number): Promise<Pick<Message, 'id' | 'createdAt'> | null> {
+    return this.db.queryOne<Pick<Message, 'id' | 'createdAt'>>(
+      `SELECT id, created_at AS createdAt FROM \`message\`
+       WHERE session_id = ? AND role = 'USER' AND ${notDeleted()} ORDER BY id ASC LIMIT 1`,
+      [sessionId],
+    );
+  }
+
+  /**
+   * beforeId 之前最近的一条现存用户消息时钟戳（跨天提示用）：用户消息正文前的
+   * `<date-change>` 标签要与「上一条用户消息」的日期比较。返回 null 表示 beforeId
+   * 之前没有现存用户消息（压缩边界跨过全部用户消息时即此态）。
+   */
+  selectPreviousUserStamp(sessionId: number, beforeId: number): Promise<Pick<Message, 'id' | 'createdAt'> | null> {
+    return this.db.queryOne<Pick<Message, 'id' | 'createdAt'>>(
+      `SELECT id, created_at AS createdAt FROM \`message\`
+       WHERE session_id = ? AND role = 'USER' AND ${notDeleted()} AND id < ? ORDER BY id DESC LIMIT 1`,
+      [sessionId, beforeId],
+    );
+  }
+
+  /** 最后一条 role=ASSISTANT 且正文非空的消息（记忆抽取输入，技术方案 5.6 D8）。 */
+  selectLastAssistantMessage(sessionId: number): Promise<Message | null> {
+    return this.db.queryOne<Message>(
+      `SELECT * FROM \`message\` WHERE session_id = ? AND role = 'ASSISTANT'
+         AND content IS NOT NULL AND content <> '' AND ${notDeleted()}
+       ORDER BY id DESC LIMIT 1`,
+      [sessionId],
+    );
+  }
+
+  /** 只更新 metadata 列（回复引用溯源挂 citations 用；不能走 updateById(message)——它会按全字段覆写）。 */
+  updateMetadata(messageId: number, metadata: string | null): Promise<void> {
+    return this.db.updateById('message', messageId, { metadata });
+  }
+
+  async deleteFromId(sessionId: number, fromId: number): Promise<void> {
+    await this.db.execute(
+      `UPDATE \`message\` SET deleted = 1 WHERE session_id = ? AND id >= ? AND ${notDeleted()}`,
+      [sessionId, fromId],
+    );
+  }
+
+  selectMessagesForSearch(sessionIds: number[], escapedKeyword: string): Promise<Message[]> {
+    if (sessionIds.length === 0) {
+      return Promise.resolve([]);
+    }
+    const placeholders = sessionIds.map(() => '?').join(',');
+    return this.db.query<Message>(
+      `SELECT t.sessionId AS sessionId, t.id AS id, t.content AS content
+       FROM (
+         SELECT m.session_id AS sessionId, m.id AS id, m.content AS content,
+                ROW_NUMBER() OVER (PARTITION BY m.session_id ORDER BY m.id ASC) AS rn
+         FROM message m
+         WHERE m.deleted = 0 AND m.role = 'USER'
+           AND m.session_id IN (${placeholders})
+           AND m.content LIKE CONCAT('%', ?, '%') ESCAPE '\\\\'
+       ) t
+       WHERE t.rn <= 5
+       ORDER BY t.id ASC`,
+      [...sessionIds, escapedKeyword],
+    );
+  }
+
+  /** 管理端关键词命中片段：每会话取第一条命中消息（默认只认对话双方，ALL 含工具输出）。 */
+  selectFirstMatchingMessages(
+    sessionIds: number[],
+    escapedKeyword: string,
+    messageScope: MessageSearchScope = 'CONVERSATION',
+  ): Promise<Array<{ sessionId: number; content: string | null }>> {
+    if (sessionIds.length === 0) {
+      return Promise.resolve([]);
+    }
+    const placeholders = sessionIds.map(() => '?').join(',');
+    return this.db.query<{ sessionId: number; content: string | null }>(
+      `SELECT t.sessionId AS sessionId, t.content AS content
+       FROM (
+         SELECT m.session_id AS sessionId, m.content AS content,
+                ROW_NUMBER() OVER (PARTITION BY m.session_id ORDER BY m.id ASC) AS rn
+         FROM message m
+         WHERE m.deleted = 0${messageRoleClause(messageScope)}
+           AND m.session_id IN (${placeholders})
+           AND m.content LIKE CONCAT('%', ?, '%') ESCAPE '\\\\'
+       ) t
+       WHERE t.rn = 1`,
+      [...sessionIds, escapedKeyword],
+    );
+  }
+
+  async selectRoundStartForMessage(sessionId: number, messageId: number): Promise<number | null> {
+    const row = await this.db.queryOne<{ id: number | null }>(
+      `SELECT MAX(id) AS id FROM \`message\`
+       WHERE session_id = ? AND role = 'USER' AND ${notDeleted()} AND id <= ?`,
+      [sessionId, messageId],
+    );
+    return row?.id == null ? null : num(row.id);
+  }
+
+  async selectNextUserMessageId(sessionId: number, afterId: number): Promise<number | null> {
+    const row = await this.db.queryOne<{ id: number | null }>(
+      `SELECT MIN(id) AS id FROM \`message\`
+       WHERE session_id = ? AND role = 'USER' AND ${notDeleted()} AND id > ?`,
+      [sessionId, afterId],
+    );
+    return row?.id == null ? null : num(row.id);
+  }
+
+  async hasMessageBefore(sessionId: number, messageId: number): Promise<boolean> {
+    const row = await this.db.queryOne<{ id: number }>(
+      `SELECT id FROM \`message\` WHERE session_id = ? AND ${notDeleted()} AND id < ? LIMIT 1`,
+      [sessionId, messageId],
+    );
+    return row != null;
+  }
+
+  async selectHitMessages(
+    sessionIds: number[],
+    mode: 'FULLTEXT' | 'LIKE',
+    match: string,
+    createdFrom: string | null = null,
+    createdToExclusive: string | null = null,
+  ): Promise<MessageSearchHitRow[]> {
+    if (sessionIds.length === 0) return [];
+    const placeholders = sessionIds.map(() => '?').join(',');
+    const dateSql: string[] = [];
+    const dateParams: unknown[] = [];
+    if (createdFrom != null) {
+      dateSql.push('AND m.created_at >= ?');
+      dateParams.push(createdFrom);
+    }
+    if (createdToExclusive != null) {
+      dateSql.push('AND m.created_at < ?');
+      dateParams.push(createdToExclusive);
+    }
+    const dateClause = dateSql.length > 0 ? `\n             ${dateSql.join('\n             ')}` : '';
+    if (mode === 'FULLTEXT') {
+      const rows = await runSearchQuery<MessageSearchHitRow>(
+        this.db,
+        mode,
+        `SELECT sessionId, messageId, role, content, createdAt, score FROM (
+           SELECT m.session_id AS sessionId, m.id AS messageId, m.role AS role,
+                  m.content AS content, m.created_at AS createdAt,
+                  MATCH(m.content) AGAINST (? IN BOOLEAN MODE) AS score,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY m.session_id
+                    ORDER BY MATCH(m.content) AGAINST (? IN BOOLEAN MODE) DESC, m.id DESC
+                  ) AS rn
+           FROM message m
+           WHERE m.deleted = 0
+             AND m.role IN ('USER', 'ASSISTANT')
+             AND m.session_id IN (${placeholders})
+             AND MATCH(m.content) AGAINST (? IN BOOLEAN MODE)${dateClause}
+         ) t
+         WHERE t.rn <= 5
+         ORDER BY t.sessionId, t.score DESC, t.messageId DESC`,
+        [match, match, ...sessionIds, match, ...dateParams],
+      );
+      return rows.map(normalizeHitRow);
+    }
+    const rows = await runSearchQuery<MessageSearchHitRow>(
+      this.db,
+      mode,
+      `SELECT sessionId, messageId, role, content, createdAt, score FROM (
+         SELECT m.session_id AS sessionId, m.id AS messageId, m.role AS role,
+                m.content AS content, m.created_at AS createdAt,
+                0 AS score,
+                ROW_NUMBER() OVER (PARTITION BY m.session_id ORDER BY m.id DESC) AS rn
+         FROM message m
+         WHERE m.deleted = 0
+           AND m.role IN ('USER', 'ASSISTANT')
+           AND m.session_id IN (${placeholders})
+           AND m.content LIKE CONCAT('%', ?, '%') ESCAPE '\\\\'${dateClause}
+       ) t
+       WHERE t.rn <= 5
+       ORDER BY t.sessionId, t.messageId DESC`,
+      [...sessionIds, match, ...dateParams],
+    );
+    return rows.map(normalizeHitRow);
+  }
+}
+
+function normalizeHitRow(row: MessageSearchHitRow): MessageSearchHitRow {
+  return {
+    sessionId: num(row.sessionId),
+    messageId: num(row.messageId),
+    role: row.role,
+    content: row.content,
+    createdAt: row.createdAt ?? null,
+    score: num(row.score),
+  };
+}
+
+export class FileChangeRepository {
+  constructor(private readonly db: Db) {}
+
+  async insert(change: FileChange): Promise<number> {
+    const id = await this.db.insert('message_file_change', {
+      messageId: change.messageId,
+      sessionId: change.sessionId,
+      filePath: change.filePath ?? (change as { path?: string }).path,
+      changeType: change.changeType ?? (change as { type?: string }).type,
+      linesAdded: change.linesAdded,
+      linesDeleted: change.linesDeleted,
+      diffMode: change.diffMode,
+      beforeContent: change.beforeContent,
+      afterContent: change.afterContent,
+      patchContent: change.patchContent,
+      patchTruncated: change.patchTruncated == null ? null : change.patchTruncated ? 1 : 0,
+      diffUnavailableReason: change.diffUnavailableReason,
+    });
+    change.id = id;
+    return id;
+  }
+
+  selectByMessageAndPath(messageId: number, path: string): Promise<FileChange | null> {
+    return this.db.queryOne<FileChange>(
+      `SELECT * FROM message_file_change WHERE message_id = ? AND file_path = ? LIMIT 1`,
+      [messageId, path],
+    );
+  }
+
+  async updateById(id: number, data: Partial<FileChange>): Promise<void> {
+    await this.db.updateById('message_file_change', id, data as Record<string, unknown>);
+  }
+
+  listBySession(sessionId: number): Promise<FileChange[]> {
+    return this.db.query<FileChange>(
+      `SELECT * FROM message_file_change WHERE session_id = ? ORDER BY id ASC`,
+      [sessionId],
+    );
+  }
+
+  listByMessageIds(sessionId: number, messageIds: number[]): Promise<FileChange[]> {
+    if (messageIds.length === 0) {
+      return Promise.resolve([]);
+    }
+    const placeholders = messageIds.map(() => '?').join(',');
+    return this.db.query<FileChange>(
+      `SELECT * FROM message_file_change WHERE session_id = ? AND message_id IN (${placeholders}) ORDER BY id ASC`,
+      [sessionId, ...messageIds],
+    );
+  }
+
+  /**
+   * 管理端聊天记录只展示路径和行数。diff 正文是 MEDIUMTEXT，SELECT * 会把整段快照从磁盘读出来。
+   */
+  listSummaryBySession(sessionId: number, excludeSourceSessionId?: number | null): Promise<FileChange[]> {
+    const src = sourceExcludeSql(excludeSourceSessionId, 'm');
+    return this.db.query<FileChange>(
+      `SELECT fc.id, fc.message_id, fc.session_id, fc.file_path, fc.change_type, fc.lines_added, fc.lines_deleted
+       FROM message_file_change fc
+       INNER JOIN \`message\` m ON m.id = fc.message_id AND ${notDeleted('m')}
+       WHERE fc.session_id = ?${src.sql}
+       ORDER BY fc.id ASC`,
+      [sessionId, ...src.params],
+    );
+  }
+
+  listSummaryByMessageIds(sessionId: number, messageIds: number[]): Promise<FileChange[]> {
+    if (messageIds.length === 0) {
+      return Promise.resolve([]);
+    }
+    const placeholders = messageIds.map(() => '?').join(',');
+    return this.db.query<FileChange>(
+      `SELECT id, message_id, session_id, file_path, change_type, lines_added, lines_deleted
+       FROM message_file_change
+       WHERE session_id = ? AND message_id IN (${placeholders})
+       ORDER BY id ASC`,
+      [sessionId, ...messageIds],
+    );
+  }
+}
+
+/** 边路分享/导出排除从父会话 fork 复制来的行。不传时 SQL 与原来一致。 */
+function sourceExcludeSql(excludeSourceSessionId?: number | null, alias?: string): { sql: string; params: number[] } {
+  if (excludeSourceSessionId == null) return { sql: '', params: [] };
+  const column = alias ? `${alias}.source_session_id` : 'source_session_id';
+  return { sql: ` AND (${column} IS NULL OR ${column} <> ?)`, params: [excludeSourceSessionId] };
+}

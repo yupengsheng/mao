@@ -1,0 +1,151 @@
+export interface FeishuBot {
+  id?: number;
+  appKey: string;
+  name: string;
+  appId: string;
+  appSecret: string;
+  agentId?: number | null;
+  modelId?: number | null;
+  enabled?: number;
+  deleted?: number;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export interface FeishuBotView extends Omit<FeishuBot, 'appSecret'> { appSecretConfigured: boolean; }
+export interface FeishuBotRepository {
+  list(): Promise<FeishuBot[]>; findById(id: number): Promise<FeishuBot | null>; findByAppKey(appKey: string): Promise<FeishuBot | null>;
+  create(bot: FeishuBot): Promise<number>; update(bot: FeishuBot): Promise<void>; softDelete(id: number): Promise<void>;
+}
+
+import type { AgentEventListener } from '../harness/core/agent-event-listener.js';
+export type FeishuChatType = 'p2p' | 'group' | 'unknown';
+export interface FeishuEventHeader { eventId?: string; eventType?: string; createTime?: string; tenantKey?: string; appId?: string; token?: string; }
+export interface FeishuNormalizedMessage { eventId: string | null; messageId: string | null; parentId?: string | null; rootId?: string | null; /** 话题 ID (omt_xxx)；非话题消息为 null。话题内回复的 parent_id 恒指向话题根，≠ 用户主动引用。 */ threadId?: string | null; chatId: string | null; chatType: FeishuChatType; senderId: string | null; senderUnionId: string | null; senderName?: string; maoUserId?: number; senderType: string | null; messageType: string; imageKey?: string | null; /** post 富文本内嵌图片 key（image 消息也含单元素数组）；imageKey 为首个，兼容群媒体单值落库。 */ imageKeys?: string[] | null; fileKey?: string | null; fileName?: string | null; text: string; mentions: string[]; isBotMentioned: boolean; content: unknown; rawEvent: unknown; header?: FeishuEventHeader; progressCardMessageId?: string | null; }
+export interface FeishuInboundContext extends FeishuNormalizedMessage {
+  accountId: string;
+  /** Group messages are annotated before reaching the agent handler. */
+  groupContext?: string;
+  senderLabel?: string;
+  /** 被引用/回复消息的内容预取（引用是任务意图核心，直接注入而非懒加载）。 */
+  quotedContext?: string;
+}
+export interface FeishuReply { text?: string | null; }
+export interface FeishuInboundHandler { authorizeDirectMessage(accountId: string, senderId: string, text: string): boolean; onMessage(context: FeishuInboundContext): Promise<FeishuReply | null>; }
+export interface FeishuHarnessService { prepareMessage(sessionId: number, content: unknown): Promise<string> | string; execute(sessionId: number, eventId: string | null, listener: AgentEventListener, cancelFlag: CancelFlag, executionUserId?: number | null): Promise<void>; }
+export interface CancelFlag { get(): boolean; set(value: boolean): void; }
+
+/** 飞书入站队列行（DB 映射，字段名 camelCase 与 toCamel 对齐）。 */
+export interface FeishuInboundQueueRow {
+  id: number;
+  botId: number;
+  sessionId: number;
+  messageId: string;
+  cardMessageId: string | null;
+  senderOpenId: string;
+  maoUserId: number | null;
+  rankNo: number;
+  status: string;
+  payload: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+/** 排队消息 payload 中存储的上下文子集（省略 rawEvent/content 等大字段）。 */
+export interface FeishuQueueStoredContext {
+  accountId: string;
+  chatType: FeishuChatType;
+  chatId: string | null;
+  senderId: string | null;
+  senderUnionId: string | null;
+  senderName?: string;
+  maoUserId?: number;
+  messageId: string | null;
+  /** 话题 ID（排队重建时需保留，否则话题消息出队后丢失路由信息）。 */
+  threadId?: string | null;
+  parentId?: string | null;
+  rootId?: string | null;
+  senderLabel?: string;
+  groupContext?: string;
+  quotedContext?: string;
+}
+
+/** 排队消息 payload 结构。 */
+export interface FeishuQueuePayload {
+  message: unknown;
+  context: FeishuQueueStoredContext;
+  botId: number;
+}
+
+/** 卡片按钮回调动作值。 */
+export type FeishuCardActionValue = FeishuQueueCardActionValue | FeishuProgressCardActionValue | FeishuAskCardActionValue | FeishuEcpAuthCardActionValue;
+
+/** 排队卡片按钮动作值。 */
+export interface FeishuQueueCardActionValue {
+  kind: 'feishu_queue';
+  queueId: number;
+  act: 'run' | 'cancel';
+}
+
+/** 进度卡按钮动作值（sender 为触发任务的原消息发送者 open_id，用于点击鉴权）。 */
+export interface FeishuProgressCardActionValue {
+  kind: 'feishu_progress';
+  act: 'cancel' | 'retry' | 'dislike';
+  sessionId: number;
+  sender: string;
+}
+
+/** 进度卡提问表单的提交按钮。requestId 放在 value 里，不放进飞书组件 name。 */
+export interface FeishuAskCardActionValue {
+  kind: 'feishu_ask';
+  act: 'submit';
+  sessionId: number;
+  sender: string;
+  requestId: string;
+}
+
+/**
+ * ECP 绑定引导卡「重新获取链接」按钮。sender 为收到卡片的原发送者 open_id，
+ * 用于限制只有本人能换链接（换出来的链接仍绑定到该发送者的飞书身份）。
+ */
+export interface FeishuEcpAuthCardActionValue {
+  kind: 'feishu_ecp_auth';
+  act: 'renew';
+  sender: string;
+}
+
+/** 飞书卡片按钮回调事件（SDK RawCardActionEvent 精简版）。 */
+export interface FeishuCardActionEvent {
+  context?: { open_message_id?: string; open_chat_id?: string };
+  open_message_id?: string;
+  open_chat_id?: string;
+  token?: string;
+  operator?: { open_id?: string; user_id?: string; union_id?: string; name?: string };
+  action?: { value?: unknown; tag?: string; name?: string; form_value?: unknown };
+}
+
+/** 卡片动作处理结果（返回给 SDK 作为回调响应）。 */
+export interface FeishuCardActionResponse {
+  toast?: { type: 'success' | 'info' | 'error' | 'warning'; content: string };
+  /**
+   * 必须随回调返回新卡片，否则飞书客户端会把交互态还原为点击前内容。
+   * `type: 'raw'` + JSON 2.0 `data` 与排队/进度卡 schema 对齐。
+   */
+  card?: { type: 'raw'; data: Record<string, unknown> };
+}
+
+/** handler 用于执行队列消费的最小端口。 */
+export interface FeishuTaskQueuePort {
+  enqueue(params: { sessionId: number; botId: number; messageId: string; senderOpenId: string; maoUserId: number | null; payload: string }): Promise<number>;
+  setCardMessageId(id: number, cardMessageId: string): Promise<void>;
+  claimNext(sessionId: number): Promise<FeishuInboundQueueRow | null>;
+  complete(id: number): Promise<void>;
+  hasPending(sessionId: number): Promise<boolean>;
+}
+
+/** 卡片动作处理器端口（card-action.service 使用）。 */
+export interface FeishuCardActionPort {
+  findByCardMessageId(cardMessageId: string): Promise<FeishuInboundQueueRow | null>;
+  jumpToFront(id: number): Promise<boolean>;
+  cancel(id: number): Promise<'CANCELLED' | 'ALREADY_STARTED' | 'NOT_FOUND'>;
+}

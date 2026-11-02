@@ -1,0 +1,117 @@
+import { BusinessException } from '../common/business-exception.js';
+import { ErrorCode } from '../common/error-code.js';
+import { JwtService } from '../crypto/jwt.service.js';
+import { UserService } from '../user/user.service.js';
+import type { LoginVO, PasswordHasher, User, UserInfoVO, UserRepository } from '../user/types.js';
+import type { PermissionService } from '../permission/permission.service.js';
+import type { LdapAuthService } from './ldap-auth.service.js';
+
+export class AuthService {
+  constructor(
+    private readonly userRepo: UserRepository,
+    private readonly jwtService: JwtService,
+    private readonly passwordHasher: PasswordHasher,
+    private readonly ldapAuthService: LdapAuthService | null,
+    private readonly permissionService?: PermissionService,
+  ) {}
+
+  async login(username: string, password: string): Promise<LoginVO> {
+    const user = await this.userRepo.findByUsername(username);
+    if (user && user.passwordHash && (await this.passwordHasher.matches(password, user.passwordHash))) {
+      return this.buildLoginResult(user);
+    }
+    if (this.ldapAuthService != null && await this.ldapAuthService.isConfigured()) {
+      try {
+        return await this.ldapAuthService.authenticate(username, password);
+      } catch {
+        // fall through
+      }
+    }
+    throw new BusinessException(ErrorCode.LOGIN_FAILED);
+  }
+
+  async buildLoginResult(user: User): Promise<LoginVO> {
+    if (user.status != null && user.status === 0) {
+      throw new BusinessException(ErrorCode.ACCOUNT_DISABLED);
+    }
+    user.lastLoginAt = formatNow();
+    await this.userRepo.updateById(user);
+    return this.toLoginVO(user);
+  }
+
+  async refreshToken(refreshToken: string): Promise<LoginVO> {
+    if (!this.jwtService.validateToken(refreshToken)
+      || this.jwtService.getTokenType(refreshToken) !== 'refresh') {
+      throw new BusinessException(ErrorCode.TOKEN_EXPIRED);
+    }
+    const userId = this.jwtService.getUserIdFromToken(refreshToken);
+    const username = this.jwtService.getUsernameFromToken(refreshToken);
+    const user = await this.userRepo.findById(userId);
+    if (!user || (user.status != null && user.status === 0)) {
+      throw new BusinessException(ErrorCode.ACCOUNT_DISABLED);
+    }
+    void username;
+    return this.toLoginVO(user);
+  }
+
+  logout(): void {
+    // Stateless JWT logout is handled client-side by discarding the token.
+  }
+
+  async toUserInfoVO(user: User, withPerms = false): Promise<UserInfoVO> {
+    const vo: UserInfoVO = {
+      id: user.id,
+      username: user.username,
+      displayName: user.displayName,
+      email: user.email,
+      avatarUrl: user.avatarUrl,
+      authSource: UserService.resolveAuthSource(user),
+    };
+    if (withPerms && this.permissionService && user.id != null) {
+      const codes = await this.permissionService.getUserPermissionCodes(user.id);
+      vo.permissions = [...new Set(codes)];
+      vo.isAdmin = await this.permissionService.isAdmin(user.id);
+    }
+    return vo;
+  }
+
+  private async toLoginVO(user: User): Promise<LoginVO> {
+    const accessToken = this.jwtService.generateToken(user.id!, user.username);
+    const refreshToken = this.jwtService.generateRefreshToken(user.id!, user.username);
+    return {
+      accessToken,
+      refreshToken,
+      expiresIn: 86400,
+      user: await this.toUserInfoVO(user),
+    };
+  }
+}
+
+/** 墙钟字符串，固定 Asia/Shanghai，与库内 `expires_at` 的字符串比较同一时钟。 */
+export function formatShanghaiDateTime(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const tz = new Date(date.toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }));
+  return `${tz.getFullYear()}-${pad(tz.getMonth() + 1)}-${pad(tz.getDate())} ${pad(tz.getHours())}:${pad(tz.getMinutes())}:${pad(tz.getSeconds())}`;
+}
+
+export function formatNow(): string {
+  return formatShanghaiDateTime(new Date());
+}
+
+/**
+ * 把库里的上海墙钟 `YYYY-MM-DD HH:mm:ss` 解析成绝对时间。
+ * `new Date('YYYY-MM-DD HH:mm:ss')` 按进程本地时区解释，和写侧固定的 Asia/Shanghai 不是同一时钟。
+ */
+export function parseShanghaiDateTime(value: string | null | undefined): number {
+  if (value == null) return Number.NaN;
+  const text = value.trim();
+  if (text === '') return Number.NaN;
+  if (/[zZ]$|[+-]\d{2}:?\d{2}$/.test(text)) return new Date(text).getTime();
+  const normalized = text.includes('T') ? text : text.replace(' ', 'T');
+  return new Date(`${normalized}+08:00`).getTime();
+}
+
+export function isShanghaiExpired(value: string | null | undefined, now = Date.now()): boolean {
+  const ts = parseShanghaiDateTime(value);
+  return !Number.isFinite(ts) || ts <= now;
+}

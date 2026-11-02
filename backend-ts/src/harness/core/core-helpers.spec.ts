@@ -1,0 +1,451 @@
+import { describe, expect, it, vi } from 'vitest';
+import { ActiveContextCalculator } from './active-context-calculator.js';
+import { TokenEstimator } from './token-estimator.js';
+import { SessionHistoryLoader } from './session-history-loader.js';
+import { CompactionArchiveService } from './compaction-archive.service.js';
+import { RuntimeDataResolver } from '../runtime/runtime-data-resolver.js';
+import { ToolMediaInjector, SYNTHETIC_ATTACHMENT_PROMPT } from './tool-media-injector.js';
+import { AgentExecutionContext } from './agent-execution-context.js';
+import { PersistedChatMessage } from './persisted-chat-message.js';
+import type { ContextManager } from './context-manager.js';
+import type { SessionService } from '../deps.js';
+import type { ChatMessage, ChatRequest, LlmAdapter, StreamCallback } from '../llm/chat-request.js';
+import { CompactionConfig } from './compaction-config.js';
+import { CompactionService } from './compaction-service.js';
+
+describe('ActiveContextCalculator', () => {
+  const calculator = new ActiveContextCalculator(new TokenEstimator());
+
+  it('usesAnchorPlusDeltaWhenValid', () => {
+    const delta = { role: 'assistant', content: 'abcd' };
+    const active = calculator.active(100, 10, [delta], null);
+    expect(active).toBe(100 + calculator.estimateMessages([delta]));
+  });
+
+  it('fallsBackToFullRequestWithoutAnchor', () => {
+    const msg = { role: 'user', content: 'hello' };
+    const request = { messages: [msg] };
+    const active = calculator.active(0, 0, null, request);
+    expect(active).toBe(calculator.estimateRequestTokens(request));
+  });
+
+  it('activeFromMessageSuffixUsesCoveredCount', () => {
+    const a = { role: 'user', content: 'aa' };
+    const b = { role: 'assistant', content: 'bbbb' };
+    const active = calculator.activeFromMessageSuffix(50, 9, [a, b], 1, null);
+    expect(active).toBe(50 + calculator.estimateMessages([b]));
+  });
+
+  it('activeFromMessageSuffixIncludesMessagesAddedAfterCoveredIndex', () => {
+    const user = { role: 'user', content: 'question' };
+    const assistant = { role: 'assistant', content: 'calling tool' };
+    const tool = { role: 'tool', toolCallId: 'c1', content: 'tool result payload' };
+    const active = calculator.activeFromMessageSuffix(1000, 42, [user, assistant, tool], 1, null);
+    expect(active).toBe(1000 + calculator.estimateMessages([assistant, tool]));
+    expect(active).toBeGreaterThan(1000);
+  });
+
+  it('activeFromMessageSuffixFallsBackWhenCoveredUnset', () => {
+    const msg = { role: 'user', content: 'x' };
+    const request = { messages: [msg] };
+    const active = calculator.activeFromMessageSuffix(500, 9, [msg], -1, request);
+    expect(active).toBe(calculator.estimateRequestTokens(request));
+    expect(active).not.toBe(500);
+  });
+});
+
+describe('SessionHistoryLoader', () => {
+  const archiveService = new CompactionArchiveService(
+    RuntimeDataResolver.forTest('/nonexistent-mao-test-root', '/nonexistent-mao-test-home'));
+
+  it('applyHistoryRestoresEphemeralSystemMessagesAtTail', async () => {
+    const contextManager = {
+      prependSessionSummary: vi.fn((summary: string | null, increment: ChatMessage[]) => {
+        const result: ChatMessage[] = [];
+        if (summary) result.push({ role: 'system', content: summary });
+        result.push(...increment);
+        return result;
+      }),
+    } as unknown as ContextManager;
+    const loader = new SessionHistoryLoader({} as SessionService, contextManager, archiveService);
+    const context = new AgentExecutionContext();
+    const messagesRef = context.messages;
+    context.addSystemMessage('background task result');
+    expect(context.ephemeralSystemMessages).toHaveLength(1);
+
+    const user = { id: 10, role: 'USER', content: 'hello' };
+    await loader.applyHistory(context, 'summary text', {
+      snapshotMessageIds: [10],
+      normalizedEntities: [user],
+      persistedMessages: [PersistedChatMessage.from(10, { role: 'user', content: 'hello' })],
+    });
+
+    expect(context.messages).toBe(messagesRef);
+    // addSystemMessage 现在注入 user role（外裹 <system-notice> 标签），
+    // 避免许多模型不支持中途 system message 的问题
+    expect(context.messages.map((m) => m.role)).toEqual(['system', 'user', 'user']);
+    expect(String(context.messages[2].content)).toContain('background task result');
+    expect(String(context.messages[2].content)).toContain('<system-notice>');
+    expect(context.sessionSummary).toBe('summary text');
+  });
+
+  it('applyHistoryReinjectsLastRealUserWhenIncrementalHasNone', async () => {
+    const contextManager = {
+      prependSessionSummary: vi.fn((
+        summary: string | null,
+        increment: ChatMessage[],
+        _hint?: string | null,
+        latestUser?: ChatMessage | null,
+      ) => {
+        const result: ChatMessage[] = [];
+        if (summary) result.push({ role: 'user', content: `## 会话压缩摘要\n\n${summary}` });
+        result.push(...increment);
+        if (latestUser) result.push(latestUser);
+        return result;
+      }),
+    } as unknown as ContextManager;
+    const sessionService = {
+      getLastUserMessage: vi.fn().mockResolvedValue({ id: 8, role: 'USER', content: '把前后端都发布到测试和预发环境' }),
+    } as unknown as SessionService;
+    const loader = new SessionHistoryLoader(sessionService, contextManager, archiveService);
+    const context = new AgentExecutionContext();
+    context.sessionId = 42;
+    context.addSystemMessage('ephemeral');
+
+    await loader.applyHistory(context, '压缩摘要', {
+      snapshotMessageIds: [12],
+      normalizedEntities: [{ id: 12, role: 'ASSISTANT', content: 'next' }],
+      persistedMessages: [PersistedChatMessage.from(12, { role: 'assistant', content: 'next' })],
+    });
+
+    expect(sessionService.getLastUserMessage).toHaveBeenCalledWith(42);
+    expect(context.messages.map((m) => m.role)).toEqual(['user', 'assistant', 'user', 'user']);
+    expect(String(context.messages[0].content)).toContain('会话压缩摘要');
+    expect(context.messages[2].content).toBe('把前后端都发布到测试和预发环境');
+    expect(String(context.messages[3].content)).toContain('<system-notice>');
+  });
+
+  it('applyHistoryDoesNotFetchLastUserWhenIncrementalAlreadyHasOne', async () => {
+    const contextManager = {
+      prependSessionSummary: vi.fn((summary: string | null, increment: ChatMessage[]) => {
+        const result: ChatMessage[] = [];
+        if (summary) result.push({ role: 'user', content: `## 会话压缩摘要\n\n${summary}` });
+        result.push(...increment);
+        return result;
+      }),
+    } as unknown as ContextManager;
+    const sessionService = {
+      getLastUserMessage: vi.fn(),
+    } as unknown as SessionService;
+    const loader = new SessionHistoryLoader(sessionService, contextManager, archiveService);
+    const context = new AgentExecutionContext();
+    context.sessionId = 42;
+
+    await loader.applyHistory(context, '压缩摘要', {
+      snapshotMessageIds: [9],
+      normalizedEntities: [{ id: 9, role: 'USER', content: '把前后端都发布到测试和预发环境' }],
+      persistedMessages: [PersistedChatMessage.from(9, { role: 'user', content: '把前后端都发布到测试和预发环境' })],
+    });
+
+    expect(sessionService.getLastUserMessage).not.toHaveBeenCalled();
+    expect(context.messages.map((m) => m.role)).toEqual(['user', 'user']);
+    expect(context.messages[1].content).toBe('把前后端都发布到测试和预发环境');
+  });
+
+  it('loadHistoryAfterBoundaryBuildsPersistedMessages', async () => {
+    const sessionService = {
+      getMessagesAfterId: vi.fn().mockResolvedValue([{ id: 5, role: 'USER', content: 'hi' }]),
+    } as unknown as SessionService;
+    const loader = new SessionHistoryLoader(sessionService, {} as ContextManager, archiveService);
+    const snapshot = await loader.loadHistoryAfterBoundary(3, 0);
+    expect(snapshot.snapshotMessageIds).toEqual([5]);
+    expect(snapshot.persistedMessages).toHaveLength(1);
+    expect(snapshot.persistedMessages[0].chatMessage.role).toBe('user');
+  });
+
+  it('loadHistoryAfterBoundaryDropsOrphanToolFromSnapshotAndPersisted', async () => {
+    const sessionService = {
+      getMessagesAfterId: vi.fn().mockResolvedValue([
+        { id: 1, role: 'USER', content: '帮我改一下登录' },
+        {
+          id: 2, role: 'ASSISTANT', content: '',
+          toolCalls: JSON.stringify([{ id: 'c1', type: 'function', function: { name: 'shell', arguments: '{}' } }]),
+        },
+        { id: 3, role: 'TOOL', toolCallId: 'c1', content: 'ok' },
+        { id: 4, role: 'TOOL', toolCallId: 'ghost', content: '残留输出' },
+        { id: 5, role: 'USER', content: '继续' },
+      ]),
+    } as unknown as SessionService;
+    const loader = new SessionHistoryLoader(sessionService, {} as ContextManager, archiveService);
+    const snapshot = await loader.loadHistoryAfterBoundary(7, 0);
+    expect(snapshot.snapshotMessageIds).toEqual([1, 2, 3, 5]);
+    expect(snapshot.persistedMessages.map((message) => message.messageId)).toEqual([1, 2, 3, 5]);
+
+    const llmAdapter = {
+      stream: vi.fn(async (_request: ChatRequest, _model: unknown, callback: StreamCallback) => {
+        callback.onChunk?.({ choices: [{ delta: { content: '<handoff>摘要正文</handoff>' } }] });
+        callback.onComplete?.({ promptTokens: 100, completionTokens: 10, totalTokens: 110 });
+      }),
+    } as unknown as LlmAdapter;
+    const tokenEstimator = {
+      estimateRequestTokens: vi.fn(() => 800),
+      estimateMessages: vi.fn(() => 30),
+    };
+    const config = new CompactionConfig();
+    config.enabled = true;
+    config.contextWindowTokens = 1000;
+    config.triggerRatio = 0.8;
+    config.maxSummaryTokens = 321;
+    const request: ChatRequest = {
+      messages: [{ role: 'user', content: '继续' }],
+      stream: true,
+    };
+    const result = await new CompactionService(llmAdapter, tokenEstimator as never).compactSession(
+      7, 0, snapshot.persistedMessages, snapshot.snapshotMessageIds, request,
+      { modelId: 'gpt-test', contextWindowTokens: 1000 }, config, null, null, 800,
+    );
+    expect(result).not.toBeNull();
+    expect(result!.newLastCompactedMessageId).toBe(5);
+  });
+
+  it('loadHistoryRestoresReasoningContentForAssistantMessages', async () => {
+    const sessionService = {
+      getMessagesAfterId: vi.fn().mockResolvedValue([
+        { id: 7, role: 'ASSISTANT', content: '答案', thinkingContent: '思考过程' },
+      ]),
+    } as unknown as SessionService;
+    const loader = new SessionHistoryLoader(sessionService, {} as ContextManager, archiveService);
+    const snapshot = await loader.loadHistoryAfterBoundary(3, 0);
+    expect(snapshot.persistedMessages[0].chatMessage.reasoningContent).toBe('思考过程');
+  });
+
+  it('toChatMessageDerivesSenderYmdFromCreatedAt', () => {
+    const loader = new SessionHistoryLoader({} as SessionService, {} as ContextManager, archiveService);
+    expect(loader.toChatMessage({ id: 1, role: 'USER', content: 'hi', createdAt: '2026-10-12 23:50:11' } as never).senderYmd)
+      .toBe('2026-10-12');
+    expect(loader.toChatMessage({ id: 2, role: 'USER', content: 'hi', createdAt: '2026-10-13 00:00:01' } as never).senderYmd)
+      .toBe('2026-10-13');
+    // created_at 缺失时不产出该字段（旧数据 / 压缩边界面）
+    expect(loader.toChatMessage({ id: 3, role: 'USER', content: 'hi' } as never).senderYmd).toBeUndefined();
+    expect(loader.toChatMessage({ id: 4, role: 'USER', content: 'hi', createdAt: '' } as never).senderYmd).toBeUndefined();
+    // 非用户消息同样带日期，但 applyDateChangeNotices 只比较 user role
+    expect(loader.toChatMessage({ id: 5, role: 'ASSISTANT', content: 'ok', createdAt: '2026-10-12 10:00:00' } as never).senderYmd)
+      .toBe('2026-10-12');
+  });
+
+  it('applyHistoryResolvesPreviousUserYmdBeforeAcrossTheCompactionBoundary', async () => {
+    const contextManager = {
+      prependSessionSummary: vi.fn((summary: string | null, increment: ChatMessage[]) => {
+        const result: ChatMessage[] = [];
+        if (summary) result.push({ role: 'user', content: `## 会话压缩摘要\n\n${summary}` });
+        result.push(...increment);
+        return result;
+      }),
+    } as unknown as ContextManager;
+    const sessionService = {
+      getPreviousUserStamp: vi.fn().mockResolvedValue({ id: 4, createdAt: '2026-10-12 23:59:00' }),
+    } as unknown as SessionService;
+    const loader = new SessionHistoryLoader(sessionService, contextManager, archiveService);
+    const context = new AgentExecutionContext();
+    context.sessionId = 42;
+
+    await loader.applyHistory(context, '压缩摘要', {
+      snapshotMessageIds: [9, 11],
+      normalizedEntities: [
+        { id: 9, role: 'USER', content: '今天继续', createdAt: '2026-10-13 08:00:00' },
+        { id: 11, role: 'ASSISTANT', content: '好的', createdAt: '2026-10-13 08:00:05' },
+      ],
+      persistedMessages: [
+        PersistedChatMessage.from(9, { role: 'user', content: '今天继续', senderYmd: '2026-10-13' }),
+        PersistedChatMessage.from(11, { role: 'assistant', content: '好的', senderYmd: '2026-10-13' }),
+      ],
+    });
+
+    // 参照点取窗口内第一条 USER（id=9）之前的最后一条用户消息，即压缩边界前那条
+    expect(sessionService.getPreviousUserStamp).toHaveBeenCalledWith(42, 9);
+    expect(context.previousUserYmdBefore).toBe('2026-10-12');
+    // senderYmd 已随历史下发，供 buildRequest 时的跨天比较使用
+    expect(context.messages[1].senderYmd).toBe('2026-10-13');
+  });
+
+  it('applyHistoryLeavesPreviousUserYmdBeforeNullWhenWindowHasNoUserMessage', async () => {
+    const contextManager = {
+      prependSessionSummary: vi.fn((summary: string | null, increment: ChatMessage[]) => [
+        ...(summary ? [{ role: 'user', content: summary }] : []),
+        ...increment,
+      ]),
+    } as unknown as ContextManager;
+    const sessionService = {
+      getPreviousUserStamp: vi.fn(),
+    } as unknown as SessionService;
+    const loader = new SessionHistoryLoader(sessionService, contextManager, archiveService);
+    const context = new AgentExecutionContext();
+    context.sessionId = 42;
+
+    await loader.applyHistory(context, '压缩摘要', {
+      snapshotMessageIds: [11],
+      normalizedEntities: [{ id: 11, role: 'ASSISTANT', content: '好的' }],
+      persistedMessages: [PersistedChatMessage.from(11, { role: 'assistant', content: '好的' })],
+    });
+
+    expect(sessionService.getPreviousUserStamp).not.toHaveBeenCalled();
+    expect(context.previousUserYmdBefore).toBeNull();
+  });
+
+  it('applyHistoryToleratesMissingPreviousUserStampDependency', async () => {
+    const contextManager = {
+      prependSessionSummary: vi.fn((_s: string | null, increment: ChatMessage[]) => [...increment]),
+    } as unknown as ContextManager;
+    // deps 未挂载 getPreviousUserStamp（精简装配）：功能降级为「只锚定不提示」，不报错
+    const loader = new SessionHistoryLoader({} as SessionService, contextManager, archiveService);
+    const context = new AgentExecutionContext();
+    context.sessionId = 42;
+
+    await loader.applyHistory(context, null, {
+      snapshotMessageIds: [9],
+      normalizedEntities: [{ id: 9, role: 'USER', content: 'hi', createdAt: '2026-10-13 08:00:00' }],
+      persistedMessages: [PersistedChatMessage.from(9, { role: 'user', content: 'hi', senderYmd: '2026-10-13' })],
+    });
+
+    expect(context.previousUserYmdBefore).toBeNull();
+  });
+
+  it('applyHistoryDegradesToNullWhenPreviousUserStampQueryFails', async () => {
+    const contextManager = {
+      prependSessionSummary: vi.fn((_s: string | null, increment: ChatMessage[]) => [...increment]),
+    } as unknown as ContextManager;
+    // DB 抖动不能打挂 buildContext 与压缩重载：降级为 null，只锚定不提示
+    const sessionService = {
+      getPreviousUserStamp: vi.fn().mockRejectedValue(new Error('db down')),
+    } as unknown as SessionService;
+    const loader = new SessionHistoryLoader(sessionService, contextManager, archiveService);
+    const context = new AgentExecutionContext();
+    context.sessionId = 42;
+
+    await loader.applyHistory(context, null, {
+      snapshotMessageIds: [9],
+      normalizedEntities: [{ id: 9, role: 'USER', content: 'hi', createdAt: '2026-10-13 08:00:00' }],
+      persistedMessages: [PersistedChatMessage.from(9, { role: 'user', content: 'hi', senderYmd: '2026-10-13' })],
+    });
+
+    expect(context.previousUserYmdBefore).toBeNull();
+    expect(context.messages).toHaveLength(1);
+    expect(context.messages[0].content).toBe('hi');
+  });
+
+  it('applyHistoryIgnoresUnparseablePreviousUserStamp', async () => {
+    const contextManager = {
+      prependSessionSummary: vi.fn((_s: string | null, increment: ChatMessage[]) => [...increment]),
+    } as unknown as ContextManager;
+    const sessionService = {
+      getPreviousUserStamp: vi.fn().mockResolvedValue({ id: 4, createdAt: '2026-10-1' }),
+    } as unknown as SessionService;
+    const loader = new SessionHistoryLoader(sessionService, contextManager, archiveService);
+    const context = new AgentExecutionContext();
+    context.sessionId = 42;
+
+    await loader.applyHistory(context, null, {
+      snapshotMessageIds: [9],
+      normalizedEntities: [{ id: 9, role: 'USER', content: 'hi', createdAt: '2026-10-13 08:00:00' }],
+      persistedMessages: [PersistedChatMessage.from(9, { role: 'user', content: 'hi', senderYmd: '2026-10-13' })],
+    });
+
+    // 长度不足 10 的脏值不能当作日期参与比较，回落 null
+    expect(context.previousUserYmdBefore).toBeNull();
+
+    // created_at 为空串（旧数据）同样回落
+    sessionService.getPreviousUserStamp.mockResolvedValue({ id: 4, createdAt: '' });
+    const emptyContext = new AgentExecutionContext();
+    emptyContext.sessionId = 42;
+    await loader.applyHistory(emptyContext, null, {
+      snapshotMessageIds: [9],
+      normalizedEntities: [{ id: 9, role: 'USER', content: 'hi', createdAt: '2026-10-13 08:00:00' }],
+      persistedMessages: [PersistedChatMessage.from(9, { role: 'user', content: 'hi', senderYmd: '2026-10-13' })],
+    });
+    expect(emptyContext.previousUserYmdBefore).toBeNull();
+  });
+
+  it('回注的窗口外用户消息排在尾部，previousUserYmdBefore 保持 null（边界行为固化）', async () => {
+    // 窗口内无真实用户消息时，resolveLatestUserMessage 会把窗口外的最后一条用户消息回注到
+    // context.messages 尾部。该消息带 senderYmd，但 previousUserYmdBefore 只参照窗口内消息，
+    // 故为 null；跨天比较回落 sessionBaseYmd。此处固化当前行为，避免后续误改。
+    const contextManager = {
+      prependSessionSummary: vi.fn((_s: string | null, inc: ChatMessage[], _h?: string | null, latest?: ChatMessage | null) => [
+        ...inc,
+        ...(latest ? [latest] : []),
+      ]),
+    } as unknown as ContextManager;
+    const sessionService = {
+      getLastUserMessage: vi.fn().mockResolvedValue({ id: 2, role: 'USER', content: '旧问题', createdAt: '2026-10-11 10:00:00' }),
+      getPreviousUserStamp: vi.fn().mockResolvedValue(null),
+    } as unknown as SessionService;
+    const loader = new SessionHistoryLoader(sessionService, contextManager, archiveService);
+    const context = new AgentExecutionContext();
+    context.sessionId = 42;
+
+    await loader.applyHistory(context, '压缩摘要', {
+      snapshotMessageIds: [11, 13],
+      normalizedEntities: [
+        { id: 11, role: 'ASSISTANT', content: 'a', createdAt: '2026-10-13 08:00:05' },
+        { id: 13, role: 'ASSISTANT', content: 'b', createdAt: '2026-10-14 09:00:05' },
+      ],
+      persistedMessages: [
+        PersistedChatMessage.from(11, { role: 'assistant', content: 'a', senderYmd: '2026-10-13' }),
+        PersistedChatMessage.from(13, { role: 'assistant', content: 'b', senderYmd: '2026-10-14' }),
+      ],
+    });
+
+    expect(context.messages.map((m) => m.role)).toEqual(['assistant', 'assistant', 'user']);
+    expect(context.messages[2].senderYmd).toBe('2026-10-11');
+    expect(context.previousUserYmdBefore).toBeNull();
+  });
+});
+
+describe('ToolMediaInjector', () => {
+  const injector = new ToolMediaInjector();
+
+  it('injectsSyntheticUserMessageAfterToolWithImageAttachment', () => {
+    const messages = [
+      { role: 'assistant', content: '', toolCalls: [{ id: 'call-1' }] },
+      { role: 'tool', toolCallId: 'call-1', content: '{"content":"ok"}' },
+    ];
+    const attachments = new Map([['call-1', { mime: 'image/png', path: 'a.png', dataUri: 'data:image/png;base64,abc' }]]);
+    const injected = injector.inject(messages, attachments, { supportsVision: true });
+    expect(injected).toHaveLength(3);
+    expect(injected![2].role).toBe('user');
+    expect(Array.isArray(injected![2].content)).toBe(true);
+    const parts = injected![2].content as Array<{ type?: string; text?: string; imageUrl?: { url: string } }>;
+    expect(parts).toHaveLength(2);
+    expect(parts[0].text).toBe(SYNTHETIC_ATTACHMENT_PROMPT);
+    expect(parts[1].type).toBe('image_url');
+    expect(parts[1].imageUrl?.url).toBe('data:image/png;base64,abc');
+  });
+
+  it('skipsInjectionWhenVisionUnsupported', () => {
+    const messages = [{ role: 'tool', toolCallId: 'call-1', content: '{"content":"ok"}' }];
+    const attachments = { 'call-1': { mime: 'image/png', path: 'a.png', dataUri: 'data:image/png;base64,abc' } };
+    const injected = injector.inject(messages, attachments, { supportsVision: false });
+    expect(injected).toHaveLength(1);
+  });
+
+  it('injectsSyntheticUserMessageAfterTheWholeParallelToolGroup', () => {
+    const messages = [
+      { role: 'assistant', content: '', toolCalls: [{ id: 'call-1' }, { id: 'call-2' }] },
+      { role: 'tool', toolCallId: 'call-1', content: '{"content":"ok"}' },
+      { role: 'tool', toolCallId: 'call-2', content: 'text' },
+    ];
+    const attachments = new Map([['call-1', { mime: 'image/png', path: 'a.png', dataUri: 'data:image/png;base64,abc' }]]);
+    const injected = injector.inject(messages, attachments, { supportsVision: true });
+    expect(injected?.map((m) => m.role)).toEqual(['assistant', 'tool', 'tool', 'user']);
+    expect(injected![3].role).toBe('user');
+    const parts = injected![3].content as Array<{ type?: string; text?: string }>;
+    expect(parts[0].text).toBe(SYNTHETIC_ATTACHMENT_PROMPT);
+  });
+
+  it('leavesNonToolMessagesUntouched', () => {
+    const messages = [{ role: 'user', content: 'hello' }];
+    const injected = injector.inject(messages, new Map(), { supportsVision: true });
+    expect(injected).toHaveLength(1);
+    expect(injected![0].content).toBe('hello');
+  });
+});

@@ -1,0 +1,495 @@
+<template>
+  <div class="file-diff-viewer">
+    <!-- View mode toggle for new files (preview/source) -->
+    <div v-if="showPreviewToggle" class="view-mode-toggle">
+      <button :class="['mode-btn', { active: viewMode === 'preview' }]" @click="viewMode = 'preview'">预览</button>
+      <button :class="['mode-btn', { active: viewMode === 'source' }]" @click="viewMode = 'source'">源码</button>
+    </div>
+
+    <div v-if="mode === 'SNAPSHOT' && !showSource" class="preview-container" @click="handleMarkdownClick">
+      <MarkdownContent :content="change.afterContent || ''" body-class="markdown-body" />
+    </div>
+
+    <template v-else-if="mode !== 'UNSUPPORTED'">
+      <div v-if="mode === 'PATCH' && change.patchTruncated" class="diff-notice">Patch 已截断，仅显示前 256 KiB</div>
+      <div ref="diffContainer" class="monaco-diff-container"></div>
+    </template>
+
+    <div v-else class="diff-message">
+      <p>{{ unavailableText }}</p>
+      <button class="open-file-btn" @click="openCurrentFile">打开当前文件</button>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { computed, inject, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import type { editor as MonacoEditor } from 'monaco-editor'
+import type { FileChange } from '../../types/chat'
+import { applyMonacoTheme, loadMonaco, themeName, type MonacoModule } from '../../utils/monaco-loader'
+import { monacoLangFromExtension } from '../../utils/monaco-lang'
+import { useTheme } from '../../utils/theme'
+import { useCenterTabs } from '../../composables/useCenterTabs'
+import { useSessionStore } from '../../stores/session'
+import MarkdownContent from '../common/MarkdownContent.vue'
+import { isExternalMarkdownLink, resolveMarkdownLink } from '../../utils/markdown-link'
+import { isAndroidCapacitor, openExternalUrl } from '../../utils/capacitor'
+import { attachMonacoQuote } from '../../composables/useMonacoQuote'
+import { buildPatchDiffModels } from '../../utils/unified-patch'
+import type { FileRangeQuotePayload } from '../../utils/selection-quote'
+
+const props = defineProps<{
+  change: FileChange
+  /** 只有工具变更的 diff: Tab 为 true。Git Diff 不引用。 */
+  quoteEnabled?: boolean
+  /** 打开这份快照时记下的修订号，不是点击时的最新值。 */
+  quoteRevision?: number
+}>()
+
+const quoteFileRangeToChat = inject<((quote: FileRangeQuotePayload) => void) | null>('quoteFileRangeToChat', null)
+
+const sessionStore = useSessionStore()
+const activeSessionIdRef = computed(() => sessionStore.activeSessionId ?? '')
+const { openFileTab } = useCenterTabs(activeSessionIdRef)
+const { isDark } = useTheme()
+
+const viewMode = ref<'preview' | 'source'>('preview')
+
+const diffContainer = ref<HTMLElement>()
+
+let diffEditor: MonacoEditor.IStandaloneDiffEditor | null = null
+let originalModel: MonacoEditor.ITextModel | null = null
+let modifiedModel: MonacoEditor.ITextModel | null = null
+let diffUpdateDisposable: { dispose: () => void } | null = null
+let detachQuote: (() => void) | null = null
+// 乱序保护：syncViewer 含多个 await（nextTick/loadMonaco/applyTheme），旧调用可能在
+// 新 change 生效后落地并覆盖模型，seq 检查确保只有最新一轮 sync 能写编辑器
+let syncSeq = 0
+
+const mode = computed(() => props.change.diffMode || 'UNSUPPORTED')
+const unavailableText = computed(() => {
+  return props.change.diffUnavailableReason || '该历史变更没有可用的 diff 数据'
+})
+
+const isMarkdown = computed(() => {
+  const ext = props.change.path.split('.').pop()?.toLowerCase()
+  return ext === 'md' || ext === 'markdown'
+})
+
+const isNewFile = computed(() => {
+  return props.change.type === 'CREATED' || !props.change.beforeContent
+})
+
+const showPreviewToggle = computed(() => {
+  return mode.value === 'SNAPSHOT' && isNewFile.value && isMarkdown.value
+})
+
+const showSource = computed(() => {
+  return !showPreviewToggle.value || viewMode.value === 'source'
+})
+
+function detachQuoteAction() {
+  detachQuote?.()
+  detachQuote = null
+}
+
+function attachQuoteAction() {
+  if (detachQuote || !diffEditor || !props.quoteEnabled || isAndroidCapacitor() || !quoteFileRangeToChat) return
+  detachQuote = attachMonacoQuote({
+    editor: diffEditor.getModifiedEditor(),
+    getFilePath: () => props.change.path,
+    getCapturedRevision: () => props.quoteRevision ?? 0,
+    onQuote: (quote) => quoteFileRangeToChat?.(quote),
+  })
+}
+
+function disposeDiffEditor() {
+  detachQuoteAction()
+  diffUpdateDisposable?.dispose()
+  diffUpdateDisposable = null
+  diffEditor?.dispose()
+  diffEditor = null
+  originalModel?.dispose()
+  originalModel = null
+  modifiedModel?.dispose()
+  modifiedModel = null
+}
+
+function revealFirstDiffChange() {
+  if (!diffEditor) return
+  const changes = diffEditor.getLineChanges()
+  if (!changes?.length) return
+  const first = changes[0]
+  if (first.modifiedStartLineNumber > 0) {
+    diffEditor.getModifiedEditor().revealLineInCenter(first.modifiedStartLineNumber)
+  } else if (first.originalStartLineNumber > 0) {
+    diffEditor.getOriginalEditor().revealLineInCenter(first.originalStartLineNumber)
+  }
+}
+
+function ensureDiffEditor(monaco: MonacoModule): MonacoEditor.IStandaloneDiffEditor {
+  if (!diffEditor) {
+    diffEditor = monaco.editor.createDiffEditor(diffContainer.value!, {
+      theme: themeName(isDark.value),
+      readOnly: true,
+      domReadOnly: true,
+      renderSideBySide: true,
+      automaticLayout: true,
+      minimap: { enabled: false },
+      scrollBeyondLastLine: false,
+      fontSize: 14,
+      lineHeight: 20,
+      fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, 'SF Mono', Menlo, Monaco, monospace",
+      renderLineHighlight: 'none',
+      overviewRulerLanes: 2,
+      contextmenu: true,
+      unicodeHighlight: { ambiguousCharacters: false },
+    })
+  }
+  return diffEditor
+}
+
+function setDiffModels(monaco: MonacoModule, original: string, modified: string, language: string) {
+  const editor = ensureDiffEditor(monaco)
+  originalModel?.dispose()
+  modifiedModel?.dispose()
+  originalModel = monaco.editor.createModel(original, language)
+  modifiedModel = monaco.editor.createModel(modified, language)
+  editor.setModel({ original: originalModel, modified: modifiedModel })
+  attachQuoteAction()
+
+  diffUpdateDisposable?.dispose()
+  diffUpdateDisposable = editor.onDidUpdateDiff(() => {
+    revealFirstDiffChange()
+    diffUpdateDisposable?.dispose()
+    diffUpdateDisposable = null
+  })
+  // Diff may already be ready synchronously for small files
+  revealFirstDiffChange()
+}
+
+async function syncViewer() {
+  const seq = ++syncSeq
+  await nextTick()
+  if (seq !== syncSeq) return
+  const monaco = await loadMonaco()
+  if (seq !== syncSeq) return
+  await applyMonacoTheme(isDark.value)
+  if (seq !== syncSeq) return
+
+  if (mode.value === 'SNAPSHOT') {
+    // 容器不在 DOM 中 = 当前是 Markdown 预览模式（v-if 拆掉了容器）：
+    // 必须销毁已有编辑器，否则来回切换预览/源码会残留 Monaco 实例
+    if (!diffContainer.value) {
+      disposeDiffEditor()
+      return
+    }
+    setDiffModels(
+      monaco,
+      props.change.beforeContent || '',
+      props.change.afterContent || '',
+      monacoLangFromExtension(props.change.path),
+    )
+    return
+  }
+
+  if (mode.value === 'PATCH') {
+    if (!diffContainer.value) return
+    // patch 只有变更 hunk：按 @@ 头把增删行摆回真实行号、未变更区填空行，
+    // 模型行号即文件行号，行号 / 引用 / 首处变更跳转都与 SNAPSHOT 一致。
+    // 文件多大都只承载 hunk 内的真实行，渲染成本与文件大小无关。
+    const { original, modified } = buildPatchDiffModels(props.change.patchContent || '')
+    setDiffModels(monaco, original, modified, monacoLangFromExtension(props.change.path))
+    return
+  }
+
+  disposeDiffEditor()
+}
+
+function openCurrentFile() {
+  const title = props.change.path.split(/[/\\]/).pop() || props.change.path
+  openFileTab(props.change.path, title)
+}
+
+async function handleMarkdownClick(e: MouseEvent) {
+  const anchor = (e.target as HTMLElement).closest('a')
+  if (!anchor) return
+
+  const href = anchor.getAttribute('href')
+  if (!href) return
+
+  e.preventDefault()
+
+  if (isExternalMarkdownLink(href)) {
+    // 兜底路径：正常情况下 document 级 externalLink 委托已在捕获阶段接管外链
+    // （openExternalUrl），这里覆盖容器先于 document 收到点击的极端时序
+    await openExternalUrl(href)
+    return
+  }
+
+  const resolvedPath = resolveMarkdownLink(props.change.path, href)
+  if (!resolvedPath) return
+
+  const title = resolvedPath.split(/[/\\]/).pop() || resolvedPath
+  openFileTab(resolvedPath, title)
+}
+
+// 仅在切换到另一个文件时回到预览：change 是 deep watch 的目标，
+// Git 状态刷新会重建同一文件的 change 对象，此时不能把用户正在看的源码打回预览。
+watch(
+  () => props.change.path,
+  () => {
+    viewMode.value = 'preview'
+  },
+)
+
+// showSource 必须参与依赖：源码容器由 v-if 控制，点「源码」后才挂载，
+// 少了它 syncViewer 不会重跑，Monaco 永不创建，源码视图恒为空白。
+watch(
+  [() => props.change, isDark, showSource],
+  () => {
+    void syncViewer()
+  },
+  { deep: true, flush: 'post', immediate: true },
+)
+
+onBeforeUnmount(disposeDiffEditor)
+</script>
+
+<style scoped>
+.file-diff-viewer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--aw-surface);
+  overflow: hidden;
+  position: relative;
+}
+
+.monaco-diff-container {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  position: relative;
+}
+
+.diff-notice {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--aw-divider-soft);
+  color: var(--aw-ink-muted-64);
+  font-size: var(--aw-text-caption);
+  background: var(--aw-canvas);
+}
+
+.diff-message {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  height: 100%;
+  color: var(--aw-ink-muted-48);
+  font-size: var(--aw-text-body);
+}
+
+.diff-message p {
+  margin: 0;
+}
+
+.open-file-btn {
+  height: var(--aw-btn-height);
+  border: 1px solid var(--aw-primary);
+  border-radius: var(--aw-radius-xs);
+  background: transparent;
+  color: var(--aw-primary);
+  cursor: pointer;
+  font-size: var(--aw-text-fine);
+  padding: var(--aw-btn-padding);
+}
+
+.open-file-btn:hover {
+  background: var(--aw-primary-hover);
+}
+
+.view-mode-toggle {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  gap: 2px;
+  z-index: 10;
+}
+
+.mode-btn {
+  height: var(--aw-btn-height);
+  padding: var(--aw-btn-padding);
+  font-size: var(--aw-text-fine);
+  color: var(--aw-ink-muted-48);
+  background: var(--aw-surface);
+  border: 1px solid var(--aw-divider-soft);
+  border-radius: var(--aw-radius-xs);
+  cursor: pointer;
+  transition: all 0.15s;
+  backdrop-filter: blur(8px);
+}
+
+.mode-btn:hover {
+  color: var(--aw-ink);
+}
+
+.mode-btn.active {
+  color: var(--aw-primary);
+  border-color: var(--aw-primary);
+  background: var(--aw-primary-hover);
+}
+
+.preview-container {
+  flex: 1;
+  overflow: auto;
+  padding: 16px 24px;
+}
+
+.markdown-body {
+  flex: 1;
+  color: var(--aw-ink);
+  font-size: var(--aw-text-caption);
+}
+
+.markdown-body :deep(h1),
+.markdown-body :deep(h2),
+.markdown-body :deep(h3),
+.markdown-body :deep(h4) {
+  font-family: var(--aw-font-display);
+  font-weight: 600;
+  color: var(--aw-ink);
+  margin: 4px 0 2px;
+  letter-spacing: 0;
+}
+
+.markdown-body :deep(h1) { font-size: var(--aw-text-lead); }
+.markdown-body :deep(h2) { font-size: var(--aw-text-tagline); }
+.markdown-body :deep(h3) { font-size: var(--aw-text-body); }
+.markdown-body :deep(h4) { font-size: var(--aw-text-caption); }
+
+.markdown-body :deep(p) {
+  margin: 0;
+  font-size: var(--aw-text-caption);
+  line-height: 2;
+  letter-spacing: -0.374px;
+}
+
+.markdown-body :deep(a) {
+  color: var(--aw-primary);
+  text-decoration: none;
+}
+
+.markdown-body :deep(a:hover) { text-decoration: underline; }
+
+.markdown-body :deep(code) {
+  font-family: var(--aw-font-mono);
+  font-size: var(--aw-text-caption);
+}
+
+.markdown-body :deep(pre) {
+  margin: 2px 0;
+  border-radius: var(--aw-radius-sm);
+  overflow: hidden;
+}
+
+.markdown-body :deep(.code-block) {
+  margin: 2px 0;
+  border-radius: var(--aw-radius-sm);
+  overflow: hidden;
+}
+
+.markdown-body :deep(.code-block-header) {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 12px;
+  background: var(--aw-surface-code-header);
+  font-size: var(--aw-text-fine);
+}
+
+.markdown-body :deep(.code-lang) {
+  color: var(--aw-ink-muted-48);
+  font-family: var(--aw-font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0;
+}
+
+.markdown-body :deep(.code-copy-btn) {
+  height: var(--aw-btn-height);
+  background: none;
+  border: 1px solid var(--aw-hairline);
+  color: var(--aw-ink-muted-48);
+  padding: var(--aw-btn-padding);
+  border-radius: var(--aw-radius-xs);
+  cursor: pointer;
+  font-size: var(--aw-text-fine);
+  transition: all 0.15s;
+}
+
+.markdown-body :deep(.code-copy-btn:hover) {
+  color: var(--aw-ink);
+  border-color: var(--aw-ink-muted-48);
+}
+
+.markdown-body :deep(.monaco-code) {
+  display: block;
+  padding: 12px;
+  background: var(--aw-surface-code);
+  color: var(--aw-text-code);
+  overflow-x: auto;
+  font-family: var(--aw-font-mono);
+  font-size: var(--aw-text-caption);
+  line-height: 20px;
+}
+
+.markdown-body :deep(ul),
+.markdown-body :deep(ol) {
+  margin: 2px 0;
+  padding-left: 20px;
+}
+
+.markdown-body :deep(li) {
+  font-size: var(--aw-text-caption);
+  line-height: 2;
+  letter-spacing: -0.374px;
+}
+
+.markdown-body :deep(blockquote) {
+  margin: 2px 0;
+  padding: 4px 12px;
+  border-left: 3px solid var(--aw-primary);
+  color: var(--aw-ink-muted-80);
+  background: var(--aw-canvas-parchment);
+  border-radius: 0 var(--aw-radius-xs) var(--aw-radius-xs) 0;
+}
+
+.markdown-body :deep(table) {
+  border-collapse: collapse;
+  margin: 2px 0;
+  width: 100%;
+}
+
+.markdown-body :deep(th),
+.markdown-body :deep(td) {
+  border: 1px solid var(--aw-hairline);
+  padding: 6px 10px;
+  text-align: left;
+  font-size: var(--aw-text-caption);
+}
+
+.markdown-body :deep(th) {
+  background: var(--aw-canvas-parchment);
+  font-weight: 600;
+}
+
+.markdown-body :deep(hr) {
+  border: none;
+  border-top: 1px solid var(--aw-divider-soft);
+  margin: 2px 0;
+}
+</style>

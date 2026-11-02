@@ -1,0 +1,365 @@
+import type { Db } from '../db/db.js';
+
+export interface FeishuConversation {
+  id: number;
+  appId: string;
+  chatId: string;
+  sessionId: number;
+  ownerUserId: number;
+  workspace?: string | null;
+  /** 群聊上下文增量注入水位线：上次已注入的最大群消息 log id。 */
+  lastContextLogId?: number | null;
+  /** 注入窗口外更早消息的 LLM 摘要缓存；contextSummaryLogId 为摘要已覆盖的最大 log id。 */
+  contextSummary?: string | null;
+  contextSummaryLogId?: number | null;
+}
+
+export interface FeishuGroupMessage {
+  id?: number;
+  appId: string;
+  chatId: string;
+  senderOpenId: string;
+  senderName: string;
+  msgType?: string;
+  content?: string | null;
+  fileKey?: string | null;
+  fileName?: string | null;
+  messageId?: string | null;
+  threadId?: string | null;
+  isMention: boolean;
+  /** 1=图片/文件/卡片内容尚未回填；水位线不得越过该行。 */
+  enrichPending?: boolean | number | null;
+  createdAt?: string | null;
+}
+
+export interface FeishuThreadSession {
+  id?: number;
+  appId: string;
+  chatId: string;
+  threadId: string;
+  rootMessageId: string;
+  sessionId: number;
+  lastContextLogId?: number | null;
+}
+
+export interface FeishuMessageRepository {
+  findGroupConversation(appId: string, chatId: string, ownerUserId?: number): Promise<FeishuConversation | null>;
+  /** 按消息 ID 查询群消息中的媒体元数据（下载工具用）。 */
+  findMediaByMessageId(messageId: string): Promise<{ appId: string; fileKey: string | null; fileName: string | null; msgType: string | null } | null>;
+  /** 按消息 ID 查询群消息完整记录（引用消息内容预取优先走日志，免 API 调用）。 */
+  findGroupMessageByMessageId(appId: string, chatId: string, messageId: string): Promise<FeishuGroupMessage | null>;
+  saveConversation(conversation: Omit<FeishuConversation, 'id'>): Promise<FeishuConversation>;
+  claimInboundMessage(appId: string, messageId: string, eventId: string | null, chatId: string | null): Promise<boolean>;
+  releaseInboundMessage(appId: string, messageId: string): Promise<void>;
+  completeInboundMessage(appId: string, messageId: string): Promise<void>;
+  appendGroupMessage(message: FeishuGroupMessage): Promise<number>;
+  listGroupMessages(appId: string, chatId: string, limit: number, maxMinutes?: number, threadId?: string | null): Promise<FeishuGroupMessage[]>;
+  /** 追溯注入窗口之前被丢弃的未注入普通消息（id > watermark 且 id < beforeId，不限时间），供溢出摘要。 */
+  listOverflowGroupMessages(appId: string, chatId: string, watermark: number, beforeId: number, limit: number, threadId?: string | null): Promise<FeishuGroupMessage[]>;
+  /** 水位线之后最旧的未富化行。窗口外的占位行也算，水位线不得越过它。没有则 null。 */
+  findOldestPendingGroupMessageId(appId: string, chatId: string, afterId: number, threadId?: string | null): Promise<number | null>;
+  /** 触发前同步补齐用：本群/话题范围内仍标记待富化（enrich_pending=1）的行快照，按 id 升序。 */
+  listPendingGroupMessages(appId: string, chatId: string, threadId?: string | null, limit?: number): Promise<Array<{ id: number; messageId: string; msgType: string }>>;
+  /** 推进群聊上下文增量注入水位线（只前进不后退；仅非话题）。 */
+  updateGroupContextWatermark(appId: string, chatId: string, logId: number): Promise<void>;
+  /** 推进话题上下文增量注入水位线（只前进不后退）。 */
+  updateThreadContextWatermark(appId: string, threadId: string, logId: number): Promise<void>;
+  /** 写入溢出摘要缓存（logId 只前进不后退）。 */
+  updateGroupContextSummary(appId: string, chatId: string, summary: string, logId: number): Promise<void>;
+  /** 回填群消息行的内容占位文本（如图片预下载完成后的本地路径引用），并清除 enrich_pending。 */
+  updateGroupMessageContent(id: number, content: string): Promise<void>;
+  /** 富化收尾（无内容回填时也清标记），使该行可参与水位线推进。 */
+  markGroupMessageEnriched(id: number): Promise<void>;
+  /** 回填群消息行的发送人显示名（入站时原始事件可能缺少姓名）。 */
+  updateGroupMessageSenderName(id: number, senderName: string): Promise<void>;
+  addGroupMember(appId: string, chatId: string, userId: number, openId: string, displayName: string): Promise<void>;
+  /** 记录飞书私聊消息 → 会话归属映射（INSERT IGNORE 防重；direction: IN=入站 / OUT=出站）。 */
+  recordP2pMessage(appId: string, messageId: string, sessionId: number, direction: 'IN' | 'OUT'): Promise<void>;
+
+  /** 按飞书消息 ID 查询归属会话 ID；未记录返回 null。 */
+  findP2pMessageSession(appId: string, messageId: string): Promise<number | null>;
+  /** 记录话题→会话映射（INSERT IGNORE 防重）。 */
+  recordThreadSession(params: { appId: string; chatId: string; threadId: string; rootMessageId: string; sessionId: number }): Promise<void>;
+  /** 按话题 ID 查归属会话（含话题水位线）；未记录返回 null。 */
+  findThreadSession(appId: string, threadId: string): Promise<{ sessionId: number; rootMessageId: string; lastContextLogId?: number | null } | null>;
+  /** 会话 → 飞书通道绑定（创建时落行、不可变）：session_id 唯一，upsert 幂等；
+   *  awaiting_first_message_title 用 GREATEST「只进不清」——指针切换的 upsert(false) 不会清掉 `---` 置上的待命名标志。 */
+  upsertSessionChannel(sessionId: number, appId: string, chatId: string, chatType: 'p2p' | 'group', awaitingFirstMessageTitle?: boolean): Promise<void>;
+  /** 按会话查通道绑定；非飞书会话返回 null。 */
+  findSessionChannel(sessionId: number): Promise<{ sessionId: number; appId: string; chatId: string; chatType: 'p2p' | 'group'; awaitingFirstMessageTitle: number } | null>;
+  /** 清除「等待首条消息命名」标志（命名完成后调用，幂等）。 */
+  clearAwaitingFirstMessageTitle(sessionId: number): Promise<void>;
+  /** 查询会话最新入站消息 ID（用于 reply 发送）。私聊查 feishu_p2p_message，群聊查 feishu_group_message_log，话题查 feishu_thread_session.root_message_id。未找到返回 null。 */
+  findLatestInboundMessageId(sessionId: number, channel: { appId: string; chatId: string; chatType: 'p2p' | 'group' }): Promise<string | null>;
+  /** 查询话题会话的话题根消息 ID（reply 该 ID 会落入当前话题）；非话题会话返回 null。 */
+  findThreadRootMessageId(sessionId: number): Promise<string | null>;
+}
+
+/** Persistence boundary for Feishu conversations. Session creation is deliberately
+ * supplied by the caller because this module must not depend on create-app. */
+export class MysqlFeishuMessageRepository implements FeishuMessageRepository {
+  constructor(private readonly db: Db) {}
+
+  findGroupConversation(appId: string, chatId: string, ownerUserId?: number): Promise<FeishuConversation | null> {
+    const sql = ownerUserId == null
+      ? 'SELECT * FROM feishu_chat WHERE app_id = ? AND chat_id = ? LIMIT 1'
+      : 'SELECT * FROM feishu_chat WHERE app_id = ? AND chat_id = ? AND owner_user_id = ? LIMIT 1';
+    const params = ownerUserId == null ? [appId, chatId] : [appId, chatId, ownerUserId];
+    return this.db.queryOne<FeishuConversation>(sql, params);
+  }
+
+  findMediaByMessageId(messageId: string): Promise<{ appId: string; fileKey: string | null; fileName: string | null; msgType: string | null } | null> {
+    return this.db.queryOne(
+      'SELECT app_id, file_key, file_name, msg_type FROM feishu_group_message_log WHERE message_id = ? AND file_key IS NOT NULL LIMIT 1',
+      [messageId],
+    );
+  }
+
+  findGroupMessageByMessageId(appId: string, chatId: string, messageId: string): Promise<FeishuGroupMessage | null> {
+    return this.db.queryOne<FeishuGroupMessage>(
+      'SELECT * FROM feishu_group_message_log WHERE app_id = ? AND chat_id = ? AND message_id = ? LIMIT 1',
+      [appId, chatId, messageId],
+    );
+  }
+
+  async saveConversation(conversation: Omit<FeishuConversation, 'id'>): Promise<FeishuConversation> {
+    await this.db.execute(
+      `INSERT INTO feishu_chat (app_id, chat_id, session_id, owner_user_id, workspace)
+       VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE session_id = VALUES(session_id), owner_user_id = VALUES(owner_user_id), workspace = VALUES(workspace)`,
+      [conversation.appId, conversation.chatId, conversation.sessionId, conversation.ownerUserId, conversation.workspace ?? null],
+    );
+    // 会话 → 通道绑定（不可变）：任何会话行写入路径同步落绑定，活跃指针切换不影响反查。
+    // awaiting_first_message_title 不在 ON DUPLICATE 中重置（`---` 新建的待命名标志只由命名动作清除）。
+    await this.upsertSessionChannel(
+      conversation.sessionId, conversation.appId, conversation.chatId,
+      conversation.chatId.startsWith('p2p:') ? 'p2p' : 'group',
+    );
+    const saved = await this.findGroupConversation(conversation.appId, conversation.chatId);
+    if (saved == null) throw new Error('Failed to save Feishu conversation');
+    return saved;
+  }
+
+  async claimInboundMessage(appId: string, messageId: string, eventId: string | null, chatId: string | null): Promise<boolean> {
+    const result = await this.db.execute(
+      `INSERT INTO feishu_inbound_event (app_id, message_id, event_id, chat_id, status)
+       VALUES (?, ?, ?, ?, 'CLAIMED')
+       ON DUPLICATE KEY UPDATE
+         status = IF(status = 'FAILED' OR (status = 'CLAIMED' AND updated_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 10 MINUTE)), 'CLAIMED', status),
+         updated_at = IF(status = 'FAILED' OR (status = 'CLAIMED' AND updated_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 10 MINUTE)), CURRENT_TIMESTAMP, updated_at)`, [appId, messageId, eventId, chatId],
+    );
+    return Number(result.affectedRows ?? 0) > 0;
+  }
+
+  async releaseInboundMessage(appId: string, messageId: string): Promise<void> {
+    await this.db.execute(
+      `UPDATE feishu_inbound_event SET status = 'FAILED' WHERE app_id = ? AND message_id = ? AND status = 'CLAIMED'`,
+      [appId, messageId],
+    );
+  }
+
+  async completeInboundMessage(appId: string, messageId: string): Promise<void> {
+    await this.db.execute(
+      `UPDATE feishu_inbound_event SET status = 'DONE' WHERE app_id = ? AND message_id = ?`,
+      [appId, messageId],
+    );
+  }
+
+  async appendGroupMessage(message: FeishuGroupMessage): Promise<number> {
+    if (message.messageId == null || message.messageId === '') throw new Error('Feishu group message requires messageId');
+    await this.db.execute(
+      `INSERT IGNORE INTO feishu_group_message_log
+       (app_id, chat_id, sender_open_id, sender_name, msg_type, content, file_key, file_name, message_id, is_mention, thread_id, enrich_pending)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [message.appId, message.chatId, message.senderOpenId, message.senderName, message.msgType ?? 'text', message.content ?? null,
+        message.fileKey ?? null, message.fileName ?? null, message.messageId, message.isMention ? 1 : 0, message.threadId ?? null,
+        message.enrichPending ? 1 : 0],
+    );
+    const saved = await this.db.queryOne<{ id?: number }>(
+      'SELECT id FROM feishu_group_message_log WHERE app_id = ? AND chat_id = ? AND message_id = ? LIMIT 1',
+      [message.appId, message.chatId, message.messageId],
+    );
+    if (saved?.id == null) throw new Error('Failed to record Feishu group message');
+    return Number(saved.id);
+  }
+
+  async addGroupMember(appId: string, chatId: string, userId: number, openId: string, displayName: string): Promise<void> {
+    await this.db.execute(
+      `INSERT INTO feishu_chat_member (app_id, chat_id, user_id, open_id, display_name)
+       VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE user_id = VALUES(user_id), display_name = VALUES(display_name)`,
+      [appId, chatId, userId, openId, displayName],
+    );
+  }
+
+  listGroupMessages(appId: string, chatId: string, limit: number, maxMinutes = 120, threadId: string | null = null): Promise<FeishuGroupMessage[]> {
+    const safeLimit = Math.max(1, Math.min(200, Math.floor(limit)));
+    const safeMinutes = Math.max(1, Math.min(10080, Math.floor(maxMinutes)));
+    // 非话题上下文排除话题消息（话题有独立会话与水位线），避免两条注入路径互相污染。
+    const threadFilter = threadId != null ? ' AND thread_id = ?' : ' AND thread_id IS NULL';
+    const params = threadId != null ? [appId, chatId, threadId] : [appId, chatId];
+    return this.db.query<FeishuGroupMessage>(
+      `SELECT * FROM feishu_group_message_log WHERE app_id = ? AND chat_id = ?${threadFilter}
+       AND created_at >= DATE_SUB(CURRENT_TIMESTAMP, INTERVAL ${safeMinutes} MINUTE)
+       ORDER BY created_at DESC, id DESC LIMIT ${safeLimit}`, params,
+    ).then((rows) => rows.reverse());
+  }
+
+  listOverflowGroupMessages(appId: string, chatId: string, watermark: number, beforeId: number, limit: number, threadId: string | null = null): Promise<FeishuGroupMessage[]> {
+    const safeLimit = Math.max(1, Math.min(200, Math.floor(limit)));
+    const threadFilter = threadId != null ? ' AND thread_id = ?' : ' AND thread_id IS NULL';
+    const params = threadId != null ? [appId, chatId, watermark, beforeId, threadId] : [appId, chatId, watermark, beforeId];
+    return this.db.query<FeishuGroupMessage>(
+      `SELECT * FROM feishu_group_message_log WHERE app_id = ? AND chat_id = ?
+       AND id > ? AND id < ? AND is_mention = 0 AND enrich_pending = 0${threadFilter}
+       ORDER BY created_at DESC, id DESC LIMIT ${safeLimit}`, params,
+    ).then((rows) => rows.reverse());
+  }
+
+  findOldestPendingGroupMessageId(appId: string, chatId: string, afterId: number, threadId: string | null = null): Promise<number | null> {
+    const threadFilter = threadId != null ? ' AND thread_id = ?' : ' AND thread_id IS NULL';
+    const params = threadId != null ? [appId, chatId, afterId, threadId] : [appId, chatId, afterId];
+    return this.db.queryOne<{ minId: number | null }>(
+      `SELECT MIN(id) AS minId FROM feishu_group_message_log
+       WHERE app_id = ? AND chat_id = ? AND enrich_pending = 1 AND id > ?${threadFilter}`,
+      params,
+    ).then((row) => (row?.minId == null ? null : Number(row.minId)));
+  }
+
+  listPendingGroupMessages(appId: string, chatId: string, threadId: string | null = null, limit = 10): Promise<Array<{ id: number; messageId: string; msgType: string }>> {
+    const safeLimit = Math.max(1, Math.min(50, Math.floor(limit)));
+    const threadFilter = threadId != null ? ' AND thread_id = ?' : ' AND thread_id IS NULL';
+    const params = threadId != null ? [appId, chatId, threadId, safeLimit] : [appId, chatId, safeLimit];
+    // 只取快照字段：合并转发行仅凭 messageId 即可重建富化输入，其余类型靠在飞行任务等待。
+    return this.db.query<{ id: number; messageId: string; msgType: string }>(
+      `SELECT id, message_id, msg_type FROM feishu_group_message_log
+       WHERE app_id = ? AND chat_id = ? AND enrich_pending = 1${threadFilter}
+       ORDER BY id ASC LIMIT ${safeLimit}`, params,
+    );
+  }
+
+  async updateGroupContextWatermark(appId: string, chatId: string, logId: number): Promise<void> {
+    await this.db.execute(
+      'UPDATE feishu_chat SET last_context_log_id = GREATEST(last_context_log_id, ?) WHERE app_id = ? AND chat_id = ?',
+      [logId, appId, chatId],
+    );
+  }
+
+  async updateThreadContextWatermark(appId: string, threadId: string, logId: number): Promise<void> {
+    await this.db.execute(
+      'UPDATE feishu_thread_session SET last_context_log_id = GREATEST(last_context_log_id, ?) WHERE app_id = ? AND thread_id = ?',
+      [logId, appId, threadId],
+    );
+  }
+
+  async updateGroupContextSummary(appId: string, chatId: string, summary: string, logId: number): Promise<void> {
+    await this.db.execute(
+      'UPDATE feishu_chat SET context_summary = ?, context_summary_log_id = GREATEST(context_summary_log_id, ?) WHERE app_id = ? AND chat_id = ?',
+      [summary, logId, appId, chatId],
+    );
+  }
+
+  updateGroupMessageContent(id: number, content: string): Promise<void> {
+    return this.db.execute(
+      'UPDATE feishu_group_message_log SET content = ?, enrich_pending = 0 WHERE id = ?',
+      [content, id],
+    ).then(() => undefined);
+  }
+
+  markGroupMessageEnriched(id: number): Promise<void> {
+    return this.db.execute(
+      'UPDATE feishu_group_message_log SET enrich_pending = 0 WHERE id = ?',
+      [id],
+    ).then(() => undefined);
+  }
+
+  updateGroupMessageSenderName(id: number, senderName: string): Promise<void> {
+    return this.db.execute('UPDATE feishu_group_message_log SET sender_name = ? WHERE id = ?', [senderName, id]).then(() => undefined);
+  }
+
+  async recordP2pMessage(appId: string, messageId: string, sessionId: number, direction: 'IN' | 'OUT'): Promise<void> {
+    if (messageId == null || messageId === '') return;
+    await this.db.execute(
+      'INSERT IGNORE INTO feishu_p2p_message (app_id, message_id, session_id, direction) VALUES (?, ?, ?, ?)',
+      [appId, messageId, sessionId, direction],
+    );
+  }
+
+  async findP2pMessageSession(appId: string, messageId: string): Promise<number | null> {
+    if (messageId == null || messageId === '') return null;
+    const row = await this.db.queryOne<{ sessionId: number }>(
+      'SELECT session_id FROM feishu_p2p_message WHERE app_id = ? AND message_id = ? LIMIT 1',
+      [appId, messageId],
+    );
+    return row?.sessionId ?? null;
+  }
+
+  async recordThreadSession(params: { appId: string; chatId: string; threadId: string; rootMessageId: string; sessionId: number }): Promise<void> {
+    if (params.threadId == null || params.threadId === '') return;
+    await this.db.execute(
+      'INSERT IGNORE INTO feishu_thread_session (app_id, chat_id, thread_id, root_message_id, session_id) VALUES (?, ?, ?, ?, ?)',
+      [params.appId, params.chatId, params.threadId, params.rootMessageId, params.sessionId],
+    );
+  }
+
+  async findThreadSession(appId: string, threadId: string): Promise<{ sessionId: number; rootMessageId: string; lastContextLogId?: number | null } | null> {
+    if (threadId == null || threadId === '') return null;
+    const row = await this.db.queryOne<{ sessionId: number; rootMessageId: string; lastContextLogId?: number | null }>(
+      'SELECT session_id, root_message_id, last_context_log_id FROM feishu_thread_session WHERE app_id = ? AND thread_id = ? LIMIT 1',
+      [appId, threadId],
+    );
+    return row ?? null;
+  }
+
+  async upsertSessionChannel(sessionId: number, appId: string, chatId: string, chatType: 'p2p' | 'group', awaitingFirstMessageTitle = false): Promise<void> {
+    await this.db.execute(
+      `INSERT INTO feishu_session_channel (session_id, app_id, chat_id, chat_type, awaiting_first_message_title)
+       VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE app_id = VALUES(app_id), chat_id = VALUES(chat_id), chat_type = VALUES(chat_type),
+        awaiting_first_message_title = GREATEST(awaiting_first_message_title, VALUES(awaiting_first_message_title))`,
+      [sessionId, appId, chatId, chatType, awaitingFirstMessageTitle ? 1 : 0],
+    );
+  }
+
+  findSessionChannel(sessionId: number): Promise<{ sessionId: number; appId: string; chatId: string; chatType: 'p2p' | 'group'; awaitingFirstMessageTitle: number } | null> {
+    return this.db.queryOne(
+      'SELECT session_id, app_id, chat_id, chat_type, awaiting_first_message_title FROM feishu_session_channel WHERE session_id = ? LIMIT 1',
+      [sessionId],
+    );
+  }
+
+  async clearAwaitingFirstMessageTitle(sessionId: number): Promise<void> {
+    await this.db.execute(
+      'UPDATE feishu_session_channel SET awaiting_first_message_title = 0 WHERE session_id = ?',
+      [sessionId],
+    );
+  }
+
+  async findLatestInboundMessageId(sessionId: number, channel: { appId: string; chatId: string; chatType: 'p2p' | 'group' }): Promise<string | null> {
+    if (channel.chatType === 'p2p') {
+      const row = await this.db.queryOne<{ messageId: string }>(
+        'SELECT message_id FROM feishu_p2p_message WHERE session_id = ? AND direction = ? ORDER BY created_at DESC LIMIT 1',
+        [sessionId, 'IN'],
+      );
+      return row?.messageId ?? null;
+    }
+    // 群聊：优先查话题根消息（话题群 reply 根消息可落入当前话题），无话题时查最新群消息。
+    const threadRow = await this.db.queryOne<{ rootMessageId: string }>(
+      'SELECT root_message_id FROM feishu_thread_session WHERE session_id = ? LIMIT 1',
+      [sessionId],
+    );
+    if (threadRow?.rootMessageId != null && threadRow.rootMessageId !== '') return threadRow.rootMessageId;
+    const groupRow = await this.db.queryOne<{ messageId: string }>(
+      'SELECT message_id FROM feishu_group_message_log WHERE app_id = ? AND chat_id = ? ORDER BY created_at DESC LIMIT 1',
+      [channel.appId, channel.chatId],
+    );
+    return groupRow?.messageId ?? null;
+  }
+
+  async findThreadRootMessageId(sessionId: number): Promise<string | null> {
+    const row = await this.db.queryOne<{ rootMessageId: string }>(
+      'SELECT root_message_id FROM feishu_thread_session WHERE session_id = ? LIMIT 1',
+      [sessionId],
+    );
+    return row?.rootMessageId ?? null;
+  }
+}

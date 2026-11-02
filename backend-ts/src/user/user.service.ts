@@ -1,0 +1,275 @@
+import { BusinessException } from '../common/business-exception.js';
+import { ErrorCode } from '../common/error-code.js';
+import { mpPage, type MpPage } from '../common/json.js';
+import { hasText } from '../common/case.js';
+import type { PermissionService } from '../permission/permission.service.js';
+import { externalAuthSource } from '../auth/external-provider.js';
+import type { PasswordHasher, Role, User, UserRepository } from './types.js';
+
+const USERNAME_PATTERN = /^[a-zA-Z0-9_]{3,64}$/;
+const PASSWORD_PATTERN = /^(?=.*[A-Za-z])(?=.*\d).{8,64}$/;
+const EMAIL_PATTERN = /^[\w.+-]+@[\w-]+(\.[\w-]+)+$/;
+const AVATAR_URL_PATTERN = /^(?=.{1,512}$)(https?:\/\/|\/)[^\s]+$/;
+const DEFAULT_USER_ROLE_ID = 2;
+
+/** 列表按角色筛选：缺省不过滤；出现则必须是正整数，避免 0 / 小数被当成「不筛选」。 */
+function normalizeListRoleId(roleId: number | null | undefined): number | null {
+  if (roleId == null) return null;
+  if (!Number.isInteger(roleId) || roleId <= 0) {
+    throw new BusinessException(ErrorCode.PARAM_INVALID, 'roleId 必须为正整数');
+  }
+  return roleId;
+}
+
+/** 用户状态取值校验：0=禁用 1=启用 null=未设置，其余值会让登录/筛选语义错乱。 */
+function validateUserStatus(status: number | null | undefined): void {
+  if (status != null && status !== 0 && status !== 1) {
+    throw new BusinessException(ErrorCode.PARAM_INVALID, '状态只能为 0（禁用）或 1（启用）');
+  }
+}
+
+/** 用户级运行时模式合法值；空串/null 视为清除覆盖（跟随全局）。 */
+export function normalizeRuntimeMode(value: string | null | undefined): string | null {
+  if (value == null) return null;
+  const trimmed = value.trim();
+  if (trimmed === '') return null;
+  if (trimmed !== 'docker' && trimmed !== 'host') {
+    throw new BusinessException(ErrorCode.PARAM_INVALID, '运行时模式仅支持 docker / host');
+  }
+  return trimmed;
+}
+
+/**
+ * 邮箱变更监听（决策 2）：用户资料邮箱实际变化后触发，供通知域即时刷新
+ * EMAIL 偏好的收件地址密文（内部自行兜底失败，不阻断资料更新）。
+ */
+export type EmailChangeListener = (userId: number, email: string | null) => void | Promise<void>;
+
+export class UserService {
+  constructor(
+    private readonly userRepo: UserRepository,
+    private readonly permissionService: PermissionService,
+    private readonly passwordHasher: PasswordHasher,
+    private readonly emailChangeListener?: EmailChangeListener,
+  ) {}
+
+  async listUsers(
+    page: number,
+    size: number,
+    keyword?: string,
+    status?: number | null,
+    authSource?: string | null,
+    roleId?: number | null,
+  ): Promise<MpPage<User>> {
+    const { records, total } = await this.userRepo.selectPage(page, size, keyword, status, authSource, normalizeListRoleId(roleId));
+    return mpPage(records, total, page, size);
+  }
+
+  async getUser(id: number): Promise<User> {
+    const user = await this.userRepo.findById(id);
+    if (!user) {
+      throw new BusinessException(ErrorCode.USER_NOT_FOUND);
+    }
+    return user;
+  }
+
+  async createUser(
+    username: string,
+    displayName: string,
+    email: string | null | undefined,
+    password: string,
+    roleIds: number[] | null | undefined,
+    status: number | null | undefined,
+  ): Promise<User> {
+    this.validateUsername(username);
+    this.validatePassword(password);
+    await this.assertUsernameUnique(username);
+
+    const user: User = {
+      username: username.trim(),
+      displayName: displayName.trim(),
+      email: hasText(email) ? email!.trim() : null,
+      passwordHash: await this.passwordHasher.hash(password),
+      status: status != null ? status : 1,
+    };
+    await this.userRepo.insert(user);
+    const roles = roleIds && roleIds.length > 0 ? roleIds : [DEFAULT_USER_ROLE_ID];
+    await this.permissionService.assignRoles(user.id!, roles);
+    return user;
+  }
+
+  async updateUser(
+    id: number,
+    displayName: string | null | undefined,
+    email: string | null | undefined,
+    roleIds: number[] | null | undefined,
+    status: number | null | undefined,
+    currentUserId?: number,
+    runtimeMode?: string | null | undefined,
+  ): Promise<User> {
+    const user = await this.getUser(id);
+    const previousEmail = user.email ?? null;
+    if (runtimeMode !== undefined) {
+      user.runtimeMode = normalizeRuntimeMode(runtimeMode);
+    }
+    if (hasText(displayName ?? undefined)) {
+      user.displayName = displayName!.trim();
+    }
+    if (email != null) {
+      const nextEmail = hasText(email) ? email.trim() : null;
+      // 管理端路径不查重邮箱（重复邮箱风险登记于技术方案 §7），但必须校验格式：
+      // 非法地址进 EMAIL 偏好密文后表现为「重试后 FAILED」的静默损坏。
+      if (nextEmail != null && !EMAIL_PATTERN.test(nextEmail)) {
+        throw new BusinessException(ErrorCode.PARAM_INVALID, '邮箱格式不正确');
+      }
+      user.email = nextEmail;
+    }
+    validateUserStatus(status);
+    if (status != null && status === 0) {
+      // 快速失败：角色变更前先做只读守卫，避免角色已改、禁用被拒的半截更新
+      await this.permissionService.assertCanDisableUser(id, currentUserId ?? 0);
+    }
+    if (status != null) {
+      user.status = status;
+    }
+    // 角色变更：空 roleIds 提前拒绝；持锁守卫必须先于用户行落库，
+    // 避免守卫因并发失败时资料/状态已写入而角色未改（半截更新）。
+    if (roleIds != null) {
+      if (roleIds.length === 0) {
+        throw new BusinessException(ErrorCode.PARAM_INVALID, '至少分配一个角色');
+      }
+      // changeRolesWithAdminGuard 在同一事务内锁 ADMIN 绑定并做最后管理员检查 + 写入
+      await this.permissionService.changeRolesWithAdminGuard(id, roleIds);
+    }
+    if (status != null && status === 0) {
+      // 禁用写入走守卫事务：检查与 status 写入原子（消除与并发禁用互相放行的 TOCTOU），
+      // 随后从整行写中剔除 status，避免旧值覆盖守卫事务的落库结果。
+      await this.permissionService.updateUserStatusWithAdminGuard(id, currentUserId ?? 0, 0);
+      user.status = undefined;
+    }
+    await this.userRepo.updateById(user);
+    // 邮箱实际变化后刷新通知域收件地址（决策 2）：失败只 warn，不阻断资料更新
+    if (email != null && (user.email ?? null) !== previousEmail) {
+      await this.emailChangeListener?.(id, user.email ?? null);
+    }
+    // 返回值回填守卫事务写入的状态，调用方（路由 VO）拿到与 DB 一致的取值
+    if (status === 0) user.status = 0;
+    return user;
+  }
+
+  async updateUserStatus(id: number, status: number | null | undefined, currentUserId: number): Promise<void> {
+    validateUserStatus(status);
+    await this.getUser(id);
+    // 守卫检查与写入同一事务：并发禁用最后两名管理员时至少一个被拒（零管理员 TOCTOU）
+    await this.permissionService.updateUserStatusWithAdminGuard(id, currentUserId, status ?? null);
+  }
+
+  async resetPassword(id: number, newPassword: string): Promise<void> {
+    const user = await this.getUser(id);
+    this.validatePassword(newPassword);
+    user.passwordHash = await this.passwordHasher.hash(newPassword);
+    await this.userRepo.updateById(user);
+  }
+
+  async updateOwnProfile(userId: number, displayName?: string | null, email?: string | null, avatarUrl?: string | null): Promise<void> {
+    const user = await this.getUser(userId);
+    const localUser = hasText(user.passwordHash ?? undefined);
+    if ((displayName != null || email != null) && !localUser) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, 'LDAP / 飞书账号的资料由系统维护，仅可修改头像');
+    }
+
+    const fields: Record<string, unknown> = {};
+    if (avatarUrl !== undefined && avatarUrl !== null) {
+      const url = hasText(avatarUrl) ? avatarUrl.trim() : null;
+      if (url != null && !AVATAR_URL_PATTERN.test(url)) {
+        throw new BusinessException(ErrorCode.PARAM_INVALID, '头像地址仅支持 http(s) 链接或 / 开头的相对路径，且长度不超过 512');
+      }
+      if (url !== (user.avatarUrl ?? null)) {
+        fields.avatarUrl = url;
+      }
+    } else if (avatarUrl === null) {
+      if (user.avatarUrl != null) {
+        fields.avatarUrl = null;
+      }
+    }
+
+    if (displayName != null) {
+      const name = displayName.trim();
+      if (name.length === 0 || name.length > 128) {
+        throw new BusinessException(ErrorCode.PARAM_INVALID, '显示名称不能为空且不超过 128 字符');
+      }
+      if (name !== user.displayName) {
+        fields.displayName = name;
+      }
+    }
+
+    if (email != null) {
+      const mail = email.trim();
+      const currentMail = user.email == null ? null : user.email.trim();
+      if (mail !== (currentMail ?? '')) {
+        if (mail.length > 0 && !EMAIL_PATTERN.test(mail)) {
+          throw new BusinessException(ErrorCode.PARAM_INVALID, '邮箱格式不正确');
+        }
+        if (mail.length > 128) {
+          throw new BusinessException(ErrorCode.PARAM_INVALID, '邮箱长度不能超过 128 字符');
+        }
+        if (mail.length > 0) {
+          const dup = await this.userRepo.countByEmailExcept(mail, userId);
+          if (dup > 0) {
+            throw new BusinessException(ErrorCode.PARAM_INVALID, '该邮箱已被其他用户使用');
+          }
+        }
+        fields.email = mail.length === 0 ? null : mail;
+      }
+    }
+
+    if (Object.keys(fields).length > 0) {
+      await this.userRepo.updateFields(userId, fields);
+    }
+    // fields.email 仅在邮箱实际变化时写入：变化后即时刷新通知域收件地址（决策 2）
+    if (Object.hasOwn(fields, 'email')) {
+      await this.emailChangeListener?.(userId, (fields.email as string | null) ?? null);
+    }
+  }
+
+  static resolveAuthSource(user: User): string {
+    if (hasText(user.passwordHash ?? undefined)) {
+      return 'LOCAL';
+    }
+    const external = externalAuthSource(user.externalProvider);
+    if (external) {
+      return external;
+    }
+    if (hasText(user.feishuUserId ?? undefined)) {
+      return 'FEISHU';
+    }
+    return 'LDAP';
+  }
+
+  batchGetUserRoles(userIds: number[]): Promise<Map<number, Role[]>> {
+    return this.permissionService.batchGetUserRoles(userIds);
+  }
+
+  getUserRoles(userId: number): Promise<Role[]> {
+    return this.permissionService.getUserRoles(userId);
+  }
+
+  private validateUsername(username: string): void {
+    if (!hasText(username) || !USERNAME_PATTERN.test(username.trim())) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '用户名须为 3-64 位字母、数字或下划线');
+    }
+  }
+
+  private validatePassword(password: string): void {
+    if (!hasText(password) || !PASSWORD_PATTERN.test(password)) {
+      throw new BusinessException(ErrorCode.PASSWORD_INVALID);
+    }
+  }
+
+  private async assertUsernameUnique(username: string): Promise<void> {
+    const count = await this.userRepo.countByUsername(username.trim());
+    if (count > 0) {
+      throw new BusinessException(ErrorCode.USERNAME_DUPLICATE);
+    }
+  }
+}

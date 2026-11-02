@@ -1,0 +1,256 @@
+import { harnessLog } from '../log.js';
+import type { Tool } from './tool.js';
+import type { PathSandbox } from '../safety/path-sandbox.js';
+import type { SessionTodoMapper } from '../todo/session-todo.mapper.js';
+import type { AgentMapper, MessageMapper, SessionCompactionService, SessionMapper, SessionService } from '../deps.js';
+import type { ScheduledTaskService } from '../../schedule/scheduled-task.service.js';
+import type { ShellSessionManager, OutputManager } from '../shell/shell-session-manager.js';
+import type { BackgroundTaskManager } from '../core/background-task-manager.js';
+import type { GitCredentialLookup } from '../../session/types.js';
+import type { WebSearchConfig } from '../../settings/types.js';
+import type { WebPageConfig } from './impl/open-web-page-tool.js';
+import type { RuntimeDataResolver } from '../runtime/runtime-data-resolver.js';
+import type { ImageModelLookup } from './impl/generate-image-tool.js';
+import type { WeixinMediaToolSupport, WeixinMediaUploadService, WeixinSendService } from './impl/wechat-tools.js';
+import type {
+  FeishuChannelToolSupport, FeishuGroupMediaLookup, FeishuMediaDownloader, FeishuMessageDetailFetcher,
+  FeishuMediaSendSupport,
+} from './impl/feishu-tools.js';
+import type { AgentDefinitionRegistry } from '../delegate/agent-definition-registry.js';
+import type { HarnessService } from '../core/harness-service.js';
+import type { AgentLoop } from '../core/agent-loop.js';
+import type { SubagentExecutionMapper } from '../delegate/subagent-execution.mapper.js';
+import type { LocalToolSessionRegistry } from '../local/local-tool-session-registry.js';
+import type { LocalToolExecutor } from '../local/local-tool-executor.js';
+import type { SubAgentVisibilityService } from '../delegate/subagent-visibility-service.js';
+import type { BackgroundSubagentManager } from '../delegate/background-subagent-manager.js';
+import {
+  CancelSubagentTool, CheckSubagentTool, SpawnSubagentTool, SubagentFollowupTool, WaitSubagentsTool,
+} from './impl/background-subagent-tools.js';
+import { AskUserQuestionsTool } from './impl/ask-user-questions-tool.js';
+import { ReadFileTool } from './impl/read-file-tool.js';
+import { WriteFileTool } from './impl/write-file-tool.js';
+import { EditFileTool } from './impl/edit-file-tool.js';
+import { GlobSearchTool } from './impl/glob-search-tool.js';
+import { GrepSearchTool } from './impl/grep-search-tool.js';
+import { ShellSessionTool, type ShellEcpInjector, type ShellLarkUatInjector, type ShellTokenIssuer, type ShellUserLookup } from './impl/shell-session-tool.js';
+import { WebSearchTool } from './impl/web-search-tool.js';
+import { OpenWebPageTool } from './impl/open-web-page-tool.js';
+import { DumpUserMessagesTool } from './impl/dump-user-messages-tool.js';
+import { GenerateImageTool } from './impl/generate-image-tool.js';
+import { EditImageTool } from './impl/edit-image-tool.js';
+import { TaskCreateTool, TaskDeleteTool, TaskListTool, TaskUpdateTool } from './impl/task-tools.js';
+import {
+  CreateScheduledTaskTool, DeleteScheduledTaskTool, ListScheduledTasksTool, UpdateScheduledTaskTool,
+} from './impl/scheduled-task-tools.js';
+import { SendWechatFileTool, SendWechatImageTool } from './impl/wechat-tools.js';
+import { FeishuDownloadFileTool, SendFeishuFileTool, SendFeishuImageTool } from './impl/feishu-tools.js';
+import { SendDingtalkFileTool, SendDingtalkImageTool, type DingtalkMediaSendSupport } from './impl/dingtalk-tools.js';
+import type { SendBytesSupport } from './impl/send-file-bytes.js';
+import { createPageTools } from './impl/page-tools.js';
+import type { EmbedPageToolRegistry } from '../embed-page-tool-registry.js';
+import { McpCallTool, type McpToolCaller } from '../mcp/workingset/impl/mcp-call-tool.js';
+import { McpDescribeTool } from '../mcp/workingset/impl/mcp-describe-tool.js';
+import type { McpToolsRegistry } from '../mcp/local/mcp-tools-registry.js';
+import {
+  HttpCallTool, HttpDescribeTool, type HttpApiToolServicePort,
+} from './impl/http-api-tools.js';
+import type { HttpApiExecutor } from './impl/http-api-executor.js';
+
+/**
+ * 自定义 HTTP 工具的两个入口（技术方案 2026-10-19 §5.3）：默认工具集中先剔除，
+ * 仅当用户有启用工具时按会话推入（装配见 harness-service buildContext）。
+ * 顺序即推入顺序：先 describe 后 call。
+ */
+export const HTTP_TOOL_NAMES = ['http_describe', 'http_call'] as const;
+
+export interface DefaultToolRegistryDeps {
+  pathSandbox: PathSandbox;
+  sessionTodoMapper: SessionTodoMapper;
+  scheduledTaskService: ScheduledTaskService;
+  sessionService: SessionService;
+  sessionMapper: SessionMapper;
+  shellSessionManager: ShellSessionManager;
+  outputManager: OutputManager;
+  backgroundTaskManager: BackgroundTaskManager;
+  gitCredentialService?: GitCredentialLookup | null;
+  jwtService?: ShellTokenIssuer | null;
+  shellUserLookup?: ShellUserLookup | null;
+  shellEcpInjector?: ShellEcpInjector | null;
+  shellLarkUatInjector?: ShellLarkUatInjector | null;
+  webSearch: () => Promise<WebSearchConfig>;
+  webPage: WebPageConfig;
+  runtimeDataResolver: RuntimeDataResolver;
+  imageModelLookup: ImageModelLookup;
+  uploadDir: string;
+  getUploadBaseUrl?: () => Promise<string>;
+  /** servlet contextPath（默认 /api）：图片产物 image_url 派生静态 origin 用。 */
+  uploadContextPath?: string;
+  weixinToolSupport: WeixinMediaToolSupport;
+  weixinUploadService: WeixinMediaUploadService;
+  weixinSendService: WeixinSendService;
+  feishuToolSupport: FeishuChannelToolSupport;
+  feishuMediaDownloader: FeishuMediaDownloader;
+  feishuGroupMediaLookup: FeishuGroupMediaLookup;
+  feishuMessageDetailFetcher: FeishuMessageDetailFetcher;
+  feishuMaxInboundFileBytes: number;
+  feishuMediaSendSupport: FeishuMediaSendSupport;
+  dingtalkMediaSendSupport: DingtalkMediaSendSupport;
+  /** 外部发送工具的容器读字节支持（docker 模式下本地路径经容器读取，§5.8）。可选注入。 */
+  sendBytesSupport?: SendBytesSupport | null;
+  definitionRegistry: AgentDefinitionRegistry;
+  harnessService: HarnessService;
+  agentLoop: AgentLoop;
+  subagentExecutionMapper: SubagentExecutionMapper;
+  localToolSessionRegistry: LocalToolSessionRegistry;
+  /** LOCAL 工具委托入口（dump_user_messages 的 LOCAL 落盘经它走 WS 委托桌面端）。 */
+  localToolExecutor: LocalToolExecutor;
+  visibilityService: SubAgentVisibilityService;
+  backgroundSubagentManager: BackgroundSubagentManager;
+  messageMapper: MessageMapper;
+  sessionCompactionService: SessionCompactionService;
+  embedPageToolRegistry: EmbedPageToolRegistry;
+  /**
+   * MCP 工作集工具（mcp_call / mcp_describe）。两者都依赖会话工具清单；
+   * 未注入时（部分单测/精简装配）不注册，全量模式行为不受影响。
+   */
+  mcpToolsRegistry?: McpToolsRegistry | null;
+  mcpClientManager?: McpToolCaller | null;
+  /**
+   * 自定义 HTTP 工具（http_describe / http_call，技术方案 2026-10-21 §5.3）。
+   * 与 MCP 工作集同款条件注册：未注入时（精简装配/单测）不注册，全量模式行为不受影响。
+   * 执行解析按 Agent 维度：sessionId → agentId → agent.httpToolIds。
+   */
+  httpToolService?: HttpApiToolServicePort | null;
+  httpApiExecutor?: HttpApiExecutor | null;
+  agentMapper?: AgentMapper | null;
+  /**
+   * 文件落盘成功回调（团队经验库索引刷新，技术方案 2026-10-24 §3.5 触发点 2）：
+   * 注入给 write_file / edit_file。回调自身判断路径是否位于经验根下，非经验文件零开销。
+   * 未注入时（精简装配/单测）两工具行为与改造前完全一致。
+   */
+  onFileChanged?: (absPath: string) => void;
+}
+
+/** Instantiates and registers all built-in tools (mirrors Spring Tool bean auto-registration). */
+export function createDefaultToolRegistry(deps: DefaultToolRegistryDeps): ToolRegistry {
+  const tools: Tool[] = [
+    new AskUserQuestionsTool(),
+    new ReadFileTool(deps.pathSandbox),
+    new WriteFileTool(deps.pathSandbox, deps.onFileChanged),
+    new EditFileTool(deps.pathSandbox, deps.onFileChanged),
+    new GlobSearchTool(deps.pathSandbox),
+    new GrepSearchTool(deps.pathSandbox),
+    new ShellSessionTool(
+      deps.pathSandbox, deps.shellSessionManager, deps.outputManager,
+      deps.backgroundTaskManager, deps.gitCredentialService,
+      deps.jwtService, deps.shellUserLookup, deps.shellEcpInjector,
+      deps.shellLarkUatInjector,
+    ),
+    new WebSearchTool(deps.webSearch),
+    new OpenWebPageTool(
+      deps.webPage,
+      deps.runtimeDataResolver,
+      async (sessionId) => {
+        // LOCAL 会话的 read_file 在桌面端执行，服务端落盘路径不可达，截断全文不落盘。
+        if (sessionId == null) return false;
+        const session = await deps.sessionMapper.selectById(sessionId);
+        return session?.executionMode === 'LOCAL';
+      },
+    ),
+    new DumpUserMessagesTool(
+      deps.sessionService,
+      deps.runtimeDataResolver,
+      deps.localToolExecutor,
+      deps.sessionMapper,
+    ),
+    new GenerateImageTool(deps.imageModelLookup, deps.uploadDir, deps.getUploadBaseUrl ?? (async () => ''), deps.uploadContextPath),
+    new EditImageTool(deps.imageModelLookup, deps.pathSandbox, deps.uploadDir, deps.getUploadBaseUrl ?? (async () => ''), deps.sendBytesSupport, deps.uploadContextPath),
+    new TaskCreateTool(deps.sessionTodoMapper),
+    new TaskListTool(deps.sessionTodoMapper),
+    new TaskUpdateTool(deps.sessionTodoMapper),
+    new TaskDeleteTool(deps.sessionTodoMapper),
+    new CreateScheduledTaskTool(deps.scheduledTaskService, deps.sessionService),
+    new ListScheduledTasksTool(deps.scheduledTaskService),
+    new UpdateScheduledTaskTool(deps.scheduledTaskService),
+    new DeleteScheduledTaskTool(deps.scheduledTaskService),
+    new SendWechatImageTool(deps.pathSandbox, deps.weixinToolSupport, deps.weixinUploadService, deps.weixinSendService, deps.sendBytesSupport),
+    new SendWechatFileTool(deps.pathSandbox, deps.weixinToolSupport, deps.weixinUploadService, deps.weixinSendService, deps.sendBytesSupport),
+    new FeishuDownloadFileTool(deps.feishuToolSupport, deps.feishuGroupMediaLookup, deps.feishuMediaDownloader, deps.feishuMaxInboundFileBytes, deps.feishuMessageDetailFetcher),
+    new SendFeishuImageTool(deps.pathSandbox, deps.feishuMediaSendSupport, deps.sendBytesSupport),
+    new SendFeishuFileTool(deps.pathSandbox, deps.feishuMediaSendSupport, deps.sendBytesSupport),
+    new SendDingtalkImageTool(deps.pathSandbox, deps.dingtalkMediaSendSupport, deps.sendBytesSupport),
+    new SendDingtalkFileTool(deps.pathSandbox, deps.dingtalkMediaSendSupport, deps.sendBytesSupport),
+    new SpawnSubagentTool(deps.backgroundSubagentManager, deps.definitionRegistry),
+    new SubagentFollowupTool(deps.backgroundSubagentManager),
+    new CheckSubagentTool(deps.backgroundSubagentManager),
+    new CancelSubagentTool(deps.backgroundSubagentManager),
+    new WaitSubagentsTool(deps.backgroundSubagentManager, (sid) => deps.agentLoop.getCancelFlag(sid)),
+    ...createPageTools(deps.embedPageToolRegistry),
+  ];
+  // 工作集模式的两个入口工具：只在依赖齐备时注册，未注入的装配保持原工具集不变。
+  if (deps.mcpToolsRegistry != null && deps.mcpClientManager != null) {
+    tools.push(
+      new McpCallTool({
+        sessionMapper: deps.sessionMapper,
+        toolsRegistry: deps.mcpToolsRegistry,
+        clientManager: deps.mcpClientManager,
+      }),
+      new McpDescribeTool({
+        sessionMapper: deps.sessionMapper,
+        toolsRegistry: deps.mcpToolsRegistry,
+      }),
+    );
+  }
+  // 自定义 HTTP 工具的两个入口：同样条件注册（执行内核与定义域齐备时才可用）。
+  if (deps.httpToolService != null && deps.httpApiExecutor != null && deps.agentMapper != null) {
+    tools.push(
+      new HttpDescribeTool({
+        sessionMapper: deps.sessionMapper,
+        agentMapper: deps.agentMapper,
+        httpToolService: deps.httpToolService,
+      }),
+      new HttpCallTool({
+        sessionMapper: deps.sessionMapper,
+        agentMapper: deps.agentMapper,
+        httpToolService: deps.httpToolService,
+        executor: deps.httpApiExecutor,
+      }),
+    );
+  }
+  return new ToolRegistry(tools);
+}
+
+
+export class ToolRegistry {
+  private readonly tools = new Map<string, Tool>();
+
+  constructor(toolBeans: Tool[] = []) {
+    for (const tool of toolBeans) {
+      this.register(tool);
+    }
+    harnessLog('info', `ToolRegistry initialized with ${this.tools.size} built-in tools: ${[...this.tools.keys()].join(',')}`);
+  }
+
+  register(tool: Tool): void {
+    this.tools.set(tool.getName(), tool);
+    harnessLog('info', `Registered tool: ${tool.getName()}`);
+  }
+
+  getTool(name: string): Tool | undefined {
+    return this.tools.get(name);
+  }
+
+  getAllTools(): Tool[] {
+    return [...this.tools.values()];
+  }
+
+  getToolsByNames(names: string[]): Tool[] {
+    const result: Tool[] = [];
+    for (const name of names) {
+      const tool = this.tools.get(name);
+      if (tool) result.push(tool);
+    }
+    return result;
+  }
+}

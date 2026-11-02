@@ -1,0 +1,163 @@
+import type { ChatRequest, LlmModelConfig } from '../llm/chat-request.js';
+import type { AgentEventListener } from './agent-event-listener.js';
+import type { AgentExecutionContext } from './agent-execution-context.js';
+import type { CompactionArchiveService } from './compaction-archive.service.js';
+import type { CompactionConfig } from './compaction-config.js';
+import type { ActiveContextCalculator } from './active-context-calculator.js';
+import type { ContextManager } from './context-manager.js';
+import type { PromptEngine } from './prompt-engine.js';
+import type { SessionHistoryLoader } from './session-history-loader.js';
+import type { SessionCompactionEventService, SessionCompactionService, SessionService } from '../deps.js';
+import { contextManifestJson } from './context-manifest.js';
+import { harnessLog } from '../log.js';
+import { LLM_CALL_SCENES, LlmCallContext } from '../../usage/llm-call-context.js';
+import type { WorkspaceRulesSnapshotService } from './workspace-rules-snapshot.service.js';
+
+export class CompactionStateReloadException extends Error {
+  constructor(cause?: unknown) {
+    super('会话压缩状态已发生变化但无法重新加载，请稍后重试');
+    this.name = 'CompactionStateReloadException';
+    this.cause = cause;
+  }
+}
+
+/** 压缩模型独立配置解析（技术方案 §5.10，可选注入；结构化接口避免依赖具体实现）。 */
+export interface CompactionModelResolverLike {
+  resolve(fallback: LlmModelConfig | null | undefined): Promise<LlmModelConfig | null | undefined>;
+}
+
+export class SessionCompactionOrchestrator {
+  constructor(
+    private readonly sessionCompactionService: SessionCompactionService,
+    private readonly sessionCompactionEventService: SessionCompactionEventService,
+    private readonly sessionHistoryLoader: SessionHistoryLoader,
+    private readonly contextManager: ContextManager,
+    private readonly sessionService: SessionService,
+    private readonly activeContextCalculator: ActiveContextCalculator,
+    private readonly promptEngine: PromptEngine,
+    private readonly compactionArchiveService: CompactionArchiveService,
+    private readonly compactionModelResolver?: CompactionModelResolverLike | null,
+    // 会话级工作区规则快照（技术方案 2026-10-14 §4.5）：压缩提交成功后解冻，
+    // 让新规则在本会话尽快生效。可选依赖，缺省时不等效任何行为。
+    private readonly workspaceRulesSnapshot?: WorkspaceRulesSnapshotService | null,
+  ) {}
+
+  async compact(
+    sessionId: number,
+    context: AgentExecutionContext,
+    normalRequest: ChatRequest,
+    listener: AgentEventListener | null,
+    config: CompactionConfig,
+    compactCurrentTurn: boolean,
+    cancelFlag: { get(): boolean } | null,
+    activeTokensHint?: number | null,
+    triggerMode: 'request_start' | 'mid_loop' | 'manual' = compactCurrentTurn ? 'mid_loop' : 'request_start',
+    force = false,
+    payloadBytes?: number | null,
+  ): Promise<boolean> {
+    const record = await this.sessionCompactionService.loadValidated(sessionId);
+    const boundary = this.sessionCompactionService.boundaryOf(record);
+    const summary = record?.summaryText ?? null;
+    const history = await this.sessionHistoryLoader.loadHistoryAfterBoundary(sessionId, boundary);
+    if (history.persistedMessages.length === 0) return false;
+
+    // 压缩模型独立配置（§5.10）：compaction.modelId 解析成功用独立模型，失效回退会话主模型；
+    // 解析结果同时用于 LLM 调用与落账 model_id，scene=compaction 的成本归属保持一致。
+    const compactionModelConfig = this.compactionModelResolver != null
+      ? await this.compactionModelResolver.resolve(context.modelConfig)
+      : context.modelConfig;
+
+    const result = await LlmCallContext.runAsync({
+      scene: LLM_CALL_SCENES.COMPACTION,
+      userId: context.executionUserId ?? context.userId ?? null,
+      sessionId: context.sessionId ?? null,
+      agentId: context.agentId ?? null,
+    }, async () => this.contextManager.compactSession(
+      sessionId, boundary, history.persistedMessages, history.snapshotMessageIds,
+      normalRequest, compactionModelConfig!, config, listener, cancelFlag, activeTokensHint ?? null, force,
+      context.modelConfig, payloadBytes ?? null));
+    if (result == null) return false;
+
+    let compactionEnded = false;
+    let contextApplied = false;
+    try {
+      const persisted = await this.sessionCompactionService.persist(
+        sessionId, record, result.expectedOldBoundary, result.newLastCompactedMessageId,
+        result.boundaryContentSnapshot, result.summaryText,
+        result.promptTokens, result.completionTokens,
+        compactionModelConfig?.modelId ?? null);
+      if (!persisted) {
+        harnessLog('info', `Session compaction CAS conflict: sessionId=${sessionId}`);
+      }
+      const latest = await this.sessionCompactionService.loadValidated(sessionId);
+      const latestBoundary = this.sessionCompactionService.boundaryOf(latest);
+      const latestSummary = latest?.summaryText ?? null;
+      const latestHistory = await this.sessionHistoryLoader.loadHistoryAfterBoundary(sessionId, latestBoundary);
+      // 归档必须先于 applyHistory：首次压缩时 hint 构建依赖归档目录已非空；
+      // 判据用 persisted（CAS 获胜），即使随后被并发压缩超越，本线程区间也已落档。
+      // 序号 = 本线程 CAS 推进后的确定性值（旧记录 compactCount + 1），
+      // 不依赖 latest 重载（并发场景下 latest 可能是他人记录，存在同名覆盖风险）
+      if (persisted) {
+        // 压缩边界已推进：解冻工作区规则，让后续请求重新读取 AGENTS.md（技术方案 §3.5）。
+        // 必须 try-catch：这里的异常会被外层 catch 包成 CompactionStateReloadException，
+        // 把已成功的压缩伪装成需要重载的故障（§4.5 评审补充）。
+        try {
+          await this.workspaceRulesSnapshot?.invalidate(sessionId);
+        } catch (e) {
+          harnessLog('warn', `Failed to invalidate workspace rules snapshot session=${sessionId}`, e);
+        }
+        this.compactionArchiveService.writeArchive(
+          context.executionMode, context.userId, context.sessionId,
+          (record?.compactCount ?? 0) + 1,
+          history.normalizedEntities.filter((m) => m.id != null
+            && m.id > boundary && m.id <= result.newLastCompactedMessageId),
+        );
+      }
+      await this.sessionHistoryLoader.applyHistory(context, latestSummary, latestHistory);
+      contextApplied = true;
+
+      const advanced = persisted && latestBoundary === result.newLastCompactedMessageId;
+      const contextChanged = latestBoundary !== boundary || latestSummary !== summary;
+      let afterRequestTokens = 0;
+      if (advanced || contextChanged) {
+        const afterRequest = await this.promptEngine.buildRequest(context);
+        afterRequestTokens = this.activeContextCalculator.estimateRequestTokens(afterRequest);
+        await this.resetContextAnchor(sessionId, context, afterRequestTokens, listener);
+      }
+      if (!advanced) {
+        listener?.onCompactionEnd?.('session', 0, 0, result.durationMs);
+        compactionEnded = true;
+        return false;
+      }
+      const savedTokens = Math.max(0, result.beforeRequestTokens - afterRequestTokens);
+      const event = await this.sessionCompactionEventService.record(
+        sessionId, triggerMode, result.expectedOldBoundary, result.newLastCompactedMessageId,
+        result.compactedCount, result.promptTokens, result.cachedTokens,
+        result.completionTokens, result.summaryTokens, savedTokens,
+        result.durationMs, compactionModelConfig?.modelId ?? null);
+      listener?.onCompactionEnd?.('session', result.summaryTokens, savedTokens, result.durationMs);
+      compactionEnded = true;
+      listener?.onCompactionPersisted?.(
+        event.id!, triggerMode, result.expectedOldBoundary, result.newLastCompactedMessageId,
+        result.compactedCount, result.summaryTokens, savedTokens, result.durationMs);
+      return true;
+    } catch (e) {
+      if (listener && !compactionEnded) {
+        listener.onCompactionEnd?.('session', 0, 0, result.durationMs);
+      }
+      if (!contextApplied) throw new CompactionStateReloadException(e);
+      throw e;
+    }
+  }
+
+  private async resetContextAnchor(
+    sessionId: number, context: AgentExecutionContext, requestTokens: number, listener: AgentEventListener | null,
+  ): Promise<void> {
+    await this.sessionService.clearContextAnchor(sessionId);
+    context.lastPromptTokens = 0;
+    context.contextAnchorMsgId = 0;
+    context.messagesCoveredByAnchor = -1;
+    await this.sessionService.updateContextTokens(sessionId, requestTokens, contextManifestJson(context.contextManifest));
+    listener?.onContextWindow?.(requestTokens, 0, context.contextManifest);
+  }
+}

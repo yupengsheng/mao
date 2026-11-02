@@ -1,0 +1,558 @@
+<template>
+  <div class="weixin-bot-panel">
+    <p class="panel-desc">
+      扫码绑定微信Bot后，您可以通过微信与AI Agent进行对话，无需打开桌面客户端。
+    </p>
+
+    <div v-if="loading" class="empty-state">加载中...</div>
+    <div v-else-if="bindingStatus.bound" class="binding-info">
+      <div class="binding-card">
+        <div class="binding-header">
+          <div class="binding-title">已绑定微信Bot</div>
+          <div class="binding-actions">
+            <button class="action-btn action-btn-danger" @click="handleUnbind">
+              解绑
+            </button>
+          </div>
+        </div>
+        <div class="binding-meta">
+          <span class="binding-time">绑定时间：{{ formatTime(bindingStatus.boundAt) }}</span>
+          <span class="binding-account">账号：{{ bindingStatus.accountId }}</span>
+        </div>
+      </div>
+
+      <div class="binding-card voice-card">
+        <div class="voice-row">
+          <div class="voice-info">
+            <div class="voice-title">语音回复</div>
+            <div class="voice-desc">Agent 完成任务后，将回复内容合成为语音发送到微信（先发文本，再附带语音）。</div>
+          </div>
+          <el-switch
+            :model-value="voiceReply"
+            :loading="voiceSaving"
+            @change="handleVoiceReplyChange"
+          />
+        </div>
+      </div>
+    </div>
+    <div v-else class="binding-action">
+      <button class="bind-btn" @click="handleBind">
+        <el-icon><Plus /></el-icon>
+        绑定微信Bot
+      </button>
+
+      <el-dialog
+        v-model="dialogVisible"
+        title="绑定微信Bot"
+        width="480px"
+        class="weixin-bot-dialog management-dialog"
+        append-to-body
+        @closed="resetQrcode"
+      >
+        <div class="qrcode-container">
+          <div v-if="qrcodeLoading" class="qrcode-loading">加载中...</div>
+          <div v-else-if="qrcodeError" class="qrcode-error">
+            <p>{{ qrcodeError }}</p>
+            <button class="retry-btn" @click="fetchQrcode">重试</button>
+          </div>
+          <div v-else class="qrcode-content">
+            <img :src="qrcodeData.qrDataUrl" alt="微信扫码二维码" class="qrcode-image" />
+            <p class="qrcode-tip">{{ qrcodeData.message }}</p>
+            <div v-if="scanStatus" class="scan-status">
+              <p v-if="scanStatus === 'wait'">等待扫码...</p>
+              <p v-else-if="scanStatus === 'scaned'">已扫码，请确认登录</p>
+              <p v-else-if="scanStatus === 'confirmed'">绑定成功！</p>
+              <p v-else-if="scanStatus === 'expired'">二维码已过期，请重新获取</p>
+            </div>
+          </div>
+        </div>
+        <template #footer>
+          <button class="dialog-btn dialog-btn-cancel" @click="dialogVisible = false">取消</button>
+          <button
+            v-if="scanStatus === 'expired'"
+            class="dialog-btn dialog-btn-confirm"
+            @click="fetchQrcode"
+          >
+            重新获取
+          </button>
+        </template>
+      </el-dialog>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, onMounted, onUnmounted } from 'vue'
+import { Plus } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import QRCode from 'qrcode'
+import { api } from '../../api'
+import { getWeixinPreference, saveWeixinPreference } from '../../api'
+
+interface BindingStatus {
+  bound: boolean
+  accountId?: string
+  boundAt?: string
+}
+
+interface QrcodeData {
+  sessionKey: string
+  qrDataUrl: string
+  message: string
+}
+
+interface QrcodeStatusData {
+  status: string
+  botToken?: string
+  baseUrl?: string
+  ilinkUserId?: string
+}
+
+const loading = ref(false)
+const bindingStatus = ref<BindingStatus>({ bound: false })
+const voiceReply = ref(false)
+const voiceSaving = ref(false)
+const dialogVisible = ref(false)
+const qrcodeLoading = ref(false)
+const qrcodeError = ref('')
+const qrcodeData = ref<QrcodeData>({ sessionKey: '', qrDataUrl: '', message: '' })
+const scanStatus = ref('')
+let statusPollingTimer: number | null = null
+let pollingActive = false
+let confirmFailures = 0
+
+function formatTime(value?: string) {
+  if (!value) return '-'
+  return value.replace('T', ' ').slice(0, 16)
+}
+
+async function fetchBindingStatus() {
+  loading.value = true
+  try {
+    const { data } = await api.get('/weixin/binding/status')
+    bindingStatus.value = data || { bound: false }
+    if (bindingStatus.value.bound) {
+      await loadVoicePreference()
+    }
+  } catch {
+    // 拦截器已统一 toast，避免 onMounted 回调 unhandledrejection
+  } finally {
+    loading.value = false
+  }
+}
+
+async function loadVoicePreference() {
+  try {
+    const pref = await getWeixinPreference()
+    voiceReply.value = pref.voiceReply
+  } catch (error) {
+    console.error('加载微信语音偏好失败:', error)
+  }
+}
+
+async function handleVoiceReplyChange(value: boolean | string | number) {
+  const next = Boolean(value)
+  voiceSaving.value = true
+  try {
+    const pref = await saveWeixinPreference({ voiceReply: next })
+    voiceReply.value = pref.voiceReply
+    ElMessage.success(next ? '已开启语音回复' : '已关闭语音回复')
+  } catch (error: any) {
+    voiceReply.value = !next
+    ElMessage.error(error.message || '保存失败')
+  } finally {
+    voiceSaving.value = false
+  }
+}
+
+async function fetchQrcode() {
+  qrcodeLoading.value = true
+  qrcodeError.value = ''
+  scanStatus.value = ''
+  try {
+    const { data } = await api.get('/weixin/qrcode')
+    // qrcode_img_content 是微信页面URL，不是图片，需要用 qrcode 库生成二维码图片
+    const qrImageUrl = data.qrDataUrl
+    const dataUrl = await QRCode.toDataURL(qrImageUrl, {
+      width: 256,
+      margin: 2,
+      errorCorrectionLevel: 'M'
+    })
+    qrcodeData.value = { ...data, qrDataUrl: dataUrl }
+    startStatusPolling()
+  } catch (error: any) {
+    qrcodeError.value = error.message || '获取二维码失败'
+  } finally {
+    qrcodeLoading.value = false
+  }
+}
+
+function startStatusPolling() {
+  stopStatusPolling()
+  pollingActive = true
+  confirmFailures = 0
+  consecutiveErrors = 0
+  pollStartedAt = Date.now()
+  pollStatus()
+}
+
+// 二维码本身约 5 分钟过期；轮询总时长超限后停止并提示重新获取，避免后台无限打接口
+const POLL_TOTAL_TIMEOUT_MS = 5 * 60 * 1000
+// 连续网络错误达到该次数后停止轮询，避免断网期间无限重试
+const POLL_MAX_CONSECUTIVE_ERRORS = 5
+let pollStartedAt = 0
+let consecutiveErrors = 0
+
+async function pollStatus() {
+  if (!pollingActive) return
+
+  try {
+    const { data } = await api.get<QrcodeStatusData>('/weixin/qrcode/status', {
+      params: { sessionKey: qrcodeData.value.sessionKey },
+      timeout: 12000,
+      skipErrorToast: true
+    } as any)
+    consecutiveErrors = 0
+    // confirmed 需等 confirm POST 成功后再置：失败重试期间不能误显示「绑定成功」
+    if (data.status !== 'confirmed') scanStatus.value = data.status
+
+    if (data.status === 'confirmed') {
+      // 确认绑定：confirm POST 成功后才把状态置为 confirmed 并结束轮询；
+      // 失败时保持轮询与「请确认登录」提示，避免 UI 误报「绑定成功！」
+      // 参数缺失说明后端下发不完整，confirm 请求根本发不出去：
+      // 必须当异常路径处理，不能落到下面的成功收尾去弹「绑定成功！」
+      if (!data.botToken || !data.baseUrl || !data.ilinkUserId) {
+        stopStatusPolling()
+        scanStatus.value = 'expired'
+        ElMessage.error('绑定信息不完整，请重新扫码')
+        return
+      }
+
+      try {
+        await api.post('/weixin/binding/confirm', null, {
+          params: {
+            sessionKey: qrcodeData.value.sessionKey,
+            botToken: data.botToken,
+            baseUrl: data.baseUrl,
+            ilinkUserId: data.ilinkUserId
+          }
+        })
+      } catch (confirmError) {
+        console.error('确认绑定失败:', confirmError)
+        confirmFailures++
+        // 后端 confirm 幂等，持续重试即可；仅前两次弹提示，避免后端不可用时每 3s 刷屏
+        if (confirmFailures <= 2) {
+          ElMessage.error('绑定确认失败，正在重试…')
+        }
+        // confirm 失败重试同样受总时长上限约束
+        if (pollingActive && Date.now() - pollStartedAt <= POLL_TOTAL_TIMEOUT_MS) {
+          statusPollingTimer = window.setTimeout(pollStatus, 3000)
+        } else if (pollingActive) {
+          stopStatusPolling()
+          scanStatus.value = 'expired'
+        }
+        return
+      }
+
+      scanStatus.value = data.status
+      stopStatusPolling()
+      ElMessage.success('微信Bot绑定成功！')
+      dialogVisible.value = false
+      await fetchBindingStatus()
+    } else if (data.status === 'expired') {
+      stopStatusPolling()
+    } else {
+      // 总时长超限：停止轮询并提示重新获取（wait/scaned 一直不 confirmed 的兜底）
+      if (Date.now() - pollStartedAt > POLL_TOTAL_TIMEOUT_MS) {
+        stopStatusPolling()
+        scanStatus.value = 'expired'
+        return
+      }
+      // 继续轮询（等上一轮完成后再发起下一轮，避免请求堆积）
+      if (pollingActive) {
+        statusPollingTimer = window.setTimeout(pollStatus, 2000)
+      }
+    }
+  } catch (error) {
+    console.error('查询扫码状态失败:', error)
+    // 网络错误时继续轮询，不中断等待流程；但连续失败达到上限或总时长超限则停止
+    consecutiveErrors++
+    if (!pollingActive) return
+    if (consecutiveErrors >= POLL_MAX_CONSECUTIVE_ERRORS || Date.now() - pollStartedAt > POLL_TOTAL_TIMEOUT_MS) {
+      stopStatusPolling()
+      scanStatus.value = 'expired'
+      return
+    }
+    statusPollingTimer = window.setTimeout(pollStatus, 3000)
+  }
+}
+
+function stopStatusPolling() {
+  pollingActive = false
+  if (statusPollingTimer) {
+    clearTimeout(statusPollingTimer)
+    statusPollingTimer = null
+  }
+}
+
+function resetQrcode() {
+  stopStatusPolling()
+  qrcodeData.value = { sessionKey: '', qrDataUrl: '', message: '' }
+  scanStatus.value = ''
+  qrcodeError.value = ''
+}
+
+function handleBind() {
+  dialogVisible.value = true
+  fetchQrcode()
+}
+
+async function handleUnbind() {
+  try {
+    await ElMessageBox.confirm(
+      '确定要解绑微信Bot吗？解绑后将无法通过微信与AI Agent对话。',
+      '确认解绑',
+      { confirmButtonText: '确定解绑', cancelButtonText: '取消', type: 'warning' }
+    )
+
+    await api.delete('/weixin/binding')
+    ElMessage.success('已成功解绑微信Bot')
+    await fetchBindingStatus()
+  } catch (error: any) {
+    if (error !== 'cancel') {
+      ElMessage.error(error.message || '解绑失败')
+    }
+  }
+}
+
+onMounted(() => {
+  fetchBindingStatus()
+})
+
+onUnmounted(() => {
+  stopStatusPolling()
+})
+</script>
+
+<style scoped>
+.weixin-bot-panel { max-width: 640px; }
+.panel-desc {
+  font-size: 13px;
+  color: var(--aw-ink-muted);
+  margin: 0 0 16px;
+  line-height: 1.5;
+}
+
+.empty-state {
+  text-align: center;
+  padding: 48px 16px;
+  color: var(--aw-ink-muted);
+  font-size: 13px;
+}
+
+.binding-card {
+  background: var(--aw-surface);
+  border: 1px solid var(--aw-divider-soft);
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.binding-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  /* 标题过长时优先挤压标题，按钮保持固定宽度，避免「解绑」被挤成两行 */
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.binding-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--aw-ink);
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.binding-actions {
+  display: flex;
+  flex-shrink: 0;
+  gap: 8px;
+}
+
+.action-btn {
+  height: var(--aw-btn-height);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: var(--aw-btn-padding);
+  border: none;
+  border-radius: var(--aw-radius-xs);
+  font-size: var(--aw-text-fine);
+  font-weight: 500;
+  cursor: pointer;
+  flex-shrink: 0;
+  white-space: nowrap;
+  transition: opacity 0.15s;
+}
+
+.action-btn:hover {
+  opacity: 0.85;
+}
+
+.action-btn-danger {
+  background: var(--aw-danger);
+  color: #fff;
+}
+
+.binding-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--aw-ink-muted);
+}
+
+.voice-card {
+  margin-top: 12px;
+}
+
+.voice-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.voice-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.voice-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--aw-ink);
+  margin-bottom: 4px;
+}
+
+.voice-desc {
+  font-size: 12px;
+  color: var(--aw-ink-muted);
+  line-height: 1.5;
+}
+
+.bind-btn {
+  height: var(--aw-btn-height);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: var(--aw-btn-padding);
+  border: none;
+  border-radius: var(--aw-radius-xs);
+  background: var(--aw-primary);
+  color: #fff;
+  font-size: var(--aw-text-fine);
+  font-weight: 500;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.bind-btn:hover {
+  opacity: 0.85;
+}
+
+.qrcode-container {
+  text-align: center;
+  padding: 20px;
+}
+
+.qrcode-loading {
+  padding: 40px;
+  color: var(--aw-ink-muted);
+}
+
+.qrcode-error {
+  padding: 20px;
+  color: var(--aw-danger);
+}
+
+.retry-btn {
+  height: var(--aw-btn-height);
+  margin-top: 12px;
+  padding: var(--aw-btn-padding);
+  border: 1px solid var(--aw-primary);
+  border-radius: var(--aw-radius-xs);
+  background: transparent;
+  color: var(--aw-primary);
+  font-size: var(--aw-text-fine);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.retry-btn:hover {
+  background: var(--aw-accent-bg);
+}
+
+.qrcode-image {
+  max-width: 256px;
+  max-height: 256px;
+  margin-bottom: 16px;
+}
+
+.qrcode-tip {
+  font-size: 13px;
+  color: var(--aw-ink-muted);
+  margin: 0 0 12px;
+}
+
+.scan-status {
+  font-size: 14px;
+  color: var(--aw-ink);
+  font-weight: 500;
+}
+
+.scan-status p {
+  margin: 0;
+}
+
+.dialog-btn {
+  height: var(--aw-btn-height);
+  padding: var(--aw-btn-padding);
+  border: none;
+  border-radius: var(--aw-radius-xs);
+  font-size: var(--aw-text-fine);
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.dialog-btn-cancel {
+  background: transparent;
+  color: var(--aw-ink-muted);
+  border: 1px solid var(--aw-hairline);
+}
+
+.dialog-btn-confirm {
+  background: var(--aw-primary);
+  color: #fff;
+  margin-left: 8px;
+}
+
+.dialog-btn-confirm:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+</style>
+
+<style>
+.weixin-bot-dialog .el-dialog__title {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.weixin-bot-dialog .el-dialog__body {
+  padding-top: 12px;
+}
+</style>

@@ -1,0 +1,1129 @@
+import { describe, expect, it, vi } from 'vitest';
+import { addDaysYmd, formatDateTime, shanghaiYmd } from '../common/json.js';
+import {
+  AdminAnalyticsDbStore,
+  AdminAnalyticsService,
+  PREVIOUS_TOTALS_TTL_MS,
+  buildTrendBucketKeys,
+  type AnalyticsRange,
+} from './admin-analytics.service.js';
+
+const range: AnalyticsRange = {
+  days: 7,
+  startYmd: '2026-01-01',
+  endYmd: '2026-01-07',
+  startAt: '2026-01-01 00:00:00',
+  endAtExclusive: '2026-01-08 00:00:00',
+};
+
+/** 窗口始终以今天结尾，用今天作为日粒度断言锚点。 */
+const today = shanghaiYmd();
+
+function buildStore() {
+  return {
+    selectLivePhaseCounts: vi.fn(async () => [
+      { phase: 'RUNNING', count: 2 },
+      { phase: 'FAILED', count: 1 },
+    ]),
+    selectPhaseCounts: vi.fn(async () => [
+      { phase: 'COMPLETED', count: 5 },
+      { phase: 'FAILED', count: 2 },
+    ]),
+    selectDailySessionCounts: vi.fn(async () => [{ day: today, count: 4 }]),
+    selectDailyMessageStats: vi.fn(async () => [{ day: today, count: 8, tokens: 800 }]),
+    selectDailyUsageStats: vi.fn(async () => [{ day: today, totalTokens: 200, callCount: 3 }]),
+    countActiveUsers: vi.fn(async () => 2),
+    countSessions: vi.fn(async () => 3),
+    sumMessages: vi.fn(async () => ({ count: 6, tokens: 600 })),
+    sumUsageTokens: vi.fn(async () => 100),
+    listAgents: vi.fn(async () => [{ id: 9, name: 'Coder' }]),
+    selectSessionCountsByAgent: vi.fn(async () => [{ id: 9, sessionCount: 4 }]),
+    selectMessageStatsByAgent: vi.fn(async () => [{ id: 9, messageCount: 8, totalTokens: 800 }]),
+    listUsers: vi.fn(async () => [
+      { id: 1, username: 'ada', displayName: 'Ada' },
+      { id: 2, username: 'idle', displayName: 'Idle' },
+    ]),
+    selectSessionCountsByUser: vi.fn(async () => [{ id: 1, sessionCount: 3 }]),
+    selectMessageStatsByUser: vi.fn(async () => [{ id: 1, messageCount: 7, totalTokens: 700 }]),
+    listModelsOrderByCreatedDesc: vi.fn(async () => [
+      { id: 3, name: 'gpt' },
+      { id: 4, name: 'idle-model' },
+    ]),
+    selectSessionCountsByModel: vi.fn(async () => [{ id: 3, sessionCount: 2 }]),
+    selectMessageStatsByModel: vi.fn(async () => [{ id: 3, messageCount: 4, totalTokens: 400 }]),
+    selectUsageStatsByModel: vi.fn(async () => [{ id: 3, totalTokens: 90, callCount: 2 }]),
+    selectSessionTypeCounts: vi.fn(async () => [
+      { key: 'NORMAL', count: 4 },
+      { key: 'SUBAGENT', count: 2 },
+    ]),
+    selectExecutionModeCounts: vi.fn(async () => [
+      { key: 'CLOUD', count: 5 },
+      { key: 'LOCAL', count: 1 },
+    ]),
+    selectDailyLlmCallStats: vi.fn(async () => [
+      {
+        day: today,
+        callCount: 10,
+        failCount: 1,
+        promptTokens: 1000,
+        cachedTokens: 200,
+        callTokens: 1500,
+        firstTokenMsSum: 9000,
+        firstTokenMsCount: 8,
+        durationMsSum: 50000,
+      },
+    ]),
+    selectLlmCallStatsByModel: vi.fn(async () => [
+      {
+        id: 3,
+        callCount: 8,
+        successCount: 7,
+        failCount: 1,
+        retryCallCount: 2,
+        promptTokens: 800,
+        completionTokens: 200,
+        cachedTokens: 100,
+        callTokens: 1000,
+        firstTokenMsSum: 4000,
+        firstTokenMsCount: 8,
+        durationMsSum: 40000,
+        decodeTokensSum: 900,
+        decodeMsSum: 15000,
+      },
+    ]),
+    selectLlmCallSceneStats: vi.fn(async () => [
+      { key: 'agent', callCount: 6, failCount: 0, callTokens: 800 },
+      { key: 'compaction', callCount: 2, failCount: 1, callTokens: 200 },
+    ]),
+    selectLlmCallProtocolStats: vi.fn(async () => [
+      { key: 'openai-compatible', callCount: 10, failCount: 1, callTokens: 1500 },
+    ]),
+    selectLlmCallStatsByUser: vi.fn(async () => [{ id: 1, callCount: 9, failCount: 1, callTokens: 1200 }]),
+    selectLlmCallStatsByAgent: vi.fn(async () => [{ id: 9, callCount: 8, failCount: 1, callTokens: 1000 }]),
+    selectLlmCallQualitySummary: vi.fn(async () => ({
+      callCount: 10,
+      successCount: 9,
+      failCount: 1,
+      retryCallCount: 2,
+      promptTokens: 1000,
+      cachedTokens: 200,
+      callTokens: 1500,
+    })),
+    countLlmCallLatency: vi.fn(async (_range: unknown, metric: string) =>
+      metric === 'first_token_ms' ? 8 : metric === 'throughput' ? 5 : 10),
+    selectLlmCallLatencyAtOffset: vi.fn(async (_range: unknown, metric: string, offset: number) => {
+      if (metric === 'first_token_ms') return offset <= 3 ? 300 : 2000
+      if (metric === 'throughput') return offset <= 2 ? 40 : 80
+      return offset <= 4 ? 2000 : 8000
+    }),
+  };
+}
+
+describe('AdminAnalyticsService', () => {
+  it('summaryAggregatesPeriodTrendsStructureAndPreviousWindow', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({ totalUsers: 2, totalSessions: 3 })) };
+    const store = buildStore();
+    const service = new AdminAnalyticsService(statistics as never, store as never);
+
+    const result = (await service.summary(7)) as Record<string, any>;
+
+    expect(result.period).toMatchObject({ days: 7, end: today });
+    expect(result.overview).toMatchObject({ totalUsers: 2, runningSessions: 2, failedSessions: 1 });
+    expect(result.trends).toHaveLength(7);
+    expect(result.trends.at(-1)).toMatchObject({
+      date: today,
+      sessions: 4,
+      messages: 8,
+      chatTokens: 800,
+      backgroundTokens: 200,
+      totalTokens: 1000,
+    });
+    expect(result.periodTotals).toMatchObject({
+      sessions: 4,
+      messages: 8,
+      totalTokens: 1000,
+      activeUsers: 2,
+      completedSessions: 5,
+      failedSessions: 2,
+    });
+    expect(result.previousTotals).toMatchObject({ sessions: 3, messages: 6, totalTokens: 700 });
+    expect(result.phaseDistribution).toEqual(expect.arrayContaining([
+      expect.objectContaining({ phase: 'COMPLETED', count: 5 }),
+    ]));
+    expect(result.agentStats[0]).toMatchObject({ agentName: 'Coder', totalTokens: 800, sessionCount: 4 });
+    expect(result.modelStats[0]).toMatchObject({
+      modelName: 'gpt',
+      chatTokens: 400,
+      backgroundTokens: 90,
+      callTokens: 1000,
+      totalTokens: 490,
+      callCount: 8,
+      callFailCount: 1,
+      callSuccessRate: 87.5,
+    });
+  });
+
+  it('modelStatsDropsModelsWithoutPeriodUsage', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({})) };
+    const service = new AdminAnalyticsService(statistics as never, buildStore() as never);
+
+    const result = (await service.summary(7)) as Record<string, any>;
+
+    expect(result.modelStats).toHaveLength(1);
+    expect(result.modelStats[0]).toMatchObject({ modelId: 3 });
+  });
+
+  it('userActivityDropsUsersWithoutPeriodActivity', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({})) };
+    const service = new AdminAnalyticsService(statistics as never, buildStore() as never);
+
+    const result = (await service.summary(7)) as Record<string, any>;
+
+    expect(result.userActivity).toHaveLength(1);
+    expect(result.userActivity[0]).toMatchObject({ username: 'ada', sessionCount: 3, messageCount: 7, totalTokens: 700 });
+  });
+
+  it('summaryClampsDaysWindow', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({})) };
+    const store = buildStore();
+    const service = new AdminAnalyticsService(statistics as never, store as never);
+
+    const result = (await service.summary(9999)) as Record<string, any>;
+
+    expect(result.period).toMatchObject({ days: 90 });
+    expect(result.trends).toHaveLength(90);
+  });
+
+  it('summaryShiftsEndDayWithEndOffset', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({})) };
+    const store = buildStore();
+    const service = new AdminAnalyticsService(statistics as never, store as never);
+
+    const result = (await service.summary(1, 1)) as Record<string, any>;
+    const yesterday = addDaysYmd(today, -1);
+
+    expect(result.period).toMatchObject({ days: 1, start: yesterday, end: yesterday });
+    expect(result.trends).toHaveLength(1);
+    expect(result.trends[0]).toMatchObject({ date: yesterday, sessions: 0, messages: 0 });
+  });
+
+  it('overviewReturnsLightPayloadWithSparkAndInsights', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({ totalUsers: 2 })) };
+    const store = buildStore();
+    // 洞察规则：失败率 2/7 ≈ 28.6% 应触发 warn
+    store.selectPhaseCounts = vi.fn(async () => [
+      { phase: 'COMPLETED', count: 5 },
+      { phase: 'FAILED', count: 2 },
+    ]);
+    const service = new AdminAnalyticsService(statistics as never, store as never);
+
+    const result = (await service.overview(7)) as Record<string, any>;
+
+    expect(result.period).toMatchObject({ days: 7, end: today });
+    expect(result.overview).toMatchObject({ totalUsers: 2, runningSessions: 2 });
+    expect(result.periodTotals).toMatchObject({
+      sessions: 4,
+      messages: 8,
+      totalTokens: 1000,
+      activeUsers: 2,
+      completedSessions: 5,
+      failedSessions: 2,
+    });
+    // 缓存命中率走 llm_call 口径：mock 命中 200 / 入 1000 = 20%
+    expect(result.periodTotals).toMatchObject({ promptTokens: 1000, cachedTokens: 200, cacheHitRate: 20 });
+    expect(result.previousTotals).toMatchObject({ cacheHitRate: 20 });
+    expect(result.spark).toHaveLength(7);
+    expect(result.spark.at(-1)).toEqual({ date: today, totalTokens: 1000 });
+    expect(result.insights.length).toBeGreaterThan(0);
+    expect(result.insights.some((item: any) => item.level === 'warn' && String(item.text).includes('失败率'))).toBe(true);
+    // overview 不应拉取模型/用户/Agent 排行
+    expect(store.listModelsOrderByCreatedDesc).not.toHaveBeenCalled();
+    expect(store.listUsers).not.toHaveBeenCalled();
+    expect(store.listAgents).not.toHaveBeenCalled();
+  });
+
+  it('overviewEmptyWindowProducesTeachingInsight', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({})) };
+    const store = buildStore();
+    store.selectPhaseCounts = vi.fn(async () => []);
+    store.selectDailySessionCounts = vi.fn(async () => []);
+    store.selectDailyMessageStats = vi.fn(async () => []);
+    store.selectDailyUsageStats = vi.fn(async () => []);
+    store.countActiveUsers = vi.fn(async () => 0);
+    const service = new AdminAnalyticsService(statistics as never, store as never);
+
+    const result = (await service.overview(7)) as Record<string, any>;
+
+    expect(result.periodTotals).toMatchObject({ sessions: 0, messages: 0, totalTokens: 0 });
+    expect(result.insights[0]).toMatchObject({ level: 'info' });
+    expect(String(result.insights[0].text)).toContain('放宽');
+  });
+
+  it('overviewCarriesCacheHitRateFromLlmCallQuality', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({})) };
+    const store = buildStore();
+    // 本窗口命中 250/1000 = 25%，上一窗口 200/1000 = 20%（环比 ↑ 5pp）；按窗口起点区分两次取数
+    const windowStart = addDaysYmd(today, -6);
+    store.selectLlmCallQualitySummary = vi.fn(async (r: any) => ({
+      callCount: 10,
+      successCount: 9,
+      failCount: 1,
+      cancelledCount: 0,
+      retryCallCount: 2,
+      promptTokens: 1000,
+      cachedTokens: r.startYmd === windowStart ? 250 : 200,
+      callTokens: 1500,
+    }));
+    const service = new AdminAnalyticsService(statistics as never, store as never);
+
+    const result = (await service.overview(7)) as Record<string, any>;
+
+    expect(result.periodTotals).toMatchObject({ promptTokens: 1000, cachedTokens: 250, cacheHitRate: 25 });
+    expect(result.previousTotals).toMatchObject({ cacheHitRate: 20 });
+  });
+
+  it('overviewCacheHitRateIsNullWhenWindowHasNoLlmCall', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({})) };
+    const store = buildStore();
+    store.selectLlmCallQualitySummary = vi.fn(async () => ({
+      callCount: 0,
+      successCount: 0,
+      failCount: 0,
+      cancelledCount: 0,
+      retryCallCount: 0,
+      promptTokens: 0,
+      cachedTokens: 0,
+      callTokens: 0,
+    }));
+    const service = new AdminAnalyticsService(statistics as never, store as never);
+
+    const result = (await service.overview(7)) as Record<string, any>;
+
+    expect(result.periodTotals).toMatchObject({ cacheHitRate: null });
+    expect(result.previousTotals).toMatchObject({ cacheHitRate: null });
+  });
+
+  it('trendsScopeReturnsDailySeriesWithoutDimensionStats', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({})) };
+    const store = buildStore();
+    const service = new AdminAnalyticsService(statistics as never, store as never);
+
+    const result = (await service.trendsScope(7)) as Record<string, any>;
+
+    expect(result.trends).toHaveLength(7);
+    expect(result.periodTotals).toMatchObject({ sessions: 4, messages: 8, totalTokens: 1000 });
+    expect(result.previousTotals).toMatchObject({ sessions: 3, totalTokens: 700 });
+    expect(store.listUsers).not.toHaveBeenCalled();
+  });
+
+  it('modelsScopeReturnsModelStatsTokenTotalAndQuality', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({})) };
+    const service = new AdminAnalyticsService(statistics as never, buildStore() as never);
+
+    const result = (await service.modelsScope(7)) as Record<string, any>;
+
+    expect(result.modelStats).toHaveLength(1);
+    expect(result.modelStats[0]).toMatchObject({
+      modelId: 3,
+      totalTokens: 490,
+      callCount: 8,
+      cacheHitRate: 12.5,
+      avgFirstTokenMs: 500,
+      avgDurationMs: 5000,
+      // 吞吐均值 = 900 输出 ÷ 15s 解码 = 60.0（加权平均，不是各行 tps 的算术平均）
+      avgThroughput: 60,
+    });
+    // store 桩未返回 cost 行 → 成本合计 0
+    expect(result.periodTotals).toEqual({ totalTokens: 490, totalCost: 0 });
+    expect(result.sceneStats[0]).toMatchObject({ key: 'agent', callTokens: 800 });
+    expect(result.protocolStats[0]).toMatchObject({ key: 'openai-compatible', callCount: 10 });
+    expect(result.userTokenTop).toEqual([
+      expect.objectContaining({ userId: 1, displayName: 'Ada', totalTokens: 700 }),
+    ]);
+  });
+
+  it('modelsScopeAvgThroughputNullWhenNoDecodableRows', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({})) };
+    const store = buildStore();
+    // 窗口内全部调用零输出（流式中途失败）：SQL 侧 decodeTokensSum 为 0 而 decodeMsSum 可能 > 0
+    store.selectLlmCallStatsByModel = vi.fn(async () => [
+      {
+        id: 3,
+        callCount: 8,
+        successCount: 0,
+        failCount: 8,
+        retryCallCount: 0,
+        promptTokens: 800,
+        completionTokens: 0,
+        cachedTokens: 0,
+        callTokens: 800,
+        firstTokenMsSum: 4000,
+        firstTokenMsCount: 8,
+        durationMsSum: 40000,
+        decodeTokensSum: 0,
+        decodeMsSum: 15000,
+      },
+    ]);
+    const service = new AdminAnalyticsService(statistics as never, store as never);
+
+    const result = (await service.modelsScope(7)) as Record<string, any>;
+
+    // 不显示 0 tok/s 误导：与桌面端 avgThroughput 的零分子 null 同口径
+    expect(result.modelStats[0].avgThroughput).toBeNull();
+  });
+
+  it('usersScopeMergesLlmCallColumns', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({})) };
+    const service = new AdminAnalyticsService(statistics as never, buildStore() as never);
+
+    const result = (await service.usersScope(7, 0, 1)) as Record<string, any>;
+
+    expect(result.userActivity).toHaveLength(1);
+    expect(result.userActivity[0]).toMatchObject({
+      username: 'ada',
+      callCount: 9,
+      callFailCount: 1,
+      callTokens: 1200,
+    });
+  });
+
+  it('agentsScopeMergesCallSuccessRate', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({})) };
+    const service = new AdminAnalyticsService(statistics as never, buildStore() as never);
+
+    const result = (await service.agentsScope(7)) as Record<string, any>;
+
+    expect(result.agentStats[0]).toMatchObject({
+      agentId: 9,
+      callCount: 8,
+      callFailCount: 1,
+      callSuccessRate: 87.5,
+    });
+  });
+
+  it('trendsScopeAddsCallQualitySeries', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({})) };
+    const service = new AdminAnalyticsService(statistics as never, buildStore() as never);
+
+    const result = (await service.trendsScope(7)) as Record<string, any>;
+    const last = result.trends.at(-1);
+
+    expect(last).toMatchObject({
+      date: today,
+      callCount: 10,
+      callFailCount: 1,
+      callTokens: 1500,
+      callSuccessRate: 90,
+      cacheHitRate: 20,
+      // 平均耗时：首字 = 9000/8（只算流式行），总耗时 = 50000/10（全部调用）
+      avgFirstTokenMs: 1125,
+      avgDurationMs: 5000,
+    });
+    expect(result.periodTotals).toMatchObject({ callCount: 10, callFailCount: 1, callTokens: 1500 });
+    expect(result.callQuality).toMatchObject({ successRate: 90, cacheHitRate: 20, retryRatio: 20 });
+  });
+
+  it('trendsScope 平均耗时：无流式行首字为 null，无调用补零桶整体为 null', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({})) };
+    const store = buildStore();
+    // 当天 3 次调用全是非流式（first_token_ms 缺失），首字均值无从计算
+    store.selectDailyLlmCallStats = vi.fn(async () => [
+      { day: today, callCount: 3, failCount: 0, promptTokens: 30, cachedTokens: 0, callTokens: 30, firstTokenMsSum: 0, firstTokenMsCount: 0, durationMsSum: 600 },
+    ]);
+    const service = new AdminAnalyticsService(statistics as never, store as never);
+
+    const result = (await service.trendsScope(7)) as Record<string, any>;
+    expect(result.trends.at(-1)).toMatchObject({ avgFirstTokenMs: null, avgDurationMs: 200 });
+    // 补零桶（无调用）两个均值都是 null，前端断线而不是画 0
+    expect(result.trends[0]).toMatchObject({ avgFirstTokenMs: null, avgDurationMs: null });
+  });
+
+  it('trendsScope 每百万 Token 平均成本：按 llm_call Token 折算，无调用为 null', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({})) };
+    const store = buildStore();
+    // 当天 3 次调用共 1500 Token、成本 3.2
+    store.selectDailyLlmCallStats = vi.fn(async () => [
+      { day: today, callCount: 3, failCount: 0, promptTokens: 1000, cachedTokens: 0, callTokens: 1500, cost: 3.2, firstTokenMsSum: 0, firstTokenMsCount: 0, durationMsSum: 600 },
+    ]);
+    const service = new AdminAnalyticsService(statistics as never, store as never);
+
+    const result = (await service.trendsScope(7)) as Record<string, any>;
+    // 3.2 / 1500 × 1e6 = 2133.33（分母为桶内 llm_call 调用 Token，与成本同口径）
+    expect(result.trends.at(-1)).toMatchObject({ costPerMTokens: 2133.33 });
+    // 补零桶无调用：分母为 0，不除出 Infinity
+    expect(result.trends[0]).toMatchObject({ costPerMTokens: null });
+  });
+
+  it('sessionsScopeAddsCallQualityPanelAndFailTop', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({})) };
+    const service = new AdminAnalyticsService(statistics as never, buildStore() as never);
+
+    const result = (await service.sessionsScope(7)) as Record<string, any>;
+
+    expect(result.phaseDistribution).toEqual(expect.arrayContaining([
+      expect.objectContaining({ phase: 'COMPLETED', count: 5 }),
+      expect.objectContaining({ phase: 'FAILED', count: 2 }),
+    ]));
+    expect(result.sessionTypes).toEqual([
+      { sessionType: 'NORMAL', count: 4 },
+      { sessionType: 'SUBAGENT', count: 2 },
+    ]);
+    expect(result.executionModes).toEqual([
+      { executionMode: 'CLOUD', count: 5 },
+      { executionMode: 'LOCAL', count: 1 },
+    ]);
+    expect(result.livePhases).toEqual(expect.arrayContaining([
+      expect.objectContaining({ phase: 'RUNNING', count: 2 }),
+      expect.objectContaining({ phase: 'FAILED', count: 1 }),
+    ]));
+    expect(result.periodTotals).toMatchObject({
+      sessions: 7,
+      completedSessions: 5,
+      failedSessions: 2,
+      activeUsers: 2,
+    });
+    expect(result.callQuality).toMatchObject({
+      callCount: 10,
+      failCount: 1,
+      successRate: 90,
+      cacheHitRate: 20,
+      firstTokenP50: 300,
+      durationP95: 8000,
+      // 吞吐分位：5 个样本 → p50 取 offset 2 = 40，p95 取 offset 3 = 80
+      throughputP50: 40,
+      throughputP95: 80,
+    });
+    expect(result.failTop.byModel[0]).toMatchObject({ name: 'gpt', failCount: 1 });
+    expect(result.failTop.byScene[0]).toMatchObject({ name: 'compaction', failCount: 1 });
+    expect(result.excludeConnectivity).toBe(true);
+  });
+
+  it('取消不计失败：failCount 剔除取消，成功率分母也剔除取消', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({})) };
+    const store = buildStore();
+    store.selectLlmCallQualitySummary = vi.fn(async () => ({
+      callCount: 10,
+      successCount: 7,
+      failCount: 1,
+      cancelledCount: 2,
+      retryCallCount: 0,
+      promptTokens: 1000,
+      cachedTokens: 0,
+      callTokens: 1500,
+    }));
+    store.selectDailyLlmCallStats = vi.fn(async () => [
+      { day: today, callCount: 10, failCount: 1, cancelledCount: 2, promptTokens: 1000, cachedTokens: 0, callTokens: 1500, firstTokenMsSum: 0, firstTokenMsCount: 0, durationMsSum: 30000 },
+    ]);
+    store.selectLlmCallStatsByModel = vi.fn(async () => [
+      {
+        id: 3,
+        callCount: 10,
+        successCount: 7,
+        failCount: 1,
+        cancelledCount: 2,
+        retryCallCount: 0,
+        promptTokens: 1000,
+        completionTokens: 500,
+        cachedTokens: 0,
+        callTokens: 1500,
+        firstTokenMsSum: 0,
+        firstTokenMsCount: 0,
+        durationMsSum: 0,
+      },
+    ]);
+    const service = new AdminAnalyticsService(statistics as never, store as never);
+
+    const trends = (await service.trendsScope(7)) as Record<string, any>;
+    // 成功率 = 7 / (10 - 2) = 87.5，取消的 2 次既不算失败也不进分母
+    expect(trends.callQuality).toMatchObject({ successRate: 87.5, failCount: 1, cancelledCount: 2 });
+    expect(trends.trends.at(-1)).toMatchObject({ callCount: 10, callFailCount: 1, callCancelledCount: 2, callSuccessRate: 87.5 });
+
+    const models = (await service.modelsScope(7)) as Record<string, any>;
+    expect(models.modelStats[0]).toMatchObject({ callFailCount: 1, callCancelledCount: 2, callSuccessRate: 87.5 });
+
+    const sessions = (await service.sessionsScope(7)) as Record<string, any>;
+    expect(sessions.callQuality).toMatchObject({ successRate: 87.5, cancelledCount: 2 });
+  });
+
+  it('全部取消时成功率为 null（分母归零，不除出 NaN）', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({})) };
+    const store = buildStore();
+    store.selectLlmCallQualitySummary = vi.fn(async () => ({
+      callCount: 4,
+      successCount: 0,
+      failCount: 0,
+      cancelledCount: 4,
+      retryCallCount: 0,
+      promptTokens: 0,
+      cachedTokens: 0,
+      callTokens: 0,
+    }));
+    const service = new AdminAnalyticsService(statistics as never, store as never);
+
+    const trends = (await service.trendsScope(7)) as Record<string, any>;
+    expect(trends.callQuality).toMatchObject({ successRate: null });
+  });
+
+  it('usersAndAgentsScopeReturnTokenTopSortedIndependently', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({})) };
+    const store = buildStore();
+    // 明细集（按消息数截断）只含 ada；tokenTop 数据源需覆盖未进入明细集的重消耗用户/Agent
+    store.selectMessageStatsByUser = vi.fn(async () => [
+      { id: 1, messageCount: 7, totalTokens: 700 },
+      { id: 2, messageCount: 1, totalTokens: 9000 },
+    ]);
+    store.selectMessageStatsByAgent = vi.fn(async () => [
+      { id: 9, messageCount: 8, totalTokens: 800 },
+      { id: 10, messageCount: 1, totalTokens: 12000 },
+    ]);
+    store.listAgents = vi.fn(async () => [
+      { id: 9, name: 'Coder' },
+      { id: 10, name: 'Heavy' },
+    ]);
+    const service = new AdminAnalyticsService(statistics as never, store as never);
+
+    const users = (await service.usersScope(7)) as Record<string, any>;
+    expect(users.tokenTop).toEqual([
+      expect.objectContaining({ userId: 2, totalTokens: 9000 }),
+      expect.objectContaining({ userId: 1, totalTokens: 700 }),
+    ]);
+
+    const agents = (await service.agentsScope(7)) as Record<string, any>;
+    expect(agents.tokenTop).toEqual([
+      expect.objectContaining({ agentId: 10, agentName: 'Heavy', totalTokens: 12000 }),
+      expect.objectContaining({ agentId: 9, totalTokens: 800 }),
+    ]);
+  });
+
+  it('modelMessageStatsSqlFiltersSoftDeletedRowsAndSessions', async () => {
+    const db = { query: vi.fn(async () => []), queryOne: vi.fn(async () => ({ c: 0 })) };
+    const store = new AdminAnalyticsDbStore(db as never);
+
+    await store.selectMessageStatsByModel(range);
+
+    const sql = (db.query.mock.calls[0] as unknown[])[0] as string;
+    expect(sql).toContain('m.deleted = 0');
+    expect(sql).toContain('s.deleted = 0');
+  });
+
+  it('messageAggregationSqlPinsMessageFirstJoinOrder', async () => {
+    const db = { query: vi.fn(async () => []), queryOne: vi.fn(async () => ({ c: 0 })) };
+    const store = new AdminAnalyticsDbStore(db as never);
+
+    await store.selectMessageStatsByAgent(range);
+    await store.selectMessageStatsByUser(range);
+    await store.selectMessageStatsByModel(range);
+    await store.countActiveUsers(range);
+
+    // 默认计划会以 session 为驱动逐会话回查 message（40 万行 / 2.1GB 表上约 1s），
+    // 这几条按 message 时间窗驱动，必须带优化器提示，否则慢查询会随统计信息回归。
+    for (const call of db.query.mock.calls) {
+      expect(String((call as unknown[])[0])).toContain('JOIN_ORDER(m, s)');
+    }
+    expect(String((db.queryOne.mock.calls[0] as unknown[])[0])).toContain('JOIN_ORDER(m, s)');
+  });
+});
+
+describe('AdminAnalyticsService 环比窗口缓存', () => {
+  /** 用固定时钟，避免跨零点时窗口位移导致缓存 key 变化。 */
+  function withFixedClock<T>(fn: () => Promise<T>): Promise<T> {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-10T10:00:00+08:00'));
+    return fn().finally(() => vi.useRealTimers());
+  }
+
+  it('同一环比窗口在 TTL 内只聚合一次', async () => {
+    await withFixedClock(async () => {
+      const statistics = { getOverview: vi.fn(async () => ({})) };
+      const store = buildStore();
+      const service = new AdminAnalyticsService(statistics as never, store as never);
+
+      await service.overview(7);
+      await service.overview(7);
+      expect(store.countSessions).toHaveBeenCalledTimes(1);
+
+      vi.advanceTimersByTime(PREVIOUS_TOTALS_TTL_MS + 1);
+      await service.overview(7);
+      expect(store.countSessions).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it('不同环比窗口各自缓存，不串数据', async () => {
+    await withFixedClock(async () => {
+      const statistics = { getOverview: vi.fn(async () => ({})) };
+      const store = buildStore();
+      const service = new AdminAnalyticsService(statistics as never, store as never);
+
+      const weekly = (await service.overview(7)) as Record<string, any>;
+      const monthly = (await service.overview(30)) as Record<string, any>;
+
+      expect(store.countSessions).toHaveBeenCalledTimes(2);
+      expect(weekly.previousTotals).toEqual(monthly.previousTotals);
+      expect(weekly.period.previousStart).not.toBe(monthly.period.previousStart);
+    });
+  });
+
+  it('连通性口径不同的环比分开缓存', async () => {
+    await withFixedClock(async () => {
+      const statistics = { getOverview: vi.fn(async () => ({})) };
+      const store = buildStore();
+      const service = new AdminAnalyticsService(statistics as never, store as never);
+
+      await service.trendsScope(7, 0, { excludeConnectivity: true });
+      await service.trendsScope(7, 0, { excludeConnectivity: false });
+      await service.trendsScope(7, 0, { excludeConnectivity: true });
+
+      // 两次口径各算一次，第三次命中缓存
+      expect(store.countSessions).toHaveBeenCalledTimes(2);
+    });
+  });
+});
+
+describe('AdminAnalyticsDbStore', () => {
+  it('issues range-scoped aggregation queries', async () => {
+    const db = { query: vi.fn(async () => []), queryOne: vi.fn(async () => ({ c: 0 })) };
+    const store = new AdminAnalyticsDbStore(db as never);
+
+    await store.selectDailySessionCounts(range);
+    await store.selectDailyMessageStats(range);
+    await store.selectDailyUsageStats(range);
+    await store.selectLivePhaseCounts();
+    await store.selectPhaseCounts(range);
+    await store.selectSessionCountsByAgent(range);
+    await store.selectMessageStatsByAgent(range);
+    await store.selectSessionCountsByUser(range);
+    await store.selectMessageStatsByUser(range);
+    await store.selectSessionCountsByModel(range);
+    await store.selectMessageStatsByModel(range);
+    await store.selectUsageStatsByModel(range);
+    await store.selectSessionTypeCounts(range);
+    await store.selectExecutionModeCounts(range);
+    await store.selectDailyLlmCallStats(range);
+    await store.selectLlmCallStatsByModel(range);
+    await store.selectLlmCallSceneStats(range);
+    await store.selectLlmCallProtocolStats(range);
+    await store.selectLlmCallStatsByUser(range);
+    await store.selectLlmCallStatsByAgent(range);
+    await store.selectLlmCallQualitySummary(range);
+    await store.countLlmCallLatency(range, 'duration_ms');
+    await store.selectLlmCallLatencyAtOffset(range, 'duration_ms', 0);
+    await store.listAgents();
+    await store.listUsers();
+    await store.listModelsOrderByCreatedDesc();
+
+    expect(db.query.mock.calls.length).toBeGreaterThanOrEqual(17);
+    for (const call of db.query.mock.calls) {
+      const params = (call as unknown[])[1] as unknown[] | undefined;
+      if (params && params.length >= 2) {
+        expect(params).toContain('2026-01-01 00:00:00');
+        expect(params).toContain('2026-01-08 00:00:00');
+      }
+    }
+  });
+
+  it('协议分布：空串归一到 openai-compatible、NULL 归一到 unknown', async () => {
+    const db = { query: vi.fn(async () => []), queryOne: vi.fn(async () => ({ c: 0 })) };
+    const store = new AdminAnalyticsDbStore(db as never);
+
+    await store.selectLlmCallProtocolStats(range);
+
+    const sql = (db.query.mock.calls[0] as unknown[])[0] as string;
+    // COALESCE 只兜 NULL：存量行 protocol=''（=OpenAI 兼容，见迁移 V091）会漏成空 key，协议分布渲染空白
+    expect(sql).toContain(
+      `CASE WHEN protocol IS NULL THEN 'unknown' WHEN TRIM(protocol) = '' THEN 'openai-compatible' ELSE protocol END`,
+    );
+    expect(sql).not.toContain('COALESCE(protocol');
+    // SELECT 与 GROUP BY 复用同一表达式：两处各写一遍会随改动漂移，分组口径与展示 key 对不上
+    expect(sql.match(/GROUP BY CASE WHEN protocol IS NULL/g)).toHaveLength(1);
+  });
+
+  it('吞吐分位：ORDER BY 派生表达式，样本条件剔除不可解码行', async () => {
+    const db = { query: vi.fn(async () => []), queryOne: vi.fn(async () => ({ c: 0, v: null })) };
+    const store = new AdminAnalyticsDbStore(db as never);
+
+    await store.countLlmCallLatency(range, 'throughput');
+    expect(db.queryOne.mock.calls[0]?.[0]).toContain(
+      'first_token_ms IS NOT NULL AND first_token_ms < duration_ms AND completion_tokens > 0',
+    );
+
+    await store.selectLlmCallLatencyAtOffset(range, 'throughput', 2);
+    const [sql, params] = db.queryOne.mock.calls[1] as [string, unknown[]];
+    expect(sql).toContain('completion_tokens / ((duration_ms - first_token_ms) / 1000) AS v');
+    expect(sql).toContain('ORDER BY completion_tokens / ((duration_ms - first_token_ms) / 1000) ASC');
+    expect(params).toContain(2);
+  });
+
+  it('buildTrendBucketKeysStopsAtCurrentHourWhenWindowIncludesToday', () => {
+    const todayRange: AnalyticsRange = {
+      days: 1,
+      startYmd: '2026-09-23',
+      endYmd: '2026-09-23',
+      startAt: '2026-09-23 00:00:00',
+      endAtExclusive: '2026-09-24 00:00:00',
+    };
+    const keys = buildTrendBucketKeys(todayRange, 'hour', new Date('2026-09-23T02:15:00+08:00'));
+    expect(keys).toEqual(['2026-09-23 00:00', '2026-09-23 01:00', '2026-09-23 02:00']);
+  });
+
+  it('buildTrendBucketKeysFillsFullHoursForAPastWindow', () => {
+    const past: AnalyticsRange = {
+      days: 2,
+      startYmd: '2026-09-21',
+      endYmd: '2026-09-22',
+      startAt: '2026-09-21 00:00:00',
+      endAtExclusive: '2026-09-23 00:00:00',
+    };
+    const keys = buildTrendBucketKeys(past, 'hour', new Date('2026-09-23T10:00:00+08:00'));
+    expect(keys).toHaveLength(48);
+    expect(keys[0]).toBe('2026-09-21 00:00');
+    expect(keys.at(-1)).toBe('2026-09-22 23:00');
+    expect(buildTrendBucketKeys(past, 'day')).toEqual(['2026-09-21', '2026-09-22']);
+  });
+
+  it('trendsScopeHourlyBucketsThroughNowAndKeepsDailyDefault', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({})) };
+    const store = buildStore();
+    const hourKey = `${today} 00:00`;
+    store.selectDailySessionCounts = vi.fn(async () => [{ day: hourKey, count: 4 }]);
+    store.selectDailyMessageStats = vi.fn(async () => [{ day: hourKey, count: 8, tokens: 800 }]);
+    store.selectDailyUsageStats = vi.fn(async () => [{ day: hourKey, totalTokens: 200, callCount: 3 }]);
+    store.selectDailyLlmCallStats = vi.fn(async () => [
+      { day: hourKey, callCount: 10, failCount: 1, promptTokens: 1000, cachedTokens: 200, callTokens: 1500, firstTokenMsSum: 9000, firstTokenMsCount: 8, durationMsSum: 50000 },
+    ]);
+    const service = new AdminAnalyticsService(statistics as never, store as never);
+
+    const beforeHour = `${formatDateTime(new Date()).slice(0, 13)}:00`;
+    const hourly = (await service.trendsScope(1, 0, { granularity: 'hour' })) as Record<string, any>;
+    const afterHour = `${formatDateTime(new Date()).slice(0, 13)}:00`;
+
+    expect(hourly.granularity).toBe('hour');
+    expect(hourly.trends[0]).toMatchObject({ date: hourKey, sessions: 4, messages: 8, callCount: 10 });
+    expect([beforeHour, afterHour]).toContain(hourly.trends.at(-1).date);
+    expect(hourly.trends.length).toBeLessThanOrEqual(24);
+    expect(store.selectDailySessionCounts).toHaveBeenCalledWith(expect.anything(), 'hour');
+    expect(store.selectDailyLlmCallStats).toHaveBeenCalledWith(expect.anything(), expect.anything(), 'hour');
+
+    const dailyStore = buildStore();
+    const dailyService = new AdminAnalyticsService(statistics as never, dailyStore as never);
+    const daily = (await dailyService.trendsScope(1, 1, { granularity: 'day' })) as Record<string, any>;
+    expect(daily.granularity).toBe('day');
+    expect(daily.trends).toHaveLength(1);
+    expect(daily.trends[0].date).toBe(addDaysYmd(today, -1));
+  });
+
+  it('trendsScopeHourlyYesterdayIsTwentyFourHours', async () => {
+    const statistics = { getOverview: vi.fn(async () => ({})) };
+    const store = buildStore();
+    const service = new AdminAnalyticsService(statistics as never, store as never);
+
+    const result = (await service.trendsScope(1, 1, { granularity: 'hour' })) as Record<string, any>;
+    const yesterday = addDaysYmd(today, -1);
+
+    expect(result.trends).toHaveLength(24);
+    expect(result.trends[0].date).toBe(`${yesterday} 00:00`);
+    expect(result.trends[23].date).toBe(`${yesterday} 23:00`);
+  });
+
+  it('hourlyQueriesGroupByShanghaiHour', async () => {
+    const db = { query: vi.fn(async () => []), queryOne: vi.fn(async () => null) };
+    const store = new AdminAnalyticsDbStore(db as never);
+
+    await store.selectDailySessionCounts(range, 'hour');
+    await store.selectDailyMessageStats(range, 'hour');
+    await store.selectDailyUsageStats(range, 'hour');
+    await store.selectDailyLlmCallStats(range, { excludeConnectivity: true }, 'hour');
+    await store.selectDailySessionCounts(range, 'day');
+
+    const sqls = db.query.mock.calls.map((call) => String(call[0]));
+    expect(sqls.slice(0, 4).every((sql) => sql.includes(`DATE_FORMAT(created_at, '%Y-%m-%d %H:00')`))).toBe(true);
+    expect(sqls[4]).toContain('DATE(created_at)');
+    expect(sqls[4]).not.toContain('DATE_FORMAT');
+  });
+
+  it('aggregates scalar counters via queryOne', async () => {
+    const db = {
+      query: vi.fn(async () => []),
+      queryOne: vi.fn(async () => ({ c: 5, count: 4, tokens: 40 })),
+    };
+    const store = new AdminAnalyticsDbStore(db as never);
+
+    expect(await store.countActiveUsers(range)).toBe(5);
+    expect(await store.countSessions(range)).toBe(5);
+    expect(await store.sumMessages(range)).toEqual({ count: 4, tokens: 40 });
+    expect(await store.sumUsageTokens(range)).toBe(40);
+  });
+});
+
+describe('AdminAnalyticsService 成本聚合（§5.2 / 决策 13：成本唯一口径 = llm_call）', () => {
+  /** 成本口径 store：只保留成本相关行，其余沿用最小桩。 */
+  function buildCostStore(overrides: Record<string, unknown> = {}) {
+    const base = buildStore();
+    return {
+      ...base,
+      selectDailyLlmCallStats: vi.fn(async () => [
+        { day: today, callCount: 10, failCount: 1, promptTokens: 1000, cachedTokens: 200, callTokens: 1500, cost: 3.2, firstTokenMsSum: 9000, firstTokenMsCount: 8, durationMsSum: 50000 },
+      ]),
+      selectLlmCallStatsByModel: vi.fn(async () => [
+        {
+          id: 3, callCount: 8, successCount: 7, failCount: 1, retryCallCount: 2,
+          promptTokens: 800, completionTokens: 200, cachedTokens: 100, callTokens: 1000,
+          cost: 2.5, firstTokenMsSum: 4000, firstTokenMsCount: 8, durationMsSum: 40000,
+        },
+      ]),
+      selectLlmCallStatsByUser: vi.fn(async () => [{ id: 1, callCount: 9, failCount: 1, callTokens: 1200, cost: 1.75 }]),
+      selectLlmCallStatsByAgent: vi.fn(async () => [{ id: 9, callCount: 8, failCount: 1, callTokens: 1000, cost: 2 }]),
+      selectLlmCallQualitySummary: vi.fn(async () => ({
+        callCount: 10, successCount: 9, failCount: 1, retryCallCount: 2,
+        promptTokens: 1000, cachedTokens: 200, callTokens: 1500, cost: 4.5,
+      })),
+      ...overrides,
+    };
+  }
+
+  it('summary：趋势点带 cost，periodTotals.totalCost 为窗口合计', async () => {
+    const service = new AdminAnalyticsService({ getOverview: vi.fn(async () => ({})) } as never, buildCostStore() as never);
+    const result = (await service.summary(7)) as Record<string, any>;
+    expect(result.trends.at(-1)).toMatchObject({ date: today, cost: 3.2 });
+    expect(result.periodTotals).toMatchObject({ totalCost: 3.2 });
+    expect(result.previousTotals).toMatchObject({ totalCost: 4.5 });
+  });
+
+  it('trendsScope：periodTotals.totalCost 与 callQuality.cost 同口径', async () => {
+    const service = new AdminAnalyticsService({ getOverview: vi.fn(async () => ({})) } as never, buildCostStore() as never);
+    const result = (await service.trendsScope(7)) as Record<string, any>;
+    expect(result.periodTotals).toMatchObject({ totalCost: 3.2 });
+    expect(result.callQuality).toMatchObject({ callCount: 10, cost: 4.5 });
+    expect(result.trends.at(-1)).toMatchObject({ cost: 3.2 });
+  });
+
+  it('modelsScope：模型行带 cost，periodTotals.totalCost 与模型行一致', async () => {
+    const service = new AdminAnalyticsService({ getOverview: vi.fn(async () => ({})) } as never, buildCostStore() as never);
+    const result = (await service.modelsScope(7)) as Record<string, any>;
+    expect(result.modelStats[0]).toMatchObject({ modelId: 3, cost: 2.5 });
+    expect(result.periodTotals).toEqual({ totalTokens: expect.any(Number), totalCost: 2.5 });
+  });
+
+  it('usersScope / agentsScope：维度行带 cost', async () => {
+    const service = new AdminAnalyticsService({ getOverview: vi.fn(async () => ({})) } as never, buildCostStore() as never);
+    const users = (await service.usersScope(7)) as Record<string, any>;
+    const agents = (await service.agentsScope(7)) as Record<string, any>;
+    expect(users.userActivity[0]).toMatchObject({ username: 'ada', cost: 1.75 });
+    expect(agents.agentStats[0]).toMatchObject({ agentId: 9, cost: 2 });
+  });
+
+  it('成本缺列（NULL 行）时归一为 0，不产出 NaN', async () => {
+    const service = new AdminAnalyticsService({ getOverview: vi.fn(async () => ({})) } as never, buildCostStore({
+      selectDailyLlmCallStats: vi.fn(async () => [
+        { day: today, callCount: 1, failCount: 0, promptTokens: 10, cachedTokens: 0, callTokens: 10, cost: null, firstTokenMsSum: 0, firstTokenMsCount: 0, durationMsSum: 120 },
+      ]),
+      selectLlmCallQualitySummary: vi.fn(async () => ({
+        callCount: 1, successCount: 1, failCount: 0, retryCallCount: 0,
+        promptTokens: 10, cachedTokens: 0, callTokens: 10, cost: null,
+      })),
+    }) as never);
+    const result = (await service.trendsScope(7)) as Record<string, any>;
+    expect(result.trends.at(-1).cost).toBe(0);
+    expect(result.periodTotals.totalCost).toBe(0);
+    // 汇总行 cost=NULL → 前端展示 null 而非 NaN
+    expect(result.callQuality.cost).toBeNull();
+  });
+
+  it('DECIMAL 字符串成本按数值累加（mysql2 读出形态）', async () => {
+    const service = new AdminAnalyticsService({ getOverview: vi.fn(async () => ({})) } as never, buildCostStore({
+      selectLlmCallStatsByModel: vi.fn(async () => [
+        {
+          id: 3, callCount: 8, successCount: 7, failCount: 1, retryCallCount: 2,
+          promptTokens: 800, completionTokens: 200, cachedTokens: 100, callTokens: 1000,
+          cost: '2.500000', firstTokenMsSum: 4000, firstTokenMsCount: 8, durationMsSum: 40000,
+        },
+      ]),
+    }) as never);
+    const result = (await service.modelsScope(7)) as Record<string, any>;
+    expect(result.modelStats[0].cost).toBe(2.5);
+    expect(result.periodTotals.totalCost).toBe(2.5);
+  });
+
+  it('聚合 SQL 以 COALESCE(SUM(cost_micros),0)/1e6 落成本口径', async () => {
+    const db = { query: vi.fn(async () => []), queryOne: vi.fn(async () => ({ c: 0 })) };
+    const store = new AdminAnalyticsDbStore(db as never);
+    await store.selectDailyLlmCallStats(range);
+    await store.selectLlmCallStatsByModel(range);
+    await store.selectLlmCallStatsByUser(range);
+    await store.selectLlmCallStatsByAgent(range);
+    await store.selectLlmCallQualitySummary(range); // 汇总走 queryOne
+    const sqls = [
+      ...db.query.mock.calls.map((c) => (c as unknown[])[0] as string),
+      ...db.queryOne.mock.calls.map((c) => (c as unknown[])[0] as string),
+    ].join('\n');
+    const costHits = (sqls.match(/COALESCE\(SUM\(cost_micros\), 0\) \/ 1000000 AS cost/g) ?? []).length;
+    expect(costHits).toBe(5);
+  });
+});
+
+describe('AdminAnalyticsService runTraceScope', () => {
+  /** service 自己按今天解析窗口（不是文件顶部的固定 range），断言前先算出来。 */
+  const traceRange = {
+    days: 7,
+    startYmd: addDaysYmd(today, -6),
+    endYmd: today,
+    startAt: `${addDaysYmd(today, -6)} 00:00:00`,
+    endAtExclusive: `${addDaysYmd(today, 1)} 00:00:00`,
+  };
+
+  function buildRunTraceStore(overrides: Record<string, unknown> = {}) {
+    return {
+      selectRunTraceSlowestRounds: vi.fn(async () => [
+        {
+          scopeKey: 9, sessionId: 42, modelName: 'gpt', createdAt: '2026-01-05 10:00:00',
+          durationMs: 90000, totalTokens: 12000, costMicros: 500000, callCount: 8,
+        },
+        {
+          scopeKey: 3, sessionId: 41, modelName: 'claude', createdAt: '2026-01-06 11:00:00',
+          durationMs: 30000, totalTokens: 9000, costMicros: null, callCount: 4,
+        },
+      ]),
+      selectRunTraceMostExpensiveRounds: vi.fn(async () => [
+        {
+          scopeKey: 3, sessionId: 41, modelName: 'claude', createdAt: '2026-01-06 11:00:00',
+          durationMs: 30000, totalTokens: 9000, costMicros: 900000, callCount: 4,
+        },
+      ]),
+      selectRunTraceToolFailureRates: vi.fn(async () => [
+        { toolType: 'RUN', errorCount: 1, totalCount: 2 },
+        { toolType: 'READ', errorCount: 5, totalCount: 20 },
+        { toolType: 'EDIT', errorCount: 0, totalCount: 9 },
+      ]),
+      listAgents: vi.fn(async () => [
+        { id: 9, name: 'Coder' },
+        { id: 3, name: 'Reviewer' },
+      ]),
+      listUsers: vi.fn(async () => [
+        { id: 1, username: 'ada', displayName: 'Ada' },
+      ]),
+      ...overrides,
+    };
+  }
+
+  it('默认 scene=agent / scope=agent：榜单补维度名，失败率按比例排序', async () => {
+    const store = buildRunTraceStore();
+    const service = new AdminAnalyticsService({ getOverview: vi.fn(async () => ({})) } as never, store as never);
+
+    const result = (await service.runTraceScope(7)) as Record<string, any>;
+
+    expect(result.scene).toBe('agent');
+    expect(result.scope).toBe('agent');
+    expect(result.slowestRounds[0]).toMatchObject({ scopeKey: 9, scopeName: 'Coder', durationMs: 90000, callCount: 8 });
+    expect(result.slowestRounds[1]).toMatchObject({ scopeKey: 3, scopeName: 'Reviewer', costMicros: null });
+    expect(result.mostExpensiveRounds[0]).toMatchObject({ scopeKey: 3, scopeName: 'Reviewer', costMicros: 900000 });
+    // READ 5/20=25% 排在 RUN 1/2=50% 之后；0 失败的 EDIT 也保留（分母>0）
+    expect(result.toolFailureRates.map((r: any) => r.toolType)).toEqual(['RUN', 'READ', 'EDIT']);
+    expect(result.toolFailureRates[0].failRate).toBe(50);
+    expect(result.toolFailureRates[1].failRate).toBe(25);
+    // 查询参数透传：scene / 维度 / limit
+    expect(store.selectRunTraceSlowestRounds).toHaveBeenCalledWith(traceRange, 'agent', 'agent', 20);
+  });
+
+  it('scope=user 走用户维度并用 displayName 命名', async () => {
+    const store = buildRunTraceStore({
+      selectRunTraceSlowestRounds: vi.fn(async () => [
+        {
+          scopeKey: 1, sessionId: 7, modelName: 'gpt', createdAt: '2026-01-05 10:00:00',
+          durationMs: 12000, totalTokens: 3000, costMicros: null, callCount: 2,
+        },
+      ]),
+      selectRunTraceMostExpensiveRounds: vi.fn(async () => []),
+    });
+    const service = new AdminAnalyticsService({ getOverview: vi.fn(async () => ({})) } as never, store as never);
+
+    const result = (await service.runTraceScope(7, 0, { scope: 'user', scene: 'compaction' })) as Record<string, any>;
+
+    expect(result.scope).toBe('user');
+    expect(result.scene).toBe('compaction');
+    expect(result.slowestRounds[0]).toMatchObject({ scopeKey: 1, scopeName: 'Ada' });
+    expect(store.selectRunTraceSlowestRounds).toHaveBeenCalledWith(traceRange, 'compaction', 'user', 20);
+    expect(store.selectRunTraceMostExpensiveRounds).toHaveBeenCalledWith(traceRange, 'compaction', 'user', 20);
+  });
+
+  it('未关联维度的行给占位名，limit 截断榜单', async () => {
+    const store = buildRunTraceStore({
+      selectRunTraceSlowestRounds: vi.fn(async () => [
+        {
+          scopeKey: 999, sessionId: null, modelName: null, createdAt: null,
+          durationMs: 1000, totalTokens: 0, costMicros: null, callCount: 1,
+        },
+      ]),
+      selectRunTraceMostExpensiveRounds: vi.fn(async () => []),
+      selectRunTraceToolFailureRates: vi.fn(async () => [
+        { toolType: 'RUN', errorCount: 1, totalCount: 2 },
+        { toolType: 'READ', errorCount: 1, totalCount: 2 },
+      ]),
+    });
+    const service = new AdminAnalyticsService({ getOverview: vi.fn(async () => ({})) } as never, store as never);
+
+    const result = (await service.runTraceScope(7, 0, { limit: 1 })) as Record<string, any>;
+
+    expect(result.slowestRounds[0].scopeName).toBe('未关联 Agent');
+    expect(result.toolFailureRates).toHaveLength(1);
+    expect(store.selectRunTraceSlowestRounds).toHaveBeenCalledWith(traceRange, 'agent', 'agent', 1);
+  });
+
+  it('聚合 SQL：轮榜按维度分区取代表调用，贵榜额外要求 cost_micros IS NOT NULL', async () => {
+    const db = { query: vi.fn(async () => []), queryOne: vi.fn(async () => ({ c: 0 })) };
+    const store = new AdminAnalyticsDbStore(db as never);
+    await store.selectRunTraceSlowestRounds(range, 'agent', 'agent', 20);
+    await store.selectRunTraceMostExpensiveRounds(range, 'agent', 'user', 20);
+    await store.selectRunTraceToolFailureRates(range);
+    const sqls = (db.query.mock.calls as unknown[][]).map((c) => c[0] as string);
+    expect(sqls[0]).toContain('ROW_NUMBER() OVER (PARTITION BY c.agent_id ORDER BY c.duration_ms DESC');
+    expect(sqls[0]).toContain('c.scene = ?');
+    expect(sqls[0]).not.toContain('c.cost_micros IS NOT NULL');
+    expect(sqls[1]).toContain('ROW_NUMBER() OVER (PARTITION BY c.user_id ORDER BY c.cost_micros DESC');
+    expect(sqls[1]).toContain('AND c.cost_micros IS NOT NULL');
+    expect(sqls[2]).toContain('GROUP BY type');
+    expect(sqls[2]).toContain("status = 'ERROR'");
+    // 轮榜传窗口与 scene；工具失败率只传窗口
+    expect((db.query.mock.calls[0] as unknown[])[1]).toEqual([range.startAt, range.endAtExclusive, 'agent', 20]);
+    expect((db.query.mock.calls[2] as unknown[])[1]).toEqual([range.startAt, range.endAtExclusive]);
+  });
+});
+
+describe('AdminAnalyticsDbStore 自定义 HTTP 工具调用统计（§9.4）', () => {
+  function store(rows: Array<Record<string, unknown>> = []) {
+    const db = {
+      query: vi.fn(async () => rows),
+      queryOne: vi.fn(async () => ({ c: rows.length })),
+    };
+    return { db, store: new AdminAnalyticsDbStore(db as never) };
+  }
+
+  it('按内层 slug 聚合调用次数 / 失败数 / 活跃用户 / 首末次时间', async () => {
+    const { db, store: dbStore } = store([
+      { slug: 'weather', calls: 12, errors: 3, users: 4, firstAt: '2026-10-20 09:00:00', lastAt: '2026-10-20 10:30:00' },
+    ]);
+    const rows = await dbStore.selectHttpToolCallStats();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ slug: 'weather', calls: 12, errors: 3, users: 4 });
+    const sql = db.query.mock.calls[0]![0] as string;
+    expect(sql).toContain("a.type = 'TOOL'");
+    expect(sql).toContain('a.target IS NOT NULL');
+    expect(sql).toContain('COUNT(DISTINCT s.user_id)');
+    expect(sql).toContain('GROUP BY a.target');
+    expect(sql).toContain('JOIN session s ON s.id = a.session_id');
+  });
+
+  it('slug 下钻时拼进 WHERE 且绑定为参数', async () => {
+    const { db, store: dbStore } = store();
+    await dbStore.selectHttpToolCallStats('weather');
+    const sql = db.query.mock.calls[0]![0] as string;
+    expect(sql).toContain('a.target = ?');
+    expect(db.query.mock.calls[0]![1]).toEqual(['weather']);
+  });
+
+  it('空 slug / 空白 slug 不下钻（返回全部工具）', async () => {
+    const { db, store: dbStore } = store();
+    await dbStore.selectHttpToolCallStats('   ');
+    const sql = db.query.mock.calls[0]![0] as string;
+    expect(sql).not.toContain('a.target = ?');
+    expect(db.query.mock.calls[0]![1]).toEqual([]);
+  });
+});

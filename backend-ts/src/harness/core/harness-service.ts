@@ -1,0 +1,1018 @@
+import { randomUUID } from 'node:crypto';
+import { nowSql } from '../../common/datetime.js';
+import { AtomicBoolean } from '../atomic-boolean.js';
+import { harnessLog } from '../log.js';
+import { boolish, llmModelToConfig, wsEvent } from '../deps.js';
+import type {
+  Agent, AgentMapper, AgentExperienceService, FileChange, FileChangeMapper, LlmModel, LlmModelMapper,
+  Message, Session, SessionActivityHeartbeat, SessionCompaction, SessionCompactionEvent,
+  SessionCompactionService, SessionMapper, SessionService, StreamingWsRegistry, TaskTerminalService,
+  ActivityService,
+} from '../deps.js';
+import type { AgentEventListener } from './agent-event-listener.js';
+import { AgentLoop, type MessagePersistenceCallback, type ToolMessageSave } from './agent-loop.js';
+import type { Db } from '../../db/db.js';
+import { AgentExecutionContext } from './agent-execution-context.js';
+import { CompactionConfig } from './compaction-config.js';
+import type { EnvironmentInfoProvider } from './environment-info-provider.js';
+import type { LocalAgentsMdRegistry } from './local-agents-md-registry.js';
+import type { PromptEngine } from './prompt-engine.js';
+import type { SessionHistoryLoader } from './session-history-loader.js';
+import type { SessionCompactionOrchestrator } from './session-compaction-orchestrator.js';
+import { CompactionCancelledException, CompactionContextOverflowException, CompactionPayloadOverflowException } from './compaction-service.js';
+import { CompactionStateReloadException } from './session-compaction-orchestrator.js';
+import type { ActiveContextCalculator } from './active-context-calculator.js';
+import type { ToolRegistry } from '../tool/tool-registry.js';
+import type { Tool } from '../tool/tool.js';
+import { isWeixinChannelTool } from '../tool/weixin-channel-tool.js';
+import { isDingtalkChannelSession, isDingtalkChannelTool } from '../tool/dingtalk-channel-tool.js';
+import { isFeishuChannelSession, isFeishuChannelTool } from '../tool/feishu-channel-tool.js';
+import { FileChangeDiffUtil } from '../tool/file-change-diff-util.js';
+import type { SkillLoader } from '../skill/skill-loader.js';
+import type { SkillSyncService } from '../skill/skill-sync-service.js';
+import type { LocalSkillRegistry } from '../skill/local-skill-registry.js';
+import type { LocalSkillRef, SkillDocument } from '../skill/skill-document.js';
+import type { McpClientManager } from '../mcp/mcp-client-manager.js';
+import type { McpSyncService } from '../mcp/local/mcp-sync-service.js';
+import { McpToolAdapter } from '../mcp/mcp-tool-adapter.js';
+import type { McpLoadModeResolver } from '../mcp/workingset/mcp-load-mode.js';
+import { buildMcpWorkingSet, type McpWorkingSet } from '../mcp/workingset/mcp-working-set.js';
+import type { McpConnectionError, McpServer, McpToolRef } from '../mcp/entity/mcp-server.js';
+import { HTTP_TOOL_NAMES } from '../tool/tool-registry.js';
+import { buildCustomHttpToolCatalog } from './custom-http-tools-catalog.js';
+import type { HttpTool } from '../../http-tool/types.js';
+import { WEIXIN_PROJECT_KEY } from '../../domain/types.js';
+import { shanghaiYmd } from '../../common/json.js';
+import { BusinessException } from '../../common/business-exception.js';
+import { ErrorCode } from '../../common/error-code.js';
+import type { ChatRequest, ChatUsage, ToolCall } from '../llm/chat-request.js';
+import type { MemoryHint } from '../../memory/types.js';
+
+const ASK_USER_QUESTIONS = 'ask_user_questions';
+/** 工作集模式的两个内置入口工具：只在该模式注入，全量模式不出现。 */
+const MCP_WORKING_SET_TOOL_NAMES = new Set(['mcp_call', 'mcp_describe']);
+/** 自定义 HTTP 工具入口：默认工具集中先剔除，仅当用户有启用工具时按会话推入（§5.4）。 */
+const HTTP_TOOL_ENTRY_NAMES = new Set<string>(HTTP_TOOL_NAMES);
+
+/** 自定义 HTTP 工具装配依赖（HttpToolService 满足；未注入时零查库、零行为差异）。 */
+export interface CustomHttpToolAssemblyPort {
+  listEnabledForAgent(agent: Pick<Agent, 'httpToolIds'>): Promise<HttpTool[]>;
+}
+
+export class HarnessService {
+  constructor(
+    private readonly agentLoop: AgentLoop,
+    private readonly toolRegistry: ToolRegistry,
+    private readonly skillLoader: SkillLoader,
+    private readonly skillSyncService: SkillSyncService,
+    private readonly localSkillRegistry: LocalSkillRegistry,
+    private readonly localAgentsMdRegistry: LocalAgentsMdRegistry,
+    private readonly sessionMapper: SessionMapper,
+    private readonly agentMapper: AgentMapper,
+    private readonly experienceService: AgentExperienceService,
+    private readonly llmModelMapper: LlmModelMapper,
+    private readonly fileChangeMapper: FileChangeMapper,
+    private readonly sessionService: SessionService,
+    private readonly sessionCompactionService: SessionCompactionService,
+    private readonly sessionHistoryLoader: SessionHistoryLoader,
+    private readonly sessionCompactionOrchestrator: SessionCompactionOrchestrator,
+    private readonly promptEngine: PromptEngine,
+    private readonly activeContextCalculator: ActiveContextCalculator,
+    private readonly compactionConfig: CompactionConfig,
+    private readonly environmentInfoProvider: EnvironmentInfoProvider,
+    private readonly db?: Db | null,
+    private readonly mcpClientManager?: McpClientManager | null,
+    private readonly mcpSyncService?: McpSyncService | null,
+    private readonly embedSessionLookup?: {
+      isEmbedSession(sessionId: number): boolean;
+      /** embed 会话且连接声明了页面能力（缺省开启）；工具过滤的唯一口径，见 filterPageTools 调用点。 */
+      isEmbedPageSession?(sessionId: number): boolean;
+    } | null,
+    private readonly memoryInjection?: { listForInjection(userId: number, projectKey: string | null, workspace: string | null): Promise<MemoryHint[]> } | null,
+    /** MCP 加载模式解析（工作集 / 全量）。未注入时维持全量注入，行为与改造前一致。 */
+    private readonly mcpLoadModeResolver?: McpLoadModeResolver | null,
+    /**
+     * 自定义 HTTP 工具装配（技术方案 2026-10-19 §5.4）。未注入时维持改造前行为：
+     * 入口工具已在默认工具集中被剔除，任何会话都看不到 http_describe / http_call。
+     */
+    private readonly httpToolService?: CustomHttpToolAssemblyPort | null,
+    /**
+     * 团队经验库挂载兜底（技术方案 2026-10-24 §3.3）：buildContext 每轮幂等补挂，
+     * 覆盖升级前存量 CLOUD 会话（有路标无链接，Agent 首写会建出真实目录）。
+     * 未注入时不补挂，行为与仅会话创建时挂载一致。
+     */
+    private readonly experienceMount?: { syncForSession(workspace: string, agentId: number, enabled: boolean, refreshIndex?: boolean): void } | null,
+  ) {}
+
+  prepareMessage(_sessionId: number, _userContent: unknown): string {
+    return randomUUID();
+  }
+
+  async executeFromEvent(
+    sessionId: number, _eventId: string, listener: AgentEventListener, cancelFlag?: AtomicBoolean | null,
+  ): Promise<void> {
+    await this.execute(sessionId, null, listener, cancelFlag);
+  }
+
+  async execute(
+    sessionId: number, _userContent: string | null, listener: AgentEventListener, cancelFlag?: AtomicBoolean | null,
+    executionUserId?: number | null,
+  ): Promise<void> {
+    const context = await this.buildContext(sessionId, listener, cancelFlag);
+    if (executionUserId != null) context.executionUserId = executionUserId;
+    const persistenceCallback = this.createPersistenceCallback(sessionId, context);
+    try {
+      await this.agentLoop.execute(context, listener, persistenceCallback);
+    } finally {
+      if (cancelFlag != null) this.agentLoop.removeCancelFlag(sessionId);
+    }
+  }
+
+  createPersistenceCallback(targetSessionId: number, context: AgentExecutionContext): MessagePersistenceCallback {
+    return {
+      onSaveAssistantMessage: (
+        content: string | null | undefined,
+        thinkingContent: string | null | undefined,
+        toolCalls: ToolCall[] | null | undefined,
+        toolResultsOrUsage?: Record<string, string> | ChatUsage,
+        usage?: ChatUsage,
+      ) => {
+        return this.persistAssistant(targetSessionId, context, content, thinkingContent, toolCalls, toolResultsOrUsage, usage);
+      },
+      onSaveToolMessage: (toolCallId: string, content: string, metadataJson?: string | null) => {
+        return this.sessionService.saveMessage(targetSessionId, 'TOOL', content, null, toolCallId, null, 0, null, metadataJson).then(() => undefined);
+      },
+      onSaveToolRound: this.db ? (
+        content, thinkingContent, toolCalls, toolMessages, toolResults, usage,
+      ) => this.persistToolRound(
+        targetSessionId, context, content, thinkingContent, toolCalls, toolMessages, toolResults, usage,
+      ) : undefined,
+    };
+  }
+
+  private async persistAssistant(
+    targetSessionId: number,
+    context: AgentExecutionContext,
+    content: string | null | undefined,
+    thinkingContent: string | null | undefined,
+    toolCalls: ToolCall[] | null | undefined,
+    toolResultsOrUsage?: Record<string, string> | ChatUsage,
+    usage?: ChatUsage,
+  ): Promise<void> {
+    let toolResults: Record<string, string> = {};
+    let resolvedUsage: ChatUsage | undefined = usage;
+    if (toolResultsOrUsage && typeof toolResultsOrUsage === 'object' && 'promptTokens' in toolResultsOrUsage) {
+      resolvedUsage = toolResultsOrUsage as ChatUsage;
+    } else if (toolResultsOrUsage && typeof toolResultsOrUsage === 'object') {
+      toolResults = toolResultsOrUsage as Record<string, string>;
+    }
+    let toolCallsJson: string | null = null;
+    if (toolCalls && toolCalls.length > 0) {
+      try {
+        toolCallsJson = JSON.stringify(toolCalls);
+      } catch (e) {
+        harnessLog('warn', `Failed to serialize tool calls for session ${targetSessionId}`, e);
+      }
+    }
+    const tokenCount = resolvedUsage?.totalTokens ?? 0;
+    const modelId = context.modelConfig?.id ?? null;
+    const savedMsg = toolCallsJson == null && this.db
+      ? await this.persistFinalAssistant(targetSessionId, content, thinkingContent, tokenCount, modelId)
+      : await this.sessionService.saveMessage(
+        targetSessionId, 'ASSISTANT', content ?? null, thinkingContent, null, toolCallsJson, tokenCount, modelId);
+    if (toolCalls && toolCalls.length > 0 && Object.keys(toolResults).length > 0) {
+      await this.saveFileChanges(savedMsg.id!, targetSessionId, toolCalls, toolResults);
+    }
+  }
+
+  private async persistFinalAssistant(
+    targetSessionId: number,
+    content: string | null | undefined,
+    thinkingContent: string | null | undefined,
+    tokenCount: number,
+    modelId: number | null,
+  ): Promise<{ id?: number }> {
+    if (!this.db) throw new Error('Database is required for final assistant persistence');
+    return this.db.transaction(async (tx) => {
+      const id = await tx.insert('message', {
+        sessionId: targetSessionId,
+        role: 'ASSISTANT',
+        content: content ?? null,
+        thinkingContent: thinkingContent ?? null,
+        toolCallId: null,
+        toolCalls: null,
+        tokenCount,
+        modelId,
+        metadata: null,
+        sourceSessionId: null,
+        deleted: 0,
+      });
+      await tx.execute(
+        `UPDATE subagent_execution SET final_message_id = ?
+         WHERE child_session_id = ? AND status IN ('RUNNING', 'RECOVERING')
+         ORDER BY id DESC LIMIT 1`,
+        [id, targetSessionId],
+      );
+      await tx.execute('UPDATE session SET updated_at = ? WHERE id = ?', [nowSql(), targetSessionId]);
+      return { id };
+    });
+  }
+
+  private async persistToolRound(
+    targetSessionId: number,
+    context: AgentExecutionContext,
+    content: string | null | undefined,
+    thinkingContent: string | null | undefined,
+    toolCalls: ToolCall[],
+    toolMessages: ToolMessageSave[],
+    toolResults: Record<string, string>,
+    usage?: ChatUsage,
+  ): Promise<void> {
+    if (!this.db) throw new Error('Database is required for tool round persistence');
+    const toolCallsJson = JSON.stringify(toolCalls);
+    const toolCallIds = toolCalls.map((call) => call.id).filter((id): id is string => Boolean(id));
+    const assistantId = await this.db.transaction(async (tx) => {
+      const id = await tx.insert('message', {
+        sessionId: targetSessionId,
+        role: 'ASSISTANT',
+        content: content ?? null,
+        thinkingContent: thinkingContent ?? null,
+        toolCallId: null,
+        toolCalls: toolCallsJson,
+        tokenCount: usage?.totalTokens ?? 0,
+        modelId: context.modelConfig?.id ?? null,
+        metadata: null,
+        sourceSessionId: null,
+        deleted: 0,
+      });
+      const toolMessageIds = new Map<string, number>();
+      for (const tool of toolMessages) {
+        toolMessageIds.set(tool.toolCallId, await tx.insert('message', {
+          sessionId: targetSessionId,
+          role: 'TOOL',
+          content: tool.content,
+          thinkingContent: null,
+          toolCallId: tool.toolCallId,
+          toolCalls: null,
+          tokenCount: 0,
+          modelId: null,
+          metadata: tool.metadataJson,
+          sourceSessionId: null,
+          deleted: 0,
+        }));
+      }
+      if (toolCallIds.length > 0) {
+        const placeholders = toolCallIds.map(() => '?').join(',');
+        const rows = await tx.query<{ id: number; parentToolCallId: string }>(
+          `SELECT id, parent_tool_call_id FROM subagent_execution
+           WHERE parent_session_id = ? AND delivery_status = 'PENDING'
+             AND invocation_type = 'DELEGATE'
+             AND parent_tool_call_id IN (${placeholders}) FOR UPDATE`,
+          [targetSessionId, ...toolCallIds],
+        );
+        const now = nowSql();
+        for (const execution of rows) {
+          const toolMessageId = toolMessageIds.get(execution.parentToolCallId);
+          if (toolMessageId == null) continue;
+          await tx.execute(
+            `UPDATE subagent_execution SET delivery_status = 'DELIVERED',
+             parent_result_delivered_at = ?, parent_assistant_message_id = ?, parent_tool_message_id = ?
+             WHERE id = ? AND delivery_status = 'PENDING' AND invocation_type = 'DELEGATE'`,
+            [now, id, toolMessageId, execution.id],
+          );
+        }
+      }
+      await tx.execute('UPDATE session SET updated_at = ? WHERE id = ?', [nowSql(), targetSessionId]);
+      return id;
+    });
+    if (Object.keys(toolResults).length > 0) {
+      await this.saveFileChanges(assistantId, targetSessionId, toolCalls, toolResults);
+    }
+  }
+
+  async executePrepared(context: AgentExecutionContext, listener: AgentEventListener): Promise<void> {
+    const persistence = this.createPersistenceCallback(context.sessionId!, context);
+    await this.agentLoop.execute(context, listener, persistence);
+  }
+
+  async buildContext(
+    sessionId: number, listener?: AgentEventListener | null, cancelFlag?: AtomicBoolean | null,
+    skipAutoCompact = false,
+  ): Promise<AgentExecutionContext> {
+    const session = await this.sessionMapper.selectById(sessionId);
+    if (session == null) throw new BusinessException(ErrorCode.SESSION_NOT_FOUND);
+    const agent = await this.agentMapper.selectById(session.agentId!);
+    if (agent == null) throw new BusinessException(ErrorCode.AGENT_NOT_FOUND);
+    // 模型解析链：会话显式指定优先（不可解析保持报错）；未指定时 Agent 默认模型（不可解析时跳过）→ 全局默认模型
+    let llmModel: LlmModel | null;
+    if (session.modelId != null) {
+      llmModel = await this.resolveModel(session.modelId);
+    } else {
+      llmModel = agent.defaultModelId != null ? await this.llmModelMapper.selectById(agent.defaultModelId) : null;
+      if (llmModel == null) {
+        llmModel = await this.resolveModel(null);
+      }
+    }
+    if (llmModel == null) throw new BusinessException(ErrorCode.MODEL_NOT_FOUND);
+
+    const executionMode = session.executionMode ?? 'CLOUD';
+    if (executionMode.toUpperCase() === 'CLOUD') {
+      try {
+        await this.skillSyncService.syncToSession(agent, session.userId ?? null, sessionId);
+      } catch (e) {
+        harnessLog('warn', `Skill sync to session runtime failed for session ${sessionId}: ${(e as Error).message}`);
+      }
+    }
+
+    const context = new AgentExecutionContext();
+    context.cancelFlag = cancelFlag;
+    // 日期锚定（技术方案 2026-10-12 §5.1）：系统提示 current-date 节取本会话首条现存用户
+    // 消息的日期，跨天不重算；无用户消息（信号 / 定时任务首轮 / 空会话）回落服务器当天，
+    // 与改造前行为完全一致。每轮重新解析，首条被软删后下一轮自动自愈。
+    context.sessionBaseYmd = await this.resolveSessionBaseYmd(sessionId);
+    context.sessionId = sessionId;
+    context.userId = session.userId;
+    context.agentId = agent.id;
+    context.projectKey = session.projectKey;
+    context.systemPrompt = agent.systemPrompt;
+    context.experiences = await this.experienceService.listEnabledContents(agent.id!);
+    // 团队经验库路标（技术方案 2026-10-24 §3.6）：仅 Agent 开关启用且 CLOUD 会话注入。
+    // LOCAL 的文件工具跑在用户本机，够不到服务器共享目录，注入路标只会引导 Agent 撞墙。
+    context.experienceLibrary = (agent.experienceLibraryEnabled ?? 1) === 1
+      && executionMode.toUpperCase() === 'CLOUD'
+      ? { agentId: agent.id! }
+      : null;
+    // 挂载兜底：升级前创建的存量 CLOUD 会话没走过 createSession 的挂载逻辑，
+    // 若只注入路标不补链接，Agent 首次写入会在工作区建出真实目录（经验入假库且
+    // 永久阻塞后续挂载）。refreshIndex=false：链接已正确时短路（lstat+readlink），
+    // 不在每轮 LLM 请求里全量扫库；链接缺失/错指才走完整挂载（含索引引导）。
+    // 注意此处 context.workspace 尚未赋值（在下方 environmentInfo 之后统一装配），用 session.workspace。
+    if (context.experienceLibrary != null && hasText(session.workspace)) {
+      try {
+        this.experienceMount?.syncForSession(session.workspace!, context.experienceLibrary.agentId, true, false);
+      } catch (e) {
+        harnessLog('warn', `experience mount backstop failed for session ${sessionId}: ${(e as Error).message}`);
+      }
+    }
+    // 长期记忆注入（技术方案 5.2）：整段独立 try-catch——查询失败仅记 warn、memories 置 null，
+    // 不阻断会话启动。注意降级逻辑与技能同步的 CLOUD 分支 try-catch 无关，勿对齐那个样板。
+    context.memories = await this.loadMemories(session);
+    context.agentName = agent.name;
+    context.executionMode = executionMode;
+    context.permissionLevel = session.permissionLevel;
+    context.workspace = session.workspace;
+    const environmentInfo = await this.environmentInfoProvider.fromSessionOrDetect(session);
+    context.isGit = environmentInfo.isGit;
+    context.platform = environmentInfo.platform;
+    context.shellPath = environmentInfo.shell;
+    context.osVersion = environmentInfo.osVersion;
+    context.modelConfig = llmModelToConfig(llmModel);
+    context.modelConfig.supportsVision = boolish(llmModel.supportsVision) === true;
+
+    const effectiveConfig = this.resolveCompactionConfig(agent);
+    context.compactionConfig = effectiveConfig;
+    const compactionRecord = await this.sessionCompactionService.loadValidated(sessionId);
+    const boundary = this.sessionCompactionService.boundaryOf(compactionRecord);
+    const summary = compactionRecord?.summaryText ?? null;
+    if (this.sessionService.cleanupIncompleteTailAfterId) {
+      await this.sessionService.cleanupIncompleteTailAfterId(sessionId, boundary);
+    }
+    const history = await this.sessionHistoryLoader.loadHistoryAfterBoundary(sessionId, boundary);
+    await this.sessionHistoryLoader.applyHistory(context, summary, history);
+
+    const anchor = await this.sessionService.loadContextAnchor(sessionId);
+    context.lastPromptTokens = anchor.lastPromptTokens;
+    context.contextAnchorMsgId = anchor.contextAnchorMsgId;
+
+    let sessionTools = HarnessService.filterToolsForSession(this.toolRegistry.getAllTools(), session.projectKey, session.workspace);
+    // 页面工具只在绑定了 embed 页面连接、且该连接未关闭页面能力的会话中暴露；
+    // 其他会话（桌面/CLOUD 他端、微信、子代理）与关闭态 embed 连接均不可见也不可调用。
+    // isEmbedPageSession 为可选方法（存量注入只提供 isEmbedSession）：用可选调用防运行时抛错，
+    // 缺失/非 true 一律按关闭收敛（fail-closed），不暴露 page_* 工具。
+    sessionTools = HarnessService.filterPageTools(sessionTools, this.embedSessionLookup?.isEmbedPageSession?.(sessionId) === true);
+    // 工作集工具只按模式注入：先从默认工具集中剔除，避免全量模式凭空多出两个模型可见工具。
+    sessionTools = sessionTools.filter((tool) => !MCP_WORKING_SET_TOOL_NAMES.has(tool.getName()));
+    // 自定义 HTTP 工具入口同样先剔除；用户有启用工具时在 MCP 块之后条件推入（§5.4）。
+    sessionTools = sessionTools.filter((tool) => !HTTP_TOOL_ENTRY_NAMES.has(tool.getName()));
+    const mcpWarnings: string[] = [];
+    let cloudMcpBound = false;
+    if (this.mcpSyncService) {
+      try {
+        const mcpServers = await this.mcpSyncService.loadAgentServers(agent, session.userId ?? null);
+        if (mcpServers.length > 0) {
+          // 模式解析放在 server 清单非空判断之后：未配置 MCP 的用户零查库、零行为差异。
+          const loadMode = this.mcpLoadModeResolver != null
+            ? await this.mcpLoadModeResolver.resolve(session.userId ?? null)
+            : 'full';
+          if (executionMode.toUpperCase() === 'LOCAL') {
+            const localTools = this.mcpSyncService.getLocalSessionTools(sessionId);
+            if (loadMode === 'full') {
+              for (const ref of localTools) {
+                sessionTools.push(new McpToolAdapter(ref, this.mcpClientManager ?? null));
+              }
+            } else {
+              const connectionErrors = this.mcpSyncService.getLocalConnectionErrors(sessionId);
+              this.applyMcpWorkingSet(
+                context, sessionTools, mcpServers, localTools, connectionErrors,
+              );
+              // 与 CLOUD 的 cloudResult.warnings 同口径：失败原因同时进尾部 system-notice，
+              // 不只藏在工作集标题里（设计 §5.2 / §5.5）。
+              for (const error of connectionErrors) {
+                const message = `${error.serverName}: ${error.reason}`;
+                if (!mcpWarnings.includes(message)) mcpWarnings.push(message);
+              }
+            }
+          } else if (this.mcpClientManager) {
+            // 透传取消标志：buildContext 在 LLM 首轮之前连接 MCP，用户此时点「停止」
+            // 唯一的出口就在这里。不传会让连接挂起整次执行，执行体到不了 finally，
+            // WS handler 的 claim/future 永久残留（线上 session 2026 即此态）。
+            const cloudResult = await this.mcpSyncService.connectForCloud(sessionId, mcpServers, this.mcpClientManager, cancelFlag ?? null);
+            cloudMcpBound = true;
+            if (loadMode === 'full') {
+              for (const ref of cloudResult.tools) {
+                sessionTools.push(new McpToolAdapter(ref, this.mcpClientManager));
+              }
+            } else {
+              this.applyMcpWorkingSet(
+                context, sessionTools, mcpServers, cloudResult.tools, cloudResult.failedServers,
+              );
+            }
+            mcpWarnings.push(...cloudResult.warnings);
+          } else {
+            harnessLog('warn', `MCP client manager unavailable for session ${sessionId}, skipping CLOUD MCP injection`);
+          }
+        }
+      } catch (e) {
+        harnessLog('warn', `MCP tool injection failed for session ${sessionId}: ${(e as Error).message}`);
+        mcpWarnings.push('MCP 工具加载失败：' + (e as Error).message);
+      }
+    }
+    // 自定义 HTTP 工具（§5.4）：按 Agent 关联装配——agent.httpToolIds → 启用工具 → 入口工具 + 目录。
+    // 全模式一致（SERVER_ONLY_TOOLS 后端直连、无审批门），渠道会话不特判；无关联零查库。
+    if (this.httpToolService) {
+      try {
+        const httpTools = await this.httpToolService.listEnabledForAgent(agent);
+        if (httpTools.length > 0) {
+          const httpEntryTools = [...HTTP_TOOL_NAMES]
+            .map((name) => this.toolRegistry.getTool(name))
+            .filter((tool): tool is Tool => tool != null);
+          if (httpEntryTools.length > 0) {
+            sessionTools.push(...httpEntryTools);
+            context.customHttpTools = buildCustomHttpToolCatalog(httpTools);
+          } else {
+            harnessLog('warn', `Custom HTTP tool entries not registered, skip assembly for session ${sessionId}`);
+          }
+        }
+      } catch (e) {
+        // 装配失败不阻断会话启动：本轮不注入自定义工具（失败即不可用，不暴露半截目录）。
+        harnessLog('warn', `Custom HTTP tool assembly failed for session ${sessionId}: ${(e as Error).message}`);
+      }
+    }
+    context.tools = sessionTools;
+
+    try {
+    let agentSkillNames: string[] | null = null;
+    const skillNamesJson = agent.skillNames ?? agent.skills;
+    if (hasText(skillNamesJson)) {
+      try {
+        agentSkillNames = JSON.parse(skillNamesJson!) as string[];
+      } catch (e) {
+        harnessLog('warn', `Failed to parse skillNames for agent ${agent.id}: ${(e as Error).message}`);
+      }
+    }
+    const userSkillNames = this.skillSyncService.getUserSkillNames(session.userId ?? 0);
+    const syncableNames = new Set<string>(userSkillNames);
+    const mergedSkillNames: string[] = [];
+    if (agentSkillNames != null) {
+      for (const name of agentSkillNames) {
+        if (this.skillLoader.hasSkill(name)) {
+          syncableNames.add(name);
+          mergedSkillNames.push(name);
+        }
+      }
+    }
+    for (const userSkill of userSkillNames) {
+      if (!mergedSkillNames.includes(userSkill)) mergedSkillNames.push(userSkill);
+    }
+    if (context.executionMode?.toUpperCase() === 'LOCAL') {
+      HarnessService.mergeLocalUnsyncedSkills(
+        mergedSkillNames, syncableNames, this.localSkillRegistry.get(sessionId), context);
+      context.agentsMdContent = this.localAgentsMdRegistry.get(sessionId);
+    }
+    context.availableSkillNames = mergedSkillNames;
+
+    const skillDocMap = new Map<string, SkillDocument>();
+    for (const doc of this.skillLoader.getAllDocuments()) skillDocMap.set(doc.name, doc);
+    for (const doc of this.skillSyncService.getUserSkillDocuments(session.userId ?? 0)) {
+      skillDocMap.set(doc.name, doc);
+    }
+    for (const ref of context.localUnsyncedSkills) {
+      if (!skillDocMap.has(ref.name)) {
+        skillDocMap.set(ref.name, { name: ref.name, description: ref.description });
+      }
+    }
+    context.availableSkillDocs = skillDocMap;
+
+    if (mcpWarnings.length > 0) {
+      // CLOUD 快照语义下「连接失败但沿用上次快照工具」也会走到这里：
+      // notice 同时告知模型该 server 当前不可用（调用可能失败），与缓存优先的取舍对应。
+      context.addSystemMessage('⚠ ' + mcpWarnings.join('；')
+        + '。相关 MCP 工具不可用或调用可能失败，请勿调用；如需恢复请检查服务器配置后新开会话。');
+    }
+
+    if (!skipAutoCompact && effectiveConfig.enabled && history.persistedMessages.length > 0) {
+      const normalRequest = await this.buildNormalRequest(context);
+      // 触发值以锚点记录的真实 prompt usage 为下限，避免内部估算器低估导致压缩永不触发
+      const activeTokensHint = Math.max(
+        context.lastPromptTokens,
+        this.activeContextCalculator.activeFromMessageSuffix(
+          context.lastPromptTokens, context.contextAnchorMsgId,
+          context.messages, context.messagesCoveredByAnchor, normalRequest),
+      );
+      try {
+        // 必须在压缩前记下体积：compact() 成功后会重建请求并覆盖 lastRequestBytes。
+        const bytesBeforeCompact = context.lastRequestBytes;
+        const compacted = await this.sessionCompactionOrchestrator.compact(
+          sessionId, context, normalRequest, listener ?? null, effectiveConfig, false, cancelFlag ?? null,
+          activeTokensHint, 'request_start', false, bytesBeforeCompact);
+        // 本次请求体积已越线时，说明这一次压缩就承担了「体积压缩」名额：
+        // 同一次执行内 mid-loop 不再重复压（技术方案 §5.4）。
+        const triggerBytes = CompactionConfig.resolveEffectiveTriggerBytes(context.modelConfig, effectiveConfig);
+        if (compacted && triggerBytes > 0 && bytesBeforeCompact >= triggerBytes) {
+          context.payloadCompactionDone = true;
+        }
+        context.preparedRequest = await this.buildNormalRequest(context);
+      } catch (e) {
+        if (e instanceof CompactionContextOverflowException
+          || e instanceof CompactionPayloadOverflowException
+          || e instanceof CompactionCancelledException
+          || e instanceof CompactionStateReloadException) {
+          throw e;
+        }
+        context.preparedRequest = await this.buildNormalRequest(context);
+        harnessLog('warn', 'Session compaction failed; continuing with a request rebuilt from current context', e);
+      }
+    } else {
+      context.preparedRequest = await this.buildNormalRequest(context);
+    }
+    return context;
+    } catch (e) {
+      if (cloudMcpBound) await this.closeBoundCloudMcp(sessionId);
+      throw e;
+    }
+  }
+
+  /**
+   * 工作集模式注入：生成结构化工作集 + 把 mcp_call / mcp_describe 放进本轮工具集。
+   * 两个工具未注册（精简装配 / 单测）时不渲染 section——否则模型会被提示调用不存在的工具。
+   */
+  private applyMcpWorkingSet(
+    context: AgentExecutionContext,
+    sessionTools: Tool[],
+    servers: McpServer[],
+    refs: McpToolRef[],
+    connectionErrors: McpConnectionError[],
+  ): void {
+    const workingSetTools = [...MCP_WORKING_SET_TOOL_NAMES]
+      .map((name) => this.toolRegistry.getTool(name))
+      .filter((tool): tool is Tool => tool != null);
+    if (workingSetTools.length === 0) {
+      harnessLog('warn', `MCP working set tools not registered, skip working set for session ${context.sessionId}`);
+      return;
+    }
+    context.mcpWorkingSet = buildMcpWorkingSet(servers, refs, connectionErrors);
+    sessionTools.push(...workingSetTools);
+  }
+
+  /** buildContext 在连上云端 MCP 之后失败时回收连接。成功路径仍由 AgentLoop / WS finally 关闭。 */
+  private async closeBoundCloudMcp(sessionId: number): Promise<void> {    if (!this.mcpClientManager) return;
+    try {
+      await this.mcpClientManager.closeSession(sessionId);
+    } catch (e) {
+      harnessLog('warn', `Failed to close MCP clients after buildContext error for session ${sessionId}`, e);
+    }
+  }
+
+  /**
+   * 空闲手动压缩（技术方案 5.4 决策 11）。调用方（handleCompactNow）已全程持有 executionClaims，
+   * 发送被 session_already_running 拒绝，故此处无需再抢锁。skipAutoCompact=true 避免「自动一次+手动一次」
+   * 双重压缩；force=true 越过阈值与 enabled 门（自动关闭≠禁止人工动作）；triggerMode='manual' 留痕。
+   * 已知限制：压缩为单次 LLM 短任务，无取消通道。无论成功失败都回收 buildContext 连上的云 MCP，避免泄漏。
+   */
+  async requestCompaction(
+    sessionId: number, listener: AgentEventListener | null,
+  ): Promise<boolean> {
+    try {
+      const context = await this.buildContext(sessionId, listener, null, true);
+      const preparedRequest = context.preparedRequest ?? await this.buildNormalRequest(context);
+      const config = context.compactionConfig ?? this.compactionConfig;
+      const activeTokensHint = Math.max(
+        context.lastPromptTokens,
+        this.activeContextCalculator.activeFromMessageSuffix(
+          context.lastPromptTokens, context.contextAnchorMsgId,
+          context.messages, context.messagesCoveredByAnchor, preparedRequest),
+      );
+      return await this.sessionCompactionOrchestrator.compact(
+        sessionId, context, preparedRequest, listener, config,
+        false, null, activeTokensHint, 'manual', true, context.lastRequestBytes);
+    } finally {
+      await this.closeBoundCloudMcp(sessionId);
+    }
+  }
+
+  /**
+   * 日期锚点解析（技术方案 2026-10-12 §5.1）：首条现存用户消息的 `created_at` 前 10 位。
+   * created_at 是写入端墙钟字符串（nowSql 写、dateStrings 读），直接截取与写入端同口径，
+   * 不引入二次时区偏移；无用户消息或查询失败时回落 shanghaiYmd()，与改造前一致。
+   */
+  private async resolveSessionBaseYmd(sessionId: number): Promise<string> {
+    try {
+      const first = this.sessionService.getFirstUserStamp == null
+        ? null
+        : await this.sessionService.getFirstUserStamp(sessionId);
+      const ymd = first?.createdAt ? String(first.createdAt).slice(0, 10) : '';
+      return ymd.length === 10 ? ymd : shanghaiYmd();
+    } catch (e) {
+      harnessLog('warn', `Failed to resolve session base date for session ${sessionId}: ${(e as Error).message}`);
+      return shanghaiYmd();
+    }
+  }
+
+  /** 记忆查询降级：任何异常都不阻断会话启动（技术方案 5.2 第 3 点）。 */
+  private async loadMemories(session: Session): Promise<MemoryHint[] | null> {
+    const userId = session.userId;
+    if (this.memoryInjection == null || userId == null) return null;
+    // 单会话关闭长期记忆注入（技术方案 5.1）：为真直接短路，memories=null → longTermMemoriesHint 自然不渲染。
+    // 生效时机=下一次执行（本方法在 buildContext 一次性装载），运行中会话改开关不影响本轮，不做请求级回读。
+    if (boolish(session.memoryInjectionDisabled) === true) return null;
+    try {
+      return await this.memoryInjection.listForInjection(userId, session.projectKey ?? null, session.workspace ?? null);
+    } catch (e) {
+      harnessLog('warn', `Failed to load memories for session ${session.id}: ${(e as Error).message}`);
+      return null;
+    }
+  }
+
+  private buildNormalRequest(context: AgentExecutionContext): Promise<ChatRequest> {
+    return this.promptEngine.buildRequest(context);
+  }
+
+  static filterToolsForSession(tools: Tool[], projectKey: string | null | undefined, workspace?: string | null): Tool[] {
+    const result = [...tools];
+    if (projectKey === WEIXIN_PROJECT_KEY) {
+      return result.filter((t) => t.getName() !== ASK_USER_QUESTIONS && !isFeishuChannelTool(t) && !isDingtalkChannelTool(t));
+    }
+    // 钉钉会话不提供提问，也不暴露飞书 / 微信通道工具。
+    if (isDingtalkChannelSession(projectKey, workspace)) {
+      return result.filter((t) => t.getName() !== ASK_USER_QUESTIONS && !isWeixinChannelTool(t) && !isFeishuChannelTool(t));
+    }
+    // 飞书会话屏蔽 ask_user_questions：进度卡表单作答易把任务挂起，体验差。微信与钉钉通道工具不暴露。
+    if (isFeishuChannelSession(projectKey, workspace)) {
+      return result.filter((t) => t.getName() !== ASK_USER_QUESTIONS && !isWeixinChannelTool(t) && !isDingtalkChannelTool(t));
+    }
+    return result.filter((t) => !isWeixinChannelTool(t) && !isFeishuChannelTool(t) && !isDingtalkChannelTool(t));
+  }
+
+  static filterPageTools(tools: Tool[], isEmbedSession: boolean): Tool[] {
+    return isEmbedSession ? [...tools] : tools.filter((t) => !t.getName().startsWith('page_'));
+  }
+
+  static mergeLocalUnsyncedSkills(
+    mergedSkillNames: string[],
+    syncableNames: Set<string>,
+    localSkills: LocalSkillRef[] | null | undefined,
+    context: AgentExecutionContext,
+  ): void {
+    if (!localSkills || localSkills.length === 0) return;
+    const unsynced: LocalSkillRef[] = [];
+    for (const ref of localSkills) {
+      if (!ref?.name || ref.name.trim() === '') continue;
+      if (!syncableNames.has(ref.name)) {
+        if (!mergedSkillNames.includes(ref.name)) mergedSkillNames.push(ref.name);
+        unsynced.push(ref);
+      }
+    }
+    context.localUnsyncedSkills = unsynced;
+  }
+
+  private resolveCompactionConfig(agent: { configJson?: string | null }): CompactionConfig {
+    if (!hasText(agent.configJson)) return this.compactionConfig;
+    try {
+      const node = JSON.parse(agent.configJson!) as Record<string, unknown>;
+      const compactionNode = node.compaction as Record<string, unknown> | undefined;
+      if (!compactionNode) return this.compactionConfig;
+      const merged = new CompactionConfig();
+      merged.enabled = this.compactionConfig.enabled;
+      merged.contextWindowTokens = this.compactionConfig.contextWindowTokens;
+      merged.triggerRatio = this.compactionConfig.triggerRatio;
+      merged.triggerPayloadBytes = this.compactionConfig.triggerPayloadBytes;
+      merged.maxSummaryTokens = this.compactionConfig.maxSummaryTokens;
+      merged.loopMidwayCompact = this.compactionConfig.loopMidwayCompact;
+      if (compactionNode.enabled != null) merged.enabled = Boolean(compactionNode.enabled);
+      if (compactionNode.contextWindowTokens != null) merged.contextWindowTokens = Number(compactionNode.contextWindowTokens);
+      if (compactionNode.triggerRatio != null) merged.triggerRatio = Number(compactionNode.triggerRatio);
+      if (compactionNode.triggerPayloadBytes != null) merged.triggerPayloadBytes = Number(compactionNode.triggerPayloadBytes);
+      if (compactionNode.maxSummaryTokens != null) merged.maxSummaryTokens = Number(compactionNode.maxSummaryTokens);
+      if (compactionNode.loopMidwayCompact != null) merged.loopMidwayCompact = Boolean(compactionNode.loopMidwayCompact);
+      // agent 级覆盖没有后台表单校验：triggerRatio=0 会让「tokens >= floor(window×0)」恒成立，
+      // 每个工具轮都触发一次压缩。这里与系统设置同口径收口，非法值退回全局默认。
+      if (!(merged.triggerRatio > 0 && merged.triggerRatio <= 1)) merged.triggerRatio = this.compactionConfig.triggerRatio;
+      if (!Number.isFinite(merged.triggerPayloadBytes) || merged.triggerPayloadBytes < 0) {
+        merged.triggerPayloadBytes = this.compactionConfig.triggerPayloadBytes;
+      }
+      return merged;
+    } catch (e) {
+      harnessLog('warn', 'Failed to parse agent compaction config, using defaults', e);
+      return this.compactionConfig;
+    }
+  }
+
+  private async saveFileChanges(
+    messageId: number, sessionId: number, toolCalls: ToolCall[], toolResults: Record<string, string>,
+  ): Promise<void> {
+    const merged = new Map<string, FileChange>();
+    for (const tc of toolCalls) {
+      const toolName = tc.function?.name;
+      if (toolName !== 'write_file' && toolName !== 'edit_file') continue;
+      const result = toolResults[tc.id!];
+      if (result == null) continue;
+      try {
+        const resultNode = JSON.parse(result) as Record<string, unknown>;
+        if (!resultNode.file_change || resultNode.success !== true) continue;
+        const fc = resultNode.file_change as Record<string, unknown>;
+        const p = String(fc.path);
+        const diff = resultNode[FileChangeDiffUtil.PRIVATE_DIFF_FIELD] as Record<string, unknown> | undefined;
+        const existing = merged.get(p);
+        if (existing) {
+          existing.linesAdded = (existing.linesAdded ?? 0) + Number(fc.lines_added ?? 0);
+          existing.linesDeleted = (existing.linesDeleted ?? 0) + Number(fc.lines_deleted ?? 0);
+          if (fc.type === 'CREATED') existing.type = 'CREATED';
+          mergeDiffPayload(existing, diff);
+        } else {
+          const change: FileChange = {
+            messageId, sessionId, path: p, type: String(fc.type),
+            linesAdded: Number(fc.lines_added ?? 0),
+            linesDeleted: Number(fc.lines_deleted ?? 0),
+          };
+          applyDiffPayload(change, diff);
+          merged.set(p, change);
+        }
+      } catch (e) {
+        harnessLog('debug', `Failed to parse file_change from tool result for tool ${toolName}`, e);
+      }
+    }
+    for (const fc of merged.values()) {
+      try {
+        await this.fileChangeMapper.insert(fc);
+      } catch (e) {
+        harnessLog('warn', `Failed to save file change record for ${fc.path}`, e);
+      }
+    }
+  }
+
+  async executeSideFirstMessage(
+    parentSessionId: number,
+    sideSessionId: number,
+    contextMode: 'fork' | 'summary' | 'none',
+    listener: AgentEventListener,
+    cancelFlag?: AtomicBoolean | null,
+  ): Promise<void> {
+    if (contextMode === 'fork') {
+      await this.forkParentMessages(parentSessionId, sideSessionId);
+    }
+    // fork 后边路会话已有完整历史消息，buildContext 会自动加载；summary/none 不改消息表
+    const context = await this.buildContext(sideSessionId, listener, cancelFlag);
+    if (contextMode === 'summary') {
+      const contextSummary = await this.generateContextSummary(parentSessionId);
+      if (hasText(contextSummary)) {
+        context.systemPrompt = (context.systemPrompt ?? '')
+          + '\n\n<主任务背景摘要>\n' + contextSummary + '\n</主任务背景摘要>\n'
+          + '以上是主任务的最近对话摘要，本次边路任务的结果不需要反馈到主任务。';
+        context.preparedRequest = null;
+      }
+    }
+    // contextMode === 'none': 跳过任何上下文注入
+    const persistenceCallback = this.createPersistenceCallback(sideSessionId, context);
+    await this.agentLoop.execute(context, listener, persistenceCallback);
+    if (cancelFlag != null) this.agentLoop.removeCancelFlag(sideSessionId);
+  }
+
+  /**
+   * 物理复制主会话的消息、file_change、压缩状态到边路会话。
+   * 复制逻辑参考 promoteSideTaskToMainSession 中的事务内消息复制模式。
+   *
+   * forkFromMessageId 非空时按轮截断：只复制该消息及其之前的内容（该 ID 即被点击那一轮的
+   * 助手最终回复）。切点落在压缩边界之前时不复制压缩状态——边路任务从第一条消息起就是
+   * 原始历史，保留压缩标记会谎称「前面是摘要」。
+   */
+  async forkParentMessages(
+    parentSessionId: number,
+    sideSessionId: number,
+    forkFromMessageId?: number | null,
+  ): Promise<void> {
+    if (!this.db) throw new Error('Database is required for fork parent messages');
+    await this.db.transaction(async (tx) => {
+      // 1. 复制消息（维护 messageIdMap: 旧 ID → 新 ID）
+      const messages = forkFromMessageId == null
+        ? await tx.query<Message>(
+            `SELECT * FROM \`message\` WHERE session_id = ? AND deleted = 0 ORDER BY created_at ASC, id ASC`,
+            [parentSessionId],
+          )
+        : await tx.query<Message>(
+            `SELECT * FROM \`message\` WHERE session_id = ? AND deleted = 0 AND id <= ? ORDER BY created_at ASC, id ASC`,
+            [parentSessionId, forkFromMessageId],
+          );
+      const messageIdMap = new Map<number, number>();
+      for (const m of messages) {
+        const newId = await tx.insert('message', {
+          sessionId: sideSessionId,
+          role: m.role,
+          content: m.content,
+          thinkingContent: m.thinkingContent,
+          toolCallId: m.toolCallId,
+          toolCalls: m.toolCalls,
+          tokenCount: m.tokenCount,
+          modelId: m.modelId,
+          metadata: m.metadata,
+          sourceSessionId: parentSessionId,
+          createdAt: m.createdAt,
+          deleted: 0,
+        });
+        if (m.id != null) messageIdMap.set(m.id, newId);
+      }
+
+      // 2. 复制 file_change（通过 messageIdMap 重映射 messageId）
+      const fileChanges = await tx.query<FileChange>(
+        `SELECT * FROM message_file_change WHERE session_id = ? ORDER BY id ASC`,
+        [parentSessionId],
+      );
+      for (const change of fileChanges) {
+        if (change.messageId == null) continue;
+        const mappedMessageId = messageIdMap.get(change.messageId);
+        if (mappedMessageId == null) continue;
+        await tx.insert('message_file_change', {
+          messageId: mappedMessageId,
+          sessionId: sideSessionId,
+          filePath: (change as { filePath?: string }).filePath ?? change.path,
+          changeType: (change as { changeType?: string }).changeType ?? change.type,
+          linesAdded: change.linesAdded,
+          linesDeleted: change.linesDeleted,
+          diffMode: change.diffMode,
+          beforeContent: change.beforeContent,
+          afterContent: change.afterContent,
+          patchContent: change.patchContent,
+          patchTruncated: change.patchTruncated == null ? null : change.patchTruncated ? 1 : 0,
+          diffUnavailableReason: change.diffUnavailableReason,
+        });
+      }
+
+      // 3. 复制压缩状态：压缩记录与压缩事件同进同退。
+      //    边界重映射不到（切点落在边界之前，被摘要覆盖的消息没被复制过来）时整体不复制，
+      //    否则边路任务会顶着「前面是摘要」的标记跑纯原始历史。
+      const compaction = await tx.queryOne<SessionCompaction>(
+        `SELECT * FROM session_compaction WHERE session_id = ?`,
+        [parentSessionId],
+      );
+      const mappedBoundary = compaction?.lastCompactedMsgId != null
+        ? messageIdMap.get(compaction.lastCompactedMsgId) ?? null
+        : null;
+      if (compaction != null && mappedBoundary != null) {
+        await tx.insert('session_compaction', {
+          sessionId: sideSessionId,
+          summaryText: compaction.summaryText,
+          lastCompactedMsgId: mappedBoundary,
+          compactCount: compaction.compactCount,
+          inputTokens: compaction.inputTokens,
+          outputTokens: compaction.outputTokens,
+          compactModel: compaction.compactModel,
+        });
+
+        // 4. 复制压缩事件（标记锚点），边界字段一并经 messageIdMap 重映射
+        const events = await tx.query<SessionCompactionEvent>(
+          `SELECT * FROM session_compaction_event WHERE session_id = ? ORDER BY boundary_msg_id ASC, id ASC`,
+          [parentSessionId],
+        );
+        for (const event of events) {
+          if (event.boundaryMsgId == null) continue;
+          const mappedBoundaryMsgId = messageIdMap.get(event.boundaryMsgId);
+          if (mappedBoundaryMsgId == null) continue;
+          // prev 边界为 0 表示无前序边界，保持 0；非 0 但映射不到同样回落 0
+          const prev = event.prevBoundaryMsgId ?? 0;
+          const mappedPrevBoundary = prev > 0 ? messageIdMap.get(prev) ?? 0 : 0;
+          await tx.insert('session_compaction_event', {
+            sessionId: sideSessionId,
+            triggerMode: event.triggerMode,
+            prevBoundaryMsgId: mappedPrevBoundary,
+            boundaryMsgId: mappedBoundaryMsgId,
+            compactedMessageCount: event.compactedMessageCount,
+            promptTokens: event.promptTokens,
+            cachedTokens: event.cachedTokens,
+            completionTokens: event.completionTokens,
+            summaryTokens: event.summaryTokens,
+            savedTokens: event.savedTokens,
+            durationMs: event.durationMs,
+            compactModel: event.compactModel,
+          });
+        }
+      }
+    });
+  }
+
+  private async generateContextSummary(parentSessionId: number): Promise<string | null> {
+    try {
+      const messages = this.sessionService.getMessages
+        ? await this.sessionService.getMessages(parentSessionId) : [];
+      if (messages.length === 0) return null;
+      const fromIndex = Math.max(0, messages.length - 10);
+      const recent = messages.slice(fromIndex);
+      let sb = '以下是主任务最近的对话摘要：\n\n';
+      for (const msg of recent) {
+        // 多模态消息落库 content 是含 base64 data URI 的 JSON 数组字符串，
+        // 先提取纯文本再截断，避免把 base64 乱码注入边路任务 system prompt
+        const text = this.sessionService.extractVisibleText
+          ? this.sessionService.extractVisibleText(msg.content ?? null)
+          : msg.content;
+        if (text != null && hasText(text)) {
+          const truncated = text.length > 300 ? text.slice(0, 300) + '...' : text;
+          sb += `[${msg.role}]: ${truncated}\n`;
+        }
+      }
+      return sb;
+    } catch (e) {
+      harnessLog('warn', 'Failed to generate context summary for side task', e);
+      return null;
+    }
+  }
+
+  async resolveModel(modelId: number | null): Promise<LlmModel | null> {
+    if (modelId != null) return this.llmModelMapper.selectById(modelId);
+    return this.llmModelMapper.selectDefault ? this.llmModelMapper.selectDefault() : null;
+  }
+}
+
+function hasText(value: string | null | undefined): boolean {
+  return value != null && value.trim().length > 0;
+}
+
+function applyDiffPayload(change: FileChange, diff: Record<string, unknown> | null | undefined): void {
+  if (!diff || typeof diff !== 'object') return;
+  change.diffMode = textOrNull(diff, 'diff_mode');
+  change.beforeContent = textOrNull(diff, 'before_content');
+  change.afterContent = textOrNull(diff, 'after_content');
+  change.patchContent = textOrNull(diff, 'patch_content');
+  change.patchTruncated = booleanOrFalse(diff, 'patch_truncated');
+  change.diffUnavailableReason = textOrNull(diff, 'diff_unavailable_reason');
+}
+
+function mergeDiffPayload(existing: FileChange, diff: Record<string, unknown> | null | undefined): void {
+  if (!diff || typeof diff !== 'object') return;
+  const mode = textOrNull(diff, 'diff_mode');
+  if (mode == null) return;
+  if (existing.diffMode == null) {
+    applyDiffPayload(existing, diff);
+    return;
+  }
+  if (existing.diffMode === 'SNAPSHOT' && mode === 'SNAPSHOT') {
+    const after = textOrNull(diff, 'after_content');
+    if (after != null) existing.afterContent = after;
+    existing.patchTruncated = existing.patchTruncated === true || booleanOrFalse(diff, 'patch_truncated');
+    return;
+  }
+  if (existing.diffMode === 'PATCH' || mode === 'PATCH') {
+    existing.diffMode = 'PATCH';
+    let patch = textOrNull(diff, 'patch_content');
+    if (patch == null && mode === 'SNAPSHOT') patch = '[snapshot diff omitted after patch-mode aggregation]\n';
+    let current = existing.patchContent ?? null;
+    if (current == null && existing.beforeContent != null && existing.afterContent != null) {
+      current = '[snapshot diff omitted before patch-mode aggregation]\n';
+    }
+    existing.patchContent = joinPatch(current, patch);
+    existing.beforeContent = null;
+    existing.afterContent = null;
+    existing.patchTruncated = existing.patchTruncated === true || booleanOrFalse(diff, 'patch_truncated');
+    return;
+  }
+  if (mode === 'UNSUPPORTED') {
+    existing.diffMode = 'UNSUPPORTED';
+    existing.beforeContent = null;
+    existing.afterContent = null;
+    existing.patchContent = null;
+    existing.patchTruncated = false;
+    existing.diffUnavailableReason = textOrNull(diff, 'diff_unavailable_reason');
+  }
+}
+
+function joinPatch(current: string | null | undefined, patch: string | null | undefined): string | null | undefined {
+  if (!hasText(current)) return patch;
+  if (!hasText(patch)) return current;
+  return current + '\n' + patch;
+}
+
+function textOrNull(node: Record<string, unknown>, field: string): string | null {
+  const value = node[field];
+  return value == null ? null : String(value);
+}
+
+function booleanOrFalse(node: Record<string, unknown>, field: string): boolean {
+  return node[field] === true;
+}

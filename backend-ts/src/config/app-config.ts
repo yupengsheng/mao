@@ -1,0 +1,571 @@
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parse as parseYaml } from 'yaml';
+
+export interface DingtalkBotConfig {
+  enabled: boolean;
+  appSecretKey: string;
+  reconcileIntervalMs: number;
+  reconnectBaseMs: number;
+  reconnectMaxMs: number;
+  maxConsecutiveFailures: number;
+  oauth: { clientId: string; clientSecret: string; redirectUri: string };
+  progressCardTemplateId: string;
+  queueCardTemplateId: string;
+  replyMaxLength: number;
+  groupContext: { maxItems: number; maxMinutes: number };
+  /** 入站防抖合并窗口（ms）：同账号+会话+发送者的连续文本消息合并为一次触发；0=禁用。 */
+  mergeWindowMs: number;
+}
+
+export interface FeishuBotConfig {
+  enabled: boolean;
+  appSecretKey: string;
+  longConnection: {
+    enabled: boolean;
+    reconcileIntervalMs: number;
+    reconnectBaseMs: number;
+    reconnectMaxMs: number;
+    maxConsecutiveFailures: number;
+  };
+  groupContext: { maxItems: number; maxMinutes: number; overflowItems: number };
+  reply: { maxLength: number };
+  file: { maxInboundFileMb: number };
+  /** 入站防抖合并窗口（ms）：同账号+会话(+话题)+发送者的连续文本消息合并为一次触发；0=禁用。 */
+  mergeWindowMs: number;
+}
+
+/** 用户运行时容器隔离配置（技术方案 §5.12）。mode=docker 时执行类工具进每用户容器。 */
+export interface CloudRuntimeConfig {
+  /** host：现状行为；docker：执行类工具派发到每用户容器。用户级 user.runtime_mode 可覆盖。 */
+  mode: 'host' | 'docker';
+  container: {
+    idleMinutes: number;
+    maxLifetimeHours: number;
+    memoryMb: number;
+    cpus: number;
+    pidsLimit: number;
+    image: string;
+    network: string;
+    channelDir: string;
+    distDir: string;
+    depsDir: string;
+    /** 每用户 /tmp 的宿主机根：{tmpDir}/{userId} 挂到容器 /tmp，跨重建保留。 */
+    tmpDir: string;
+    /** /tmp 清理阈值（天）：超过该 mtime 的条目在容器创建时顺带清理。 */
+    tmpRetentionDays: number;
+    startTimeoutMs: number;
+  };
+}
+
+export interface AppConfig {
+  server: {
+    port: number;
+    servlet: { contextPath: string };
+  };
+  spring: {
+    datasource: {
+      url: string;
+      username: string;
+      password: string;
+      hikari: {
+        maximumPoolSize: number;
+        minimumIdle: number;
+        connectionTimeout: number;
+        idleTimeout: number;
+        maxLifetime: number;
+      };
+    };
+    flyway: {
+      enabled: boolean;
+      baselineOnMigrate: boolean;
+      baselineVersion: string;
+      validateOnMigrate: boolean;
+      locations: string;
+    };
+  };
+  jwt: {
+    secret: string;
+    expiration: number;
+    refreshExpiration: number;
+    shellExpiration: number;
+  };
+  feishu: {
+    bot: FeishuBotConfig;
+  };
+  dingtalk: DingtalkBotConfig;
+  app: {
+    rootDir: string;
+    gitCredential: { secretKey: string };
+    file: { uploadDir: string };
+    ws: { outboundQueueCapacity: number };
+    taskNotification: {
+      secretKey: string;
+    };
+    harness: {
+      workspaceRoot: string;
+      runtimeDir: string;
+      userHomeDir: string;
+      localToolTimeoutSeconds: number;
+      embedPageToolTimeoutSeconds: number;
+      skillsDir: string;
+      userSkillsDir: string;
+      skillsCacheSeconds: number;
+      /** 公共共享目录（MAO_SHARE_DIR）：管理员宿主机投放，全员只读。 */
+      shareDir: string;
+      shell: {
+        output: { maxPreviewLines: number; maxPreviewChars: number };
+      };
+      cleanup: {
+        intervalMs: number;
+        shellOutputMaxAgeDays: number;
+        cleanupSkills: boolean;
+      };
+    };
+    mcp: {
+      secretKey: string;
+      clientTimeoutSeconds: number;
+      syncTimeoutSeconds: number;
+    };
+    openapi: {
+      tokenSecretKey: string;
+    };
+    signal: {
+      secretKey: string;
+    };
+    httpTool: {
+      /**
+       * 自定义 HTTP 工具请求头敏感值加密密钥（独立轮换）。
+       * 优先 APP_HTTP_TOOL_SECRET，回退历史名 APP_USER_TOOL_SECRET（设计 §5.12 要求兼容旧部署）。
+       */
+      secretKey: string;
+    };
+    search: {
+      fulltextEnabled: boolean;
+    };
+    cloudRuntime: CloudRuntimeConfig;
+  };
+  weixin: {
+    bot: {
+      enabled: boolean;
+      voiceReply: boolean;
+      silkEncoderPath: string;
+      ffmpegPath: string;
+      voiceMaxSeconds: number;
+      ilinkBaseUrl: string;
+      cdnBaseUrl: string;
+      maxInboundFileMb: number;
+      monitor: {
+        enabled: boolean;
+        reconcileIntervalMs: number;
+        longPollTimeoutMs: number;
+        maxConsecutiveFailures: number;
+      };
+      /** 入站防抖合并窗口（ms）：同账号+会话+发送者的连续文本消息合并为一次触发；0=禁用。 */
+      mergeWindowMs: number;
+    };
+  };
+}
+
+const DEFAULTS: AppConfig = {
+  server: {
+    port: 9080,
+    servlet: { contextPath: '/api' },
+  },
+  spring: {
+    datasource: {
+      url: 'jdbc:mysql://127.0.0.1:3306/mao?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true',
+      username: 'root',
+      password: '',
+      hikari: {
+        maximumPoolSize: 20,
+        minimumIdle: 5,
+        connectionTimeout: 10000,
+        idleTimeout: 300000,
+        maxLifetime: 600000,
+      },
+    },
+    flyway: {
+      enabled: true,
+      baselineOnMigrate: true,
+      baselineVersion: '12',
+      validateOnMigrate: false,
+      locations: 'filesystem:db/migration',
+    },
+  },
+  jwt: {
+    secret: 'mao-dev-jwt-secret-change-me-32bytes!!',
+    expiration: 86400000,
+    refreshExpiration: 604800000,
+    shellExpiration: 7200000,
+  },
+  dingtalk: {
+    enabled: false,
+    appSecretKey: '',
+    reconcileIntervalMs: 5000,
+    reconnectBaseMs: 1000,
+    reconnectMaxMs: 30000,
+    maxConsecutiveFailures: 5,
+    oauth: { clientId: '', clientSecret: '', redirectUri: '' },
+    progressCardTemplateId: '',
+    queueCardTemplateId: '',
+    replyMaxLength: 2000,
+    groupContext: { maxItems: 10, maxMinutes: 120 },
+    mergeWindowMs: 1000,
+  },
+  feishu: {
+    bot: {
+      enabled: false,
+      appSecretKey: '',
+      longConnection: {
+        enabled: true,
+        reconcileIntervalMs: 5000,
+        reconnectBaseMs: 1000,
+        reconnectMaxMs: 30000,
+        maxConsecutiveFailures: 5,
+      },
+      groupContext: { maxItems: 20, maxMinutes: 120, overflowItems: 100 },
+      reply: { maxLength: 2000 },
+      file: { maxInboundFileMb: 100 },
+      mergeWindowMs: 1000,
+    },
+  },
+  app: {
+    rootDir: '/opt/mao',
+    gitCredential: { secretKey: '' },
+    file: { uploadDir: './uploads' },
+    ws: { outboundQueueCapacity: 10000 },
+    taskNotification: {
+      secretKey: 'mao-task-notification-default-key-v1-20260713',
+    },
+    harness: {
+      workspaceRoot: './workspace',
+      runtimeDir: '/opt/mao-data/runtime',
+      userHomeDir: '/opt/mao-data/users',
+      localToolTimeoutSeconds: 900,
+      // 需覆盖 per_action 逐次确认窗口（SDK 确认超时 120s），否则用户确认后动作仍会执行但结果无人接收。
+      embedPageToolTimeoutSeconds: 180,
+      skillsDir: './skills',
+      userSkillsDir: join(process.env.HOME ?? '/tmp', '.mao/data/userskills'),
+      skillsCacheSeconds: 300,
+      shareDir: '/opt/mao-data/share',
+      shell: {
+        output: { maxPreviewLines: 100, maxPreviewChars: 10000 },
+      },
+      cleanup: {
+        intervalMs: 24 * 3600 * 1000,
+        shellOutputMaxAgeDays: 7,
+        cleanupSkills: true,
+      },
+    },
+    mcp: {
+      secretKey: 'mao-mcp-default-secret-change-me',
+      clientTimeoutSeconds: 120,
+      syncTimeoutSeconds: 60,
+    },
+    openapi: {
+      tokenSecretKey: 'mao-openapi-token-default-key-v1-20261010',
+    },
+    signal: {
+      secretKey: 'mao-signal-secret-default-key-v1-20261011',
+    },
+    httpTool: {
+      secretKey: 'mao-http-tool-default-secret-change-me',
+    },
+    search: {
+      fulltextEnabled: true,
+    },
+    cloudRuntime: {
+      mode: 'host',
+      container: {
+        idleMinutes: 60,
+        maxLifetimeHours: 72,
+        memoryMb: 2048,
+        cpus: 2,
+        pidsLimit: 512,
+        image: 'mao-runtime:latest',
+        network: 'bridge',
+        channelDir: '/opt/mao-data/runtime/channels',
+        distDir: '/opt/mao/backend-ts/dist',
+        depsDir: '/opt/mao-data/deps',
+        tmpDir: '/opt/mao-data/tmp',
+        tmpRetentionDays: 7,
+        startTimeoutMs: 15000,
+      },
+    },
+  },
+  weixin: {
+    bot: {
+      enabled: false,
+      voiceReply: false,
+      silkEncoderPath: '/usr/local/bin/silk-encoder',
+      ffmpegPath: 'ffmpeg',
+      voiceMaxSeconds: 300,
+      ilinkBaseUrl: 'https://ilinkai.weixin.qq.com',
+      cdnBaseUrl: '',
+      maxInboundFileMb: 100,
+      monitor: {
+        enabled: true,
+        reconcileIntervalMs: 5000,
+        longPollTimeoutMs: 35000,
+        maxConsecutiveFailures: 3,
+      },
+      mergeWindowMs: 1000,
+    },
+  },
+};
+
+function here(): string {
+  return dirname(fileURLToPath(import.meta.url));
+}
+
+function findConfigFile(): string | null {
+  const extra = process.env.MAO_CONFIG_FILE;
+  if (extra && existsSync(extra)) {
+    return extra;
+  }
+  const candidates = [
+    join(process.cwd(), 'config/application-local.yml'),
+    join(process.cwd(), 'config/application.yml'),
+    join(here(), '../../config/application-local.yml'),
+    join(here(), '../../config/application.yml'),
+  ];
+  return candidates.find((p) => existsSync(p)) ?? null;
+}
+
+function kebabToCamel(key: string): string {
+  return key.replace(/-([a-z])/g, (_, c: string) => c.toUpperCase());
+}
+
+function keysToCamel(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(keysToCamel);
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[kebabToCamel(k)] = keysToCamel(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+function deepMerge<T>(base: T, overlay: unknown): T {
+  if (!overlay || typeof overlay !== 'object' || Array.isArray(overlay)) {
+    return (overlay as T) ?? base;
+  }
+  const result: Record<string, unknown> = { ...(base as Record<string, unknown>) };
+  for (const [k, v] of Object.entries(overlay as Record<string, unknown>)) {
+    if (v && typeof v === 'object' && !Array.isArray(v) && typeof result[k] === 'object' && result[k]) {
+      result[k] = deepMerge(result[k], v);
+    } else if (v !== undefined) {
+      result[k] = v;
+    }
+  }
+  return result as T;
+}
+
+function lookupPath(obj: unknown, dotted: string): string | undefined {
+  const parts = dotted.split('.').map(kebabToCamel);
+  let cur: unknown = obj;
+  for (const p of parts) {
+    if (!cur || typeof cur !== 'object') {
+      return undefined;
+    }
+    cur = (cur as Record<string, unknown>)[p];
+  }
+  if (cur === undefined || cur === null) {
+    return undefined;
+  }
+  return String(cur);
+}
+
+function resolvePlaceholders(value: unknown, root: unknown): unknown {
+  if (typeof value === 'string') {
+    return value.replace(/\$\{([^}:]+)(?::([^}]*))?\}/g, (_m, key: string, def: string | undefined) => {
+      if (key === 'HOME' || key === '$HOME') {
+        const home = process.env.HOME;
+        return home != null && home !== '' ? home : def ?? '';
+      }
+      // 空串按「未设置」处理：运维在 .env / systemd 里写 `KEY=` 很常见，若当成已设置
+      // 会顶掉 ${VAR:default} 的默认值（路径类配置变空 → 落成进程 cwd）。
+      // 与 coerceTypes 里的 `if (process.env.X)` 口径保持一致。
+      const fromEnv = process.env[key];
+      if (fromEnv !== undefined && fromEnv !== '') {
+        return fromEnv;
+      }
+      const fromConfig = lookupPath(root, key);
+      if (fromConfig !== undefined) {
+        return fromConfig;
+      }
+      return def ?? '';
+    });
+  }
+  if (Array.isArray(value)) {
+    return value.map((v) => resolvePlaceholders(v, root));
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = resolvePlaceholders(v, root);
+    }
+    return out;
+  }
+  return value;
+}
+
+function coerceTypes(cfg: AppConfig): AppConfig {
+  // 空串 / 纯空白按「未设置」处理：`MAO_TS_PORT=` 若被 Number('') 解析成 0，端口会变成
+  // 随机端口（服务起来了但网关与健康检查都连不上）；同理 `MAO_CLEANUP_INTERVAL_MS=` 会得到 0。
+  const n = (v: unknown, d: number) => {
+    if (v == null || (typeof v === 'string' && v.trim() === '')) return d;
+    const x = Number(v);
+    return Number.isFinite(x) ? x : d;
+  };
+  const b = (v: unknown, d: boolean) => {
+    if (typeof v === 'boolean') return v;
+    if (typeof v === 'string') {
+      const text = v.trim().toLowerCase();
+      if (text === '') return d; // `FLYWAY_ENABLED=` 不应被当成显式 false
+      return text === 'true' || text === '1';
+    }
+    return d;
+  };
+  cfg.server.port = n(process.env.MAO_TS_PORT ?? cfg.server.port, 9080);
+  if (process.env.MAO_RUNTIME_DIR) {
+    cfg.app.harness.runtimeDir = process.env.MAO_RUNTIME_DIR;
+  }
+  if (process.env.MAO_USER_HOME_DIR) {
+    cfg.app.harness.userHomeDir = process.env.MAO_USER_HOME_DIR;
+  }
+  cfg.app.harness.cleanup.intervalMs = n(process.env.MAO_CLEANUP_INTERVAL_MS ?? cfg.app.harness.cleanup.intervalMs, 24 * 3600 * 1000);
+  cfg.app.harness.cleanup.shellOutputMaxAgeDays = n(process.env.MAO_CLEANUP_SHELL_MAX_AGE_DAYS ?? cfg.app.harness.cleanup.shellOutputMaxAgeDays, 7);
+  cfg.app.harness.cleanup.cleanupSkills = b(process.env.MAO_CLEANUP_SKILLS ?? cfg.app.harness.cleanup.cleanupSkills, true);
+  cfg.spring.flyway.enabled = b(process.env.FLYWAY_ENABLED ?? cfg.spring.flyway.enabled, true);
+  cfg.app.search = cfg.app.search ?? { fulltextEnabled: true };
+  cfg.app.search.fulltextEnabled = b(process.env.SEARCH_FULLTEXT_ENABLED ?? cfg.app.search.fulltextEnabled, true);
+  cfg.app.cloudRuntime = cfg.app.cloudRuntime ?? {
+    mode: 'host',
+    container: {
+      idleMinutes: 60, maxLifetimeHours: 72, memoryMb: 2048, cpus: 2, pidsLimit: 512,
+      image: 'mao-runtime:latest', network: 'bridge', channelDir: '/opt/mao-data/runtime/channels',
+      distDir: '/opt/mao/backend-ts/dist', depsDir: '/opt/mao-data/deps',
+      tmpDir: '/opt/mao-data/tmp', tmpRetentionDays: 7, startTimeoutMs: 15000,
+    },
+  };
+  cfg.app.cloudRuntime.mode = (process.env.MAO_CLOUD_RUNTIME as 'host' | 'docker' | undefined)
+    === 'docker' ? 'docker' : (process.env.MAO_CLOUD_RUNTIME === 'host' ? 'host' : cfg.app.cloudRuntime.mode);
+  cfg.app.cloudRuntime.container.idleMinutes = n(process.env.MAO_CONTAINER_IDLE_MINUTES ?? cfg.app.cloudRuntime.container.idleMinutes, 60);
+  cfg.app.cloudRuntime.container.maxLifetimeHours = n(process.env.MAO_CONTAINER_MAX_LIFETIME_HOURS ?? cfg.app.cloudRuntime.container.maxLifetimeHours, 72);
+  cfg.app.cloudRuntime.container.memoryMb = n(process.env.MAO_CONTAINER_MEMORY_MB ?? cfg.app.cloudRuntime.container.memoryMb, 2048);
+  cfg.app.cloudRuntime.container.cpus = n(process.env.MAO_CONTAINER_CPUS ?? cfg.app.cloudRuntime.container.cpus, 2);
+  cfg.app.cloudRuntime.container.pidsLimit = n(process.env.MAO_CONTAINER_PIDS_LIMIT ?? cfg.app.cloudRuntime.container.pidsLimit, 512);
+  if (process.env.MAO_CONTAINER_IMAGE) cfg.app.cloudRuntime.container.image = process.env.MAO_CONTAINER_IMAGE;
+  if (process.env.MAO_CONTAINER_NETWORK) cfg.app.cloudRuntime.container.network = process.env.MAO_CONTAINER_NETWORK;
+  if (process.env.MAO_CONTAINER_CHANNEL_DIR) cfg.app.cloudRuntime.container.channelDir = process.env.MAO_CONTAINER_CHANNEL_DIR;
+  if (process.env.MAO_CONTAINER_DIST_DIR) cfg.app.cloudRuntime.container.distDir = process.env.MAO_CONTAINER_DIST_DIR;
+  if (process.env.MAO_CONTAINER_DEPS_DIR) cfg.app.cloudRuntime.container.depsDir = process.env.MAO_CONTAINER_DEPS_DIR;
+  if (process.env.MAO_CONTAINER_TMP_DIR) cfg.app.cloudRuntime.container.tmpDir = process.env.MAO_CONTAINER_TMP_DIR;
+  cfg.app.cloudRuntime.container.tmpRetentionDays = n(process.env.MAO_CONTAINER_TMP_RETENTION_DAYS ?? cfg.app.cloudRuntime.container.tmpRetentionDays, 7);
+  cfg.app.cloudRuntime.container.startTimeoutMs = n(process.env.MAO_CONTAINER_START_TIMEOUT_MS ?? cfg.app.cloudRuntime.container.startTimeoutMs, 15000);
+  cfg.dingtalk.enabled = b(process.env.DINGTALK_BOT_ENABLED ?? cfg.dingtalk.enabled, false);
+  cfg.dingtalk.reconcileIntervalMs = n(process.env.DINGTALK_BOT_RECONCILE_INTERVAL_MS ?? cfg.dingtalk.reconcileIntervalMs, 5000);
+  cfg.dingtalk.reconnectBaseMs = n(process.env.DINGTALK_BOT_RECONNECT_BASE_MS ?? cfg.dingtalk.reconnectBaseMs, 1000);
+  cfg.dingtalk.reconnectMaxMs = n(process.env.DINGTALK_BOT_RECONNECT_MAX_MS ?? cfg.dingtalk.reconnectMaxMs, 30000);
+  cfg.dingtalk.maxConsecutiveFailures = n(process.env.DINGTALK_BOT_MAX_CONSECUTIVE_FAILURES ?? cfg.dingtalk.maxConsecutiveFailures, 5);
+  cfg.dingtalk.replyMaxLength = n(process.env.DINGTALK_BOT_REPLY_MAX_LENGTH ?? cfg.dingtalk.replyMaxLength, 2000);
+  cfg.dingtalk.groupContext.maxItems = n(process.env.DINGTALK_BOT_GROUP_CONTEXT_MAX_ITEMS ?? cfg.dingtalk.groupContext.maxItems, 10);
+  cfg.dingtalk.groupContext.maxMinutes = n(process.env.DINGTALK_BOT_GROUP_CONTEXT_MAX_MINUTES ?? cfg.dingtalk.groupContext.maxMinutes, 120);
+  cfg.dingtalk.mergeWindowMs = n(process.env.DINGTALK_BOT_MERGE_WINDOW_MS ?? cfg.dingtalk.mergeWindowMs, 1000);
+  cfg.feishu.bot.enabled = b(process.env.FEISHU_BOT_ENABLED ?? cfg.feishu.bot.enabled, false);
+  cfg.feishu.bot.longConnection.enabled = b(process.env.FEISHU_BOT_LC_ENABLED ?? cfg.feishu.bot.longConnection.enabled, true);
+  cfg.feishu.bot.longConnection.reconcileIntervalMs = n(process.env.FEISHU_BOT_RECONCILE_INTERVAL_MS ?? cfg.feishu.bot.longConnection.reconcileIntervalMs, 5000);
+  cfg.feishu.bot.longConnection.reconnectBaseMs = n(process.env.FEISHU_BOT_RECONNECT_BASE_MS ?? cfg.feishu.bot.longConnection.reconnectBaseMs, 1000);
+  cfg.feishu.bot.longConnection.reconnectMaxMs = n(process.env.FEISHU_BOT_RECONNECT_MAX_MS ?? cfg.feishu.bot.longConnection.reconnectMaxMs, 30000);
+  cfg.feishu.bot.longConnection.maxConsecutiveFailures = n(process.env.FEISHU_BOT_MAX_CONSECUTIVE_FAILURES ?? cfg.feishu.bot.longConnection.maxConsecutiveFailures, 5);
+  cfg.feishu.bot.groupContext.maxItems = n(process.env.FEISHU_BOT_GROUP_CONTEXT_MAX_ITEMS ?? cfg.feishu.bot.groupContext.maxItems, 20);
+  cfg.feishu.bot.groupContext.maxMinutes = n(process.env.FEISHU_BOT_GROUP_CONTEXT_MAX_MINUTES ?? cfg.feishu.bot.groupContext.maxMinutes, 120);
+  cfg.feishu.bot.groupContext.overflowItems = n(process.env.FEISHU_BOT_GROUP_CONTEXT_OVERFLOW_ITEMS ?? cfg.feishu.bot.groupContext.overflowItems, 100);
+  cfg.feishu.bot.reply.maxLength = n(process.env.FEISHU_BOT_REPLY_MAX_LENGTH ?? cfg.feishu.bot.reply.maxLength, 2000);
+  cfg.feishu.bot.file.maxInboundFileMb = n(process.env.FEISHU_BOT_MAX_INBOUND_FILE_MB ?? cfg.feishu.bot.file.maxInboundFileMb, 100);
+  cfg.feishu.bot.mergeWindowMs = n(process.env.FEISHU_BOT_MERGE_WINDOW_MS ?? cfg.feishu.bot.mergeWindowMs, 1000);
+  cfg.weixin.bot.mergeWindowMs = n(process.env.WEIXIN_BOT_MERGE_WINDOW_MS ?? cfg.weixin.bot.mergeWindowMs, 1000);
+  cfg.jwt.expiration = n(cfg.jwt.expiration, 86400000);
+  cfg.jwt.refreshExpiration = n(cfg.jwt.refreshExpiration, 604800000);
+  cfg.jwt.shellExpiration = n(cfg.jwt.shellExpiration, 7200000);
+  return cfg;
+}
+
+export function parseJdbcUrl(jdbc: string): { host: string; port: number; database: string } {
+  const stripped = jdbc.replace(/^jdbc:mysql:\/\//, '');
+  const [hostPort, rest] = stripped.split('/');
+  const [host, portStr] = hostPort.split(':');
+  const database = (rest ?? '').split('?')[0];
+  return {
+    host: host || '127.0.0.1',
+    port: Number(portStr) || 3306,
+    database,
+  };
+}
+
+let cached: AppConfig | null = null;
+
+export function loadConfig(): AppConfig {
+  if (cached) {
+    return cached;
+  }
+  let cfg = structuredClone(DEFAULTS);
+  const file = findConfigFile();
+  if (file) {
+    const raw = parseYaml(readFileSync(file, 'utf8'));
+    cfg = deepMerge(cfg, keysToCamel(raw));
+  }
+  cfg = resolvePlaceholders(cfg, cfg) as AppConfig;
+  cfg = coerceTypes(cfg);
+  if (process.env.JWT_SECRET) {
+    cfg.jwt.secret = process.env.JWT_SECRET;
+  }
+  if (process.env.APP_GIT_CREDENTIAL_SECRET) {
+    cfg.app.gitCredential.secretKey = process.env.APP_GIT_CREDENTIAL_SECRET;
+  }
+  if (process.env.APP_NOTIFICATION_WEBHOOK_SECRET) {
+    cfg.app.taskNotification.secretKey = process.env.APP_NOTIFICATION_WEBHOOK_SECRET;
+  }
+  if (process.env.APP_MCP_SECRET) {
+    cfg.app.mcp.secretKey = process.env.APP_MCP_SECRET;
+  }
+  if (process.env.APP_OPENAPI_TOKEN_SECRET) {
+    cfg.app.openapi.tokenSecretKey = process.env.APP_OPENAPI_TOKEN_SECRET;
+  }
+  if (process.env.APP_SIGNAL_SECRET) {
+    cfg.app.signal.secretKey = process.env.APP_SIGNAL_SECRET;
+  }
+  // 历史部署只配置 APP_USER_TOOL_SECRET；新名可选，旧名必须继续生效（设计 §5.12）。
+  const httpToolSecret = process.env.APP_HTTP_TOOL_SECRET ?? process.env.APP_USER_TOOL_SECRET;
+  if (httpToolSecret) {
+    cfg.app.httpTool.secretKey = httpToolSecret;
+  }
+  if (process.env.APP_FEISHU_BOT_SECRET) {
+    cfg.feishu.bot.appSecretKey = process.env.APP_FEISHU_BOT_SECRET;
+  }
+  if (process.env.APP_DINGTALK_BOT_SECRET) {
+    cfg.dingtalk.appSecretKey = process.env.APP_DINGTALK_BOT_SECRET;
+  }
+  if (process.env.DINGTALK_OAUTH_CLIENT_ID) cfg.dingtalk.oauth.clientId = process.env.DINGTALK_OAUTH_CLIENT_ID;
+  if (process.env.DINGTALK_OAUTH_SECRET) cfg.dingtalk.oauth.clientSecret = process.env.DINGTALK_OAUTH_SECRET;
+  if (process.env.DINGTALK_OAUTH_REDIRECT_URI) cfg.dingtalk.oauth.redirectUri = process.env.DINGTALK_OAUTH_REDIRECT_URI;
+  if (process.env.DINGTALK_PROGRESS_CARD_TEMPLATE_ID) cfg.dingtalk.progressCardTemplateId = process.env.DINGTALK_PROGRESS_CARD_TEMPLATE_ID;
+  if (process.env.DINGTALK_QUEUE_CARD_TEMPLATE_ID) cfg.dingtalk.queueCardTemplateId = process.env.DINGTALK_QUEUE_CARD_TEMPLATE_ID;
+  cached = cfg;
+  return cfg;
+}
+
+export function resetConfigCache(): void {
+  cached = null;
+}
+
+export function configDir(): string {
+  return resolve(join(here(), '../../config'));
+}

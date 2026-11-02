@@ -1,0 +1,470 @@
+<template>
+  <div class="tool-call-card" :class="[`status-${toolCall.status}`]">
+    <div class="tool-header" @click="toggleExpand">
+      <div class="tool-info">
+        <span class="tool-summary">{{ displaySummary }}</span>
+      </div>
+      <div class="tool-status">
+        <button
+          v-if="isDelegate && childSessionId && !hideProcess"
+          class="view-subagent-btn"
+          title="查看子代理过程"
+          @click.stop="openSubagentProcess"
+        >
+          查看过程
+        </button>
+        <el-tooltip v-if="approvalBadge" :content="approvalBadge.reason" placement="top">
+          <span class="approval-badge" :class="approvalBadge.kind">{{ approvalBadge.label }}</span>
+        </el-tooltip>
+        <el-tooltip v-if="toolCall.resultTruncated" content="后端已截断工具输出（超出工具自身的输出上限），此处展示的是截断后的内容" placement="top">
+          <span class="truncated-badge">输出已截断</span>
+        </el-tooltip>
+        <span v-if="toolCall.status === 'running'" class="status-spinner"></span>
+        <el-icon v-else-if="toolCall.status === 'success'" class="status-icon success"><Select /></el-icon>
+        <el-icon v-else-if="toolCall.status === 'error'" class="status-icon error"><CloseBold /></el-icon>
+        <el-icon
+          v-if="hasExpandableBody"
+          class="expand-icon"
+          :class="{ expanded: isExpanded }"
+        ><ArrowDown /></el-icon>
+      </div>
+    </div>
+    <div v-if="isExpanded && hasExpandableBody" class="tool-body">
+      <div v-if="formattedInput" class="tool-result">
+        <div class="result-label">输入</div>
+        <div class="code-block-wrapper">
+          <pre class="result-content"><code>{{ formattedInput }}</code></pre>
+          <button class="copy-btn" title="复制" @click="copyText(formattedInput)">
+            <el-icon :size="14"><CopyDocument /></el-icon>
+          </button>
+        </div>
+      </div>
+      <div v-if="toolCall.result || imagePreviewUrl" class="tool-result">
+        <div class="result-label">输出</div>
+        <el-image
+          v-if="imagePreviewUrl"
+          :src="imagePreviewUrl"
+          :preview-src-list="[imagePreviewUrl]"
+          :initial-index="0"
+          fit="contain"
+          class="image-preview"
+          :preview-teleported="true"
+          @click.stop
+        />
+        <div v-if="displayResultText" class="code-block-wrapper">
+          <pre class="result-content"><code>{{ displayResultText }}</code></pre>
+          <button class="copy-btn" title="复制完整输出" @click="copyText(fullResultText)">
+            <el-icon :size="14"><CopyDocument /></el-icon>
+          </button>
+        </div>
+        <div v-if="isResultTruncated" class="result-expand-row">
+          <button class="expand-result-btn" @click="showFullResult = !showFullResult">
+            {{ showFullResult ? '收起完整输出' : '展开完整输出' }}
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, computed, watch, inject } from 'vue'
+import { ElMessage } from 'element-plus'
+import { Select, CloseBold, ArrowDown, CopyDocument } from '@element-plus/icons-vue'
+import type { ToolCall } from '../../composables/useChat'
+import { useSessionStore } from '../../stores/session'
+import { copyText as copyToClipboard } from '../../utils/clipboard'
+import { getToolDisplayName, getToolInputPreview } from '../../utils/toolDisplay'
+
+const props = withDefaults(defineProps<{
+  toolCall: ToolCall
+  hideProcess?: boolean
+}>(), {
+  hideProcess: false
+})
+
+const sessionStore = useSessionStore()
+const openSubagent = inject<(payload: { childSessionId: number; title?: string }) => void>('openSubagent', () => {})
+
+const isExpanded = ref(props.toolCall.isExpanded ?? false)
+
+watch(
+  () => props.toolCall.isExpanded,
+  val => {
+    if (val !== undefined) isExpanded.value = val
+  }
+)
+
+const isDelegate = computed(() => ['delegate', 'delegate_followup', 'spawn_subagent', 'subagent_followup'].includes(props.toolCall.name))
+
+/** 审批放行徽标：替我审批的 LLM 拍板 / Jev 前置决策低风险放行 / 规则静默放行（V135） */
+const approvalBadge = computed(() => {
+  const mark = props.toolCall.approvalMark
+  if (!mark) return null
+  if (mark.mode === 'jev') return { kind: 'jev', label: '低风险放行', reason: mark.reason }
+  if (mark.mode === 'rule') return { kind: 'rule', label: '规则放行', reason: mark.reason }
+  return mark.approved
+    ? { kind: 'approved', label: 'AI 已批准', reason: mark.reason }
+    : { kind: 'denied', label: 'AI 已拒绝', reason: mark.reason }
+})
+
+const childSessionId = computed(() => {
+  const result = props.toolCall.result
+  if (result) {
+    try {
+      const obj = JSON.parse(result)
+      const id = obj?.child_session_id ?? obj?.childSessionId
+      if (id != null && Number(id) > 0) return Number(id)
+    } catch {
+      // ignore
+    }
+  }
+  // 并行 delegate：优先按 tool_call_id 绑定
+  const byToolCall = sessionStore.findSubagentByToolCallId(props.toolCall.id)
+  if (byToolCall) return byToolCall
+
+  const parentId = sessionStore.activeSessionId
+  if (!parentId) return null
+  const agentType = typeof props.toolCall.input?.agent_type === 'string'
+    ? props.toolCall.input.agent_type
+    : undefined
+  const task = typeof props.toolCall.input?.task === 'string'
+    ? props.toolCall.input.task
+    : undefined
+  // 仅在能唯一匹配时返回，避免多个 RUNNING 时绑错
+  return sessionStore.findSubagentChildId(parentId, {
+    runningOnly: props.toolCall.status === 'running' || props.toolCall.status === 'pending',
+    agentType,
+    task,
+  })
+})
+
+function openSubagentProcess() {
+  const id = childSessionId.value
+  if (!id) {
+    ElMessage.info('子代理会话尚未就绪')
+    return
+  }
+  const title = typeof props.toolCall.input?.task === 'string'
+    ? `子代理: ${String(props.toolCall.input.task).slice(0, 40)}`
+    : '子代理'
+  openSubagent({ childSessionId: id, title })
+}
+
+const displaySummary = computed(() => {
+  if (props.toolCall.summary) return props.toolCall.summary
+  const displayName = getToolDisplayName(props.toolCall.name)
+  if (props.toolCall.argsStreaming && !inputPreview.value) {
+    const raw = props.toolCall.argumentsText || ''
+    if (raw) return `${displayName} · ${raw.slice(-80)}`
+    return `${displayName} · 参数加载中...`
+  }
+  const preview = inputPreview.value
+  return preview ? `${displayName} · ${preview}` : displayName
+})
+
+const inputPreview = computed(() => getToolInputPreview(props.toolCall.name, props.toolCall.input))
+
+const formattedInput = computed(() => {
+  const input = props.toolCall.input
+  if (!input) return ''
+  try {
+    return JSON.stringify(input, null, 2)
+  } catch {
+    return ''
+  }
+})
+
+const hasExpandableBody = computed(
+  () => !!(formattedInput.value || props.toolCall.result || imagePreviewUrl.value)
+)
+
+const imagePreviewUrl = computed(() => {
+  if (props.toolCall.preview?.data_uri) {
+    return props.toolCall.preview.data_uri
+  }
+  const r = props.toolCall.result || ''
+  try {
+    const obj = JSON.parse(r)
+    if (obj?.media_type === 'image' && obj?.data_uri) {
+      return obj.data_uri as string
+    }
+  } catch {
+    // not json
+  }
+  return ''
+})
+
+/** 未截断的完整输出文本（图片结果展示 content 字段，其余展示原文）。 */
+const fullResultText = computed(() => {
+  if (imagePreviewUrl.value) {
+    const r = props.toolCall.result || ''
+    try {
+      const obj = JSON.parse(r)
+      if (obj?.content) return String(obj.content)
+    } catch {
+      // fall through
+    }
+  }
+  return props.toolCall.result || ''
+})
+
+const isResultTruncated = computed(() => fullResultText.value.length > 4000)
+
+const showFullResult = ref(false)
+
+const displayResultText = computed(() => {
+  const full = fullResultText.value
+  if (isResultTruncated.value && !showFullResult.value) {
+    return full.slice(0, 4000) + '\n…（输出已截断）'
+  }
+  return full
+})
+
+async function copyText(text: string) {
+  const ok = await copyToClipboard(text)
+  if (ok) ElMessage.success('已复制')
+  else ElMessage.error('复制失败')
+}
+
+function toggleExpand() {
+  if (!hasExpandableBody.value) return
+  isExpanded.value = !isExpanded.value
+}
+</script>
+
+<style scoped>
+.tool-call-card {
+  padding: 0px 5px;
+  overflow: hidden;
+  background: var(--aw-canvas);
+  transition: border-color 0.2s;
+}
+
+.tool-call-card.status-running {
+  border-color: var(--aw-primary);
+}
+
+.tool-call-card.status-error {
+  border-color: var(--aw-danger);
+}
+
+.tool-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 0px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s;
+}
+
+.tool-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: 5px;
+  min-width: 0;
+  flex: 1;
+}
+
+.tool-summary {
+  font-size: 12px;
+  color: var(--aw-ink-muted-48);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  letter-spacing: -0.12px;
+}
+
+.tool-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.view-subagent-btn {
+  height: var(--aw-btn-height);
+  border: 1px solid var(--aw-hairline);
+  background: transparent;
+  color: var(--aw-primary);
+  font-size: var(--aw-text-fine);
+  padding: var(--aw-btn-padding);
+  border-radius: var(--aw-radius-sm);
+  cursor: pointer;
+  line-height: 1.4;
+}
+
+.view-subagent-btn:hover {
+  background: var(--aw-canvas-parchment);
+}
+
+.status-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--aw-hairline);
+  border-top-color: var(--aw-primary);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.status-icon.success { color: var(--aw-success); }
+.status-icon.error { color: var(--aw-danger); }
+
+.approval-badge {
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 6px;
+  border-radius: var(--aw-radius-xs);
+  cursor: default;
+  white-space: nowrap;
+}
+
+.approval-badge.approved,
+.approval-badge.jev,
+.approval-badge.rule {
+  color: var(--aw-success);
+  background: color-mix(in srgb, var(--aw-success) 12%, transparent);
+}
+
+.approval-badge.denied {
+  color: var(--aw-danger);
+  background: color-mix(in srgb, var(--aw-danger) 12%, transparent);
+}
+
+.truncated-badge {
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 6px;
+  border-radius: var(--aw-radius-xs);
+  cursor: default;
+  white-space: nowrap;
+  color: var(--aw-warning, #b45309);
+  background: color-mix(in srgb, var(--aw-warning, #b45309) 12%, transparent);
+}
+
+.expand-icon {
+  color: var(--aw-ink-muted-48);
+  transition: transform 0.2s;
+  font-size: 12px;
+  transform: rotate(-90deg);
+}
+
+.expand-icon.expanded {
+  transform: rotate(0deg);
+}
+
+.tool-body {
+  border-top: 1px solid var(--aw-divider-soft);
+  padding: 10px 14px;
+}
+
+.code-block-wrapper {
+  position: relative;
+  margin-bottom: 8px;
+}
+
+.code-block-wrapper:last-child {
+  margin-bottom: 0;
+}
+
+.copy-btn {
+  width: var(--aw-btn-height);
+  height: var(--aw-btn-height);
+  padding: 0;
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: var(--aw-radius-sm);
+  background: var(--aw-surface-glass);
+  color: var(--aw-ink-muted-48);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s;
+}
+
+.code-block-wrapper:hover .copy-btn {
+  opacity: 1;
+}
+
+.copy-btn:hover {
+  color: var(--aw-ink);
+}
+
+.tool-command code {
+  font-family: var(--aw-font-mono);
+  font-size: var(--aw-text-caption);
+  color: var(--aw-text-code);
+  background: none;
+  padding: 0;
+}
+
+.result-label {
+  font-size: var(--aw-text-fine);
+  color: var(--aw-ink-muted-48);
+  margin-bottom: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.result-expand-row {
+  margin-top: 2px;
+}
+
+.expand-result-btn {
+  border: none;
+  background: none;
+  padding: 0;
+  font-size: var(--aw-text-fine);
+  color: var(--aw-primary);
+  cursor: pointer;
+}
+
+.expand-result-btn:hover {
+  text-decoration: underline;
+}
+
+.result-content {
+  margin: 0;
+  padding: 8px 12px;
+  background: var(--aw-surface-code);
+  border-radius: var(--aw-radius-sm);
+  overflow-x: auto;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.result-content code {
+  font-family: var(--aw-font-mono);
+  font-size: var(--aw-text-caption);
+  color: var(--aw-text-code);
+  background: none;
+  padding: 0;
+  white-space: pre;
+}
+
+.image-preview {
+  display: block;
+  max-width: 120px;
+  max-height: 90px;
+  border-radius: var(--aw-radius-sm);
+  margin-bottom: 8px;
+  border: 1px solid var(--aw-divider-soft);
+  cursor: zoom-in;
+}
+
+.image-preview :deep(img) {
+  max-width: 120px;
+  max-height: 90px;
+  object-fit: contain;
+}
+</style>

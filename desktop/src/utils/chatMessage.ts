@@ -1,0 +1,461 @@
+import {
+  normalizeMessageRole,
+  type ChatMessage,
+  type Citation,
+  type CompactionEvent,
+  type FileChange,
+  type MessageSegment,
+  type ToolCall
+} from '../types/chat'
+import { formatDateTime } from './datetime'
+
+/** 解析工具参数（后端 arguments 为 JSON 字符串） */
+export function parseToolArguments(raw: unknown): Record<string, unknown> | undefined {
+  if (raw == null || raw === '') return undefined
+  if (typeof raw === 'object' && !Array.isArray(raw)) {
+    return raw as Record<string, unknown>
+  }
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw)
+      return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : undefined
+    } catch {
+      return undefined
+    }
+  }
+  return undefined
+}
+
+/** 从 TOOL 消息 metadata 提取图片预览 */
+export function extractToolPreviewFromMetadata(metadata: unknown): ToolCall['preview'] | undefined {
+  if (metadata == null) return undefined
+  try {
+    const root = typeof metadata === 'string' ? JSON.parse(metadata) : metadata
+    const attachments = (root as { attachments?: unknown[] })?.attachments
+    if (!Array.isArray(attachments) || attachments.length === 0) return undefined
+    const first = attachments[0] as { mime?: string; data_uri?: string }
+    if (!first?.data_uri) return undefined
+    return {
+      media_type: 'image',
+      mime: first.mime,
+      data_uri: first.data_uri
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/** 从 TOOL 消息 metadata 提取审批放行标记（替我审批 / 前置决策 / 规则放行） */
+export function extractApprovalMarkFromMetadata(metadata: unknown): ToolCall['approvalMark'] | undefined {
+  if (metadata == null) return undefined
+  try {
+    const root = typeof metadata === 'string' ? JSON.parse(metadata) : metadata
+    const mark = (root as { approvalMark?: unknown })?.approvalMark
+    if (mark == null || typeof mark !== 'object') return undefined
+    const node = mark as { mode?: unknown; approved?: unknown; reason?: unknown; ruleId?: unknown }
+    if (node.mode !== 'llm' && node.mode !== 'jev' && node.mode !== 'rule') return undefined
+    if (typeof node.approved !== 'boolean') return undefined
+    return {
+      mode: node.mode,
+      approved: node.approved,
+      reason: typeof node.reason === 'string' ? node.reason : '',
+      ...(node.mode === 'rule' && typeof node.ruleId === 'number' ? { ruleId: node.ruleId } : {})
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/** 从 TOOL 消息 metadata 提取后端截断标识（技术方案 5.6：结果 JSON 顶层 truncated 落库为 resultTruncated）。 */
+export function extractResultTruncatedFromMetadata(metadata: unknown): boolean {
+  if (metadata == null) return false
+  try {
+    const root = typeof metadata === 'string' ? JSON.parse(metadata) : metadata
+    return (root as { resultTruncated?: unknown })?.resultTruncated === true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 从 ASSISTANT 消息 metadata 提取引用来源（回复引用溯源，技术方案 2026-10-12）。
+ * 后端已做白名单校验，这里仍逐条校验形态：n 为正整数、url 仅 http/https、
+ * title 为字符串（缺失回落空串，前端展示时回落域名 + 路径）；非法条目跳过。
+ */
+export function extractCitationsFromMetadata(metadata: unknown): Citation[] {
+  if (metadata == null) return []
+  try {
+    const root = typeof metadata === 'string' ? JSON.parse(metadata) : metadata
+    const raw = (root as { citations?: unknown })?.citations
+    if (!Array.isArray(raw)) return []
+    const out: Citation[] = []
+    for (const item of raw) {
+      if (item == null || typeof item !== 'object') continue
+      const node = item as { n?: unknown; url?: unknown; title?: unknown }
+      if (typeof node.n !== 'number' || !Number.isInteger(node.n) || node.n < 1) continue
+      if (typeof node.url !== 'string' || !/^https?:\/\//i.test(node.url)) continue
+      out.push({ n: node.n, url: node.url, title: typeof node.title === 'string' ? node.title : '' })
+    }
+    // 后端按 n 升序写入，这里防御性重排 + 去重，保证展示序号稳定
+    const seen = new Set<number>()
+    return out
+      .sort((a, b) => a.n - b.n)
+      .filter((c) => (seen.has(c.n) ? false : (seen.add(c.n), true)))
+  } catch {
+    return []
+  }
+}
+
+/** OpenAI / 后端 ToolCall → 前端 UI 结构 */
+export function normalizeApiToolCall(
+  tc: Record<string, unknown>,
+  overrides?: Partial<ToolCall>
+): ToolCall {
+  const fn = tc.function as { name?: string; arguments?: unknown } | undefined
+  if (fn) {
+    return {
+      id: String(tc.id ?? overrides?.id ?? ''),
+      name: String(fn.name ?? ''),
+      input: parseToolArguments(fn.arguments),
+      result: overrides?.result,
+      summary: (tc.summary as string | undefined) ?? overrides?.summary,
+      status: overrides?.status ?? 'success',
+      isExpanded: false,
+      argsStreaming: false
+    }
+  }
+
+  return {
+    id: String(tc.id ?? ''),
+    name: String(tc.name ?? ''),
+    input: (tc.input as Record<string, unknown> | undefined) ?? parseToolArguments(tc.arguments),
+    result: (tc.result as string | undefined) ?? overrides?.result,
+    summary: (tc.summary as string | undefined) ?? overrides?.summary,
+    status: (tc.status as ToolCall['status']) ?? overrides?.status ?? 'success',
+    isExpanded: false,
+    argsStreaming: false
+  }
+}
+
+const TASK_TOOL_NAMES = new Set(['task_create', 'task_update', 'task_delete', 'task_list'])
+
+export function normalizeToolCallsList(raw: unknown): ToolCall[] {
+  if (!raw) return []
+  let list: unknown[] = []
+  if (typeof raw === 'string') {
+    try {
+      list = JSON.parse(raw) as unknown[]
+    } catch {
+      return []
+    }
+  } else if (Array.isArray(raw)) {
+    list = raw
+  } else {
+    return []
+  }
+  return list
+    .filter((item): item is Record<string, unknown> => item != null && typeof item === 'object')
+    .map(tc => normalizeApiToolCall(tc))
+}
+
+/** 过滤掉 task_* 工具（仅供内部 todo 管理，不展示） */
+function filterTaskTools(toolCalls: ToolCall[]): ToolCall[] {
+  return toolCalls.filter(tc => !TASK_TOOL_NAMES.has(tc.name))
+}
+
+/** 由正文 + 工具列表构建时间线（历史消息每轮一条 assistant） */
+export function buildSegmentsFromContentAndTools(
+  content: string,
+  toolCalls: ToolCall[]
+): MessageSegment[] {
+  const segments: MessageSegment[] = []
+  // 文本在前，与实际流式时序一致（LLM 先输出文本，再输出工具调用）
+  if (content?.trim()) {
+    segments.push({ type: 'text', content })
+  }
+  for (const tc of toolCalls) {
+    if (tc.id) {
+      segments.push({ type: 'tool', callId: tc.id })
+    }
+  }
+  return segments
+}
+
+/** 流式追加文本：合并到末尾 text 段或新建 */
+export function appendTextDelta(msg: ChatMessage, delta: string) {
+  if (!delta) return
+  if (!msg.segments) msg.segments = []
+  msg.content = (msg.content || '') + delta
+
+  const last = msg.segments[msg.segments.length - 1]
+  if (last?.type === 'text') {
+    last.content += delta
+  } else {
+    msg.segments.push({ type: 'text', content: delta })
+  }
+}
+
+/** 流式思考内容增量：合并到尾部 thinking segment 或新建 */
+export function appendThinkingDelta(msg: ChatMessage, delta: string) {
+  if (!delta) return
+  if (!msg.segments) msg.segments = []
+  msg.thinkingContent = (msg.thinkingContent || '') + delta
+
+  const last = msg.segments[msg.segments.length - 1]
+  if (last?.type === 'thinking') {
+    last.content += delta
+  } else {
+    msg.segments.push({ type: 'thinking', content: delta })
+  }
+}
+
+/** 流式工具开始：追加 tool 段（已存在则更新 input） */
+export function appendToolCallStart(msg: ChatMessage, call: ToolCall) {
+  if (!msg.toolCalls) msg.toolCalls = []
+  if (!msg.segments) msg.segments = []
+  const existing = msg.toolCalls.find(c => c.id === call.id)
+  if (existing) {
+    if (call.name && (!existing.name || existing.name === 'tool')) existing.name = call.name
+    if (call.input) existing.input = call.input
+    if (call.status === 'running' || call.status === 'pending') {
+      existing.status = call.status
+      existing.argsStreaming = call.argsStreaming
+    }
+    return
+  }
+  msg.toolCalls.push(call)
+  msg.segments.push({ type: 'tool', callId: call.id })
+}
+
+const COMPLETED_TOOL_STATUSES = new Set<ToolCall['status']>(['success', 'error'])
+
+/**
+ * 丢掉当前这趟未完成的 LLM 生成（尾部正文/思考、仍在 running/pending 的工具），
+ * 保留同一条流式气泡里已经结束的工具轮次。
+ * `llm_stream_reset` 只针对当前模型调用；整轮执行共用一条气泡，不能整段清空。
+ */
+export function discardAbortedStreamTail(msg: ChatMessage): void {
+  const toolCalls = msg.toolCalls ?? []
+  const completed = toolCalls.filter(tc => COMPLETED_TOOL_STATUSES.has(tc.status))
+  const completedIds = new Set(completed.map(tc => tc.id))
+
+  if (completedIds.size === 0) {
+    msg.content = ''
+    msg.thinkingContent = undefined
+    msg.toolCalls = []
+    msg.segments = []
+    return
+  }
+
+  msg.toolCalls = completed
+  const segments = msg.segments ?? []
+  if (segments.length === 0) {
+    return
+  }
+
+  const kept: MessageSegment[] = []
+  for (const seg of segments) {
+    if (seg.type === 'tool') {
+      if (completedIds.has(seg.callId)) kept.push(seg)
+      continue
+    }
+    kept.push(seg)
+  }
+
+  let lastToolIdx = -1
+  for (let i = 0; i < kept.length; i++) {
+    if (kept[i].type === 'tool') lastToolIdx = i
+  }
+  msg.segments = lastToolIdx >= 0 ? kept.slice(0, lastToolIdx + 1) : []
+  msg.content = msg.segments.filter(s => s.type === 'text').map(s => s.content || '').join('')
+  const thinking = msg.segments.filter(s => s.type === 'thinking').map(s => s.content || '').join('')
+  msg.thinkingContent = thinking || undefined
+}
+
+/** 将 API 消息映射为聊天消息，并附加 fileChanges */
+export function mapMessagesWithFileChanges(raw: Array<Record<string, unknown>>) {
+  const messages = mapApiMessagesToChat(raw)
+  const rawById = new Map(raw.map(m => [String(m.id), m]))
+  const allChanges: FileChange[] = []
+  for (const msg of messages) {
+    const rawMsg = rawById.get(msg.id)
+    if (rawMsg?.fileChanges && Array.isArray(rawMsg.fileChanges)) {
+      const changes = (rawMsg.fileChanges as Array<Record<string, unknown>>).map(fc => ({
+        path: String(fc.path),
+        type: fc.type as FileChange['type'],
+        linesAdded: Number(fc.linesAdded) || 0,
+        linesDeleted: Number(fc.linesDeleted) || 0,
+        diffMode: fc.diffMode as FileChange['diffMode'],
+        beforeContent: fc.beforeContent != null ? String(fc.beforeContent) : undefined,
+        afterContent: fc.afterContent != null ? String(fc.afterContent) : undefined,
+        patchContent: fc.patchContent != null ? String(fc.patchContent) : undefined,
+        patchTruncated: Boolean(fc.patchTruncated),
+        diffUnavailableReason: fc.diffUnavailableReason != null ? String(fc.diffUnavailableReason) : undefined,
+      }))
+      msg.fileChanges = changes
+      allChanges.push(...changes)
+    }
+  }
+  return { messages, allChanges }
+}
+
+/** 将 API / WS 压缩事件转为前端结构 */
+export function mapCompactionEvents(raw: Array<Record<string, unknown>> | undefined | null): CompactionEvent[] {
+  if (!raw?.length) return []
+  return raw.map(e => ({
+    id: String(e.id ?? ''),
+    triggerMode: String(e.triggerMode ?? ''),
+    prevBoundaryMsgId: String(e.prevBoundaryMsgId ?? 0),
+    boundaryMsgId: String(e.boundaryMsgId ?? ''),
+    compactedMessageCount: Number(e.compactedMessageCount ?? 0),
+    summaryTokens: Number(e.summaryTokens ?? 0),
+    savedTokens: Number(e.savedTokens ?? 0),
+    durationMs: Number(e.durationMs ?? 0),
+    compactModel: e.compactModel != null ? String(e.compactModel) : undefined,
+    createdAt: e.createdAt != null ? String(e.createdAt) : undefined,
+  })).filter(e => e.id && e.boundaryMsgId)
+}
+
+/** 将 API 原始消息列表转为聊天 UI 消息（合并 TOOL 结果、过滤 tool 气泡） */
+export function mapApiMessagesToChat(raw: Array<Record<string, unknown>>): ChatMessage[] {
+  const result: ChatMessage[] = []
+  /** 第一轮未匹配的 TOOL 消息，留到第二轮处理 */
+  const pendingToolResults: Array<{ toolCallId: string; content: string; preview?: ToolCall['preview']; approvalMark?: ToolCall['approvalMark']; resultTruncated?: boolean }> = []
+
+  for (const m of raw) {
+    const roleRaw = String(m.role ?? 'assistant').toLowerCase()
+
+    if (roleRaw === 'tool' || roleRaw === 'function') {
+      const toolCallId = m.toolCallId != null ? String(m.toolCallId) : ''
+      const content = String(m.content ?? '')
+      const preview = extractToolPreviewFromMetadata(m.metadata)
+      const approvalMark = extractApprovalMarkFromMetadata(m.metadata)
+      const resultTruncated = extractResultTruncatedFromMetadata(m.metadata)
+      let matched = false
+      for (let j = result.length - 1; j >= 0; j--) {
+        const prev = result[j]
+        if (prev.role !== 'assistant' || !prev.toolCalls?.length) continue
+        const call = prev.toolCalls.find(c => c.id === toolCallId)
+        if (call) {
+          call.result = content
+          call.status = inferToolStatus(content)
+          if (preview) call.preview = preview
+          if (approvalMark) call.approvalMark = approvalMark
+          if (resultTruncated) call.resultTruncated = true
+          matched = true
+          break
+        }
+      }
+      if (!matched) {
+        pendingToolResults.push({ toolCallId, content, preview, approvalMark, resultTruncated })
+      }
+      continue
+    }
+
+    const role = normalizeMessageRole(String(m.role ?? 'assistant'))
+    if (role !== 'user' && role !== 'assistant' && role !== 'system') {
+      continue
+    }
+
+    // Parse content: may be string or ContentPart[] (multimodal)
+    const rawContent = m.content
+    let content = ''
+    let images: string[] = []
+    if (typeof rawContent === 'string') {
+      content = rawContent
+    } else if (Array.isArray(rawContent)) {
+      for (const part of rawContent) {
+        if (part.type === 'text') content += part.text || ''
+        if (part.type === 'image_url' && part.image_url?.url) images.push(part.image_url.url)
+      }
+    } else {
+      content = String(rawContent ?? '')
+    }
+
+    // Also pick up images from the API response if present
+    if (m.images && Array.isArray(m.images)) {
+      images = m.images as string[]
+    }
+
+    const toolCalls = filterTaskTools(normalizeToolCallsList(m.toolCalls))
+
+    // Skip assistant messages that are empty (e.g. task_* tool-only messages)
+    if (role === 'assistant' && !content.trim() && toolCalls.length === 0) continue
+
+    const thinkingContent = m.thinkingContent ? String(m.thinkingContent) : undefined
+    const segments = buildSegmentsFromContentAndTools(content, toolCalls)
+    if (thinkingContent) {
+      segments.unshift({ type: 'thinking', content: thinkingContent })
+    }
+
+    result.push({
+      id: String(m.id ?? `msg_${Date.now()}_${Math.random()}`),
+      role,
+      content,
+      thinkingContent: thinkingContent || undefined,
+      createdAt: formatDateTime(m.createdAt != null ? String(m.createdAt) : ''),
+      updatedAt: m.updatedAt ? formatDateTime(String(m.updatedAt)) : undefined,
+      images: images.length > 0 ? images : undefined,
+      toolCalls,
+      segments,
+      metadata: parseMessageMetadata(m.metadata)
+    })
+  }
+
+  // 第二轮：匹配第一轮因顺序问题未关联的 TOOL 消息
+  if (pendingToolResults.length > 0) {
+    for (const { toolCallId, content, preview, approvalMark, resultTruncated } of pendingToolResults) {
+      for (const msg of result) {
+        if (msg.role !== 'assistant' || !msg.toolCalls?.length) continue
+        const call = msg.toolCalls.find(c => c.id === toolCallId)
+        if (call) {
+          call.result = content
+          call.status = inferToolStatus(content)
+          if (preview) call.preview = preview
+          if (approvalMark) call.approvalMark = approvalMark
+          if (resultTruncated) call.resultTruncated = true
+          break
+        }
+      }
+    }
+  }
+
+  return result
+}
+
+function inferToolStatus(result: string): ToolCall['status'] {
+  const text = result || ''
+  // Try JSON-based detection: {"error": ...} or {"exit_code": non-zero}
+  try {
+    const obj = JSON.parse(text)
+    if (obj && typeof obj === 'object') {
+      if (obj.error) return 'error'
+      if (typeof obj.exit_code === 'number' && obj.exit_code !== 0) return 'error'
+    }
+  } catch {
+    // Not JSON — fall back to plain text heuristic
+  }
+  if (text.startsWith('Tool execution failed')) return 'error'
+  return 'success'
+}
+
+/** 解析后端消息 metadata（可能是 JSON 字符串或对象）为前端可读结构。 */
+function parseMessageMetadata(raw: unknown): Record<string, unknown> | undefined {
+  if (raw == null) return undefined
+  if (typeof raw === 'object' && !Array.isArray(raw)) {
+    return raw as Record<string, unknown>
+  }
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw)
+      return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : undefined
+    } catch {
+      return undefined
+    }
+  }
+  return undefined
+}

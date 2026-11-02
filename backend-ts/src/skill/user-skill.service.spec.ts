@@ -1,0 +1,341 @@
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { describe, expect, it } from 'vitest';
+import { useTmpDir } from '../testing/tmp-dir.js';
+import { noSystemSkillNames } from '../testing/system-skill-names.js';
+import { UserSkillService } from './user-skill.service.js';
+
+function skill(name: string, description: string, body: string): string {
+  return `---\nname: ${name}\ndescription: ${description}\n---\n${body}\n`;
+}
+
+describe('UserSkillService', () => {
+  it('listsReadsUploadsAndDeletesUserSkills', async () => {
+    const dir = useTmpDir('mao-uskill-');
+    const service = new UserSkillService(dir, noSystemSkillNames);
+    const existing = join(dir, '7', 'existing');
+    mkdirSync(existing, { recursive: true });
+    writeFileSync(join(existing, 'SKILL.md'), skill('existing', 'Existing', 'Body'));
+
+    const list = service.listUserSkills(7);
+    expect(list.map((s) => s.name)).toEqual(['existing']);
+
+    const existingDir = join(dir, '8', 'other-user-skill');
+    mkdirSync(existingDir, { recursive: true });
+    writeFileSync(join(existingDir, 'SKILL.md'), skill('other-user-skill', 'Other', 'Other body'));
+    const all = service.listAllUserSkills();
+    expect(all.map((s) => `${s.userId}:${s.name}`)).toEqual(['7:existing', '8:other-user-skill']);
+
+    const detail = service.getUserSkill(7, 'existing');
+    expect(detail.code).toBe(0);
+    expect(detail.data?.body).toBe('Body');
+
+    const uploaded = service.uploadUserSkill(7, [
+      { originalFilename: 'new/SKILL.md', buffer: Buffer.from(skill('new', 'New', 'New body')) },
+      { originalFilename: 'new/ref/info.txt', buffer: Buffer.from('info') },
+      { originalFilename: 'new/.secret', buffer: Buffer.from('skip') },
+      { originalFilename: 'new/ref/.secret', buffer: Buffer.from('skip') },
+    ]);
+    expect(uploaded.code).toBe(0);
+    expect(uploaded.data).toEqual(['new']);
+    expect(join(dir, '7', 'new', 'SKILL.md')).toBeTruthy();
+    const { existsSync } = await import('node:fs');
+    expect(existsSync(join(dir, '7', 'new', 'SKILL.md'))).toBe(true);
+    expect(existsSync(join(dir, '7', 'new', 'ref', 'info.txt'))).toBe(true);
+    expect(existsSync(join(dir, '7', 'new', '.secret'))).toBe(true);
+    expect(existsSync(join(dir, '7', 'new', 'ref', '.secret'))).toBe(false);
+
+    const deleted = service.deleteUserSkill(7, 'new');
+    expect(deleted.code).toBe(0);
+    expect(existsSync(join(dir, '7', 'new'))).toBe(false);
+  });
+
+  it('错位技能（目录名≠frontmatter 名）可查看/删除：按 frontmatter 名经 folderPath 寻址', async () => {
+    const dir = useTmpDir('mao-uskill-mismatch-');
+    const service = new UserSkillService(dir, noSystemSkillNames);
+    const { existsSync } = await import('node:fs');
+
+    // 上传通道即可构造：目录 holder、frontmatter 名 theirs（validateSkillGroup 不比对二者）
+    const uploaded = service.uploadUserSkill(7, [
+      { originalFilename: 'holder/SKILL.md', buffer: Buffer.from(skill('theirs', '错位技能', 'Body')) },
+    ]);
+    expect(uploaded.code).toBe(0);
+    expect(existsSync(join(dir, '7', 'holder'))).toBe(true);
+
+    // 列表按 frontmatter 名展示，folderPath 指向真实目录
+    const list = service.listUserSkills(7);
+    expect(list.map((s) => s.name)).toEqual(['theirs']);
+    expect(list[0].folderPath).toBe(join(dir, '7', 'holder'));
+
+    // 按列表名查看与删除都必须命中真实目录（旧实现按名字重拼目录 → 404，数据被锁死）
+    const detail = service.getUserSkill(7, 'theirs');
+    expect(detail.code).toBe(0);
+    expect(detail.data?.name).toBe('theirs');
+    expect(detail.data?.folderPath).toBe(join(dir, '7', 'holder'));
+
+    expect(service.deleteUserSkill(7, 'theirs').code).toBe(0);
+    expect(existsSync(join(dir, '7', 'holder'))).toBe(false);
+    expect(service.listUserSkills(7)).toEqual([]);
+  });
+
+  it('按目录名传入仍兼容；不存在/非法名 → 404/400', async () => {
+    const dir = useTmpDir('mao-uskill-mismatch-fallback-');
+    const service = new UserSkillService(dir, noSystemSkillNames);
+    const { existsSync } = await import('node:fs');
+    mkdirSync(join(dir, '7', 'holder'), { recursive: true });
+    writeFileSync(join(dir, '7', 'holder', 'SKILL.md'), skill('theirs', '错位技能', 'Body'));
+
+    // 目录名回退：既有按目录名寻址的调用方不受影响
+    expect(service.getUserSkill(7, 'holder').code).toBe(0);
+    expect(service.getUserSkill(7, 'holder').data?.name).toBe('theirs');
+    expect(service.deleteUserSkill(7, 'holder').code).toBe(0);
+    expect(existsSync(join(dir, '7', 'holder'))).toBe(false);
+
+    expect(service.getUserSkill(7, 'ghost').code).toBe(404);
+    expect(service.deleteUserSkill(7, 'ghost').code).toBe(404);
+    expect(service.getUserSkill(7, '../escape').code).toBe(400);
+    expect(service.deleteUserSkill(7, '../escape').code).toBe(400);
+  });
+
+  it('重名技能（两个目录同一 frontmatter 名）按名寻址失败闭合 409：不误删首个，可按 folderPath 精确删', async () => {
+    const dir = useTmpDir('mao-uskill-dup-name-');
+    const service = new UserSkillService(dir, noSystemSkillNames);
+    const { existsSync } = await import('node:fs');
+
+    // 上传通道即可构造：validateSkillGroup 只校验 SKILL.md 自身，不查 frontmatter 名重复
+    const uploaded = service.uploadUserSkill(7, [
+      { originalFilename: 'aaa/SKILL.md', buffer: Buffer.from(skill('dup', '第一个', 'A')) },
+      { originalFilename: 'bbb/SKILL.md', buffer: Buffer.from(skill('dup', '第二个', 'B')) },
+    ]);
+    expect(uploaded.code).toBe(0);
+    const rows = service.listUserSkills(7);
+    expect(rows.map((r) => r.name)).toEqual(['dup', 'dup']);
+    expect(rows.map((r) => r.folderPath)).toEqual([join(dir, '7', 'aaa'), join(dir, '7', 'bbb')]);
+
+    // 按名查看/删除必须失败闭合：find() 首个命中会删错对象（UI 删第二行实际删第一个目录）并误报已删除
+    const detail = service.getUserSkill(7, 'dup');
+    expect(detail.code).toBe(409);
+    expect(detail.message).toContain('多个目录');
+    expect(service.deleteUserSkill(7, 'dup').code).toBe(409);
+    expect(existsSync(join(dir, '7', 'aaa'))).toBe(true);
+    expect(existsSync(join(dir, '7', 'bbb'))).toBe(true);
+
+    // 行级 folderPath 精确寻址：删用户真正点的第二行
+    expect(service.deleteUserSkill(7, 'dup', join(dir, '7', 'bbb')).code).toBe(0);
+    expect(existsSync(join(dir, '7', 'aaa'))).toBe(true);
+    expect(existsSync(join(dir, '7', 'bbb'))).toBe(false);
+
+    // 删剩一个后歧义消除，按名恢复可用
+    expect(service.getUserSkill(7, 'dup').code).toBe(0);
+    expect(service.deleteUserSkill(7, 'dup').code).toBe(0);
+    expect(existsSync(join(dir, '7', 'aaa'))).toBe(false);
+  });
+
+  it('folderPath 精确寻址不串用户、不串目录', async () => {
+    const dir = useTmpDir('mao-uskill-folder-scope-');
+    const service = new UserSkillService(dir, noSystemSkillNames);
+    const { existsSync } = await import('node:fs');
+    for (const [userId, folder] of [[7, 'aaa'], [8, 'aaa']] as const) {
+      mkdirSync(join(dir, String(userId), folder), { recursive: true });
+      writeFileSync(join(dir, String(userId), folder, 'SKILL.md'), skill(folder, `U${userId}`, 'Body'));
+    }
+
+    // 传入他人 folderPath：本用户目录集内寻不到 → 404，不动他人目录
+    expect(service.deleteUserSkill(7, 'aaa', join(dir, '8', 'aaa')).code).toBe(404);
+    expect(existsSync(join(dir, '8', 'aaa'))).toBe(true);
+    expect(existsSync(join(dir, '7', 'aaa'))).toBe(true);
+
+    // 传入本用户不存在的目录 → 404
+    expect(service.getUserSkill(7, 'aaa', join(dir, '7', 'ghost')).code).toBe(404);
+    expect(service.deleteUserSkill(7, 'aaa', join(dir, '7', 'ghost')).code).toBe(404);
+  });
+
+  it('restoresExecutableBitsForUploadedScripts', async () => {
+    const dir = useTmpDir('mao-uskill-');
+    const service = new UserSkillService(dir, noSystemSkillNames);
+    const uploaded = service.uploadUserSkill(7, [
+      { originalFilename: 'cli/SKILL.md', buffer: Buffer.from(skill('cli', 'CLI', 'Body')) },
+      { originalFilename: 'cli/run.sh', buffer: Buffer.from('#!/bin/sh\necho hi') },
+      { originalFilename: 'cli/tools/exec-py', buffer: Buffer.from('#!/usr/bin/env python3\nprint(1)') },
+      { originalFilename: 'cli/tools/plain.txt', buffer: Buffer.from('text') },
+    ]);
+    expect(uploaded.code).toBe(0);
+    const { statSync } = await import('node:fs');
+    const base = join(dir, '7', 'cli');
+    // 执行位断言不受进程 umask 影响
+    expect(statSync(join(base, 'run.sh')).mode & 0o111).toBe(0o111);
+    expect(statSync(join(base, 'tools', 'exec-py')).mode & 0o111).toBe(0o111);
+    expect(statSync(join(base, 'SKILL.md')).mode & 0o111).toBe(0);
+    expect(statSync(join(base, 'tools', 'plain.txt')).mode & 0o111).toBe(0);
+  });
+
+  it('returnsFailuresForInvalidUploadReadAndDeleteRequests', async () => {
+    const dir = useTmpDir('mao-uskill-');
+    const service = new UserSkillService(dir, noSystemSkillNames);
+    expect(service.listUserSkills(7)).toEqual([]);
+    expect(service.listAllUserSkills()).toEqual([]);
+    expect(service.getUserSkill(7, 'missing').code).toBe(404);
+    expect(service.deleteUserSkill(7, 'missing').code).toBe(404);
+    expect(service.getUserSkill(7, '../outside').code).toBe(400);
+    expect(service.deleteUserSkill(7, '../../..').code).toBe(400);
+    expect(service.uploadUserSkill(7, null).code).toBe(400);
+    expect(service.uploadUserSkill(7, []).code).toBe(400);
+    expect(service.uploadUserSkill(7, [{ originalFilename: 'SKILL.md', buffer: Buffer.from('x') }]).code).toBe(400);
+    expect(service.uploadUserSkill(7, [{ originalFilename: 'bad/readme.md', buffer: Buffer.from('x') }]).message).toContain('missing SKILL.md');
+    expect(service.uploadUserSkill(7, [{ originalFilename: 'bad/SKILL.md', buffer: Buffer.from('no yaml') }]).message).toContain('frontmatter');
+    expect(service.uploadUserSkill(7, [{
+      originalFilename: 'bad/SKILL.md',
+      buffer: Buffer.from('---\nname: bad\n---\nbody\n'),
+    }]).message).toContain('description');
+  });
+
+  it('replacesSkillOnlyAfterStagingSucceeds', () => {
+    const dir = useTmpDir('mao-uskill-');
+    const service = new UserSkillService(dir, noSystemSkillNames);
+    const folder = join(dir, '7', 'keep');
+    mkdirSync(folder, { recursive: true });
+    writeFileSync(join(folder, 'SKILL.md'), skill('keep', 'Keep', 'Old'));
+
+    const invalid = service.uploadUserSkill(7, [
+      { originalFilename: 'keep/SKILL.md', buffer: Buffer.from(skill('keep', 'Keep', 'New')) },
+      { originalFilename: 'bad/readme.md', buffer: Buffer.from('x') },
+    ]);
+    expect(invalid.code).toBe(400);
+    expect(readFileSync(join(folder, 'SKILL.md'), 'utf8')).toContain('Old');
+
+    const replaced = service.uploadUserSkill(7, [
+      { originalFilename: 'keep/SKILL.md', buffer: Buffer.from(skill('keep', 'Keep', 'New')) },
+      { originalFilename: 'other/SKILL.md', buffer: Buffer.from(skill('other', 'Other', 'Body')) },
+    ]);
+    expect(replaced.code).toBe(0);
+    expect(replaced.data).toEqual(['keep', 'other']);
+    expect(readFileSync(join(folder, 'SKILL.md'), 'utf8')).toContain('New');
+    expect(readFileSync(join(dir, '7', 'other', 'SKILL.md'), 'utf8')).toContain('Body');
+    expect(service.listUserSkills(7).map((item) => item.name).sort()).toEqual(['keep', 'other']);
+  });
+
+  it('上传与系统技能同名的技能被拒绝（409）：按 frontmatter 名判重，整批不落盘', async () => {
+    const dir = useTmpDir('mao-uskill-system-conflict-');
+    const service = new UserSkillService(dir, { getAllNames: () => ['mao-cli'] });
+    const { existsSync } = await import('node:fs');
+
+    // frontmatter 名与系统技能同名（目录名不同也拦：会话按 frontmatter 名合并，用户版本会顶掉系统版本）
+    const conflict = service.uploadUserSkill(7, [
+      { originalFilename: 'holder/SKILL.md', buffer: Buffer.from(skill('mao-cli', '冒名', 'Body')) },
+    ]);
+    expect(conflict.code).toBe(409);
+    expect(conflict.message).toContain('mao-cli');
+    expect(existsSync(join(dir, '7', 'holder'))).toBe(false);
+
+    // 目录名与系统技能同名但 frontmatter 名不同 → 不冲突，照常放行
+    const ok = service.uploadUserSkill(7, [
+      { originalFilename: 'mao-cli/SKILL.md', buffer: Buffer.from(skill('my-cli', '我的', 'Body')) },
+    ]);
+    expect(ok.code).toBe(0);
+    expect(existsSync(join(dir, '7', 'mao-cli', 'SKILL.md'))).toBe(true);
+
+    // 一批里有一个同名 → 整批拒绝，任何一个都不落盘
+    const batch = service.uploadUserSkill(7, [
+      { originalFilename: 'fine/SKILL.md', buffer: Buffer.from(skill('fine', 'Fine', 'Body')) },
+      { originalFilename: 'bad/SKILL.md', buffer: Buffer.from(skill('mao-cli', 'Bad', 'Body')) },
+    ]);
+    expect(batch.code).toBe(409);
+    expect(existsSync(join(dir, '7', 'fine'))).toBe(false);
+    expect(existsSync(join(dir, '7', 'bad'))).toBe(false);
+
+    // 无系统技能时不受限制
+    const noSystem = new UserSkillService(dir, noSystemSkillNames);
+    expect(noSystem.uploadUserSkill(7, [
+      { originalFilename: 'plain/SKILL.md', buffer: Buffer.from(skill('mao-cli', 'D', 'B')) },
+    ]).code).toBe(0);
+  });
+
+  it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)(
+    'keepsExistingSkillWhenReplaceCannotStart',
+    () => {
+      const dir = useTmpDir('mao-uskill-');
+      const service = new UserSkillService(dir, noSystemSkillNames);
+      const userDir = join(dir, '7');
+      const folder = join(userDir, 'keep');
+      mkdirSync(folder, { recursive: true });
+      writeFileSync(join(folder, 'SKILL.md'), skill('keep', 'Keep', 'Old'));
+      chmodSync(userDir, 0o555);
+      try {
+        const failed = service.uploadUserSkill(7, [
+          { originalFilename: 'keep/SKILL.md', buffer: Buffer.from(skill('keep', 'Keep', 'New')) },
+        ]);
+        expect(failed.code).toBe(500);
+        expect(failed.message).toContain('原技能未替换');
+        expect(readFileSync(join(folder, 'SKILL.md'), 'utf8')).toContain('Old');
+      } finally {
+        chmodSync(userDir, 0o755);
+      }
+    },
+  );
+});
+
+describe('UserSkillService.installUserSkillFiles（依赖一键补装）', () => {
+  it('内存文件安装：写盘成功且隐藏路径段被过滤', async () => {
+    const dir = useTmpDir('mao-uskill-install-');
+    const service = new UserSkillService(dir, noSystemSkillNames);
+    const { existsSync } = await import('node:fs');
+
+    const installed = service.installUserSkillFiles(7, 'code-review', {
+      'SKILL.md': skill('code-review', 'Review', 'Body'),
+      'refs/guide.md': 'guide content',
+      '.hidden': 'skip',
+      'refs/.secret': 'skip',
+    });
+    expect(installed).toMatchObject({ code: 0, data: 'code-review' });
+    expect(existsSync(join(dir, '7', 'code-review', 'SKILL.md'))).toBe(true);
+    expect(existsSync(join(dir, '7', 'code-review', 'refs', 'guide.md'))).toBe(true);
+    expect(existsSync(join(dir, '7', 'code-review', '.hidden'))).toBe(false);
+    expect(existsSync(join(dir, '7', 'code-review', 'refs', '.secret'))).toBe(false);
+    expect(service.listUserSkills(7).map((s) => s.name)).toEqual(['code-review']);
+  });
+
+  it('校验链：SKILL.md 缺失/结构非法/frontmatter 不一致/名称非法/路径穿越/超总量均拒绝且不落盘', async () => {
+    const dir = useTmpDir('mao-uskill-install-bad-');
+    const service = new UserSkillService(dir, noSystemSkillNames);
+    const { existsSync } = await import('node:fs');
+
+    expect(service.installUserSkillFiles(7, 'x', { 'refs/a.md': 'no SKILL.md' }).code).toBe(400);
+    expect(service.installUserSkillFiles(7, 'x', { 'SKILL.md': 'no frontmatter' }).code).toBe(400);
+    expect(service.installUserSkillFiles(7, 'x', { 'SKILL.md': skill('other', 'D', 'B') }).message).toContain('不一致');
+    expect(service.installUserSkillFiles(7, '../escape', { 'SKILL.md': skill('../escape', 'D', 'B') }).code).toBe(400);
+    expect(service.installUserSkillFiles(7, 'x', { 'SKILL.md': skill('x', 'D', 'B'), 'a/../../evil.md': 'x' }).code).toBe(400);
+    expect(service.installUserSkillFiles(7, 'x', { 'SKILL.md': skill('x', 'D', 'B'), '': 'empty path' }).code).toBe(400);
+
+    const big = 'a'.repeat(6 * 1024 * 1024);
+    expect(service.installUserSkillFiles(7, 'x', { 'SKILL.md': skill('x', 'D', 'B'), 'big1.md': big, 'big2.md': big }).message).toContain('上限');
+    expect(existsSync(join(dir, '7', 'x'))).toBe(false);
+  });
+
+  it('目标同名目录已存在即拒绝覆盖：不替换、不触发暂存交换', async () => {
+    const dir = useTmpDir('mao-uskill-install-reject-');
+    const service = new UserSkillService(dir, noSystemSkillNames);
+    const { existsSync } = await import('node:fs');
+
+    // 自检按 frontmatter 名判缺失、写盘按目录名落盘："目录 A、frontmatter 名 B"的技能
+    // 会让补装静默覆盖 A/（rename 备份成功后即删除）。此处断言写盘侧显式拒绝
+    mkdirSync(join(dir, '7', 'dup'), { recursive: true });
+    writeFileSync(join(dir, '7', 'dup', 'SKILL.md'), skill('dup', 'Old', 'Old'));
+    const rejected = service.installUserSkillFiles(7, 'dup', { 'SKILL.md': skill('dup', 'New', 'New') });
+    expect(rejected.code).toBe(409);
+    expect(rejected.message).toContain('拒绝覆盖');
+    expect(readFileSync(join(dir, '7', 'dup', 'SKILL.md'), 'utf8')).toContain('Old');
+    expect(existsSync(join(dir, '.staging'))).toBe(false);
+  });
+
+  it('与系统技能同名拒绝安装（409）：补装同样写用户技能目录，会顶掉系统版本', async () => {
+    const dir = useTmpDir('mao-uskill-install-system-conflict-');
+    const service = new UserSkillService(dir, { getAllNames: () => ['mao-cli'] });
+    const { existsSync } = await import('node:fs');
+
+    const rejected = service.installUserSkillFiles(7, 'mao-cli', { 'SKILL.md': skill('mao-cli', 'D', 'B') });
+    expect(rejected.code).toBe(409);
+    expect(rejected.message).toContain('mao-cli');
+    expect(existsSync(join(dir, '7', 'mao-cli'))).toBe(false);
+    expect(existsSync(join(dir, '.staging'))).toBe(false);
+  });
+});

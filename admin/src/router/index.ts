@@ -1,0 +1,257 @@
+import { createRouter, createWebHistory } from 'vue-router'
+import type { RouteRecordRaw } from 'vue-router'
+import { useAuthStore } from '../stores/auth'
+import { pickHomePath } from '../utils/home'
+import { chunkReloadTarget } from './chunk-reload'
+
+const routes: RouteRecordRaw[] = [
+  {
+    path: '/login',
+    name: 'Login',
+    component: () => import('../views/auth/LoginView.vue'),
+    meta: { requiresAuth: false }
+  },
+  {
+    path: '/auth/ecp/feishu-callback',
+    name: 'EcpFeishuCallback',
+    component: () => import('../views/auth/EcpFeishuCallbackView.vue'),
+    meta: { requiresAuth: false }
+  },
+  {
+    path: '/',
+    name: 'Layout',
+    component: () => import('../components/Layout.vue'),
+    redirect: '/analytics',
+    children: [
+      {
+        path: 'agents',
+        name: 'Agents',
+        component: () => import('../views/agent/AgentListView.vue'),
+        meta: { title: 'Agent 管理', keepAlive: true, permission: 'agent:read' }
+      },
+      {
+        path: 'models',
+        name: 'Models',
+        component: () => import('../views/model/ModelListView.vue'),
+        meta: { title: '模型管理', keepAlive: true, permission: 'model:read' }
+      },
+      {
+        path: 'users',
+        name: 'Users',
+        component: () => import('../views/user/UserListView.vue'),
+        meta: { title: '用户管理', keepAlive: true, permission: 'user:read' }
+      },
+      {
+        path: 'skills',
+        name: 'Skills',
+        component: () => import('../views/skill/SkillListView.vue'),
+        meta: { title: 'Skills 管理', keepAlive: true, permission: 'skill:read' }
+      },
+      {
+        path: 'mcp-servers',
+        name: 'McpServers',
+        component: () => import('../views/mcp/McpServerListView.vue'),
+        meta: { title: 'MCP 服务器', keepAlive: true, permission: 'mcp:read' }
+      },
+      {
+        path: 'sessions',
+        name: 'Sessions',
+        component: () => import('../views/session/SessionListView.vue'),
+        meta: { title: '会话管理', keepAlive: true, permission: 'session:read' }
+      },
+      {
+        path: 'roles',
+        name: 'Roles',
+        component: () => import('../views/permission/RolePermissionView.vue'),
+        meta: { title: '角色权限', keepAlive: true, permission: 'role:read' }
+      },
+      {
+        path: 'audit-logs',
+        name: 'AuditLogs',
+        component: () => import('../views/audit/AuditLogView.vue'),
+        meta: { title: '审计日志', keepAlive: true, permission: 'audit:read' }
+      },
+      {
+        path: 'approval-rules',
+        name: 'ApprovalRules',
+        component: () => import('../views/approval/ApprovalRuleView.vue'),
+        meta: { title: '审批规则', keepAlive: true, permission: 'approval-rule:read' }
+      },
+      {
+        path: 'analytics',
+        name: 'Analytics',
+        component: () => import('../views/analytics/AnalyticsView.vue'),
+        meta: { title: '用量分析', keepAlive: true, permission: 'analytics:read' }
+      },
+      {
+        path: 'llm-calls',
+        name: 'LlmCalls',
+        component: () => import('../views/llm-call/LlmCallView.vue'),
+        meta: { title: '调用流水', keepAlive: true, permission: 'llm-call:read' }
+      },
+      {
+        path: 'openapi-calls',
+        name: 'OpenApiCalls',
+        component: () => import('../views/openapi/OpenApiCallView.vue'),
+        meta: { title: '开放调用', keepAlive: true, permission: 'openapi:read' }
+      },
+      {
+        path: 'signal-watchers',
+        name: 'SignalWatchers',
+        component: () => import('../views/signal/SignalWatcherListView.vue'),
+        meta: { title: '信号哨兵', keepAlive: true, permission: 'signal:read' }
+      },
+      {
+        path: 'http-tools',
+        name: 'HttpTools',
+        component: () => import('../views/http-tool/HttpToolListView.vue'),
+        meta: { title: '自定义工具', keepAlive: true, permission: 'http_tool:read' }
+      },
+      {
+        path: 'feedback',
+        name: 'Feedback',
+        component: () => import('../views/feedback/FeedbackView.vue'),
+        meta: { title: '点踩反馈', keepAlive: true, permission: 'feedback:read' }
+      },
+      {
+        path: 'memory',
+        name: 'MemoryAudit',
+        component: () => import('../views/memory/MemoryAuditView.vue'),
+        meta: { title: '用户记忆', keepAlive: true, permission: 'memory:read' }
+      },
+      {
+        path: 'scheduled-tasks',
+        name: 'ScheduledTasks',
+        component: () => import('../views/scheduled-tasks/index.vue'),
+        meta: { title: '定时任务', keepAlive: true, permission: 'scheduled-task:read' }
+      },
+      {
+        path: 'budgets',
+        name: 'Budgets',
+        component: () => import('../views/budget/BudgetView.vue'),
+        meta: { title: '用量预算', keepAlive: true, permission: 'budget:read' }
+      },
+      {
+        path: 'system-commands',
+        name: 'SystemCommands',
+        component: () => import('../views/system-commands/SystemCommandListView.vue'),
+        meta: { title: '指令管理', keepAlive: true, permission: 'command:read' }
+      },
+      {
+        path: 'feishu-bots',
+        name: 'FeishuBots',
+        component: () => import('../views/feishu-bot/FeishuBotListView.vue'),
+        meta: { title: '飞书机器人', keepAlive: true, permission: 'feishu-bot:read' }
+      },
+      {
+        path: 'dingtalk-bots',
+        name: 'DingtalkBots',
+        component: () => import('../views/dingtalk-bot/DingtalkBotListView.vue'),
+        meta: { title: '钉钉机器人', keepAlive: true, permission: 'dingtalk-bot:read' }
+      },
+      {
+        path: 'settings',
+        name: 'SystemSettings',
+        component: () => import('../views/settings/SystemSettingsView.vue'),
+        meta: { title: '系统设置', keepAlive: true, permission: 'settings:read' }
+      },
+      {
+        path: 'sessions/:id',
+        name: 'SessionDetail',
+        component: () => import('../views/session/SessionDetailView.vue'),
+        meta: { title: '会话详情', keepAlive: true, permission: 'session:read' }
+      },
+      {
+        path: 'forbidden',
+        name: 'Forbidden',
+        component: () => import('../views/auth/ForbiddenView.vue'),
+        meta: { title: '无权限' }
+      },
+    ]
+  },
+  {
+    // 404 兜底：未知路径回用量分析首页，避免白屏
+    path: '/:pathMatch(.*)*',
+    redirect: '/analytics'
+  }
+]
+
+const router = createRouter({
+  history: createWebHistory(import.meta.env.BASE_URL),
+  routes
+})
+
+// 部署后旧标签仍引用已删除的懒加载脚本。导航失败时整页打开目标地址以加载新版本，
+// 短时间内只跳转一次，避免新版本本身缺文件时反复刷新。
+router.onError((error, to) => {
+  let storage: Storage | null = null
+  try {
+    storage = window.sessionStorage
+  } catch {
+    storage = null
+  }
+  const href = chunkReloadTarget(error, router.resolve(to).href, storage)
+  if (href) window.location.assign(href)
+})
+
+// Navigation guard
+router.beforeEach(async (to, _from, next) => {
+  const token = localStorage.getItem('token')
+  if (to.meta.requiresAuth !== false && !token) {
+    next('/login')
+    return
+  }
+
+  if (token && to.meta.requiresAuth !== false) {
+    const authStore = useAuthStore()
+    if (!authStore.user) {
+      try {
+        await authStore.fetchUserInfo()
+      } catch (error: any) {
+        // 401/403：token 失效，清理后进登录页
+        if (error?.response?.status === 401 || error?.response?.status === 403) {
+          authStore.clearAuth()
+          next('/login')
+          return
+        }
+        // 其他异常（网络抖动等）：用户信息不可得则无法校验权限，
+        // 受保护路由一律 fail-closed 进登录页，避免跳过权限检查
+        authStore.clearAuth()
+        next('/login')
+        return
+      }
+    }
+    const permission = to.meta.permission as string | undefined
+    if (permission && !authStore.hasPermission(permission)) {
+      // 登录后默认进用量分析。没有该读权限时落到其有权限的首个页面，避免一登录就无权限。
+      if (to.path === '/analytics') {
+        const home = pickHomePath((p) => authStore.hasPermission(p))
+        next(home === '/analytics' ? '/forbidden' : home)
+        return
+      }
+      next('/forbidden')
+      return
+    }
+    next()
+    return
+  }
+
+  // 已登录访问 /login：仅在用户信息可用时回工作台，避免拉取失败时与守卫互相踢
+  if (to.path === '/login' && token) {
+    const authStore = useAuthStore()
+    if (!authStore.user) {
+      try {
+        await authStore.fetchUserInfo()
+      } catch {
+        next()
+        return
+      }
+    }
+    next('/')
+    return
+  }
+
+  next()
+})
+
+export default router

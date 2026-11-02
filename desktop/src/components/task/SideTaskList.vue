@@ -1,0 +1,632 @@
+<template>
+  <div ref="listEl" class="side-task-list">
+    <div v-if="!tasks || tasks.length === 0" class="side-task-empty">
+      暂无边路任务
+    </div>
+    <div
+      v-for="task in sortedTasks"
+      :key="task.id"
+      class="side-task-item"
+      :class="{
+        editing: editingId === task.id,
+        'confirming-delete': confirmingDeleteId === task.id
+      }"
+      @click="handleClick(task)"
+      @contextmenu.prevent="openContextMenu($event, task)"
+      @touchstart.passive="onTouchStart($event, task)"
+      @touchmove.passive="onTouchMove"
+      @touchend="onTouchEnd"
+      @touchcancel="onTouchEnd"
+    >
+      <div class="side-task-item-main">
+        <span class="side-task-phase-dot" :class="phaseClass(task.phase)"></span>
+        <input
+          v-if="editingId === task.id"
+          v-model="editingTitle"
+          class="side-task-title-input"
+          @keydown.enter="confirmEdit(task)"
+          @keydown.escape="cancelEdit"
+          @click.stop
+          @blur="onEditBlur(task)"
+        />
+        <span v-else class="side-task-title">{{ task.title || '任务' }}</span>
+      </div>
+      <div class="side-task-item-meta">
+        <span class="side-task-elapsed">{{ taskStatusLabel(task) }}</span>
+      </div>
+      <div class="side-task-item-actions">
+        <template v-if="confirmingDeleteId === task.id">
+          <button class="action-btn action-confirm" @click.stop="confirmDelete(task)" title="确认删除">
+            <el-icon :size="13"><Check /></el-icon>
+          </button>
+          <button class="action-btn action-cancel" @click.stop="cancelDelete" title="取消">
+            <el-icon :size="13"><Close /></el-icon>
+          </button>
+        </template>
+        <template v-else-if="editingId === task.id">
+          <button class="action-btn action-confirm" @click.stop="confirmEdit(task)" title="确认">
+            <el-icon :size="13"><Check /></el-icon>
+          </button>
+          <button class="action-btn action-cancel" @click.stop="cancelEdit" title="取消">
+            <el-icon :size="13"><Close /></el-icon>
+          </button>
+        </template>
+        <template v-else></template>
+      </div>
+    </div>
+    <Teleport to="body">
+      <div
+        v-if="contextMenu.visible"
+        class="side-task-context-menu"
+        :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
+        @click.stop
+      >
+        <div class="context-menu-item" @click="menuShare">分享…</div>
+        <div class="context-menu-item" @click="menuExportJsonl">导出 JSONL</div>
+        <div
+          class="context-menu-item"
+          :class="{ disabled: !selectedTask || !canPromote(selectedTask) }"
+          @click="menuPromote"
+        >升级为主会话</div>
+        <div class="context-menu-item" @click="menuEditTitle">编辑标题</div>
+        <div class="context-menu-item danger" @click="menuDelete">删除</div>
+      </div>
+    </Teleport>
+    <ShareDialog v-model="shareVisible" :session-id="shareSessionId" />
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, nextTick, computed, reactive, onMounted, onUnmounted } from 'vue'
+import { Check, Close } from '@element-plus/icons-vue'
+import type { SideTaskItem, TaskPhase } from '../../stores/session'
+import { sideTaskToFocusCandidate, sortByFocusPriority } from '../../utils/focusSort'
+import { useRelativeTime, formatRelativeTime } from '../../composables/useRelativeTime'
+import ShareDialog from './ShareDialog.vue'
+import { downloadSessionJsonl } from '../../utils/sessionShare'
+import { shouldDismissContextMenuForScroll } from '../../utils/contextMenuDismiss'
+
+const props = defineProps<{
+  tasks?: SideTaskItem[]
+  listMode?: 'standard' | 'focus'
+}>()
+
+useRelativeTime()
+
+const listEl = ref<HTMLElement | null>(null)
+
+const emit = defineEmits<{
+  'open-side-task': [payload: { sideSessionId: number; title: string }]
+  'edit-title': [payload: { sideSessionId: number; title: string }]
+  'delete-side-task': [sideSessionId: number]
+  'promote-side-task': [sideSessionId: number]
+}>()
+
+/** 聚焦模式下按优先级排序（与服务端 tree* 信号无关，右侧使用边路自身字段）；标准模式保持原顺序。 */
+const sortedTasks = computed<SideTaskItem[]>(() => {
+  const list = props.tasks ?? []
+  if (props.listMode !== 'focus') return list
+  const byId = new Map(list.map((t) => [String(t.id), t]))
+  return sortByFocusPriority(list.map(sideTaskToFocusCandidate)).map(
+    (c) => byId.get(String(c.id))!
+  )
+})
+
+const editingId = ref<number | null>(null)
+const editingTitle = ref('')
+const confirmingDeleteId = ref<number | null>(null)
+
+const contextMenu = reactive({
+  visible: false,
+  x: 0,
+  y: 0,
+  taskId: null as number | null,
+})
+
+const shareVisible = ref(false)
+const shareSessionId = ref('')
+
+const selectedTask = computed(() =>
+  sortedTasks.value.find(task => task.id === contextMenu.taskId) ?? null
+)
+
+function phaseClass(phase: TaskPhase) {
+  switch (phase) {
+    case 'RUNNING': return 'running'
+    case 'WAITING_APPROVAL': return 'waiting'
+    case 'COMPLETED': return 'completed'
+    case 'FAILED': return 'failed'
+    default: return 'idle'
+  }
+}
+
+function taskStatusLabel(task: SideTaskItem) {
+  switch (task.phase) {
+    case 'RUNNING': return `运行中 ${formatRelativeTime(task.startedAt || task.updatedAt || task.createdAt)}`
+    case 'RESUMING': return '恢复中'
+    case 'WAITING_APPROVAL': return '待审批'
+    case 'CANCELLING': return '取消中'
+    case 'COMPLETED': return `${formatRelativeTime(task.updatedAt || task.createdAt)}前完成`
+    case 'FAILED': return '已失败'
+    case 'CANCELLED': return '已取消'
+    default: return formatRelativeTime(task.createdAt)
+  }
+}
+
+function handleClick(task: SideTaskItem) {
+  if (Date.now() < suppressClickUntil) return
+  if (editingId.value === task.id || confirmingDeleteId.value === task.id) return
+  closeContextMenu()
+  confirmingDeleteId.value = null
+  emit('open-side-task', { sideSessionId: task.id, title: task.title || '任务' })
+}
+
+function openContextMenu(e: { clientX: number; clientY: number }, task: SideTaskItem) {
+  if (editingId.value === task.id || confirmingDeleteId.value === task.id) return
+  // 5 项菜单实测约 156 × 168 px（--aw-text-caption 14px / item padding 7px 10px / 容器 6px），哨兵留余量
+  const menuWidth = 160
+  const menuHeight = 200
+  const x = Math.min(e.clientX, window.innerWidth - menuWidth - 8)
+  const y = Math.min(e.clientY, window.innerHeight - menuHeight - 8)
+  contextMenu.taskId = task.id
+  contextMenu.x = Math.max(4, x)
+  contextMenu.y = Math.max(4, y)
+  contextMenu.visible = true
+}
+
+/** 触屏长按唤出上下文菜单（500ms，移动超过 10px 或提前松手取消） */
+let longPressTimer: number | null = null
+let longPressStart = { clientX: 0, clientY: 0 }
+let longPressTriggered = false
+/** 长按触发后松手：锚定 touchend 时刻的短时间窗，抑制紧随其后的合成 click */
+let suppressClickUntil = 0
+
+function clearLongPress() {
+  if (longPressTimer !== null) {
+    clearTimeout(longPressTimer)
+    longPressTimer = null
+  }
+}
+
+function onTouchStart(e: TouchEvent, task: SideTaskItem) {
+  const touch = e.touches[0]
+  if (!touch) return
+  longPressStart = { clientX: touch.clientX, clientY: touch.clientY }
+  longPressTriggered = false
+  clearLongPress()
+  longPressTimer = window.setTimeout(() => {
+    longPressTimer = null
+    longPressTriggered = true
+    openContextMenu(longPressStart, task)
+  }, 500)
+}
+
+function onTouchMove(e: TouchEvent) {
+  const touch = e.touches[0]
+  if (!touch) return
+  if (longPressTriggered) return
+  if (Math.hypot(touch.clientX - longPressStart.clientX, touch.clientY - longPressStart.clientY) > 10) {
+    clearLongPress()
+  }
+}
+
+function onTouchEnd() {
+  clearLongPress()
+  if (longPressTriggered) {
+    longPressTriggered = false
+    // 部分浏览器（如 Android Chrome）长按后不派发合成 click，用时间窗而非一次性标志，
+    // 避免标志残留吞掉用户的下一次真实点击；锚定 touchend 保证长按浏览菜单后松手也不误触
+    suppressClickUntil = Date.now() + 400
+  }
+}
+
+function closeContextMenu() {
+  contextMenu.visible = false
+}
+
+function menuPromote() {
+  const task = selectedTask.value
+  closeContextMenu()
+  if (task) promote(task)
+}
+
+function menuEditTitle() {
+  const task = selectedTask.value
+  closeContextMenu()
+  if (task) startEdit(task)
+}
+
+function menuDelete() {
+  const task = selectedTask.value
+  closeContextMenu()
+  if (task) startDelete(task)
+}
+
+function menuShare() {
+  const task = selectedTask.value
+  closeContextMenu()
+  if (!task) return
+  shareSessionId.value = String(task.id)
+  shareVisible.value = true
+}
+
+function menuExportJsonl() {
+  const task = selectedTask.value
+  closeContextMenu()
+  if (task) void downloadSessionJsonl(String(task.id))
+}
+
+function startEdit(task: SideTaskItem) {
+  confirmingDeleteId.value = null
+  editingId.value = task.id
+  editingTitle.value = task.title || ''
+  nextTick(() => {
+    // v-for 内 template ref 会变成数组，改用 querySelector（与 TaskIndexPanel 一致）
+    const input = document.querySelector('.side-task-title-input') as HTMLInputElement | null
+    if (input) {
+      input.focus()
+      input.select()
+    }
+  })
+}
+
+function confirmEdit(task: SideTaskItem) {
+  if (editingId.value !== task.id) return
+  const title = editingTitle.value.trim()
+  editingId.value = null
+  if (title && title !== task.title) {
+    emit('edit-title', { sideSessionId: task.id, title })
+  }
+}
+
+function cancelEdit() {
+  editingId.value = null
+  editingTitle.value = ''
+}
+
+/** blur 时若焦点移到确认/取消按钮，不立即提交，交给按钮处理 */
+function onEditBlur(task: SideTaskItem) {
+  nextTick(() => {
+    if (editingId.value !== task.id) return
+    const active = document.activeElement
+    if (active?.closest('.side-task-item-actions')) return
+    confirmEdit(task)
+  })
+}
+
+function startDelete(task: SideTaskItem) {
+  editingId.value = null
+  confirmingDeleteId.value = task.id
+}
+
+function cancelDelete() {
+  confirmingDeleteId.value = null
+}
+
+function confirmDelete(task: SideTaskItem) {
+  confirmingDeleteId.value = null
+  emit('delete-side-task', task.id)
+}
+
+function canPromote(task: SideTaskItem) {
+  return !['RUNNING', 'RESUMING', 'WAITING_APPROVAL', 'CANCELLING'].includes(task.phase)
+}
+
+function promote(task: SideTaskItem) {
+  if (!canPromote(task)) return
+  editingId.value = null
+  confirmingDeleteId.value = null
+  emit('promote-side-task', task.id)
+}
+
+/** 边路列表自身（或其父级）滚动、以及窗口尺寸变化时关闭。对话区贴底滚动不关。 */
+function onViewportChange(e: Event) {
+  if (e.type === 'scroll' && !shouldDismissContextMenuForScroll(e.target, listEl.value)) return
+  closeContextMenu()
+}
+
+onMounted(() => {
+  window.addEventListener('click', closeContextMenu)
+  window.addEventListener('resize', onViewportChange)
+  window.addEventListener('scroll', onViewportChange, true)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('click', closeContextMenu)
+  window.removeEventListener('resize', onViewportChange)
+  window.removeEventListener('scroll', onViewportChange, true)
+  clearLongPress()
+})
+</script>
+
+<style scoped>
+.side-task-list {
+  padding: 8px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.side-task-empty {
+  font-size: var(--aw-text-caption);
+  color: var(--aw-ink-muted-48);
+  padding: 8px 0;
+}
+
+.side-task-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  border-radius: var(--aw-radius-sm);
+  cursor: pointer;
+  transition: background 0.15s;
+  gap: 8px;
+}
+
+.side-task-item:hover {
+  background: rgba(0, 0, 0, 0.04);
+}
+
+.side-task-item.editing,
+.side-task-item.confirming-delete {
+  background: var(--aw-surface-pearl);
+}
+
+.side-task-item-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+}
+
+.side-task-phase-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.side-task-phase-dot.running {
+  background: var(--aw-primary);
+  animation: pulse-running 1.5s ease-in-out infinite;
+}
+
+.side-task-phase-dot.waiting { background: var(--aw-status-waiting); }
+.side-task-phase-dot.completed { background: var(--aw-success); }
+.side-task-phase-dot.failed { background: var(--aw-danger); }
+.side-task-phase-dot.idle { background: var(--aw-hairline); }
+
+@keyframes pulse-running {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.side-task-title {
+  font-size: var(--aw-text-caption);
+  color: var(--aw-ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  letter-spacing: -0.224px;
+}
+
+.side-task-title-input {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--aw-text-caption);
+  color: var(--aw-ink);
+  letter-spacing: -0.224px;
+  background: var(--aw-surface-pearl);
+  border: 1px solid var(--aw-primary);
+  border-radius: var(--aw-radius-xs);
+  padding: 1px 6px;
+  outline: none;
+}
+
+.side-task-item-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  transition: opacity 0.15s;
+}
+
+.side-task-item.editing .side-task-item-meta,
+.side-task-item.confirming-delete .side-task-item-meta {
+  opacity: 0;
+}
+
+.side-task-elapsed {
+  font-family: var(--aw-font-mono);
+  font-size: var(--aw-text-micro);
+  color: var(--aw-ink-muted-48);
+  letter-spacing: -0.1px;
+}
+
+.side-task-item-actions {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 4px;
+  border-radius: var(--aw-radius-xs);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.side-task-item.editing .side-task-item-actions,
+.side-task-item.confirming-delete .side-task-item-actions {
+  opacity: 1;
+}
+
+.action-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--aw-btn-height);
+  height: var(--aw-btn-height);
+  border: none;
+  background: var(--aw-canvas-parchment);
+  border-radius: var(--aw-radius-xs);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  color: var(--aw-ink-muted-48);
+}
+
+.action-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.action-promote {
+  width: auto;
+  min-width: 22px;
+  padding: 0 5px;
+  font-size: 11px;
+}
+
+.action-promote:not(:disabled):hover {
+  background: #f3f4f6;
+  color: var(--aw-primary);
+}
+
+.action-delete:hover {
+  background: #fee2e2;
+  color: var(--aw-danger);
+}
+
+.action-edit:hover {
+  background: #f3f4f6;
+  color: var(--aw-primary);
+}
+
+.action-confirm {
+  background: #fee2e2;
+  color: var(--aw-danger);
+}
+
+.action-confirm:hover {
+  background: #fecaca;
+}
+
+.action-cancel:hover {
+  background: #f3f4f6;
+  color: var(--aw-ink);
+}
+
+[data-theme="dark"] .side-task-item:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+[data-theme="dark"] .side-task-item.editing,
+[data-theme="dark"] .side-task-item.confirming-delete {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+[data-theme="dark"] .action-btn {
+  background: #1a1a2e;
+}
+
+[data-theme="dark"] .action-delete:hover {
+  background: #3b1520;
+  color: #f85149;
+}
+
+[data-theme="dark"] .action-edit:hover {
+  background: #27272a;
+  color: var(--aw-primary);
+}
+
+[data-theme="dark"] .action-confirm {
+  background: #3b1520;
+  color: #f85149;
+}
+
+[data-theme="dark"] .action-confirm:hover {
+  background: #4a1a28;
+}
+
+[data-theme="dark"] .action-cancel:hover {
+  background: #27272a;
+  color: var(--aw-ink);
+}
+
+[data-theme="dark"] .side-task-title-input {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: var(--aw-primary);
+}
+</style>
+
+<style>
+.side-task-context-menu {
+  position: fixed;
+  z-index: 9999;
+  min-width: 142px;
+  padding: 6px;
+  background: #ffffff;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: var(--aw-radius-sm);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+  user-select: none;
+}
+
+.side-task-context-menu .context-menu-item {
+  padding: 7px 10px;
+  border-radius: var(--aw-radius-xs);
+  color: var(--aw-ink, #1a1a1a);
+  font-size: var(--aw-text-caption);
+  line-height: 1.2;
+  cursor: pointer;
+}
+
+.side-task-context-menu .context-menu-item:hover {
+  background: var(--aw-canvas-parchment, #f5f5f5);
+  color: var(--aw-primary, #0066cc);
+}
+
+.side-task-context-menu .context-menu-item.danger {
+  color: var(--aw-danger, #d92d20);
+}
+
+.side-task-context-menu .context-menu-item.danger:hover {
+  background: #fee2e2;
+}
+
+.side-task-context-menu .context-menu-item.disabled {
+  color: var(--aw-ink-muted-48, #8a8a8a);
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.side-task-context-menu .context-menu-item.disabled:hover {
+  background: transparent;
+  color: var(--aw-ink-muted-48, #8a8a8a);
+}
+
+[data-theme="dark"] .side-task-context-menu {
+  background: #2a2a2a;
+  border-color: var(--aw-hairline, #3a3a3a);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+[data-theme="dark"] .side-task-context-menu .context-menu-item {
+  color: var(--aw-ink, #e0e0e0);
+}
+
+[data-theme="dark"] .side-task-context-menu .context-menu-item:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--aw-primary);
+}
+
+[data-theme="dark"] .side-task-context-menu .context-menu-item.danger:hover {
+  background: #3b1520;
+  color: #f85149;
+}
+</style>

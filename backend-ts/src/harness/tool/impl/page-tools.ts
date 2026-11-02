@@ -1,0 +1,390 @@
+import { BaseTool } from '../tool.js';
+import type { Tool } from '../tool.js';
+import { asText, parseObject, toJson } from '../json.js';
+import type { EmbedPageToolRegistry } from '../../embed-page-tool-registry.js';
+import { harnessLog } from '../../log.js';
+import { PromptImageResizer } from '../prompt-image-resizer.js';
+
+/**
+ * Agent 提供的页面工具参数绝不能携带 selector / XPath / 脚本 / 坐标。
+ * 元素只能用 snapshot 作用域内的 opaque elementId 引用。
+ */
+const FORBIDDEN_ARG_KEYS = new Set([
+  'selector', 'selectors', 'css', 'cssselector', 'queryselector',
+  'xpath', 'dompath', 'path', 'outerhtml', 'innerhtml', 'html',
+  'javascript', 'js', 'script', 'code', 'evaluate', 'exec',
+  'coordinate', 'coordinates', 'coord', 'clientx', 'clienty',
+  'screenx', 'screeny', 'pagex', 'pagey', 'offsetx', 'offsety', 'mousex', 'mousey',
+]);
+
+function findForbiddenKey(value: unknown, depth = 0): string | null {
+  if (depth > 4 || value == null || typeof value !== 'object') return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findForbiddenKey(item, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    if (FORBIDDEN_ARG_KEYS.has(key.toLowerCase())) return key;
+    const found = findForbiddenKey(child, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+interface RequestOutcome { raw: string; }
+
+/**
+ * 解析页面工具回传的 outcome JSON。保留全部顶层字段（透传给调用方覆盖/合并），
+ * 只挑出 success / result / error 三个判定字段。原先这里用白名单重建对象，
+ * 上游后续在 outcome 上加的字段（pageVersion、snapshotId…）会被静默吞掉。
+ */
+function parseOutcome(raw: string): {
+  success: boolean;
+  result?: unknown;
+  error?: { code?: string; message?: string };
+  extra?: Record<string, unknown>;
+} {
+  try {
+    const node = JSON.parse(raw) as Record<string, unknown>;
+    if (node != null && typeof node === 'object') {
+      const { success: _s, result: _r, error: _e, ...extra } = node;
+      return {
+        success: node.success === true,
+        result: node.result,
+        error: node.error != null && typeof node.error === 'object' ? node.error as { code?: string; message?: string } : undefined,
+        extra,
+      };
+    }
+  } catch { /* 非 JSON 结果原样返回 */ }
+  return { success: false, error: { message: raw } };
+}
+
+abstract class PageToolBase extends BaseTool {
+  constructor(protected readonly pageTools: EmbedPageToolRegistry) { super(); }
+
+  getOutputSchema(): Record<string, unknown> { return { type: 'object' }; }
+
+  protected async call(sessionId: number | null, args: Record<string, unknown>): Promise<RequestOutcome> {
+    if (sessionId == null) {
+      return { raw: toJson({ success: false, error: { code: 'invalid_arguments', message: '页面工具必须在具体会话中调用' } }) };
+    }
+    const forbidden = findForbiddenKey(args);
+    if (forbidden) {
+      return { raw: toJson({ success: false, error: { code: 'invalid_arguments', message: `页面工具不接受参数 ${forbidden}；请使用 page_inspect 返回的 snapshotId + elementId` } }) };
+    }
+    const { future } = await this.pageTools.request(sessionId, this.getName(), args);
+    try {
+      return { raw: await future };
+    } catch (e) {
+      harnessLog('error', `${this.getName()} page tool failed`, e);
+      return { raw: toJson({ success: false, error: { code: 'internal_error', message: (e as Error).message } }) };
+    }
+  }
+
+  protected async executePageTool(argumentsJson: string, sessionId: number | null): Promise<string> {
+    const args = parseObject(argumentsJson ?? '{}');
+    if (!args) return toJson({ success: false, error: { code: 'invalid_arguments', message: '无效的 JSON 参数' } });
+    const missing = this.requireArgs(args);
+    if (missing) return toJson({ success: false, error: { code: 'invalid_arguments', message: `缺少参数: ${missing}` } });
+    return (await this.call(sessionId, args)).raw;
+  }
+
+  protected requireArgs(_args: Record<string, unknown>): string | null { return null; }
+
+  protected executeWithSession(argumentsJson: string, sessionId: number | null): Promise<string> {
+    return this.executePageTool(argumentsJson, sessionId);
+  }
+}
+
+function requireStrings(args: Record<string, unknown>, keys: string[]): string | null {
+  for (const key of keys) {
+    const value = asText(args[key]);
+    if (value == null || value === '') return key;
+  }
+  return null;
+}
+
+export class PageInspectTool extends PageToolBase {
+  getName(): string { return 'page_inspect'; }
+  getDescription(): string {
+    return '读取当前浏览器页面可见的交互元素快照（按钮、链接、输入框、下拉、勾选、可编辑区域等），返回 snapshotId 与 opaque elementId。'
+      + '包含已打开的下拉建议（role=option 以及 Element/Ant Design 等常见下拉项）。'
+      + '后续所有页面动作都必须使用本次返回的 snapshotId + elementId；页面导航或重渲染后旧引用失效，必须重新 inspect。';
+  }
+  getInputSchema(): Record<string, unknown> {
+    return { type: 'object', properties: { includeHidden: { type: 'boolean', description: '是否包含不可见元素，默认 false' } } };
+  }
+}
+
+export class PageObserveTool extends PageToolBase {
+  getName(): string { return 'page_observe'; }
+  getDescription(): string {
+    return '观察页面当前状态：URL、标题、pageVersion、相对上次快照的交互元素增减与值/勾选状态变化，以及是否发生导航。用于确认动作后的页面变化。';
+  }
+  getInputSchema(): Record<string, unknown> {
+    return { type: 'object', properties: { snapshotId: { type: 'string', description: '用于对比的可选快照 ID' } } };
+  }
+}
+
+export class PageScreenshotTool extends PageToolBase {
+  getName(): string { return 'page_screenshot'; }
+  getDescription(): string {
+    return '截取当前浏览器可视区域截图（仅视口，不含 Mao 浮窗）。'
+      + '默认按当前授权级别处理敏感区域遮罩；需要原图时会先请求用户确认。'
+      + '截图会作为视觉输入给你，并直接展示在用户浮窗的工具结果里。'
+      + '不要在回复中用 Markdown 图片、attachment://、page-screenshot.png 或其它虚构 URL 再贴一次；用户端无法解析，只会显示破图。用文字描述你看到的画面即可。';
+  }
+  getInputSchema(): Record<string, unknown> {
+    return {
+      type: 'object',
+      properties: {
+        maskSensitive: { type: 'boolean', description: '是否强制遮罩敏感区域（默认按授权级别）' },
+        reason: { type: 'string', description: '截图用途说明，展示给用户' },
+      },
+    };
+  }
+  protected async executePageTool(argumentsJson: string, sessionId: number | null): Promise<string> {
+    const raw = await super.executePageTool(argumentsJson, sessionId);
+    const outcome = parseOutcome(raw);
+    if (!outcome.success || outcome.result == null || typeof outcome.result !== 'object') return raw;
+    const shot = outcome.result as Record<string, unknown>;
+    const dataUri = asText(shot.dataUri);
+    if (!dataUri || !dataUri.startsWith('data:image/')) return raw;
+    const mime = asText(shot.mime) ?? 'image/png';
+    // 写入侧一次性压缩（技术方案 2026-10-22 §7.2）：截图同样 >1.5MB 才压，≤1.5MB 原样。
+    const compressed = await compressScreenshot(dataUri, mime);
+    // 扁平透传而非白名单重建：上游（SDK / 桌面）后续在 result（viewport、
+    // deviceScaleFactor…）或 outcome（pageVersion、snapshotId…）上加字段都要能到模型与前端，
+    // 重建对象会静默吞掉且无日志。剔除两项：原始 dataUri（已被压缩后的 data_uri 取代，
+    // 双份 base64 会让请求体无谓翻倍）、outcome.result（已平铺）。
+    const { dataUri: _rawDataUri, ...shotFields } = shot;
+    const { result: _outcomeResult, ...outcomeFields } = outcome.extra ?? {};
+    return toJson({
+      ...outcomeFields,
+      ...shotFields,
+      media_type: 'image',
+      mime: compressed?.mime ?? mime,
+      path: 'page-screenshot.png',
+      data_uri: compressed?.dataUri ?? dataUri,
+      width: compressed?.width ?? shot.width ?? null,
+      height: compressed?.height ?? shot.height ?? null,
+      masked: shot.masked === true,
+    });  }
+}
+
+/** 截图 data URI 的写入侧压缩；失败/无需压缩时返回 null（调用方回退原图）。 */
+async function compressScreenshot(
+  dataUri: string,
+  declaredMime: string,
+): Promise<{ dataUri: string; mime: string; width: number; height: number } | null> {
+  try {
+    const comma = dataUri.indexOf(',');
+    if (comma < 0) return null;
+    const meta = dataUri.slice(5, comma);
+    if (!meta.includes('base64')) return null;
+    const bytes = Buffer.from(dataUri.slice(comma + 1), 'base64');
+    const resized = await PromptImageResizer.tryCompressForStore(bytes, declaredMime);
+    if (resized == null || !resized.resized) return null;
+    return { dataUri: resized.toDataUri(), mime: resized.mime, width: resized.width, height: resized.height };
+  } catch (e) {
+    harnessLog('warn', `Page screenshot compression failed: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+export class PageScrollTool extends PageToolBase {
+  getName(): string { return 'page_scroll'; }
+  getDescription(): string {
+    return '滚动当前页面或某个可滚动元素。可用 x/y 指定像素偏移，或用 to=top/bottom 滚到两端。';
+  }
+  getInputSchema(): Record<string, unknown> {
+    return {
+      type: 'object',
+      properties: {
+        snapshotId: { type: 'string' }, elementId: { type: 'string' },
+        x: { type: 'number' }, y: { type: 'number' }, to: { type: 'string', enum: ['top', 'bottom'] },
+      },
+    };
+  }
+}
+
+export class PageFocusTool extends PageToolBase {
+  getName(): string { return 'page_focus'; }
+  getDescription(): string { return '把键盘焦点移动到快照中的某个可聚焦元素。'; }
+  getInputSchema(): Record<string, unknown> {
+    return { type: 'object', properties: { snapshotId: { type: 'string' }, elementId: { type: 'string' } }, required: ['snapshotId', 'elementId'] };
+  }
+  protected requireArgs(args: Record<string, unknown>): string | null { return requireStrings(args, ['snapshotId', 'elementId']); }
+}
+
+export class PageFillTool extends PageToolBase {
+  getName(): string { return 'page_fill'; }
+  getDescription(): string {
+    return '向快照中的输入框、文本域或 contenteditable 元素写入文本，并触发兼容 React/Vue 受控组件的事件；执行后会回读校验是否写入成功。'
+      + '对 combobox / 远程搜索框默认保持焦点并短暂等待下拉建议，观察结果可能包含 suggestions；需要失焦提交时传 blur=true。'
+      + '出现建议后请 page_inspect，再 page_click 对应选项，不要对自定义下拉使用 page_select。';
+  }
+  getInputSchema(): Record<string, unknown> {
+    return {
+      type: 'object',
+      properties: {
+        snapshotId: { type: 'string' }, elementId: { type: 'string' }, value: { type: 'string' },
+        blur: { type: 'boolean', description: '填写后是否失焦。远程搜索/combobox 默认 false，普通输入框默认 true' },
+      },
+      required: ['snapshotId', 'elementId', 'value'],
+    };
+  }
+  protected requireArgs(args: Record<string, unknown>): string | null {
+    const missing = requireStrings(args, ['snapshotId', 'elementId']);
+    if (missing) return missing;
+    if (asText(args.value) == null) return 'value';
+    return null;
+  }
+}
+
+export class PageSelectTool extends PageToolBase {
+  getName(): string { return 'page_select'; }
+  getDescription(): string {
+    return '仅用于原生 HTML select：选择指定 value 的选项并回读校验。'
+      + 'Vue/React 组件库下拉（el-select、Ant Select、远程搜索等）不是原生 select，page_select 会失败；请先 page_fill 搜索框，再 page_inspect，然后 page_click 对应 option。';
+  }
+  getInputSchema(): Record<string, unknown> {
+    return {
+      type: 'object',
+      properties: { snapshotId: { type: 'string' }, elementId: { type: 'string' }, value: { type: 'string' } },
+      required: ['snapshotId', 'elementId', 'value'],
+    };
+  }
+  protected requireArgs(args: Record<string, unknown>): string | null { return requireStrings(args, ['snapshotId', 'elementId', 'value']); }
+}
+
+export class PageCheckTool extends PageToolBase {
+  getName(): string { return 'page_check'; }
+  getDescription(): string { return '勾选快照中的 checkbox / radio / ARIA 勾选控件，并回读校验最终状态。'; }
+  getInputSchema(): Record<string, unknown> {
+    return { type: 'object', properties: { snapshotId: { type: 'string' }, elementId: { type: 'string' } }, required: ['snapshotId', 'elementId'] };
+  }
+  protected requireArgs(args: Record<string, unknown>): string | null { return requireStrings(args, ['snapshotId', 'elementId']); }
+}
+
+export class PageUncheckTool extends PageToolBase {
+  getName(): string { return 'page_uncheck'; }
+  getDescription(): string { return '取消勾选快照中的 checkbox / ARIA 勾选控件（radio 不能取消，会明确报错），并回读校验最终状态。'; }
+  getInputSchema(): Record<string, unknown> {
+    return { type: 'object', properties: { snapshotId: { type: 'string' }, elementId: { type: 'string' } }, required: ['snapshotId', 'elementId'] };
+  }
+  protected requireArgs(args: Record<string, unknown>): string | null { return requireStrings(args, ['snapshotId', 'elementId']); }
+}
+
+export class PageClickTool extends PageToolBase {
+  getName(): string { return 'page_click'; }
+  getDescription(): string {
+    return '点击快照中可见且可操作的按钮、链接或控件，不使用坐标。会派发完整鼠标序列（mousedown/mouseup/click），适配 Element/Ant 等自定义下拉项。'
+      + '点击后会检测导航、DOM 变化或控件状态变化；点下拉 option 时 observation.selected=true 才表示已选中，false/null 时请重新 page_inspect 确认选中标签，不要直接点查询。';
+  }
+  getInputSchema(): Record<string, unknown> {
+    return { type: 'object', properties: { snapshotId: { type: 'string' }, elementId: { type: 'string' } }, required: ['snapshotId', 'elementId'] };
+  }
+  protected requireArgs(args: Record<string, unknown>): string | null { return requireStrings(args, ['snapshotId', 'elementId']); }
+}
+
+export class PageKeyboardTool extends PageToolBase {
+  getName(): string { return 'page_keyboard'; }
+  getDescription(): string {
+    return '向快照中的元素（缺省为当前焦点元素）发送键盘事件：key 必填，可选 modifiers（ctrl/alt/shift/meta）；text 会在可编辑元素中插入文本。'
+      + '受浏览器安全限制，合成键盘事件不会触发原生默认行为（如表单提交、Tab 焦点跳转）。';
+  }
+  getInputSchema(): Record<string, unknown> {
+    return {
+      type: 'object',
+      properties: {
+        snapshotId: { type: 'string' }, elementId: { type: 'string' },
+        key: { type: 'string', description: '按键名，如 Enter / Escape / Tab / a' },
+        modifiers: { type: 'array', items: { type: 'string', enum: ['ctrl', 'alt', 'shift', 'meta'] } },
+        text: { type: 'string', description: '可选：在可编辑元素中插入的文本' },
+      },
+      required: ['key'],
+    };
+  }
+  protected requireArgs(args: Record<string, unknown>): string | null {
+    if (asText(args.key) == null || asText(args.key) === '') return 'key';
+    return null;
+  }
+}
+
+export class PageWaitTool extends PageToolBase {
+  getName(): string { return 'page_wait'; }
+  getDescription(): string {
+    return '等待页面稳定：可等待固定毫秒数（上限 10 秒），或等待 DOM 在一小段时间内不再变化（until=stable）。'
+      + '远程搜索下拉在 fill 后若 suggestions 仍为空，先 wait 再 page_inspect。';
+  }
+  getInputSchema(): Record<string, unknown> {
+    return {
+      type: 'object',
+      properties: {
+        ms: { type: 'integer', description: '等待毫秒数，0-10000' },
+        until: { type: 'string', enum: ['stable'], description: '等待 DOM 稳定' },
+      },
+    };
+  }
+}
+
+export class PageActionsTool extends PageToolBase {
+  getName(): string { return 'page_actions'; }
+  getDescription(): string {
+    return '按顺序执行一组页面动作（有序批量）。每一步都会重新校验授权、快照和元素状态；'
+      + '出现失败、页面导航或结构变化时立即停止，返回已执行步骤和中断原因。'
+      + '在「每次确认」授权下，执行完一个经用户确认的动作后会暂停，剩余动作请逐个确认后再调用。';
+  }
+  getInputSchema(): Record<string, unknown> {
+    return {
+      type: 'object',
+      properties: {
+        snapshotId: { type: 'string', description: '批量动作共享的快照 ID' },
+        actions: {
+          type: 'array',
+          description: '有序动作列表；每项包含 type 与 elementId（scroll/wait 可省略 elementId）',
+          items: {
+            type: 'object',
+            properties: {
+              type: { type: 'string', enum: ['click', 'focus', 'fill', 'select', 'check', 'uncheck', 'keyboard', 'scroll', 'wait'] },
+              elementId: { type: 'string' },
+              value: { type: 'string' },
+              blur: { type: 'boolean' },
+              key: { type: 'string' },
+              modifiers: { type: 'array', items: { type: 'string' } },
+              x: { type: 'number' }, y: { type: 'number' }, to: { type: 'string' },
+              ms: { type: 'integer' }, until: { type: 'string' },
+            },
+            required: ['type'],
+          },
+        },
+      },
+      required: ['actions'],
+    };
+  }
+  protected requireArgs(args: Record<string, unknown>): string | null {
+    return Array.isArray(args.actions) && args.actions.length > 0 ? null : 'actions';
+  }
+}
+
+export function createPageTools(pageTools: EmbedPageToolRegistry): Tool[] {
+  return [
+    new PageInspectTool(pageTools),
+    new PageObserveTool(pageTools),
+    new PageScreenshotTool(pageTools),
+    new PageScrollTool(pageTools),
+    new PageFocusTool(pageTools),
+    new PageFillTool(pageTools),
+    new PageSelectTool(pageTools),
+    new PageCheckTool(pageTools),
+    new PageUncheckTool(pageTools),
+    new PageClickTool(pageTools),
+    new PageKeyboardTool(pageTools),
+    new PageWaitTool(pageTools),
+    new PageActionsTool(pageTools),
+  ];
+}

@@ -1,0 +1,1339 @@
+import { ref } from 'vue'
+import { ElMessage } from 'element-plus'
+import { useSessionStore, type TaskPhase } from '../stores/session'
+import { useInboxStore } from '../stores/inbox'
+import { api } from '../api'
+import { getToken } from '../utils/auth-storage'
+import { nowDateTime } from '../utils/datetime'
+import { mapCompactionEvents } from '../utils/chatMessage'
+import { isAndroidCapacitor } from '../utils/capacitor'
+import { stripImageUrlLines } from '../utils/imageUrlAnnotation'
+import { isElectronClient } from '../utils/platform'
+import { updateSideTaskTabTitleFor } from './useCenterTabs'
+import { notifyInboxSystemUpdate, setupDesktopNotifyBridge } from './useInboxSystemNotify'
+import { ensureDesktopShellBridgeFromWs } from './useDesktopShell'
+import { resolveFileChangeWorkspace } from '../utils/file-change-workspace'
+import type { SideTaskContextMode } from '../types/file-browser'
+
+/// <reference types="vite/client" />
+
+export interface ActivityData {
+  id?: number
+  type: string
+  target?: string
+  summary: string
+  status?: string
+}
+
+// A local (not-yet-uploaded) skill from ~/.agents/skills, reported for LOCAL-mode tasks only
+export interface LocalSkillReport {
+  name: string
+  description: string
+  folderName: string
+}
+
+// Singleton state — shared across all components
+let ws: WebSocket | null = null
+const connected = ref(false)
+/** 是否曾成功建立连接：区分「首次连接中」与「断线重连中」，断线横幅据此避免首屏闪现 */
+const everConnected = ref(false)
+const reconnectDelay = ref(1000)
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null
+let lastServerMessageAt = 0
+const SERVER_SILENCE_TIMEOUT_MS = 30_000
+/**
+ * 服务端鉴权失败时主动关闭连接的 reason（见 streaming-ws-registry.closeConnection）。
+ * 这类关闭重试也不会成功，必须保持退避增长；token 刷新后重连会重新读取并使用新 token。
+ */
+const AUTH_CLOSE_REASONS = new Set([
+  'Not authenticated',
+  'Missing or invalid token',
+  'Account disabled',
+  'Authentication expired'
+])
+
+function isAuthRejection(event: CloseEvent): boolean {
+  return event?.code === 1003 && AUTH_CLOSE_REASONS.has(event.reason)
+}
+let intentionalClose = false
+let connectPromise: Promise<void> | null = null
+// 在途 connect() 的 settle 句柄与 socket 归属：与 connectPromise 同层级（模块级）。
+// disconnect 可能来自另一个 useStreamWS() 实例（如登出时新建实例调用），旧 socket 的
+// 迟到 onclose 也必须能跨实例 settle 本轮 Promise——放实例级会句柄错位导致 Promise 永不 settle
+let pendingSettle: {
+  resolve: () => void
+  reject: (err: Error) => void
+  socket: WebSocket
+} | null = null
+
+// Active execution ID per session — used to discard stale stream events after cancel
+const activeExecutionIds = new Map<string, string>()
+// Last cancelled execution ID per session — filters stragglers after clearActiveExecution
+const cancelledExecutionIds = new Map<string, string>()
+// Session-level gate: after cancel, drop ALL stream events until next RUNNING sets an executionId.
+// Covers the race where stop happens before session_status carries executionId (events without id).
+const suppressedStreamSessions = new Set<string>()
+// Sessions the client intends to receive stream events for (main + side tasks).
+// Restored on every reconnect — server subscriptions do not survive a new WS.
+const subscribedSessionIds = new Set<string>()
+
+export function setActiveExecution(sessionId: string, executionId: string) {
+  cancelledExecutionIds.delete(sessionId)
+  suppressedStreamSessions.delete(sessionId)
+  activeExecutionIds.set(sessionId, executionId)
+}
+
+export function clearActiveExecution(sessionId: string) {
+  const active = activeExecutionIds.get(sessionId)
+  if (active) {
+    cancelledExecutionIds.set(sessionId, active)
+  }
+  activeExecutionIds.delete(sessionId)
+  suppressedStreamSessions.add(sessionId)
+}
+
+function isStaleExecution(sessionId: string, data: any): boolean {
+  // 空闲手动压缩（compact_now 空闲路径）由后端合成 listener 以 sentinel executionId
+  // `manual_compact_*` 下发 compaction_start/end/marker 与 context_window。这是会话跑完任务后
+  // （已进 suppressedStreamSessions）、且无 RUNNING 帧登记的新型过程事件；不豁免则整批被陈旧帧门
+  // 吞掉，违反「过程实时可见 / 水位下降 / 分隔线 / isCompacting 点亮」验收。该前缀只可能由手动压缩
+  // 产生（真实执行是 UUID/数字 id），绝不会是被取消执行的迟到残留，故按 id 无条件放行即可。
+  if (typeof data?.executionId === 'string' && data.executionId.startsWith('manual_compact_')) {
+    return false
+  }
+  if (suppressedStreamSessions.has(sessionId)) {
+    return true
+  }
+  const active = activeExecutionIds.get(sessionId)
+  if (!active) {
+    const cancelled = cancelledExecutionIds.get(sessionId)
+    if (cancelled && data?.executionId === cancelled) return true
+    return false
+  }
+  if (!data?.executionId) return false
+  return data.executionId !== active
+}
+
+const STREAM_EVENT_TYPES = new Set([
+  'content_delta', 'tool_call_start', 'tool_call_args_delta', 'tool_call_result',
+  'thinking_start', 'thinking_end', 'thinking_delta', 'message_end',
+  'file_change', 'activity', 'compaction_start', 'compaction_end', 'compaction_marker',
+  'context_window', 'llm_waiting', 'llm_stream_reset', 'llm_retry', 'session_already_running', 'error',
+  'round_start', 'round_end'
+])
+
+function refreshQueue(sessionId: string) {
+  const store = useSessionStore()
+  api.get(`/sessions/${sessionId}/queue`)
+    .then(({ data }) => store.setQueueMessages(sessionId, data || []))
+    .catch(() => {})
+}
+const pendingCallbacks = new Map<string, {
+  onSending?: () => void
+  resolve?: () => void
+  reject?: (err: Error) => void
+}>()
+
+// 消息保存确认的回调机制
+type MessageSavedCallback = (sessionId: string, messageId: string) => void
+const messageSavedCallbacks = new Map<string, MessageSavedCallback>()
+
+// Module-level flags to ensure IPC listeners are registered only once
+let skillSyncListenerRegistered = false
+
+/** skill_sync_done payloads waiting for WS to become OPEN (reconnect during sync). */
+const pendingSkillSyncDones = new Map<number, {
+  sessionId: number
+  success: boolean
+  error?: string
+  syncId?: string
+}>()
+
+/**
+ * skill_sync_required 下发的轮次 ID：主进程的完成回调只带 sessionId，
+ * 而后端按 syncId 匹配轮次（不带则忽略该信号并等到 60s 超时判会话失败）。
+ */
+const activeSkillSyncIds = new Map<number, string>()
+
+function sendOrQueueSkillSyncDone(data: { sessionId: number; success: boolean; error?: string }) {
+  const payload = { ...data, syncId: activeSkillSyncIds.get(data.sessionId) }
+  if (ws?.readyState === WebSocket.OPEN && connected.value) {
+    ws.send(JSON.stringify({
+      type: 'skill_sync_done',
+      sessionId: payload.sessionId,
+      success: payload.success,
+      error: payload.error,
+      syncId: payload.syncId ?? null
+    }))
+    pendingSkillSyncDones.delete(payload.sessionId)
+    activeSkillSyncIds.delete(payload.sessionId)
+    return
+  }
+  console.warn(
+    '[skill-sync] WS not open, queue skill_sync_done for flush on reconnect, readyState=' + ws?.readyState
+  )
+  pendingSkillSyncDones.set(payload.sessionId, payload)
+}
+
+function flushPendingSkillSyncDones() {
+  if (pendingSkillSyncDones.size === 0) return
+  if (ws?.readyState !== WebSocket.OPEN) return
+  const pending = Array.from(pendingSkillSyncDones.values())
+  pendingSkillSyncDones.clear()
+  for (const data of pending) {
+    ws.send(JSON.stringify({
+      type: 'skill_sync_done',
+      sessionId: data.sessionId,
+      success: data.success,
+      error: data.error,
+      syncId: data.syncId ?? null
+    }))
+    activeSkillSyncIds.delete(data.sessionId)
+  }
+  console.info(`[skill-sync] flushed ${pending.length} pending skill_sync_done after reconnect`)
+}
+
+export function useStreamWS() {
+  const sessionStore = useSessionStore()
+  const inboxStore = useInboxStore()
+
+  // 桌面壳事件桥接（托盘 / 快捷键失败提示）：幂等注册，登录后 WS 单例活跃即生效
+  if (isElectronClient()) ensureDesktopShellBridgeFromWs()
+
+  // Listen for skill sync completion from main process (register once)
+  if (!skillSyncListenerRegistered && isElectronClient()) {
+    skillSyncListenerRegistered = true
+    ;(window as any).electronAPI.onSkillSyncComplete?.((data: { sessionId: number; success: boolean; error?: string }) => {
+      sendOrQueueSkillSyncDone(data)
+    })
+  }
+
+  function connect(): Promise<void> {
+    // 只有「握手 + 服务端鉴权确认」都完成才算已连接：仅 OPEN 但尚未收到 connected 帧时，
+    // 业务帧会被服务端按未认证连接关闭，且此时 connectPromise 仍在途，必须继续等它。
+    if (ws && ws.readyState === WebSocket.OPEN && connected.value) {
+      return Promise.resolve()
+    }
+    if (connectPromise) return connectPromise
+
+    const wsBase = import.meta.env.VITE_WS_BASE_URL || import.meta.env.VITE_API_BASE_URL?.replace(/^http/, 'ws').replace(/\/api\/v1$/, '/api') || 'ws://localhost:9080/api'
+    const token = getToken()
+    if (!token) return Promise.reject(new Error('No token'))
+
+    const client = isAndroidCapacitor() ? 'android' : (isElectronClient() ? 'electron' : 'browser')
+    // token 不进握手 URL（避免被代理/日志记录），改为连接成功后的首帧 auth 消息
+    const url = `${wsBase}/ws/stream?client=${client}`
+    // 局部引用：disconnect() 将模块级 ws 置空后，迟到回调仍能安全访问自身 socket
+    const socket = new WebSocket(url)
+    ws = socket
+    intentionalClose = false
+
+    connectPromise = new Promise<void>((resolve, reject) => {
+      pendingSettle = { resolve, reject, socket }
+      socket.onopen = () => {
+        // 已被更新的连接或 disconnect() 取代：本轮握手结果不再有效
+        if (socket !== ws) return
+        // 鉴权首帧：必须是新连接发出的第一条消息，先于任何 subscribe 等业务帧。
+        // 此刻还不算「已连接」——等服务端 connected 确认帧（handleAuthenticated）后
+        // 才置 connected、重置退避并补订阅，避免业务帧与异步鉴权竞争。
+        socket.send(JSON.stringify({ type: 'auth', token, client }))
+        // 心跳与静默判死从握手起生效：鉴权迟迟无响应时由 30s 静默兜底触发重连
+        startHeartbeat()
+        // 通知点击桥接尽早注册（幂等）：等首条 inbox_updated 再注册会丢掉这期间
+        // 对通知中心里旧通知的点击（主进程立即派发时渲染层还没有监听）。注册时
+        // 会顺带 consume 主进程积存的点击深链，覆盖本连接建立前的点击。
+        if (isElectronClient()) setupDesktopNotifyBridge()
+      }
+
+      socket.onmessage = (event) => {
+        if (event.target !== ws) return
+        lastServerMessageAt = Date.now()
+        let msg: any
+        try {
+          msg = JSON.parse(event.data)
+        } catch {
+          return
+        }
+        routeEvent(msg)
+      }
+
+      // 只处理当前活跃连接的关闭事件：重连后旧 socket 的迟到 onclose
+      // 不能清掉新连接的心跳/状态，也不能再排一次多余重连
+      socket.onclose = (event) => {
+        if (event.target !== ws) {
+          // 旧 socket 的迟到关闭：若模块级在途 Promise 仍属于本 socket（未被新 connect
+          // 取代、未被 disconnect settle），必须就地 settle，否则调用方 await 永久挂起
+          if (connectPromise && pendingSettle?.socket === socket) {
+            connectPromise = null
+            const settle = pendingSettle
+            pendingSettle = null
+            if (intentionalClose) {
+              settle.resolve()
+            } else {
+              settle.reject(new Error('WebSocket connection closed'))
+            }
+          }
+          return
+        }
+        connected.value = false
+        stopHeartbeat()
+        // 断线后内存中的瞬时 LLM 重试状态已不可信，全部清理避免重连后残留过期提示
+        sessionStore.clearAllLlmRetry()
+        if (!intentionalClose && isAuthRejection(event)) {
+          // 鉴权被拒：保留退避增长（不重置 reconnectDelay），避免 1s 一次的热循环；
+          // 每次重连都会重读 token，令牌刷新后自动恢复
+          console.warn(`[ws] authentication rejected by server: code=${event.code} reason=${event.reason}`)
+        }
+        const settle = pendingSettle
+        connectPromise = null
+        pendingSettle = null
+        if (intentionalClose) {
+          settle?.resolve()
+        } else {
+          // 首连失败、重连握手失败、已建立连接断开：都必须 settle 本轮 Promise，
+          // 否则发送方 await connect() 会永久挂起，后续连通也无法恢复原发送。
+          scheduleReconnect()
+          settle?.reject(new Error('WebSocket connection closed'))
+        }
+      }
+
+      socket.onerror = () => {
+        // onclose will fire after onerror, which handles the reject/reconnect
+      }
+    })
+
+    return connectPromise
+  }
+
+  function disconnect() {
+    intentionalClose = true
+    stopHeartbeat()
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+    if (ws) {
+      ws.close()
+      ws = null
+    }
+    connected.value = false
+    // 复位未 settle 的连接 Promise：disconnect 后 socket 迟到 onclose 会走早退分支，
+    // 若 connectPromise 残留，后续 connect() 会返回永不 settle 的死 Promise（输入框锁死）
+    if (connectPromise) {
+      connectPromise = null
+      const settle = pendingSettle
+      pendingSettle = null
+      settle?.reject(new Error('WebSocket connection cancelled'))
+    }
+    // 登出/强制下线：清空跨会话残留状态，避免换号登录后串用户；
+    // pendingCallbacks 先 reject 等待中的 Promise 再清空，否则等待执行终态的调用方永久悬挂
+    for (const cb of pendingCallbacks.values()) {
+      cb.reject?.(new Error('已登出，执行已中断'))
+    }
+    pendingCallbacks.clear()
+    activeExecutionIds.clear()
+    cancelledExecutionIds.clear()
+    suppressedStreamSessions.clear()
+    messageSavedCallbacks.clear()
+    pendingSkillSyncDones.clear()
+    // 关闭已订阅会话在桌面端的 MCP 连接（stdio 子进程 / HTTP 会话）
+    const mcpSessionIds = Array.from(subscribedSessionIds)
+    subscribedSessionIds.clear()
+    if (mcpSessionIds.length > 0 && typeof window !== 'undefined' && (window as any).electronAPI?.mcpClose) {
+      mcpSessionIds.forEach((sid) => {
+        ;(window as any).electronAPI.mcpClose?.(Number(sid)).catch?.((err: Error) =>
+          console.warn('[mcp-close] failed for session', sid, err?.message))
+      })
+    }
+  }
+
+  /**
+   * 服务端确认首帧鉴权（connected 帧）：这一刻起连接才可收发业务帧。
+   * 重连退避也在此刻复位——鉴权被拒时退避持续增长，避免 1s 一次的热循环。
+   */
+  function handleAuthenticated() {
+    connected.value = true
+    everConnected.value = true
+    reconnectDelay.value = 1000
+    const settle = pendingSettle
+    connectPromise = null
+    pendingSettle = null
+    settle?.resolve()
+    // Re-subscribe all tracked sessions (main + open side tasks).
+    // Server-side subscriptions are tied to the previous socket and are lost on reconnect.
+    const toResubscribe = new Set(subscribedSessionIds)
+    if (sessionStore.activeSessionId) {
+      toResubscribe.add(String(sessionStore.activeSessionId))
+    }
+    for (const sid of toResubscribe) {
+      subscribedSessionIds.add(sid)
+      send({ type: 'subscribe', sessionId: Number(sid) })
+      refreshQueue(sid)
+    }
+    // Flush skill_sync_done that completed while WS was down (LOCAL skill sync race)
+    flushPendingSkillSyncDones()
+    // 聚焦数据已加载过：重连后静默重拉全量 ACTIVE，保证断线期间变化不丢失
+    if (sessionStore.focusLoaded) {
+      void sessionStore.fetchFocusSessions(true)
+    }
+    // 收件箱未读数重拉兜底（刻意不放进 focusLoaded 分支：聚焦列表未加载时徽标也要能更新）。
+    // inbox_updated 已在 CRITICAL_EVENT_TYPES，这里是双保险。
+    void inboxStore.fetchUnreadCount()
+  }
+
+  function startHeartbeat() {
+    // Any server message proves the connection is alive; allow enough time for a delayed
+    // pong when the shared outbound queue is busy with stream events.
+    lastServerMessageAt = Date.now()
+    // 先清理可能残留的上一代心跳定时器（旧连接迟到事件或未触发 onclose 的场景）
+    stopHeartbeat()
+    heartbeatTimer = setInterval(() => {
+      if (ws?.readyState !== WebSocket.OPEN) return
+      if (Date.now() - lastServerMessageAt > SERVER_SILENCE_TIMEOUT_MS) {
+        const dying = ws
+        dying.close()
+        // 半开连接（合盖休眠/拔线无 RST）下 close() 的关闭帧可能永远得不到应答，
+        // onclose 要等 OS 级 TCP 超时（分钟级）才触发；3s 内未关闭则强制按断开处理。
+        // 迟到的 onclose 会因 event.target !== ws 走早退分支，不会重复重连。
+        setTimeout(() => {
+          if (ws !== dying) return
+          ws = null
+          connected.value = false
+          stopHeartbeat()
+          sessionStore.clearAllLlmRetry()
+          // 鉴权/握手未完成就判死：必须同时结束在途 connect Promise，
+          // 否则后续 connect() 会直接返回这个永挂的旧 Promise，再也建不出新连接
+          if (connectPromise) {
+            connectPromise = null
+            const settle = pendingSettle
+            pendingSettle = null
+            settle?.reject(new Error('WebSocket handshake timeout'))
+          }
+          scheduleReconnect()
+        }, 3_000)
+        return
+      }
+      ws.send(JSON.stringify({ type: 'ping' }))
+    }, 5_000)
+  }
+
+  function scheduleReconnect() {
+    if (reconnectTimer) return
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null
+      // 未登录窗口 connect() 会立即 reject，吞掉避免 unhandled rejection
+      connect().catch(() => {})
+    }, reconnectDelay.value)
+    reconnectDelay.value = Math.min(reconnectDelay.value * 2, 30_000)
+  }
+
+  function stopHeartbeat() {
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer)
+      heartbeatTimer = null
+    }
+  }
+
+  function send(msg: any) {
+    // 只有服务端确认鉴权后的连接才允许发业务帧：鉴权未完成时服务端会按未认证关闭连接
+    if (ws?.readyState === WebSocket.OPEN && connected.value) {
+      ws.send(JSON.stringify(msg))
+    } else {
+      console.warn('[ws] send dropped (not authenticated):', msg.type, 'readyState=' + ws?.readyState)
+    }
+  }
+
+  async function sendReliable(msg: any): Promise<boolean> {
+    const trySend = (): boolean => {
+      const socket = ws
+      // 鉴权确认（connected 帧）前不发业务帧：否则服务端会按未认证连接关闭
+      if (socket?.readyState === WebSocket.OPEN && connected.value) {
+        socket.send(JSON.stringify(msg))
+        return true
+      }
+      return false
+    }
+
+    if (trySend()) {
+      return true
+    }
+    try {
+      // connect() 在 TCP 黑洞下可能挂起很久（浏览器无内建握手超时），
+      // 超时后按发送失败处理，让调用方（停止/重试/发送）给出明确提示
+      await withTimeout(connect(), 15_000)
+    } catch {
+      console.warn('[ws] sendReliable failed to reconnect for', msg.type)
+      return false
+    }
+    if (trySend()) {
+      return true
+    }
+    console.warn('[ws] sendReliable dropped after reconnect:', msg.type, 'readyState=' + ws?.readyState)
+    return false
+  }
+
+  function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timeout after ${ms}ms`)), ms)
+      promise.then(
+        (v) => { clearTimeout(timer); resolve(v) },
+        (e) => { clearTimeout(timer); reject(e) }
+      )
+    })
+  }
+
+  function resetSessionStreamState(sessionId: string) {
+    sessionStore.setStreaming(sessionId, false)
+    sessionStore.setThinking(sessionId, false)
+    sessionStore.clearLlmRetry(sessionId)
+    sessionStore.clearAskQuestions(sessionId)
+    clearActiveExecution(sessionId)
+  }
+
+  async function subscribe(sessionId: string | null): Promise<boolean> {
+    if (sessionId) {
+      const sid = String(sessionId)
+      if (subscribedSessionIds.has(sid)) return true
+      subscribedSessionIds.add(sid)
+      return sendReliable({ type: 'subscribe', sessionId: Number(sid) })
+    }
+    return false
+  }
+
+  async function unsubscribe(sessionId: string | null): Promise<boolean> {
+    if (sessionId) {
+      subscribedSessionIds.delete(String(sessionId))
+      return sendReliable({ type: 'unsubscribe', sessionId: Number(sessionId) })
+    }
+    return false
+  }
+
+  async function sendMessage(sessionId: string, content: string, eventId: string, images?: string[], localSkills?: LocalSkillReport[], agentsMdContent?: string, modelId?: number): Promise<boolean> {
+    const payload = {
+      type: 'send_message',
+      sessionId: Number(sessionId),
+      data: {
+        content,
+        eventId,
+        images: images || [],
+        ...(modelId != null ? { modelId } : {}),
+        ...(localSkills && localSkills.length > 0 ? { localSkills } : {}),
+        ...(agentsMdContent ? { agentsMdContent } : {})
+      }
+    }
+    return sendReliable(payload)
+  }
+
+  async function sendEditMessage(sessionId: string, content: string, messageId: string, images?: string[], localSkills?: LocalSkillReport[], agentsMdContent?: string): Promise<boolean> {
+    const payload = {
+      type: 'edit_and_resend',
+      sessionId: Number(sessionId),
+      messageId: Number(messageId),
+      content,
+      images: images || [],
+      ...(localSkills && localSkills.length > 0 ? { localSkills } : {}),
+      ...(agentsMdContent ? { agentsMdContent } : {})
+    }
+    return sendReliable(payload)
+  }
+
+  async function cancel(sessionId: string): Promise<boolean> {
+    return sendReliable({ type: 'cancel', sessionId: Number(sessionId) })
+  }
+
+  async function retryExecution(sessionId: string): Promise<boolean> {
+    return sendReliable({ type: 'retry_execution', sessionId: Number(sessionId), data: {} })
+  }
+
+  /** 手动整理上下文（技术方案 5.4）：空闲立即执行、运行中在下个工具轮边界执行，二者都由服务端回执事件驱动 UI。 */
+  async function compactNow(sessionId: string): Promise<boolean> {
+    return sendReliable({ type: 'compact_now', sessionId: Number(sessionId) })
+  }
+
+  async function sendAskUserQuestionsResult(sessionId: string, requestId: string, answers: any[]): Promise<boolean> {
+    return sendReliable({
+      type: 'ask_user_questions_result',
+      sessionId: Number(sessionId),
+      data: { requestId, answers }
+    })
+  }
+
+  async function enqueueMessage(sessionId: string, content: string, eventId: string, images: string[]): Promise<boolean> {
+    return sendReliable({ type: 'enqueue_message', sessionId: Number(sessionId), data: { content, eventId, images } })
+  }
+
+  async function insertMessage(sessionId: string, queueId: string): Promise<boolean> {
+    return sendReliable({ type: 'insert_message', sessionId: Number(sessionId), data: { queueId } })
+  }
+
+  async function deleteQueueMessage(sessionId: string, queueId: string): Promise<boolean> {
+    return sendReliable({ type: 'delete_queue_message', sessionId: Number(sessionId), data: { queueId } })
+  }
+
+  async function reorderQueueMessage(sessionId: string, queueId: string, targetIndex: number): Promise<boolean> {
+    return sendReliable({ type: 'reorder_queue_message', sessionId: Number(sessionId), data: { queueId, targetIndex } })
+  }
+
+  async function sendToolApproval(sessionId: string, requestId: string, approved: boolean, alwaysAllow = false): Promise<boolean> {
+    return sendReliable({
+      type: 'tool_approval',
+      sessionId: Number(sessionId),
+      requestId,
+      approved,
+      // 「总是允许」（V135）：仅布尔位，pattern 由服务端按 requestId 取回自己生成的 hint
+      ...(alwaysAllow ? { alwaysAllow: true } : {})
+    })
+  }
+
+  async function createSideSession(
+    parentSessionId: string,
+    content: string,
+    contextMode: SideTaskContextMode,
+    modelId?: number,
+    localSkills?: LocalSkillReport[],
+    agentsMdContent?: string,
+    images?: string[],
+    permissionLevel?: string,
+    forkFromMessageId?: number | null
+  ): Promise<boolean> {
+    const payload = {
+      type: 'create_side_session',
+      sessionId: Number(parentSessionId),
+      data: {
+        content,
+        contextMode,
+        images: images || [],
+        ...(modelId != null ? { modelId } : {}),
+        ...(localSkills && localSkills.length > 0 ? { localSkills } : {}),
+        ...(agentsMdContent ? { agentsMdContent } : {}),
+        ...(permissionLevel ? { permissionLevel } : {}),
+        // 按轮分叉的切点（被点击那一轮的助手最终回复 id）；缺省即全量分叉
+        ...(forkFromMessageId != null ? { forkFromMessageId } : {})
+      }
+    }
+    return sendReliable(payload)
+  }
+
+  function routeEvent(msg: any) {
+    const { type, sessionId: rawSid, data } = msg
+    const sessionId = rawSid != null ? String(rawSid) : null
+
+    // session_already_running 是对本端发送的同步拒绝回执：data.executionId 指向【占用方】，
+    // 永远不会等于本端刚登记的 active id，按 stale 过滤会吞掉拒绝帧导致发送假成功
+    // （乐观消息停在临时 ID、回调被占用方终态误 resolve）。故豁免于陈旧过滤，直达 reject。
+    if (sessionId && type !== 'session_already_running' && STREAM_EVENT_TYPES.has(type) && isStaleExecution(sessionId, data)) {
+      return
+    }
+
+    switch (type) {
+      case 'connected':
+        // 首帧 auth 的服务端确认：此刻连接才可收发业务帧
+        handleAuthenticated()
+        break
+
+      case 'pong':
+        break
+
+      case 'content_delta':
+        if (sessionId) {
+          sessionStore.appendDelta(sessionId, data.delta)
+          sessionStore.clearLlmRetry(sessionId)
+        }
+        break
+
+      case 'tool_call_start':
+        if (sessionId) {
+          sessionStore.setStreaming(sessionId, false)
+          sessionStore.appendToolCallStart(sessionId, data)
+          sessionStore.clearLlmRetry(sessionId)
+          // 轨迹 tab 的进行中计时：duration_ms 要等工具结束才有，起表由客户端时钟负责
+          if (typeof data?.executionId === 'string') {
+            sessionStore.applyLiveToolStart(sessionId, data.executionId, data.tool_call_id, data.tool_name)
+          }
+        }
+        break
+
+      case 'tool_call_args_delta':
+        if (sessionId) sessionStore.updateToolCallArgs(sessionId, data)
+        break
+
+      case 'tool_call_result':
+        if (sessionId) sessionStore.updateToolCallResult(sessionId, data)
+        if (sessionId && typeof data?.executionId === 'string') {
+          sessionStore.applyLiveToolEnd(sessionId, data.executionId, data.tool_call_id)
+        }
+        break
+
+      case 'round_start':
+        // 只驱动轨迹 tab 的「本次执行第几轮」临时行；持久序号以 REST 的 seq 为准
+        if (sessionId && typeof data?.executionId === 'string') {
+          sessionStore.applyLiveRoundStart(sessionId, data.executionId, Number(data.round))
+        }
+        break
+
+      case 'round_end':
+        if (sessionId && typeof data?.executionId === 'string') {
+          sessionStore.applyLiveRoundEnd(sessionId, data.executionId, Number(data.round))
+        }
+        break
+
+      case 'activity':
+        if (sessionId) sessionStore.addActivity(sessionId, data)
+        break
+
+      case 'todo_updated':
+        if (sessionId) sessionStore.setTodos(sessionId, data.todos || [])
+        break
+
+      case 'file_change':
+        if (sessionId) {
+          const workspace = resolveFileChangeWorkspace(sessionId, {
+            getSession: (id) => sessionStore.getSessionEntity(id),
+            findSideTaskRootKey: (id) => sessionStore.findSideTaskRootKey(id),
+            findSubagentParentId: (id) => {
+              for (const [parentId, list] of sessionStore.subagentCache) {
+                if (list.some(item => item.id === id)) return parentId
+              }
+              return null
+            },
+          })
+          sessionStore.appendFileChange(sessionId, {
+            path: data.path,
+            type: data.type,
+            linesAdded: data.lines_added,
+            linesDeleted: data.lines_deleted,
+            toolCallId: data.tool_call_id,
+            diffMode: data.diff_mode,
+            beforeContent: data.before_content,
+            afterContent: data.after_content,
+            patchContent: data.patch_content,
+            patchTruncated: Boolean(data.patch_truncated),
+            diffUnavailableReason: data.diff_unavailable_reason
+          }, workspace)
+        }
+        break
+
+      case 'session_title_updated':
+        if (sessionId && typeof data?.title === 'string') {
+          sessionStore.updateSession(sessionId, { title: data.title })
+          if (data.sessionType === 'SIDE_TASK' && data.parentSessionId != null) {
+            // 深层边路任务的事件只带直接父会话 id，而递归缓存 / Tab 状态都以根主会话 id 为键：
+            // 按任务 id 反查所属根键，查不到（缓存未加载）回退直接父 id，兼容仅一级边路的旧数据
+            const sid = Number(sessionId)
+            const rootKey = sessionStore.findSideTaskRootKey(sid) ?? String(data.parentSessionId)
+            sessionStore.updateSideTaskTitle(rootKey, sid, data.title)
+            updateSideTaskTabTitleFor(rootKey, sid, data.title)
+          }
+        }
+        break
+
+      case 'session_status':
+        if (sessionId) {
+          const phase = data.phase as TaskPhase
+          const terminalPhases = ['COMPLETED', 'FAILED', 'CANCELLED', 'IDLE']
+
+          if (phase === 'RUNNING' && data.executionId) {
+            setActiveExecution(sessionId, data.executionId)
+          }
+          const startedAt = phase === 'RUNNING' ? new Date().toISOString() : undefined
+
+          // Ignore stale CANCELLING after local optimistic cancel
+          if (phase === 'CANCELLING' && !activeExecutionIds.has(sessionId)) {
+            break
+          }
+
+          sessionStore.updateSessionPhase(sessionId, phase, startedAt)
+          sessionStore.updateSideTaskPhase(Number(sessionId), phase, startedAt)
+          sessionStore.updateSubagentPhase(Number(sessionId), phase)
+          // Sync unread state — skip for active session (user is already viewing)
+          if (data.unread !== undefined) {
+            if (sessionId === sessionStore.activeSessionId) {
+              sessionStore.markAsRead(sessionId)
+            } else {
+              sessionStore.updateSession(sessionId, { unread: data.unread })
+              // 边路任务会话不在主列表：unread 单独落到 SideTask 缓存（左侧任务栏圆点）
+              const parentSessionId = sessionStore.updateSideTaskUnread(Number(sessionId), data.unread)
+              if (data.unread === true) {
+                const currentPhase = sessionStore.getSessionPhase(sessionId)
+                if (currentPhase === 'RUNNING' || currentPhase === 'RESUMING' || currentPhase === 'WAITING_APPROVAL' || currentPhase === 'CANCELLING') {
+                  void sessionStore.fetchSession(sessionId)
+                }
+                if (parentSessionId) {
+                  void sessionStore.fetchSession(parentSessionId)
+                  void sessionStore.refreshSideTasks(parentSessionId)
+                }
+              }
+            }
+          }
+          if (terminalPhases.includes(phase)) {
+            // 服务端对被中止的轮次不会补发工具结果（agent-loop 命中 cancelFlag 后直接丢弃），
+            // CANCELLED/FAILED 必须就地终结仍在 running 的工具，否则转圈永久残留
+            if (phase === 'CANCELLED' || phase === 'FAILED') {
+              sessionStore.finishInterruptedStreamingMessage(
+                sessionId,
+                phase === 'CANCELLED' ? '执行已被中止' : '执行失败中断'
+              )
+            }
+            sessionStore.setStreaming(sessionId, false)
+            sessionStore.setThinking(sessionId, false)
+            sessionStore.setCompacting(sessionId, false)
+            sessionStore.clearLlmRetry(sessionId)
+            sessionStore.clearAskQuestions(sessionId)
+            // 轨迹 tab：执行终止后丢掉临时轮 / 工具计时行，完成态以 REST 为准（面板自行重拉）
+            sessionStore.clearLiveState(sessionId)
+            if (phase === 'CANCELLED' || phase === 'COMPLETED' || phase === 'FAILED') {
+              clearActiveExecution(sessionId)
+            }
+            const cb = pendingCallbacks.get(sessionId)
+            if (cb) {
+              pendingCallbacks.delete(sessionId)
+              cb.resolve?.()
+            }
+          } else if (phase === 'RUNNING' || phase === 'WAITING_APPROVAL') {
+            if (!pendingCallbacks.has(sessionId)) {
+              pendingCallbacks.set(sessionId, {
+                resolve: () => {},
+                reject: () => {}
+              })
+            }
+          }
+        }
+        break
+
+      case 'session_list_update':
+        if (sessionId) {
+          const phase = data.phase as TaskPhase
+          sessionStore.updateSessionPhase(sessionId, phase)
+          sessionStore.updateSideTaskPhase(Number(sessionId), phase)
+          sessionStore.updateSubagentPhase(Number(sessionId), phase)
+        }
+        break
+
+      case 'inbox_updated': {
+        // 服务端 COUNT 为唯一权威：只写未读数，不做本地累加。
+        // 与 session_status.unread 是两套独立概念，禁止互相覆盖（红线 #2）。
+        const unreadCount = Number(data?.unreadCount ?? 0)
+        if (Number.isFinite(unreadCount)) inboxStore.setUnreadCount(unreadCount)
+        // Electron 失焦时补一条系统通知；Web/安卓在 composable 内部空转
+        if (isElectronClient()) void notifyInboxSystemUpdate()
+        break
+      }
+
+      case 'context_window':
+        if (sessionId) sessionStore.setContextWindow(sessionId, data)
+        break
+
+      case 'compaction_start':
+        if (sessionId) sessionStore.setCompacting(sessionId, true)
+        break
+
+      case 'compaction_end':
+        if (sessionId) sessionStore.setCompacting(sessionId, false)
+        break
+
+      case 'compaction_marker':
+        if (sessionId && data) {
+          const events = mapCompactionEvents([data as Record<string, unknown>])
+          if (events[0]) sessionStore.addCompactionEvent(sessionId, events[0])
+        }
+        break
+
+      case 'compaction_queued':
+        // 运行中手动压缩：本工具轮边界才执行，先回执排队态。后续 compaction_start/end/marker 由 loop 真实 listener 下发。
+        ElMessage.info(data?.message ?? '已排队，将在本轮工具结束后整理上下文')
+        break
+
+      case 'compaction_result':
+        // 空闲手动压缩的最终回执；compaction_start/end/marker 已驱动分隔线与水位，这里补一条结果提示。
+        // 失败回执走压缩通道（compacted=false + failed=true），只提示、绝不影响会话执行状态。
+        if (data?.failed) ElMessage.error(data?.message ?? '整理上下文失败，请稍后重试')
+        else if (data?.compacted === false) ElMessage.info('当前上下文已足够精简，无需整理')
+        else ElMessage.success('已整理上下文')
+        break
+
+      case 'thinking_start':
+        if (sessionId) {
+          sessionStore.setStreaming(sessionId, false)
+          sessionStore.setThinking(sessionId, true)
+          // 重试成功后首个事件可能是 thinking_start，清除过期重试提示
+          sessionStore.clearLlmRetry(sessionId)
+        }
+        break
+
+      case 'thinking_end':
+        if (sessionId) {
+          sessionStore.setStreaming(sessionId, false)
+          sessionStore.setThinking(sessionId, false)
+          sessionStore.clearLlmRetry(sessionId)
+        }
+        break
+
+      case 'thinking_delta':
+        if (sessionId) {
+          sessionStore.appendThinkingDelta(sessionId, data.delta)
+          sessionStore.clearLlmRetry(sessionId)
+        }
+        break
+
+      case 'llm_waiting':
+        if (sessionId && data) {
+          sessionStore.setLlmRetry(sessionId, {
+            phase: data.phase,
+            elapsedSeconds: data.elapsedSeconds
+          })
+        }
+        break
+
+      case 'llm_stream_reset':
+        if (sessionId) {
+          sessionStore.resetStreamingAssistantMessage(sessionId)
+        }
+        break
+
+      case 'llm_retry':
+        if (sessionId && data) {
+          sessionStore.setLlmRetry(sessionId, {
+            reason: data.reason,
+            statusCode: data.statusCode,
+            attempt: data.attempt,
+            maxRetries: data.maxRetries,
+            delaySeconds: data.delaySeconds
+          })
+        }
+        break
+
+      case 'session_already_running':
+        if (sessionId) {
+          const cb = pendingCallbacks.get(sessionId)
+          if (cb) {
+            pendingCallbacks.delete(sessionId)
+            cb.reject?.(new Error(data?.message || '该任务仍在运行'))
+          }
+        }
+        break
+
+      case 'message_end':
+        if (sessionId) {
+          sessionStore.markMessageComplete(sessionId, data)
+          sessionStore.clearLlmRetry(sessionId)
+        }
+        break
+
+      case 'user_message_saved': {
+        // 本端发送：把乐观消息的临时 ID（msg_*）替换为服务端真实 ID；
+        // 远端来源（微信/飞书/定时任务/其他端）：按内容回显新消息。
+        // 判定不依赖 source 白名单——桌面端广播现在也带 source/content，其他端（多标签页/
+        // Electron+浏览器/安卓）需要同样实时看到远端发来的消息；messageId 可能为 null（飞书）。
+        if (sessionId) {
+          const sid = sessionId
+          const content = typeof data?.content === 'string' ? data.content : ''
+          const images = Array.isArray(data?.images) && data.images.length > 0 ? data.images as string[] : undefined
+          const remoteMsgId = data?.messageId != null ? String(data.messageId) : null
+          const hasRemoteEcho = content !== '' || (images != null && images.length > 0)
+
+          // 本端刚发送的乐观消息：最后一条乐观用户消息（msg_/side_user_ 等临时 ID 前缀），
+          // 其内容与本事件一致 → 只替换 ID。注意边路任务乐观 ID 是 side_user_ 前缀，
+          // 不能只判 msg_，否则会误判为远端回显、追加出重复的用户消息。
+          // 两侧都剥离图片 URL 注入行再比对：广播口径是剥离后的正文，而用户正文恰好
+          // 命中注入行格式时（[图片 N] <无空格串>）广播端会被误剥，逐字比对会失配。
+          const list = sessionStore.getMessages(sid) ?? []
+          const lastUser = [...list].reverse().find(m => m.role === 'user')
+          const remoteText = content.trim()
+          const isLocalOptimistic = lastUser != null
+            && sessionStore.isOptimisticUserId(String(lastUser.id))
+            && (stripImageUrlLines(lastUser.content) === stripImageUrlLines(content)
+              || (lastUser.content.trim() === '' && remoteText === ''))
+
+          if (isLocalOptimistic && remoteMsgId != null) {
+            sessionStore.updateLastMessageId(sid, 'user', remoteMsgId)
+            // 消息保存确认回调：仅本端发送链路使用，远端事件不得误配本端在途发送。
+            messageSavedCallbacks.forEach((callback) => {
+              callback(sid, remoteMsgId)
+            })
+          } else if (hasRemoteEcho) {
+            // 远端消息（无本端乐观消息可匹配）：追加回显并占位流式 assistant 消息。
+            sessionStore.addUserMessage(sid, {
+              id: remoteMsgId ?? `msg_${Date.now()}_user`,
+              role: 'user',
+              content,
+              createdAt: nowDateTime(),
+              images
+            })
+            sessionStore.ensureStreamingAssistantMessage(sid)
+          }
+        }
+        break
+      }
+
+      case 'assistant_message_saved': {
+        // 后台子代理完成通知：消息由服务端直接落库（不经本端发送链路），
+        // 若不实时插入，用户盯屏期间看不到卡片，只有刷新后 REST 历史才补出来。
+        // messageId 为空（极端失败）时不插入：无 id 的气泡会在下次 fetchMessages 时变成
+        // 无法去重的重复条目；此时靠会话终态的重拉兜底。
+        if (sessionId && data?.messageId != null) {
+          const noticeId = String(data.messageId)
+          const metadata = parseNoticeMetadata(data.metadata)
+          // 仅处理带后台子代理标记的通知；其他来源的助手消息不在这里插入
+          if (metadata?.backgroundSubagentCompletion != null
+            && !sessionStore.getMessages(sessionId).some(m => String(m.id) === noticeId)) {
+            // 插在流式气泡之前：通知到达时主线往往还在流式输出，append 到尾部会让
+            // 下一个 delta 新建空气泡，把同一轮回复劈成两段。
+            sessionStore.insertPersistedAssistantMessage(sessionId, {
+              id: noticeId,
+              role: 'assistant',
+              content: typeof data.content === 'string' ? data.content : '',
+              createdAt: nowDateTime(),
+              metadata
+            })
+          }
+        }
+        break
+      }
+
+      case 'session_snapshot':
+        // Subscribe also reconciles a terminal state missed while the socket was disconnected.
+        if (sessionId && data?.phase) {
+          if (data.executionId) setActiveExecution(sessionId, data.executionId)
+          const phase = data.phase as TaskPhase
+          const startedAt = phase === 'RUNNING' ? new Date().toISOString() : undefined
+          sessionStore.updateSessionPhase(sessionId, phase, startedAt)
+          sessionStore.updateSideTaskPhase(Number(sessionId), phase, startedAt)
+          sessionStore.updateSubagentPhase(Number(sessionId), phase)
+          if (['COMPLETED', 'FAILED', 'CANCELLED', 'IDLE'].includes(phase)) {
+            // 与 session_status 终态分支一致：断线期间错过结果事件的工具需要就地终结
+            if (phase === 'FAILED' || phase === 'CANCELLED') {
+              sessionStore.finishInterruptedStreamingMessage(
+                sessionId,
+                phase === 'CANCELLED' ? '执行已被中止' : '执行失败中断'
+              )
+            }
+            sessionStore.setStreaming(sessionId, false)
+            sessionStore.setThinking(sessionId, false)
+            sessionStore.setCompacting(sessionId, false)
+            sessionStore.clearLlmRetry(sessionId)
+            sessionStore.clearAskQuestions(sessionId)
+            // 轨迹 tab：与 session_status 终态分支对齐——重连补齐的终态同样要丢掉
+            // 临时轮 / 工具计时行，否则残留键会让轨迹面板显示上一次执行的内容
+            sessionStore.clearLiveState(sessionId)
+            if (phase !== 'IDLE') clearActiveExecution(sessionId)
+          } else if (data.thinking === true) {
+            // 会话执行中恰好处于模型思考阶段：刷新/重连后恢复「思考中」，
+            // 否则思考块会错误显示「思考完成」而内容仍在持续追加
+            sessionStore.setThinking(sessionId, true)
+          }
+        }
+        break
+
+      case 'session_tree_status':
+        // Side Task 状态变化后，父任务的任务树聚合信号（tree*）实时推送（聚焦模式重排）
+        if (sessionId && data) {
+          sessionStore.updateSessionTreeSignals(String(sessionId), {
+            treePendingApprovalCount: data.treePendingApprovalCount,
+            treePendingQuestionCount: data.treePendingQuestionCount,
+            treeUnread: data.treeUnread,
+            treeRunning: data.treeRunning,
+            treeFailed: data.treeFailed,
+          })
+          if (data.treeRunning === false) {
+            void sessionStore.fetchSession(String(sessionId))
+            void sessionStore.refreshSideTasks(String(sessionId))
+          }
+        }
+        break
+
+      case 'side_session_created':
+        // Side task session created — dispatch custom event for SideChatPanel to handle
+        if (sessionId && data?.sideSessionId && data?.title) {
+          window.dispatchEvent(new CustomEvent('side_session_created', {
+            detail: {
+              parentSessionId: sessionId,
+              sideSessionId: data.sideSessionId,
+              title: data.title
+            }
+          }))
+          // Subscribe to the new side session for stream events
+          subscribe(String(data.sideSessionId))
+        }
+        break
+
+      case 'subagent_session_created':
+        if (sessionId && data?.childSessionId) {
+          window.dispatchEvent(new CustomEvent('subagent_session_created', {
+            detail: {
+              parentSessionId: sessionId,
+              childSessionId: data.childSessionId,
+              title: data.title || '子代理',
+              agentType: data.agentType || '',
+              task: data.task || '',
+              toolCallId: data.toolCallId || ''
+            }
+          }))
+          subscribe(String(data.childSessionId))
+        }
+        break
+
+      case 'subagent_followup_created':
+        // 追问的 USER 消息由服务端直接落库，不会经过 user_message_saved 链路。
+        // 必须在此补插：否则子代理面板 store 缓存的上轮 assistant 会与新轮流式增量直接续接，
+        // 表现为看不到追问内容、输出接在上一回合尾部；真实 messageId 与历史拉取天然去重。
+        if (sessionId && data?.childSessionId) {
+          const followupChildSid = String(data.childSessionId)
+          subscribe(followupChildSid)
+          if (data.messageId != null) {
+            sessionStore.addUserMessage(followupChildSid, {
+              id: String(data.messageId),
+              role: 'user',
+              content: typeof data.task === 'string' ? data.task : '',
+              createdAt: nowDateTime()
+            })
+            // 新一轮尚未产生流事件时提前占位 assistant，保证面板进入正确的回合分组
+            sessionStore.ensureStreamingAssistantMessage(followupChildSid)
+          }
+        }
+        break
+
+      case 'skill_sync_required': {
+        // Server requests skill sync — trigger main process to download & extract zip
+        const syncUrl = data?.syncUrl
+        const workspace = data?.workspace
+        if (sessionId && typeof data?.syncId === 'string') {
+          activeSkillSyncIds.set(Number(sessionId), data.syncId)
+        }
+        if (sessionId && syncUrl && isElectronClient()) {
+          const token = getToken() || ''
+          const apiBase = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:9080/api/v1')
+            .replace(/\/v1\/?$/, '')
+          ;(window as any).electronAPI.skillSync?.(Number(sessionId), syncUrl, token, workspace || '', apiBase)
+        } else {
+          console.warn('[skill-sync] cannot sync:', { sessionId, syncUrl, hasElectronAPI: isElectronClient() })
+        }
+        break
+      }
+
+      case 'mcp_sync_required': {
+        // Server requests MCP sync — main process connects to MCP servers and lists tools
+        const servers = data?.servers
+        const syncId = data?.syncId
+        const reportToServer = (reports: Array<{ name: string; connected: boolean; tools: unknown[]; error: string | null }>) => {
+          sendReliable({
+            type: 'mcp_tools_report',
+            sessionId: Number(sessionId),
+            syncId: syncId || null,
+            servers: reports
+          }).catch((err: Error) => console.error('[mcp-sync] report failed:', err?.message))
+        }
+        if (sessionId && Array.isArray(servers) && isElectronClient()) {
+          ;(window as any).electronAPI
+            .mcpSync?.(Number(sessionId), servers)
+            .then((resp: { reports?: Array<{ name: string; connected: boolean; tools: unknown[]; error: string | null }> }) => {
+              reportToServer(resp?.reports || [])
+            })
+            .catch((err: Error) => {
+              console.error('[mcp-sync] failed:', err)
+              reportToServer((servers as Array<{ name: string }>).map((s) => ({
+                name: s?.name,
+                connected: false,
+                tools: [],
+                error: err instanceof Error ? err.message : 'MCP sync failed'
+              })))
+            })
+        } else {
+          console.warn('[mcp-sync] cannot sync:', { sessionId, hasServers: Array.isArray(servers), hasElectronAPI: isElectronClient() })
+          if (sessionId) {
+            // 非 Electron 或无法连接：上报全部失败，让服务端降级处理
+            reportToServer((Array.isArray(servers) ? servers : []).map((s: { name: string }) => ({
+              name: s?.name,
+              connected: false,
+              tools: [],
+              error: 'Electron MCP client unavailable'
+            })))
+          }
+        }
+        break
+      }
+
+      case 'tool_execute': {
+        if (!sessionId || !data) break
+        const { requestId, toolName, arguments: toolArgs, workspace, needApproval, dangerReason, approvalHint } = data
+        if (typeof window !== 'undefined' && (window as any).electronAPI?.toolExecute) {
+          ;(window as any).electronAPI
+            .toolExecute(toolName, toolArgs, requestId, workspace, Number(sessionId), !!needApproval, dangerReason || null, approvalHint || null)
+            .then(async (response: { requestId: string; result: string | null; error: string | null }) => {
+              if (response.error) {
+                await sendReliable({
+                  type: 'tool_error',
+                  sessionId: Number(sessionId),
+                  requestId: response.requestId,
+                  error: response.error
+                })
+              } else {
+                await sendReliable({
+                  type: 'tool_result',
+                  sessionId: Number(sessionId),
+                  requestId: response.requestId,
+                  result: response.result
+                })
+              }
+            })
+            .catch(async (err: Error) => {
+              await sendReliable({
+                type: 'tool_error',
+                sessionId: Number(sessionId),
+                requestId,
+                error: err.message || 'IPC call failed'
+              })
+            })
+        }
+        // Non-Electron clients (browser tabs) silently ignore — let Electron handle it
+        break
+      }
+
+      case 'ask_user_questions': {
+        if (sessionId && data) {
+          // 同一轮可以并行多组提问，重连也会把全部 pending 逐条重推。
+          // 按到达顺序追加；同 requestId 由 store 去重。清空留给终态、停止和 cancelled 事件。
+          sessionStore.appendAskQuestion(sessionId, {
+            requestId: data.requestId,
+            questions: data.questions || [],
+            metadata: data.metadata
+          })
+        }
+        break
+      }
+
+      case 'ask_user_questions_cancelled': {
+        if (sessionId && data?.requestId) {
+          sessionStore.removeAskQuestion(sessionId, data.requestId)
+        }
+        break
+      }
+
+      case 'error': {
+        if (sessionId) {
+          const message = (data?.message && String(data.message)) || 'Agent 执行异常'
+          // 边路任务创建被拒（切点失效 / 模型不支持图片 / 本地端未连接等）：
+          // 这不是父会话的执行失败，不能把它标成 FAILED，交给等待中的边路面板自行回滚。
+          if (data?.code === 'side_session_rejected') {
+            window.dispatchEvent(new CustomEvent('side_session_rejected', {
+              detail: { message, parentSessionId: sessionId },
+            }))
+            break
+          }
+          // 预算 BLOCK（P3，技术方案 §5.7）：错误态 / FAILED 相位照常翻转（横幅文案已含消耗/上限），
+          // 只额外派发窗口事件，供 ChatPanel 给横幅加「查看我的预算」跳转——不改 store 与相位逻辑。
+          if (data?.code === 'budget_exceeded') {
+            window.dispatchEvent(new CustomEvent('budget_blocked', {
+              detail: { sessionId },
+            }))
+          }
+          sessionStore.setExecutionError(sessionId, message)
+          sessionStore.updateSessionPhase(sessionId, 'FAILED' as TaskPhase)
+          sessionStore.updateSideTaskPhase(Number(sessionId), 'FAILED' as TaskPhase)
+          sessionStore.updateSubagentPhase(Number(sessionId), 'FAILED' as TaskPhase)
+          // 与 session_status 终态分支（CANCELLED/FAILED）对称：error 帧由客户端自行翻
+          // FAILED，phase watcher 会立即触发不带 preserveLiveStream 的终态重拉；必须先标记
+          // 中断，否则已流出的部分回复（服务端不落库失败轮次，唯一副本）被当尾部残留删除，
+          // 而迟到的终态 session_status 帧再调 finishInterruptedStreamingMessage 已空转
+          sessionStore.finishInterruptedStreamingMessage(sessionId, '执行失败中断')
+          resetSessionStreamState(sessionId)
+          const cb = pendingCallbacks.get(sessionId)
+          if (cb) {
+            pendingCallbacks.delete(sessionId)
+            // Banner already shows the error — skip ephemeral toast in useChat catch
+            const err = new Error(message) as Error & { toastShown?: boolean }
+            err.toastShown = true
+            cb.reject?.(err)
+          }
+        }
+        break
+      }
+
+      case 'queue_updated': {
+        if (sessionId && data?.queue) {
+          sessionStore.setQueueMessages(sessionId, data.queue)
+        }
+        break
+      }
+
+      case 'queue_message_consumed': {
+        if (sessionId && data) {
+          sessionStore.addUserMessage(sessionId, {
+            id: String(data.messageId),
+            role: 'user',
+            content: typeof data.content === 'string' ? data.content : '',
+            createdAt: nowDateTime(),
+            images: data.images && data.images.length > 0 ? data.images : undefined
+          })
+          sessionStore.ensureStreamingAssistantMessage(sessionId)
+          refreshQueue(sessionId)
+        }
+        break
+      }
+    }
+  }
+
+  /**
+   * 完成通知事件的 metadata：服务端下发的是 JSON 字符串（与 REST 消息行一致），
+   * 解析成对象才匹配 MessageBubble 的 backgroundSubagentCompletion 判定。
+   * 解析失败或形状不符时返回 null，调用方据此跳过插入。
+   */
+  function parseNoticeMetadata(raw: unknown): Record<string, unknown> | null {
+    if (raw == null) return null
+    if (typeof raw === 'object' && !Array.isArray(raw)) return raw as Record<string, unknown>
+    if (typeof raw !== 'string') return null
+    try {
+      const parsed = JSON.parse(raw)
+      return typeof parsed === 'object' && parsed != null && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : null
+    } catch {
+      return null
+    }
+  }
+
+  // 消息保存确认的回调注册函数
+  function onMessageSaved(callback: MessageSavedCallback): string {
+    const callbackId = `callback_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`
+    messageSavedCallbacks.set(callbackId, callback)
+    return callbackId
+  }
+
+  function offMessageSaved(callbackId: string) {
+    messageSavedCallbacks.delete(callbackId)
+  }
+
+  /** 当前 WS readyState；未建立/已登出（ws 为 null）时返回 -1，供回前台恢复检测区分「从未连接」与「已断开」。 */
+  function getReadyState(): number {
+    return ws?.readyState ?? -1
+  }
+
+  // Don't disconnect on component unmount — WS is global
+
+  return {
+    connected,
+    everConnected,
+    connect,
+    disconnect,
+    getReadyState,
+    subscribe,
+    unsubscribe,
+    sendMessage,
+    sendEditMessage,
+    cancel,
+    retryExecution,
+    compactNow,
+    sendAskUserQuestionsResult,
+    enqueueMessage,
+    insertMessage,
+    deleteQueueMessage,
+    reorderQueueMessage,
+    sendToolApproval,
+    createSideSession,
+    pendingCallbacks,
+    setActiveExecution,
+    clearActiveExecution,
+    onMessageSaved,
+    offMessageSaved
+  }
+}

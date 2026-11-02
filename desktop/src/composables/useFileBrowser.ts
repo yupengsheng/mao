@@ -1,0 +1,230 @@
+import { ref, watch, type Ref } from 'vue'
+import type { FileNode } from '../types/file-browser'
+import type { WorkspaceFileProvider } from './workspace-file-provider'
+
+export function useFileBrowser(provider: Ref<WorkspaceFileProvider | null>) {
+  const treeData = ref<FileNode[]>([])
+  const loading = ref(false)
+  const expandedPaths = ref<Set<string>>(new Set())
+  /** 根加载竞态序号：provider 快速切换/refresh 并发时丢弃过期结果 */
+  let rootRequestSeq = 0
+
+  async function loadRoot() {
+    const seq = ++rootRequestSeq
+    if (!provider.value) {
+      treeData.value = []
+      loading.value = false
+      return
+    }
+    loading.value = true
+    try {
+      const result = await provider.value.listDirectory('')
+      if (seq !== rootRequestSeq) return
+      if (result.error) {
+        treeData.value = [{ name: '', path: '', isDirectory: false, error: result.error }]
+      } else {
+        const inherited = result.readOnly === true
+        treeData.value = (result.entries || []).map((entry) => entryToNode(entry, inherited))
+      }
+    } catch (e: any) {
+      if (seq !== rootRequestSeq) return
+      treeData.value = [{ name: '', path: '', isDirectory: false, error: e.message }]
+    } finally {
+      if (seq === rootRequestSeq) loading.value = false
+    }
+  }
+
+  async function loadChildren(node: FileNode): Promise<void> {
+    if (!provider.value) return
+    try {
+      const result = await provider.value.listDirectory(node.path)
+      if (result.error) {
+        node.children = [{ name: '', path: node.path, isDirectory: false, error: result.error }]
+      } else {
+        const inherited = node.readOnly === true || result.readOnly === true
+        node.children = (result.entries || []).map((entry) => entryToNode(entry, inherited))
+      }
+    } catch (e: any) {
+      node.children = [{ name: '', path: node.path, isDirectory: false, error: e.message }]
+    }
+  }
+
+  /**
+   * Collapse chains of single-child directories into package-style names (a/b/c),
+   * loading intermediate directories as needed.
+   */
+  async function compactSingleChildDirs(node: FileNode): Promise<void> {
+    if (!node.isDirectory || node.isSymlink || node.readOnly || !node.children) return
+
+    while (node.children) {
+      const kids: FileNode[] = node.children.filter((c) => !c.error)
+      if (kids.length !== 1) break
+      const only: FileNode = kids[0]
+      if (!only.isDirectory || only.isSymlink || only.readOnly) break
+
+      if (!only.children) {
+        await loadChildren(only)
+      }
+
+      const oldPath = node.path
+      node.name = node.name ? `${node.name}/${only.name}` : only.name
+      node.path = only.path
+      node.children = only.children
+      node.isSymlink = only.isSymlink
+
+      if (expandedPaths.value.has(oldPath)) {
+        expandedPaths.value.delete(oldPath)
+        expandedPaths.value.add(node.path)
+      }
+    }
+  }
+
+  async function expandDir(node: FileNode) {
+    if (!provider.value || !node.isDirectory) return
+    if (node.expanded) {
+      node.expanded = false
+      expandedPaths.value.delete(node.path)
+      return
+    }
+
+    if (node.children) {
+      node.expanded = true
+      expandedPaths.value.add(node.path)
+      await compactSingleChildDirs(node)
+      return
+    }
+
+    node.children = []
+    node.expanded = true
+    expandedPaths.value.add(node.path)
+
+    await loadChildren(node)
+    await compactSingleChildDirs(node)
+  }
+
+  /** Expand a directory without collapsing if already expanded. */
+  async function forceExpand(node: FileNode) {
+    if (!provider.value || !node.isDirectory) return
+    if (!node.children) {
+      node.children = []
+      await loadChildren(node)
+    }
+    node.expanded = true
+    expandedPaths.value.add(node.path)
+    await compactSingleChildDirs(node)
+  }
+
+  function collapseDir(node: FileNode) {
+    node.expanded = false
+    expandedPaths.value.delete(node.path)
+  }
+
+  async function refresh() {
+    if (!provider.value) return
+    const seq = ++rootRequestSeq
+    const pathsToRefresh = Array.from(expandedPaths.value)
+
+    loading.value = true
+    try {
+      const result = await provider.value.listDirectory('')
+      if (seq !== rootRequestSeq) return
+      if (result.error) {
+        treeData.value = [{ name: '', path: '', isDirectory: false, error: result.error }]
+        return
+      }
+      const inherited = result.readOnly === true
+      treeData.value = (result.entries || []).map((entry) => entryToNode(entry, inherited))
+      // 旧树已替换：清空展开集合，仅恢复本次刷新前已展开且仍存在的路径
+      expandedPaths.value.clear()
+    } catch (e: any) {
+      if (seq !== rootRequestSeq) return
+      treeData.value = [{ name: '', path: '', isDirectory: false, error: e.message }]
+      return
+    } finally {
+      if (seq === rootRequestSeq) loading.value = false
+    }
+
+    for (const relPath of pathsToRefresh) {
+      if (seq !== rootRequestSeq) return
+      await restoreExpandedPath(relPath)
+    }
+  }
+  /**
+   * Restore an expanded folder after refresh. Handles compacted package paths
+   * by walking segments and re-running compaction on each expand.
+   */
+  async function restoreExpandedPath(relPath: string) {
+    const parts = relPath.split('/').filter(Boolean)
+    if (parts.length === 0) return
+
+    let level = treeData.value
+    let i = 0
+    while (i < parts.length) {
+      const target = parts.slice(0, i + 1).join('/')
+      const node = level.find((n) =>
+        n.isDirectory && (
+          n.path === target
+          || n.path.startsWith(target + '/')
+          || n.name === parts[i]
+          || n.path.split('/').pop() === parts[i]
+        ),
+      )
+      if (!node) return
+
+      await forceExpand(node)
+
+      // Compaction may advance past several segments
+      if (node.path === relPath || !relPath.startsWith(node.path + '/')) {
+        return
+      }
+      const advanced = node.path.split('/').filter(Boolean).length
+      i = Math.max(advanced, i + 1)
+      level = node.children || []
+    }
+  }
+
+  function entryToNode(
+    entry: { name: string; path: string; isDirectory: boolean; size: number; isSymlink: boolean },
+    inheritedReadOnly = false,
+  ): FileNode {
+    const readOnly = inheritedReadOnly || (entry.isDirectory && entry.isSymlink)
+    return {
+      name: entry.name,
+      path: entry.path,
+      isDirectory: entry.isDirectory,
+      isSymlink: entry.isSymlink,
+      size: entry.size,
+      ...(readOnly ? { readOnly: true } : {}),
+    }
+  }
+
+  function findNodeByPath(nodes: FileNode[], relPath: string): FileNode | null {
+    for (const node of nodes) {
+      if (node.path === relPath) return node
+      if (node.children) {
+        const found = findNodeByPath(node.children, relPath)
+        if (found) return found
+      }
+    }
+    return null
+  }
+
+  watch(provider, () => {
+    // provider 变更（切换会话/工作区）：立即失效进行中的请求并清空旧树，避免闪现上一工作区内容
+    rootRequestSeq++
+    expandedPaths.value.clear()
+    treeData.value = []
+    loadRoot()
+  }, { immediate: true })
+
+  return {
+    treeData,
+    loading,
+    expandedPaths,
+    expandDir,
+    collapseDir,
+    refresh,
+    restoreExpandedPath,
+    findNodeByPath,
+  }
+}

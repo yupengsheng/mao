@@ -1,0 +1,119 @@
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { BaseTool } from '../tool.js';
+import { asBool, asText, parseObject, toJson } from '../json.js';
+import { FileChangeDiffUtil } from '../file-change-diff-util.js';
+import type { PathSandbox } from '../../safety/path-sandbox.js';
+import { harnessLog } from '../../log.js';
+import { applyEditMatch } from './edit-file-match.js';
+import { withFileLock } from './file-write-lock.js';
+import { applyEol, detectEol, stripBom, toLf } from './file-eol.js';
+
+export class EditFileTool extends BaseTool {
+  constructor(
+    private readonly pathSandbox: PathSandbox,
+    /** 落盘成功回调（团队经验库索引刷新，技术方案 2026-10-24 §3.5）：回调自身过滤路径，失败不影响编辑结果。 */
+    private readonly onFileChanged?: (absPath: string) => void,
+  ) {
+    super();
+  }
+
+  getName(): string { return 'edit_file'; }
+  getDescription(): string {
+    return '通过精确匹配字符串并替换为新内容来编辑文件。默认仅在 old_string 全文件唯一出现时替换；出现多次则失败并返回行号，需补充上下文或显式传入 replace_all=true。参数：path（必填）、old_string（必填）、new_string（必填）、replace_all（可选）。';
+  }
+  getInputSchema(): Record<string, unknown> {
+    return {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '要编辑的文件路径：相对路径基于当前会话工作区解析，绝对路径可编辑工作区外文件' },
+        old_string: { type: 'string', description: '需要查找并替换的精确字符串；默认必须在文件中只出现一次' },
+        new_string: { type: 'string', description: '替换后的字符串' },
+        replace_all: {
+          type: 'boolean',
+          description: '为 true 时替换 old_string 的全部出现；默认 false，仅当恰好匹配一处时才写入',
+        },
+      },
+      required: ['path', 'old_string', 'new_string'],
+    };
+  }
+  getOutputSchema(): Record<string, unknown> {
+    return {
+      type: 'object',
+      properties: {
+        success: { type: 'boolean' },
+        replacements: { type: 'integer' },
+        occurrences: { type: 'integer' },
+        occurrence_lines: { type: 'array', items: { type: 'integer' } },
+      },
+    };
+  }
+
+  protected async executeWithWorkspace(argumentsJson: string, workspace: string | null): Promise<string> {
+    try {
+      const args = parseObject(argumentsJson);
+      if (!args) return toJson({ success: false, replacements: 0, error: '无效的JSON参数' });
+      const filePathArg = asText(args.path);
+      const oldStringRaw = asText(args.old_string);
+      const newStringRaw = asText(args.new_string);
+      const replaceAll = asBool(args.replace_all, false);
+      if (filePathArg == null || oldStringRaw == null || newStringRaw == null) {
+        return toJson({ success: false, replacements: 0, error: '缺少必填参数: path, old_string, new_string' });
+      }
+      // read_file 展示的是 LF 文本；匹配前统一成 LF，写回时按原文件行尾还原。
+      const oldString = toLf(oldStringRaw);
+      const newString = toLf(newStringRaw);
+      if (oldString === newString) {
+        return toJson({
+          success: false,
+          replacements: 0,
+          error: 'old_string 与 new_string 完全相同，未执行编辑；请检查并提供实际需要修改的内容',
+        });
+      }
+      const filePath = this.pathSandbox.resolveLenient(filePathArg, workspace);
+      // 并行工具调用可能同时编辑同一文件：按路径串行化 read-modify-write
+      return await withFileLock(filePath, () => {
+        if (!existsSync(filePath)) {
+          return toJson({ success: false, replacements: 0, error: '文件不存在：' + filePathArg });
+        }
+        const raw = readFileSync(filePath, 'utf8');
+        const eol = detectEol(raw);
+        const content = toLf(stripBom(raw));
+        const match = applyEditMatch(content, oldString, newString, replaceAll);
+        if (!match.ok) {
+          return toJson({
+            success: false,
+            replacements: 0,
+            error: match.error,
+            ...(match.occurrences != null ? { occurrences: match.occurrences, occurrence_lines: match.occurrence_lines } : {}),
+          });
+        }
+        writeFileSync(filePath, applyEol(match.updated, eol));
+        this.notifyFileChanged(filePath);
+        const lineDelta = FileChangeDiffUtil.computeLineDelta(content, match.updated);
+        return toJson({
+          success: true,
+          replacements: match.replacements,
+          file_change: {
+            path: filePathArg,
+            type: 'MODIFIED',
+            lines_added: lineDelta.linesAdded,
+            lines_deleted: lineDelta.linesDeleted,
+          },
+          [FileChangeDiffUtil.PRIVATE_DIFF_FIELD]: FileChangeDiffUtil.buildDiff(filePathArg, content, match.updated),
+        });
+      });
+    } catch (e) {
+      harnessLog('error', 'EditFileTool execution failed', e);
+      return toJson({ success: false, replacements: 0, error: (e as Error).message });
+    }
+  }
+
+  private notifyFileChanged(filePath: string): void {
+    if (this.onFileChanged == null) return;
+    try {
+      this.onFileChanged(filePath);
+    } catch (e) {
+      harnessLog('warn', `EditFileTool onFileChanged callback failed: ${(e as Error).message}`);
+    }
+  }
+}

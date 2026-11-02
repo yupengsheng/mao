@@ -1,0 +1,79 @@
+// @mao/contracts — 前后端共享的类型契约入口
+//
+// 约定：
+// 1. 仅导出纯类型（interface / type / enum），禁止放入运行时逻辑（函数、类实例、常量值除外）。
+// 2. 数据实体（数据库行）、Repository/Service 接口、前端 UI 视图模型均不在此列。
+// 3. 后端通过 `export type { X } from '@mao/contracts'` 从自身 types.ts re-export，保持原有 import 路径不变。
+// 4. 前端通过 `import type { X } from '@mao/contracts'` 消费，避免重复定义。
+//
+// 注意：后端采用 Node16 moduleResolution 且本包未标记 "type": "module"，
+// 内部 re-export 使用无扩展名相对路径即可（TypeScript 类型检查阶段可解析）。
+
+export type { SsoExchangeVO } from './sso';
+export type { Result } from './result';
+export type { PageQuery, PageResult } from './pagination';
+export type { NotificationChannel, TaskNotificationPreference } from './notification';
+export type {
+  InboxKind,
+  InboxSource,
+  InboxItem,
+  InboxListResult,
+  InboxPreference,
+} from './inbox';
+export type { QuickCommandItem, QuickCommandsVO } from './command';
+export type { LlmCallScene } from './usage';
+export type { SignalCompareMode, SignalWatcherStatus, SignalTriggerMode, SignalWatcherWarning } from './signal';
+export type { MemoryScope, MemoryStatus, MemorySource } from './memory';
+export type { ApprovalRuleType, ApprovalRuleScope, ApprovalHint } from './approval-rule';
+export type { FeedbackReason, FeedbackSource, FeedbackStatus } from './feedback';
+export type { ToolVO } from './tool';
+export type { UserInfoVO, LoginVO } from './user';
+export type { ModelVO, ModelPageResult, ModelListFilter, ClientImpersonation, ApiProtocol } from './model';
+export type { ExperienceVO, SuggestedQuestionVO, AgentVO, AgentAvatarUploadVO } from './agent';
+export type { WeixinPreferenceVO, TaskPanelPreferenceState } from './preference';
+export type { OnboardingState, ReadinessVO, OnboardingCompleteInput } from './readiness';
+export type { BudgetScope, BudgetLimitType, BudgetAction, BudgetStatus, MyBudgetItemVO, MyBudgetsVO } from './budget';
+export type { AuditLog, AuditListFilter } from './audit';
+export type { MessageSearchGroup, MessageSearchHit, MessageSearchResult, SessionSource } from './session';
+export type { WorkspaceKind, WorkspaceChannel, WorkspaceChatType } from './workspace';
+export type {
+  WsClientType,
+  WsAuthFrame,
+  WsAuthRefreshFrame,
+  WsAuthRefreshedFrame,
+  WsPingFrame,
+  WsSubscribeFrame,
+  WsUnsubscribeFrame,
+  WsSendMessageData,
+  WsSendMessageFrame,
+  WsCancelFrame,
+  WsToolApprovalFrame,
+  WsAskUserQuestionsResultFrame,
+  PageToolName,
+  PageToolErrorCode,
+  WsPageToolRequestData,
+  WsPageToolRequestFrame,
+  WsPageToolResultData,
+  WsPageToolError,
+  WsPageToolResultFrame,
+  WsPageToolCancelData,
+  WsEmbedOutboundFrame,
+  WsConnectedData,
+  WsTaskPhase,
+  WsSessionStatusData,
+  WsSessionSnapshotData,
+  WsSessionTitleUpdatedData,
+  WsAskUserQuestionOption,
+  WsAskUserQuestionItem,
+  WsAskUserQuestionAnswer,
+  WsAskUserQuestionsData,
+  WsAskUserQuestionsCancelledData,
+  WsLlmWaitingData,
+  WsLlmRetryData,
+  WsErrorData,
+  WsServerEvent,
+  EmbedSessionVO,
+  EmbedCreateSessionRequest,
+  EmbedSessionPage,
+  EmbedMessageVO,
+} from './ws';

@@ -1,0 +1,660 @@
+<template>
+  <nav class="top-nav">
+    <div class="nav-left" :class="{ 'is-mac': reserveTrafficLightInset }">
+      <div class="nav-left-actions">
+        <el-tooltip content="我的工作区" :show-after="100" placement="bottom" :disabled="isMobileDevice()">
+          <div class="theme-toggle" role="button" aria-label="我的工作区" @click="openMyWorkspaces">
+            <el-icon :size="16"><FolderOpened /></el-icon>
+          </div>
+        </el-tooltip>
+        <el-tooltip v-if="isSettingsRoute" content="返回工作台" :show-after="100" placement="bottom" :disabled="isMobileDevice()">
+          <div class="theme-toggle" role="button" aria-label="返回工作台" @click="goBackFromSettings">
+            <el-icon :size="16"><ArrowLeft /></el-icon>
+          </div>
+        </el-tooltip>
+        <el-tooltip content="左侧面板" :show-after="100" placement="bottom" :disabled="isMobileDevice()">
+          <div class="theme-toggle" role="button" aria-label="左侧面板" @click="toggleLeft">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="3" width="18" height="18" rx="2" /><line x1="9" y1="3" x2="9" y2="21" />
+            </svg>
+          </div>
+        </el-tooltip>
+      </div>
+    </div>
+    <div class="nav-right">
+      <el-tooltip content="右侧面板" :show-after="100" placement="bottom" :disabled="isMobileDevice()">
+        <div class="theme-toggle" role="button" aria-label="右侧面板" @click="toggleRight">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="2" /><line x1="15" y1="3" x2="15" y2="21" />
+          </svg>
+        </div>
+      </el-tooltip>
+      <SessionSearchPopover ref="searchPopoverRef" />
+      <UsageBell />
+      <el-tooltip v-if="!isSettingsRoute" content="我的指令" :show-after="100" placement="bottom" :disabled="isMobileDevice()">
+        <div
+          class="theme-toggle commands-toggle"
+          role="button"
+          aria-label="我的指令"
+          :class="{ active: commandsDrawerVisible }"
+          @click="commandsDrawerVisible = true"
+        >
+          <el-icon :size="16"><Reading /></el-icon>
+        </div>
+      </el-tooltip>
+      <el-tooltip :content="terminalAvailability.tooltip" :show-after="100" placement="bottom" :disabled="isMobileDevice()">
+        <div
+          class="theme-toggle terminal-toggle"
+          role="button"
+          :aria-label="terminalAvailability.tooltip"
+          :class="{ active: terminalOpen, disabled: !terminalAvailability.enabled }"
+          @click="toggleTerminal"
+        >
+          <!--
+            终端图形是横向矩形，原为 18×14，在 24 格 viewBox 里比同排方形图标矮一截，
+            图形本身放大到 20×17 补上高度差。盒子保持与邻居一致的 16px ——
+            17px 会让墨迹涨到 15.2×13.1，明显大于同排图标。
+          -->
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="3.5" width="20" height="17" rx="2" /><polyline points="6.5 12 9 9.8 6.5 7.6" /><line x1="11.5" y1="13.2" x2="16" y2="13.2" />
+          </svg>
+        </div>
+      </el-tooltip>
+      <el-tooltip :content="updateTooltip" :show-after="100" placement="bottom" :disabled="isMobileDevice()">
+        <div
+          class="theme-toggle refresh-btn"
+          role="button"
+          :aria-label="updateTooltip"
+          :class="{ 'has-update': showUpdateIndicator }"
+          @click="handleUpdateClick"
+        >
+          <el-icon :size="16"><Refresh /></el-icon>
+          <span v-if="showUpdateIndicator" class="update-dot" />
+        </div>
+      </el-tooltip>
+      <template v-if="authStore.user">
+        <el-tooltip v-if="!isSettingsRoute" content="设置" :show-after="100" placement="bottom" :disabled="isMobileDevice()">
+          <div
+            class="theme-toggle settings-toggle"
+            role="button"
+            aria-label="设置"
+            @click="router.push('/settings/profile')"
+          >
+            <el-icon :size="16"><Setting /></el-icon>
+          </div>
+        </el-tooltip>
+        <el-dropdown @command="handleCommand" trigger="click">
+          <div class="nav-user" role="button" aria-label="用户菜单">
+            <el-avatar :size="24" :src="authStore.user?.avatarUrl || undefined">
+              <el-icon v-if="!authStore.user?.avatarUrl"><User /></el-icon>
+            </el-avatar>
+          </div>
+          <template #dropdown>
+            <el-dropdown-menu class="nav-dropdown">
+              <el-dropdown-item command="commands">
+                <el-icon><Reading /></el-icon>
+                我的指令
+              </el-dropdown-item>
+              <el-dropdown-item command="inbox">
+                <el-icon><ChatLineSquare /></el-icon>
+                站内收件箱
+              </el-dropdown-item>
+              <el-dropdown-item command="settings">
+                <el-icon><Setting /></el-icon>
+                设置
+              </el-dropdown-item>
+              <el-dropdown-item command="profile">
+                <el-icon><User /></el-icon>
+                个人信息
+              </el-dropdown-item>
+              <el-dropdown-item command="logout">
+                <el-icon><SwitchButton /></el-icon>
+                退出登录
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
+      </template>
+    </div>
+    <CommandManagerDrawer v-model="commandsDrawerVisible" />
+    <InboxDrawer v-model="inboxDrawerVisible" />
+  </nav>
+</template><script setup lang="ts">
+import { ArrowLeft, ChatLineSquare, FolderOpened, Reading, Refresh, Setting, SwitchButton, User } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { useAuthStore } from '../../stores/auth'
+import { useSessionStore } from '../../stores/session'
+import { useTerminal } from '../../composables/useTerminal'
+import { usePanelLayout, isMobileDevice } from '../../composables/usePanelLayout'
+import { useVersionCheck } from '../../composables/useVersionCheck'
+import { readScreenFillingWindow, reserveMacTrafficLightInset as shouldReserveMacTrafficLightInset } from '../../utils/macTrafficLightInset'
+import { isElectronClient } from '../../utils/platform'
+import { goBackToWorkbench } from '../../utils/workbench-nav'
+import { openWorkspaceOverviewTabFor } from '../../composables/useCenterTabs'
+import SessionSearchPopover from '../search/SessionSearchPopover.vue'
+import UsageBell from '../usage/UsageBell.vue'
+import CommandManagerDrawer from '../command/CommandManagerDrawer.vue'
+import InboxDrawer from '../inbox/InboxDrawer.vue'
+
+// macOS 窗口态红绿灯盖住左上角，需要预留；全屏后系统收起红绿灯，按钮贴左（与移动端一致）。
+// 原生全屏不走 Fullscreen API，用内容区是否铺满整屏判断。
+const isMacPlatform = typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform || '')
+const screenFilling = ref(readScreenFillingWindow())
+const reserveTrafficLightInset = computed(() => shouldReserveMacTrafficLightInset(isMacPlatform, screenFilling.value))
+
+function syncScreenFilling() {
+  screenFilling.value = readScreenFillingWindow()
+}
+
+const searchPopoverRef = ref()
+const commandsDrawerVisible = ref(false)
+const inboxDrawerVisible = ref(false)
+
+const sessionStore = useSessionStore()
+const authStore = useAuthStore()
+const { isOpen: terminalOpen, togglePanel } = useTerminal()
+const { toggleLeft, toggleRight } = usePanelLayout()
+
+/** 终端按钮可用性矩阵：CLOUD 走云端终端（需 terminal:use），LOCAL 仅 Electron 可用。 */
+const terminalAvailability = computed<{ enabled: boolean; tooltip: string }>(() => {
+  const session = sessionStore.activeSession
+  if (!session) return { enabled: false, tooltip: '请先打开一个任务' }
+  if (session.executionMode === 'CLOUD') {
+    if (!authStore.hasPermission('terminal:use')) return { enabled: false, tooltip: '没有终端使用权限' }
+    if (!session.workspace) return { enabled: false, tooltip: '任务工作区不可用' }
+    return { enabled: true, tooltip: '终端 (Ctrl+`)' }
+  }
+  // LOCAL：Web 与安卓 Capacitor 都没有 electronAPI，无法开本机终端
+  if (!isElectronClient()) return { enabled: false, tooltip: '本地任务的终端仅在桌面客户端可用' }
+  return { enabled: true, tooltip: '终端 (Ctrl+`)' }
+})
+
+function toggleTerminal() {
+  if (!terminalAvailability.value.enabled) return
+  const session = sessionStore.activeSession
+  let cwd: string | undefined
+  if (session?.executionMode === 'LOCAL' && session.workspace) {
+    cwd = session.workspace
+  }
+  togglePanel(cwd)
+}
+
+const router = useRouter()
+const route = useRoute()
+const {
+  hasUpdate,
+  appUpdateStatus,
+  appUpdateAvailable,
+  appUpdateDownloaded,
+  appUpdateVersion,
+  appUpdateProgress,
+  appUpdateError,
+  reloadApp,
+  startPolling,
+  stopPolling,
+  startAppUpdater,
+  stopAppUpdater,
+  checkAppUpdate,
+  installAppUpdate,
+  ignoreAndroidUpdate,
+  isAndroidForcedUpdate,
+  isAndroidCapacitor
+} = useVersionCheck()
+
+const isSettingsRoute = computed(() => route.path.startsWith('/settings'))
+const showUpdateIndicator = computed(() => hasUpdate.value || appUpdateAvailable.value)
+const updateTooltip = computed(() => {
+  if (appUpdateDownloaded.value) {
+    return appUpdateVersion.value ? `客户端 ${appUpdateVersion.value} 已下载，点击安装` : '客户端更新已下载，点击安装'
+  }
+  if (appUpdateStatus.value === 'downloading') {
+    const percent = appUpdateProgress.value == null ? '' : ` ${Math.round(appUpdateProgress.value)}%`
+    return `正在下载客户端更新${percent}`
+  }
+  if (appUpdateStatus.value === 'available') {
+    return appUpdateVersion.value ? `发现客户端 ${appUpdateVersion.value}，正在下载` : '发现客户端更新，正在下载'
+  }
+  if (hasUpdate.value) return '发现页面新版本，点击刷新'
+  if (appUpdateStatus.value === 'checking') return '正在检查客户端更新'
+  if (appUpdateStatus.value === 'error') return appUpdateError.value || '检查客户端更新失败'
+  return '刷新页面'
+})
+
+function goBackFromSettings() {
+  const active = sessionStore.activeSession
+  goBackToWorkbench(router, active?.id ?? sessionStore.sessions[0]?.id)
+}
+
+function openMyWorkspaces() {
+  const onWorkbench = route.name === 'Home' || route.name === 'Task'
+  if (onWorkbench) {
+    openWorkspaceOverviewTabFor()
+    return
+  }
+  const sessionId = sessionStore.activeSession?.id ?? sessionStore.sessions[0]?.id
+  openWorkspaceOverviewTabFor(sessionId ? String(sessionId) : undefined)
+  goBackToWorkbench(router, sessionId)
+}
+
+onMounted(() => {
+  startPolling()
+  startAppUpdater()
+  document.addEventListener('keydown', handleSearchShortcut)
+  syncScreenFilling()
+  window.addEventListener('resize', syncScreenFilling)
+})
+
+onUnmounted(() => {
+  stopPolling()
+  stopAppUpdater()
+  document.removeEventListener('keydown', handleSearchShortcut)
+  window.removeEventListener('resize', syncScreenFilling)
+})
+
+/** Ctrl/Cmd+K：打开/关闭会话搜索浮窗；Ctrl/Cmd+`：打开/关闭终端（常驻注册，不随页面切换失效）。 */
+function handleSearchShortcut(e: KeyboardEvent) {
+  if (e.repeat) return
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+    e.preventDefault()
+    searchPopoverRef.value?.toggle()
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key === '`') {
+    e.preventDefault()
+    toggleTerminal()
+  }
+}
+
+let installPromptVisible = false
+
+watch(appUpdateDownloaded, (downloaded) => {
+  if (downloaded && !isAndroidCapacitor()) {
+    void confirmInstallUpdate()
+  }
+})
+
+let androidUpdatePromptVisible = false
+
+watch(appUpdateAvailable, (available) => {
+  if (available && isAndroidCapacitor() && appUpdateStatus.value === 'available') {
+    void confirmAndroidUpdate()
+  }
+})
+
+async function confirmAndroidUpdate() {
+  if (androidUpdatePromptVisible) return
+  androidUpdatePromptVisible = true
+  const forced = isAndroidForcedUpdate()
+  try {
+    await ElMessageBox.confirm(
+      appUpdateVersion.value ? `发现安卓客户端 ${appUpdateVersion.value}，是否立即更新？` : '发现安卓客户端新版本，是否立即更新？',
+      forced ? '必须更新' : '发现新版本',
+      {
+        confirmButtonText: '立即更新',
+        cancelButtonText: forced ? undefined : '稍后',
+        distinguishCancelAndClose: !forced,
+        showCancelButton: !forced,
+        closeOnClickModal: !forced,
+        closeOnPressEscape: !forced,
+        showClose: !forced,
+        customClass: 'app-update-message-box',
+        type: forced ? 'warning' : 'success'
+      }
+    )
+    const result = await installAppUpdate()
+    if (result?.error && result.error !== 'need-permission') {
+      ElMessage.error(result.error)
+    } else if (result?.error === 'need-permission') {
+      ElMessage.warning('请开启“允许安装未知来源应用”后返回 Mao 再次点击更新')
+    }
+  } catch (action) {
+    if (forced) {
+      void confirmAndroidUpdate()
+    } else if (action === 'close') {
+      ignoreAndroidUpdate()
+    }
+  } finally {
+    androidUpdatePromptVisible = false
+  }
+}
+
+async function confirmInstallUpdate() {
+  if (installPromptVisible) return
+  installPromptVisible = true
+  try {
+    await ElMessageBox.confirm(
+      '客户端新版本已下载完成，重启 Mao 后将自动完成安装。',
+      '客户端更新已就绪',
+      {
+        confirmButtonText: '重启安装',
+        cancelButtonText: '稍后',
+        customClass: 'app-update-message-box',
+        type: 'success'
+      }
+    )
+    const result = await installAppUpdate()
+    if (result?.error) {
+      ElMessage.error(result.error)
+    }
+  } catch {
+    // 用户选择稍后安装
+  } finally {
+    installPromptVisible = false
+  }
+}
+
+async function handleUpdateClick() {
+  if (appUpdateDownloaded.value) {
+    void confirmInstallUpdate()
+    return
+  }
+  if (appUpdateStatus.value === 'downloading') {
+    ElMessage.info(updateTooltip.value)
+    return
+  }
+  if (appUpdateAvailable.value) {
+    if (isAndroidCapacitor()) {
+      void confirmAndroidUpdate()
+    } else {
+      ElMessage.info('客户端更新正在下载，请稍候')
+    }
+    return
+  }
+  if (hasUpdate.value) {
+    reloadApp()
+    return
+  }
+  await checkAppUpdate()
+  // 检查发现客户端更新时保留当前页，让下载/安装流程继续；否则再刷新页面
+  // appUpdateAvailable 在 update-available 时已为 true，覆盖 downloading 态
+  if (appUpdateAvailable.value || appUpdateDownloaded.value) {
+    return
+  }
+  reloadApp()
+}
+
+async function handleCommand(command: string) {
+  if (command === 'commands') {
+    commandsDrawerVisible.value = true
+  } else if (command === 'inbox') {
+    inboxDrawerVisible.value = true
+  } else if (command === 'settings') {
+    router.push('/settings/profile')
+  } else if (command === 'profile') {
+    router.push('/settings/profile')
+  } else if (command === 'logout') {
+    await authStore.logout()
+  }
+}
+</script>
+
+<style scoped>
+.top-nav {
+  display: flex !important;
+  align-items: center;
+  justify-content: space-between;
+  height: var(--aw-nav-height);
+  min-height: var(--aw-nav-height);
+  padding: 0 16px;
+  background: var(--aw-nav-bg);
+  border-bottom: 1px solid var(--aw-divider-soft);
+  flex-shrink: 0;
+  visibility: visible !important;
+  opacity: 1 !important;
+  -webkit-app-region: drag;
+}
+
+.nav-left {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  -webkit-app-region: no-drag;
+}
+
+/* 仅 macOS 窗口态为红绿灯预留；全屏时去掉 is-mac，按钮贴左 */
+.nav-left.is-mac {
+  padding-left: 78px;
+}
+
+.nav-logo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.logo-icon {
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--aw-primary);
+  border-radius: var(--aw-radius-xs);
+  color: var(--aw-on-primary);
+}
+
+.logo-text {
+  font-family: var(--aw-font-display);
+  font-size: var(--aw-text-fine);
+  font-weight: 400;
+  color: var(--aw-nav-text);
+  letter-spacing: -0.12px;
+}
+
+.nav-left-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  -webkit-app-region: no-drag;
+  margin-right: 5px;
+}
+
+.nav-links {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.nav-link {
+  font-size: var(--aw-text-fine);
+  font-weight: 400;
+  color: var(--aw-nav-text-muted);
+  letter-spacing: -0.12px;
+  padding: 4px 10px;
+  border-radius: var(--aw-radius-xs);
+  text-decoration: none;
+  transition: color 0.15s, background 0.15s;
+  line-height: 1.4;
+}
+
+.nav-link:hover {
+  color: var(--aw-nav-text);
+  text-decoration: none;
+  background: rgba(0, 0, 0, 0.06);
+}
+
+[data-theme="dark"] .nav-link:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.nav-link.active {
+  color: var(--aw-nav-text);
+}
+
+.nav-right {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  -webkit-app-region: no-drag;
+}
+
+.nav-user {
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  padding: 4px;
+  border-radius: var(--aw-radius-xs);
+  transition: background 0.15s;
+  color: var(--aw-nav-text-muted);
+}
+
+.nav-user:hover {
+  background: rgba(0, 0, 0, 0.06);
+}
+
+[data-theme="dark"] .nav-user:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.nav-user :deep(.el-avatar) {
+  background: var(--aw-surface-chip);
+  color: var(--aw-ink);
+}
+
+
+.nav-dropdown :deep(.el-dropdown-menu__item) {
+  font-size: var(--aw-text-caption);
+  padding: 4px 12px;
+}
+
+.theme-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--aw-radius-xs);
+  cursor: pointer;
+  color: var(--aw-nav-text-muted);
+  transition: color 0.15s, background 0.15s;
+  position: relative;
+}
+
+@media (pointer: coarse) {
+  .theme-toggle::before {
+    content: '';
+    position: absolute;
+    inset: 50% auto auto 50%;
+    width: 44px;
+    height: 44px;
+    transform: translate(-50%, -50%);
+  }
+}
+
+.theme-toggle:hover {
+  color: var(--aw-nav-text);
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.commands-toggle {
+  text-decoration: none;
+  color: var(--aw-nav-text-muted);
+}
+
+.settings-toggle {
+  text-decoration: none;
+  color: var(--aw-nav-text-muted);
+}
+
+.theme-toggle.active {
+  color: var(--aw-primary);
+  background: var(--aw-primary-lighter);
+}
+
+[data-theme="dark"] .theme-toggle:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.terminal-toggle.disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.terminal-toggle.disabled:hover {
+  color: var(--aw-nav-text-muted);
+  background: transparent;
+}
+
+.refresh-btn {
+  position: relative;
+}
+
+.refresh-btn.has-update {
+  color: var(--aw-warning, #e6a23c);
+  animation: pulse-update 2s ease-in-out infinite;
+}
+
+.update-dot {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--aw-warning, #e6a23c);
+}
+
+@keyframes pulse-update {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+:global(.app-update-message-box) {
+  width: 420px;
+  max-width: calc(100vw - 48px);
+  padding: 18px 20px 16px;
+  border-radius: 8px;
+}
+
+:global(.app-update-message-box .el-message-box__header) {
+  padding: 0 28px 12px 0;
+}
+
+:global(.app-update-message-box .el-message-box__title) {
+  font-size: 18px;
+  line-height: 1.35;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+:global(.app-update-message-box .el-message-box__headerbtn) {
+  top: 14px;
+  right: 14px;
+  width: var(--aw-btn-height);
+  height: var(--aw-btn-height);
+  font-size: 16px;
+}
+
+:global(.app-update-message-box .el-message-box__content) {
+  padding: 4px 0 16px;
+  min-height: 0;
+}
+
+:global(.app-update-message-box .el-message-box__status) {
+  font-size: 22px !important;
+}
+
+:global(.app-update-message-box .el-message-box__message p) {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.65;
+  letter-spacing: 0;
+}
+
+:global(.app-update-message-box .el-message-box__btns) {
+  padding: 0;
+  gap: 8px;
+}
+
+:global(.app-update-message-box .el-message-box__btns .el-button) {
+  min-width: 76px;
+  height: 34px;
+  padding: 0 16px;
+  font-size: 14px;
+  font-weight: 500;
+  border-radius: 8px;
+}
+</style>

@@ -1,0 +1,2386 @@
+import { randomUUID } from 'node:crypto';
+import type { Agent, ContentPart, LlmModel, LocalSkillRef, Message, MessageQueueItem, McpToolRef, Session } from '../../domain/types.js';
+import type { TaskNotifySource } from '../task-terminal.service.js';
+import type { MessageQueueSource } from '../types.js';
+import { imageUrlFromPart } from '../session-vo.js';
+import { stripImageUrlLines } from '../util/image-url-annotation.js';
+import { queueWaitMsOf } from '../../openapi/open-api-call-log.logic.js';
+
+/** 轻量读取入站帧类型：鉴权窗口排队只关心是否为 auth，解析失败按未知类型处理。 */
+function peekFrameType(payload: string): string | null {
+  try {
+    const root = JSON.parse(payload) as { type?: unknown };
+    return typeof root?.type === 'string' ? root.type : null;
+  } catch {
+    return null;
+  }
+}
+
+/** user_message_saved 广播用的用户消息内容：text 提取自纯文本或 ContentPart，images 提取自图片 URL。 */
+export interface UserMessagePayload {
+  content: string;
+  images: string[];
+}
+
+export function userMessagePayloadOf(messageContent: unknown): UserMessagePayload {
+  if (typeof messageContent === 'string') {
+    return { content: messageContent, images: [] };
+  }
+  if (Array.isArray(messageContent)) {
+    const content: string[] = [];
+    const images: string[] = [];
+    for (const part of messageContent as ContentPart[]) {
+      const map = part as unknown as Record<string, unknown> | null;
+      if (map?.type === 'text' && map.text != null) content.push(String(map.text));
+      else if (map?.type === 'image_url') {
+        const url = imageUrlFromPart(map);
+        if (url != null) images.push(url);
+      }
+    }
+    // 带图消息的文本 part 尾部含注入行（image-url-annotation）。广播要回到「用户原始正文」口径：
+    // 前端按 content 逐字比对来替换乐观消息，口径不一致会让用户消息重复上屏、乐观 id 永不替换。
+    // 无图时是恒等操作：纯文本消息与各渠道自建内容（feishu/dingtalk/weixin/scheduled）不受影响。
+    const raw = content.join('\n');
+    return { content: images.length > 0 ? stripImageUrlLines(raw) : raw, images };
+  }
+  return { content: '', images: [] };
+}
+
+const SIDE_PERMISSION_LEVELS = new Set(['READ_ONLY', 'READ_WRITE', 'SMART', 'PROXY', 'FULL']);
+
+/** 边路创建时带上输入框里选的权限；缺省或非法值沿用父会话。 */
+function sidePermissionLevel(requested: unknown, parentLevel: string | null | undefined): string | null | undefined {
+  if (typeof requested === 'string' && SIDE_PERMISSION_LEVELS.has(requested)) return requested;
+  return parentLevel;
+}
+
+/**
+ * 边路任务创建被拒绝时回给父会话的 error。带 code 让客户端区分「这次创建没成」与运行期错误：
+ * 否则客户端会把父会话标成 FAILED，并在占位 Tab 里留下发不出去的幽灵消息。
+ */
+function sideRejection(message: string): { message: string; code: string } {
+  return { message, code: 'side_session_rejected' };
+}
+import type { JwtService } from '../../crypto/jwt.service.js';
+import { contentParts, WsStreamingEventListener, type AgentEventListener, type WsListenerDeps } from './ws-streaming-event-listener.js';
+import type { StreamingWsRegistry, WsSocket } from './streaming-ws-registry.js';
+import { wsEvent } from './ws-event.js';
+import { isActivePhase } from '../session-vo.js';
+import type { AgentExecutionContext } from '../../harness/core/agent-execution-context.js';
+import type { EmbedPageToolRegistry } from '../../harness/embed-page-tool-registry.js';
+import type { McpConnectionError } from '../../harness/mcp/entity/mcp-server.js';
+import type { ApprovalHint } from '../../harness/approval/approval-hint.js';
+
+export interface WsHandlerDeps {
+  registry: StreamingWsRegistry;
+  titleService: {
+    scheduleForFirstUserMessage(sessionId: number, messageId: number | null | undefined, content: unknown): void;
+  };
+  harnessService: {
+    prepareMessage(sessionId: number, content: unknown): Promise<string> | string;
+    executeFromEvent(sessionId: number, eventId: string, listener: AgentEventListener, cancelFlag: { get(): boolean; set(v: boolean): void }): Promise<void>;
+    /** 以预构建上下文执行（子代理重试走 buildSubContext 裁剪后的上下文）。 */
+    executePrepared(context: AgentExecutionContext, listener: AgentEventListener): Promise<void>;
+    executeSideFirstMessage(parentId: number, sideId: number, contextMode: 'fork' | 'summary' | 'none', listener: AgentEventListener, cancelFlag: { get(): boolean; set(v: boolean): void }): Promise<void>;
+    forkParentMessages(parentId: number, sideId: number, forkFromMessageId?: number | null): Promise<void>;
+    /** 空闲手动压缩（技术方案 5.4）：调用方已持有 executionClaims，force 越阈值/越 enabled 门，triggerMode='manual'。 */
+    requestCompaction(sessionId: number, listener: AgentEventListener | null): Promise<boolean>;
+  };
+  sessionService: {
+    getSession(id: number): Promise<Session | null>;
+    findOwnedMessage(sessionId: number, messageId: number): Promise<Message | null>;
+    saveMessage(sessionId: number, role: string, content: unknown, a: null, b: null, c: null, d: number, e: null): Promise<Message>;
+    updatePhase(sessionId: number, phase: string): Promise<void>;
+    updateField(sessionId: number, field: string, value: unknown): Promise<void>;
+    updateModelId(sessionId: number, modelId: number): Promise<void>;
+    getMessages(sessionId: number): Promise<Message[]>;
+    getLastUserMessage(sessionId: number): Promise<Message | null>;
+    editMessageAndTruncate(sessionId: number, messageId: number, content: string, images: string[]): Promise<Message>;
+    deleteMessageById(sessionId: number, messageId: number): Promise<void>;
+    save(session: Session): Promise<void>;
+    listSubagentSessions(parentId: number): Promise<Session[]>;
+    cleanupIncompleteTail(sessionId: number): Promise<number>;
+    updateContextTokens(sessionId: number, tokens: number): Promise<void>;
+  };
+  taskTerminalService: {
+    finishExecution(sessionId: number, userId: number, phase: string, executionId: string, reason?: string, notifySource?: TaskNotifySource): Promise<void>;
+  };
+  messageQueueService: {
+    listPending(sessionId: number): Promise<MessageQueueItem[]>;
+    enqueue(sessionId: number, userId: number, content: string, images: string | null, scheduledTaskId?: number | null, source?: MessageQueueSource | null, openTriggerId?: number | null, openCallLogId?: number | null): Promise<void>;
+    enqueueHead(sessionId: number, userId: number, content: string, images: string | null, scheduledTaskId?: number | null, source?: MessageQueueSource | null, openTriggerId?: number | null, openCallLogId?: number | null): Promise<void>;
+    dequeue(sessionId: number): Promise<MessageQueueItem | null>;
+    getById(id: number): Promise<MessageQueueItem | null>;
+    delete(id: number): Promise<void>;
+    moveToIndex(id: number, targetIndex: number): Promise<void>;
+  };
+  /** busy 入队的定时任务在队列真正执行完成后回写 lastExecutionStatus */
+  onScheduledTaskQueueConsumed?: (taskId: number, status: 'COMPLETED' | 'FAILED' | 'CANCELLED') => Promise<void> | void;
+  /** busy 入队的 Webhook 触发器消息在队列真正执行完成后回写连续失败计数（开放接口域） */
+  onOpenTriggerQueueConsumed?: (triggerId: number, status: 'COMPLETED' | 'FAILED' | 'CANCELLED') => Promise<void> | void;
+  /** API/WEBHOOK 入队流水的终态回写。messageId 拿不到时为 null。 */
+  onOpenApiCallQueueSettled?: (callLogId: number, phase: 'COMPLETED' | 'FAILED' | 'CANCELLED', queueWaitMs: number | null, messageId: number | null) => Promise<void> | void;
+  embedPageToolRegistry: EmbedPageToolRegistry;
+  localToolSessionRegistry: {
+    setUserForSession(sessionId: number, userId: number): void;
+    isConnected(sessionId: number): boolean | Promise<boolean>;
+    failAllForSession(sessionId: number): void;
+    failAllForUser(userId: number): void;
+    completeToolRequest(sessionId: number, requestId: string, result: string): void;
+    completeToolRequestError(sessionId: number, requestId: string, error: string): void;
+  };
+  askUserQuestionsRegistry: {
+    failAllForSession(sessionId: number): void;
+    getPendingForSession(sessionId: number): Array<{ requestId: string; questions: unknown[]; metadata?: unknown }>;
+    complete(sessionId: number, requestId: string, resultJson: string): boolean;
+  };
+  treeSignalPublisher: {
+    publishIfSideTask(sessionId: number): void;
+    publishForSession(sessionId: number): void | Promise<void>;
+  };
+  approvalRegistry: {
+    unregister(sessionId: number | null, requestId: string | null): void | Promise<void>;
+    /** alwaysAllow 消费服务端 hint（恰好一次）；缺省场景（旧测试桩）返回 null 即可。 */
+    takeHint?(sessionId: number, requestId: string): ApprovalHint | null;
+  };
+  /** 审批规则域（V135）：未注入时 alwaysAllow 静默忽略（不建规则、不影响执行）。 */
+  approvalRuleService?: {
+    createSessionRuleFromAlwaysAllow(userId: number, sessionId: number, hint: ApprovalHint): Promise<void>;
+  } | null;
+  /**
+   * 用户点了执行或拒绝后，按 approval:{sessionId}:{requestId} 抑制尚未发出的升级提醒。
+   * 未注入时不外推。失败不得影响审批帧本身。
+   */
+  approvalEscalationSuppressor?: {
+    suppressByRequest(sessionId: number, requestId: string): Promise<void>;
+  } | null;
+  activityService: WsListenerDeps['activityService'];
+  activityHeartbeat: { touch(sessionId: number): void; clear(sessionId: number): void };
+  sessionTodoMapper: {
+    deleteBySessionId(sessionId: number): Promise<void>;
+    selectBySessionId(sessionId: number): Promise<Array<{ id?: number; content?: string | null; status?: string | null }>>;
+  };
+  agentLoop: {
+    registerCancelFlag(sessionId: number): { get(): boolean; set(v: boolean): void };
+    removeCancelFlag(sessionId: number): void;
+    requestCancel(sessionId: number): void;
+    /** 查询本实例在途执行的取消标志（含崩溃恢复/通道入站注册的），用于区分「执行未提交」与「执行在 handler 簿记外运行」。 */
+    getCancelFlag?(sessionId: number): { get(): boolean; set(v: boolean): void } | undefined;
+  };
+  /** 手动压缩信号总线（技术方案 5.4）：运行中路径由 handler 置位、由 AgentLoop 在工具轮边界消费；与 AgentLoop 注入的是同一实例。 */
+  compactionSignalBus?: { signal(sessionId: number): void; has(sessionId: number): boolean; consume(sessionId: number): boolean; clear(sessionId: number): void };
+  backgroundSubagentManager?: {
+    cancelAllForParent(parentSessionId: number): Promise<void>;
+    beginRetry(parentSessionId: number, childSessionId: number): Promise<{ ok: boolean; taskId?: number; error?: string }>;
+    completeRetry(parentSessionId: number, taskId: number, status: 'COMPLETED' | 'FAILED' | 'CANCELLED'): Promise<void>;
+    /** 子代理重试专用：构建与后台执行一致的裁剪上下文（工具/技能面）。 */
+    buildRetryContext(childSessionId: number): Promise<AgentExecutionContext>;
+  };
+  shellSessionManager: { closeByConversation(sessionId: number): void };
+  skillSyncService: {
+    syncToSession(agent: Agent, userId: number, sessionId: number): Promise<void>;
+    getRemovedSkillNames(agent: Agent, userId: number, sessionId: number): string[];
+  };
+  localSkillRegistry: {
+    report(sessionId: number, skills: LocalSkillRef[]): void;
+    clear(sessionId: number): void;
+  };
+  localAgentsMdRegistry: {
+    report(sessionId: number, content: string | null): void;
+    clear(sessionId: number): void;
+  };
+  mcpSyncService: {
+    loadAgentServers(agent: Agent, userId: number): Promise<Array<{ name: string }>>;
+    buildSyncPayload(servers: Array<{ name: string }>): Record<string, unknown>;
+    clearSession(sessionId: number): void;
+    clearLocalSession(sessionId: number): void;
+    resolveServerIdByName(name: string): number | null;
+    recordReport(sessionId: number, tools: McpToolRef[], connectionErrors?: McpConnectionError[]): void;
+  };
+  mcpClientManager: { closeSession(sessionId: number): void };
+  agentMapper: { selectById(id: number): Promise<Agent | null> };
+  llmModelMapper: {
+    selectById(id: number): Promise<LlmModel | null>;
+    selectDefault(): Promise<LlmModel | null>;
+  };
+  jwtService: JwtService;
+  /**
+   * 账号状态检查（BUG-C3）：与 REST preHandler 同一口径——停用/已删除账号的 token
+   * 不得建立或续期 WS 连接。未注入时跳过（旧测试桩不受影响）。
+   */
+  accountStatusChecker?: ((userId: number) => Promise<boolean> | boolean) | null;
+  agentExecutor: (fn: () => void | Promise<void>) => unknown;
+  mcpSyncTimeoutSeconds?: number;
+  /**
+   * 用量预算 BLOCK 闸门（技术方案 §5.7，可选注入：budget 域未装配时为 undefined，不做检查）。
+   * WS 外层 dispatch catch 只 console.error，抛 BusinessException 前端无感知——
+   * 命中 BLOCK 必须显式 registry.send error 事件并早退，不得依赖异常冒泡。
+   */
+  budgetGate?: {
+    /** 命中返回 BLOCK 行信息（scope/当期消耗/上限）；未命中或目标为子代理/边路返回 null。 */
+    checkAdmission(target: { userId: number | null; agentId: number | null }): Promise<BudgetBlockInfo | null>;
+    /** 队列消费 BLOCK 后的收件箱提醒（同周期同预算恰好一次，实现侧幂等）。 */
+    noticeQueueBlocked(block: BudgetBlockInfo, notifyUserId: number | null): Promise<void>;
+  };
+}
+
+/** 预算 BLOCK 命中信息（结构化对齐 budget.service 的 BudgetBlock，附 budgetId 供收件箱去重）。 */
+export interface BudgetBlockInfo {
+  budgetId: number;
+  scope: string;
+  /** 当期消耗（COST → 成本单位；TOKENS → token 数） */
+  spend: number;
+  limitValue: number;
+  limitType: 'COST' | 'TOKENS';
+}
+
+/** BLOCK 错误事件文案：message 携带 scope/当期消耗/上限（技术方案 §5.7）。 */
+export function budgetBlockMessage(block: BudgetBlockInfo): string {
+  const scopeLabel = block.scope === 'GLOBAL' ? '全局' : block.scope === 'USER' ? '用户' : 'Agent';
+  return `本月${scopeLabel}预算已超限：当期消耗 ${block.spend.toLocaleString('zh-CN')} / 上限 ${block.limitValue.toLocaleString('zh-CN')}（${block.limitType === 'COST' ? '成本' : 'Token'} 口径），新任务已被拒绝。请调整预算或联系管理员`;
+}
+
+/**
+ * 预算 BLOCK 错误事件数据：带 code 让客户端区分「预算被拦」与运行期错误
+ * （P3 横幅「查看我的预算」跳转，技术方案 §5.7；与 sideRejection 同型）。
+ */
+function budgetRejection(block: BudgetBlockInfo): { message: string; code: string } {
+  return { message: budgetBlockMessage(block), code: 'budget_exceeded' };
+}
+
+function cancelFlag(): { get(): boolean; set(v: boolean): void } {
+  let v = false;
+  return { get: () => v, set: (n) => { v = n; } };
+}
+
+/**
+ * 队列消费侧的回写绑定：autoConsume / 插队消费到带来源的队列行时登记，
+ * 执行终态后由 settleQueuedBinding 按绑定分发回写；同时承载收件箱来源透传。
+ * 对象身份即归属判定依据：finally 按「值未易主」清理。
+ */
+interface QueueSettlement {
+  /** 队列行来源（收件箱徽标透传） */
+  source: QueuedSource;
+  /** 定时任务回写绑定（source=SCHEDULED 时非空） */
+  taskId: number | null;
+  /** Webhook 触发器回写绑定（source=WEBHOOK 时非空） */
+  triggerId: number | null;
+  /** 入站调用流水绑定（API/WEBHOOK 入队时非空） */
+  callLogId: number | null;
+  /** 入队到开始消费的毫秒数；时间戳解析失败为 null */
+  queueWaitMs: number | null;
+  /** 消费时落库的用户消息；补偿删消息后清空 */
+  messageId: number | null;
+}
+
+/** 队列行来源（收件箱徽标透传）：与 MessageQueueSource / TaskNotifySource 的非 MANUAL 子集同构。 */
+type QueuedSource = 'SCHEDULED' | 'WEBHOOK' | 'API' | 'SIGNAL';
+
+/** 队列行 → settlement：V133 前的存量行 source_type 为 NULL，按 scheduledTaskId 回退为 SCHEDULED。 */
+function queueSettlementOf(row: { sourceType?: string | null; scheduledTaskId?: number | null; openTriggerId?: number | null; openCallLogId?: number | null; createdAt?: string | Date | null }): QueueSettlement | null {
+  const source: QueuedSource | null = row.sourceType === 'SCHEDULED' || row.sourceType === 'WEBHOOK' || row.sourceType === 'API'
+    || row.sourceType === 'SIGNAL'
+    ? row.sourceType
+    : row.scheduledTaskId != null ? 'SCHEDULED' : null;
+  if (source == null && row.openCallLogId == null) return null;
+  const resolved: QueuedSource = source ?? 'API';
+  return {
+    source: resolved,
+    taskId: resolved === 'SCHEDULED' ? (row.scheduledTaskId ?? null) : null,
+    triggerId: resolved === 'WEBHOOK' ? (row.openTriggerId ?? null) : null,
+    callLogId: row.openCallLogId ?? null,
+    queueWaitMs: queueWaitMsOf(row.createdAt),
+    messageId: null,
+  };
+}
+
+/** settlement → 入队参数，回补队首时透传保源。 */
+function settlementToEnqueueArgs(settlement: QueueSettlement | null): { scheduledTaskId: number | null; source: QueuedSource | null; openTriggerId: number | null; openCallLogId: number | null } {
+  if (settlement == null) return { scheduledTaskId: null, source: null, openTriggerId: null, openCallLogId: null };
+  return { scheduledTaskId: settlement.taskId, source: settlement.source, openTriggerId: settlement.triggerId, openCallLogId: settlement.callLogId };
+}
+
+/**
+ * 定时任务 → liveExecution 的装配线（唯一实现，create-app.ts 与 spec 共用）。
+ *
+ * 刻意抽成命名导出而不是留在 create-app.ts 的 `setLiveExecution(lambda)` 里：
+ * TS 允许「形参更少的函数」赋值给「形参更多的函数类型」，装配层漏接第 6 参
+ * scheduledTaskId 时编译零告警、运行期静默丢弃，定时任务收件箱条目会全部
+ * 丢失「定时任务」来源。抽出来才能被 spec 直接断言。
+ */
+export function createScheduledLiveExecution(handler: StreamingWsHandler) {
+  return (
+    session: Session,
+    userId: number,
+    executionId: string,
+    savedMessage: Message,
+    startedAt?: number,
+    scheduledTaskId?: number | null,
+    source?: 'SCHEDULED' | 'WEBHOOK' | 'API' | 'SIGNAL' | null,
+  ): Promise<void> =>
+    handler.executePersistedUserPrompt(session, userId, executionId, savedMessage, startedAt, scheduledTaskId, source);
+}
+
+export class StreamingWsHandler {
+  private readonly cancelFlags = new Map<number, { get(): boolean; set(v: boolean): void }>();
+  private readonly runningTasks = new Map<number, unknown>();
+  private readonly runningExecutionIds = new Map<number, string>();
+  private readonly executionClaims = new Set<number>();
+  private readonly sessionLocks = new Map<number, Promise<void>>();
+  private readonly pendingSkillSyncs = new Map<number, { syncId: string; resolve: () => void; reject: (e: Error) => void }>();
+  private readonly pendingMcpSyncs = new Map<number, { syncId: string; resolve: () => void; reject: (e: Error) => void }>();
+  private readonly autoConsumingSessionIds = new Set<number>();
+  private readonly suppressAutoConsumeSend = new Set<number>();
+  /** 用户已点「停止」但 cancel flag 尚未注册（执行提交前的窗口期）的会话 → 登记时间戳；注册标志时按时间判定消费。 */
+  private readonly pendingCancels = new Map<number, number>();
+  private readonly insertLocks = new Map<number, Promise<void>>();
+  /**
+   * 鉴权进行中的连接：首帧 auth 的账号状态校验是异步查库，期间到达的业务帧
+   * （客户端 onopen 里 auth 与 subscribe 是同一 tick 连发的）必须排队，等 auth
+   * 注册完成后按序处理；否则会被判为未认证连接并 1003 关闭（客户端无限重连）。
+   * 只能串行化「鉴权窗口」，鉴权完成后的帧仍并发处理——cancel 这类帧依赖插队
+   * 打断在途 handler，不能被前一条消息阻塞。
+   */
+  private readonly authInFlight = new WeakSet<WsSocket>();
+  private readonly pendingInbound = new WeakMap<WsSocket, string[]>();
+  /**
+   * autoConsume / 插队消费到的带来源队列行：sessionId → 回写绑定，执行终态后
+   * `settleQueuedBinding` 按类据分发（定时任务回写 lastExecutionStatus、Webhook
+   * 触发器回写连续失败计数）。对象身份即归属判定依据：finally 按「值未易主」清理。
+   * 收件箱来源透传也读本绑定（优先级低于 liveExecution 路径的 liveSourceBindings）。
+   */
+  private readonly queueSettlements = new Map<number, QueueSettlement>();
+  /**
+   * liveExecution 路径的来源绑定：sessionId → { source }（对象身份作归属判定）。
+   * executePersistedUserPrompt 入口写入、runExecution finally 按归属清理。
+   * 三个 finisher 据此给 finishExecution 传 SCHEDULED / WEBHOOK / API。
+   */
+  private readonly liveSourceBindings = new Map<number, { source: QueuedSource }>();
+  private readonly mcpSyncTimeoutSeconds: number;
+
+  constructor(private readonly deps: WsHandlerDeps) {
+    this.mcpSyncTimeoutSeconds = deps.mcpSyncTimeoutSeconds ?? 60;
+  }
+
+  hasExecutionClaim(sessionId: number): boolean {
+    return this.executionClaims.has(sessionId) || this.runningTasks.has(sessionId);
+  }
+
+  /** 本实例当前在途执行的会话（蓝绿排空前据此等待收尾，并标记被中断的会话）。 */
+  listActiveExecutionSessionIds(): number[] {
+    return [...new Set([...this.executionClaims, ...this.runningTasks.keys()])];
+  }
+
+  afterConnectionClosed(session: WsSocket): void {
+    const userId = this.deps.registry.getUserId(session);
+    // 页面连接断开：先让该连接上所有等待中的页面工具立即失败，再注销连接与绑定。
+    for (const boundSessionId of this.deps.registry.getEmbedSessionsForConnection(session)) {
+      this.deps.embedPageToolRegistry.failSession(boundSessionId, '页面连接已断开，页面操作已取消', 'embed_client_not_connected');
+    }
+    this.deps.registry.unregister(session);
+    if (userId != null && !this.deps.registry.hasLocalClientConnection(userId)) {
+      this.deps.localToolSessionRegistry.failAllForUser(userId);
+    }
+  }
+
+  handleTransportError(session: WsSocket): void {
+    this.afterConnectionClosed(session);
+  }
+
+  async handleTextMessage(session: WsSocket, payload: string): Promise<void> {
+    // 鉴权窗口内到达的帧先排队：auth 的账号校验是异步查库，并发处理会让紧随其后的
+    // subscribe 看到「尚未 register」的连接而被 1003 关闭（见 authInFlight 注释）。
+    if (this.authInFlight.has(session)) {
+      const queued = this.pendingInbound.get(session) ?? [];
+      queued.push(payload);
+      this.pendingInbound.set(session, queued);
+      return;
+    }
+    const type = peekFrameType(payload);
+    if (type === 'auth') {
+      this.authInFlight.add(session);
+      try {
+        await this.processTextMessage(session, payload);
+      } finally {
+        this.authInFlight.delete(session);
+      }
+      // auth 处理结束（注册成功或连接被关闭）后按到达顺序冲刷排队帧；
+      // 连接已关闭时后续帧会在 processTextMessage 的鉴权检查处早退。
+      const queued = this.pendingInbound.get(session);
+      this.pendingInbound.delete(session);
+      for (const frame of queued ?? []) {
+        await this.processTextMessage(session, frame);
+      }
+      return;
+    }
+    await this.processTextMessage(session, payload);
+  }
+
+  private async processTextMessage(session: WsSocket, payload: string): Promise<void> {
+    if (!this.deps.registry.isConnectionAuthorized(session)) return;
+    let root: Record<string, unknown>;
+    try {
+      root = JSON.parse(payload) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    if (!root || typeof root !== 'object') return;
+    const type = typeof root.type === 'string' ? root.type : null;
+    if (!type) return;
+    // 鉴权改为首帧 auth 消息：token 不再出现在握手 URL（避免进日志/代理记录）。
+    // 未注册连接仅接受 auth 帧；其余消息 fail fast 关闭，防止无凭据占用连接。
+    const userId = this.deps.registry.getUserId(session);
+    if (userId == null) {
+      if (type !== 'auth') {
+        this.deps.registry.closeConnection(session, 'Not authenticated');
+        return;
+      }
+      const token = typeof root.token === 'string' ? root.token : undefined;
+      const metadata = token ? this.deps.jwtService.getAccessTokenMetadata(token) : null;
+      if (!metadata || (metadata.authSource === 'company_sso' && this.deps.jwtService.getTokenType(token!) !== 'access')) {
+        this.deps.registry.closeConnection(session, 'Missing or invalid token');
+        return;
+      }
+      // 只验签不查账号状态 → 停用账号的未过期 token 仍能建 WS 连接（与 REST preHandler 同一缺口，BUG-C3）
+      if (this.deps.accountStatusChecker != null && !(await this.deps.accountStatusChecker(metadata.userId))) {
+        this.deps.registry.closeConnection(session, 'Account disabled');
+        return;
+      }
+      const clientType = this.normalizeClient(typeof root.client === 'string' ? root.client : undefined);
+      // 页面操作能力声明：缺省/非布尔按 true（旧版 SDK 不发送该字段，行为与现状一致）。
+      const pageEnabled = typeof root.pageEnabled === 'boolean' ? root.pageEnabled : true;
+      this.deps.registry.register(session, metadata.userId, clientType, metadata, pageEnabled);
+      this.deps.registry.sendToConnection(session, wsEvent('connected', null, { userId: metadata.userId }));
+      return;
+    }
+    if (type === 'auth_refresh') {
+      await this.handleAuthRefresh(session, root);
+      return;
+    }
+    try {
+      await this.dispatch(session, userId, type, root);
+    } catch (e) {
+      console.error(`WS handler failed for type=${type} userId=${userId}`, e);
+    }
+  }
+
+  private async dispatch(session: WsSocket, userId: number, type: string, root: Record<string, unknown>): Promise<void> {
+    switch (type) {
+      case 'subscribe': await this.handleSubscribe(session, userId, root); break;
+      case 'unsubscribe': this.handleUnsubscribe(session, userId, root); break;
+      case 'send_message': await this.handleSendMessage(userId, root, true); break;
+      case 'edit_and_resend': await this.handleEditAndResend(userId, root); break;
+      case 'cancel': await this.handleCancel(userId, root); break;
+      case 'enqueue_message': await this.handleEnqueueMessage(userId, root); break;
+      case 'insert_message': await this.handleInsertMessage(userId, root); break;
+      case 'delete_queue_message': await this.handleDeleteQueueMessage(userId, root); break;
+      case 'reorder_queue_message': await this.handleReorderQueueMessage(userId, root); break;
+      case 'skill_sync_done': await this.handleSkillSyncDone(userId, root); break;
+      case 'mcp_tools_report': await this.handleMcpToolsReport(userId, root); break;
+      case 'tool_result': await this.handleToolResult(userId, root); break;
+      case 'tool_error': await this.handleToolError(userId, root); break;
+      case 'page_tool_result': await this.handlePageToolResult(session, userId, root); break;
+      case 'tool_approval': await this.handleToolApproval(userId, root); break;
+      case 'ask_user_questions_result': await this.handleAskUserQuestionsResult(userId, root); break;
+      case 'create_side_session': await this.handleCreateSideSession(userId, root); break;
+      case 'cancel_side_task': await this.handleCancelSideTask(userId, root); break;
+      case 'retry_execution': await this.handleRetryExecution(userId, root); break;
+      case 'compact_now': await this.handleCompactNow(userId, root); break;
+      case 'ping': this.deps.registry.send(userId, wsEvent('pong', null, {})); break;
+      default: break;
+    }
+  }
+
+  private async handleSubscribe(session: WsSocket, userId: number, root: Record<string, unknown>): Promise<void> {
+    const sessionId = this.getLong(root, 'sessionId');
+    if (sessionId == null) return;
+    const s = await this.requireOwnedSession(userId, sessionId);
+    if (!s) return;
+    this.deps.registry.subscribe(userId, sessionId);
+    // 页面执行端绑定：embed 连接订阅 agent 会话后，该会话的页面工具请求只发往此连接。
+    if (this.deps.registry.getClientType(session) === 'embed') {
+      const previous = this.deps.registry.getEmbedSessionBinding(sessionId);
+      if (previous && previous.id !== session.id) {
+        // 同一会话被新标签页/新连接接管：旧连接上在途的页面请求立即失败，
+        // 即使旧连接已不 OPEN 也要清掉，否则它会堵住该会话的串行队列直到超时。
+        this.deps.embedPageToolRegistry.failSession(sessionId, '页面连接已切换，页面操作已取消', 'embed_client_not_connected');
+        // 旧连接可能仍 OPEN 并在本地继续执行在途 DOM 动作；显式通知它中止，避免与新连接重复执行。
+        this.deps.registry.sendToConnection(previous, wsEvent('page_tool_cancel', sessionId, { reason: '页面连接已切换' }));
+      }
+      this.deps.registry.bindEmbedSession(sessionId, session);
+    }
+    const active = this.isSessionActive(s.phase);
+    if (s.executionMode === 'LOCAL' && active) {
+      this.deps.localToolSessionRegistry.setUserForSession(sessionId, userId);
+    }
+    // 订阅既是流式事件通道，也是客户端断线后的状态校准点。即使任务已结束，
+    // 也必须回传终态，避免完成事件恰好在断线期间丢失后界面永久停在“执行中”。
+    const executionId = this.currentExecutionId(sessionId);
+    this.deps.registry.send(userId, wsEvent('session_snapshot', sessionId, {
+      phase: s.phase === 'RESUMING' ? 'RUNNING' : s.phase,
+      // 会话执行中可能正处于模型思考阶段：随快照带回，前端刷新/重连后才能恢复「思考中」
+      ...(active && this.deps.registry.isSessionThinking(sessionId) ? { thinking: true } : {}),
+      ...(executionId ? { executionId } : {}),
+    }));
+    if (active) {
+      for (const toolCall of this.deps.registry.getActiveToolCalls(sessionId)) {
+        this.deps.registry.send(userId, wsEvent('tool_call_start', sessionId, toolCall));
+      }
+      for (const pq of this.deps.askUserQuestionsRegistry.getPendingForSession(sessionId)) {
+        const payload: Record<string, unknown> = { requestId: pq.requestId, questions: pq.questions ?? [] };
+        if (pq.metadata != null) payload.metadata = pq.metadata;
+        this.deps.registry.send(userId, wsEvent('ask_user_questions', sessionId, payload));
+      }
+    }
+  }
+
+  private handleUnsubscribe(session: WsSocket, userId: number, root: Record<string, unknown>): void {
+    const sessionId = this.getLong(root, 'sessionId');
+    if (sessionId == null) return;
+    this.deps.registry.unsubscribe(userId, sessionId);
+    if (this.deps.registry.getClientType(session) === 'embed'
+      && this.deps.registry.getEmbedSessionsForConnection(session).includes(sessionId)) {
+      // 页面端主动退订（切换/新建会话）：在途页面请求立即失败，不等超时。
+      this.deps.embedPageToolRegistry.failSession(sessionId, '页面已取消订阅，页面操作已取消', 'embed_client_not_connected');
+      this.deps.registry.unbindEmbedSession(sessionId, session);
+    }
+  }
+
+  private async handleSendMessage(userId: number, root: Record<string, unknown>, clearTodos: boolean): Promise<void> {
+    const sessionId = this.getLong(root, 'sessionId');
+    if (sessionId == null) return;
+    const data = (root.data ?? {}) as Record<string, unknown>;
+    // claimAlreadyHeld=true 表示调用方（auto-consume）已在出队前占位会话，
+    // 本方法内任何未进入执行的失败出口都必须释放占位，否则会话永久卡死
+    const claimAlreadyHeld = data.executionClaimHeld === true;
+    // auto-consume / 插队路径的消息在调用本方法前已落库：校验失败回补队首时须一并删除孤儿消息，
+    // 否则下次消费会再写一条同内容 USER 消息（重复落库）。
+    const autoSavedMessageId = typeof data.autoSavedMessageId === 'number' ? data.autoSavedMessageId : null;
+    if (typeof data.content !== 'string') {
+      if (claimAlreadyHeld) this.executionClaims.delete(sessionId);
+      return;
+    }
+    const content = data.content;
+    const eventId = typeof data.eventId === 'string' ? data.eventId : null;
+    const images = Array.isArray(data.images) ? data.images.map(String) : [];
+    // 本次发送的起始时间：pendingCancels 只消费「登记时间晚于本次发送开始」的取消标记，
+    // 避免此前一次取消（当时无执行在跑）残留的标记误杀用户后续的新发送。
+    // autoConsume 必须取「占位/出队时刻」而非本方法入口：500ms 延迟窗口内的取消
+    // 登记时间早于入口，若用入口时间会被误判为陈旧标记而丢弃（M-2 回归）。
+    const autoConsumeStartedAt = typeof data.autoConsumeStartedAt === 'number' ? data.autoConsumeStartedAt : null;
+    const sendStartedAt = autoConsumeStartedAt != null ? autoConsumeStartedAt : Date.now();
+    const session = await this.requireOwnedSession(userId, sessionId);
+    if (!session) {
+      if (claimAlreadyHeld) this.executionClaims.delete(sessionId);
+      return;
+    }
+    const replacingExecution = data.replaceExecution === true;
+    // 只有「调用前已经落库」的自动消费/插队才拥有这个标记。手动 send 若无条件 delete，
+    // 会偷走 500ms 窗口里的标记，导致自动消费那次被当成普通发送再写一条同样的用户消息。
+    const ownsAutoConsume = claimAlreadyHeld && autoSavedMessageId != null;
+    const isAutoConsume = ownsAutoConsume && this.autoConsumingSessionIds.delete(sessionId);
+    /** 自动消费的消息已出队并落库，任何未进入执行的早退都必须回补队首，否则消息永不执行 */
+    const requeueIfClaimed = async () => {
+      if (!claimAlreadyHeld) return;
+      this.executionClaims.delete(sessionId);
+      // 回补即放弃本次消费：清掉来源绑定，避免下次无关执行误回写陈旧任务终态/触发器计数
+      const settlement = this.queueSettlements.get(sessionId) ?? null;
+      this.queueSettlements.delete(sessionId);
+      const requeueArgs = settlementToEnqueueArgs(settlement);
+      if (autoSavedMessageId != null) {
+        try {
+          await this.deps.sessionService.deleteMessageById(sessionId, autoSavedMessageId);
+        } catch (e) {
+          console.error(`Failed to delete orphan auto-saved message ${autoSavedMessageId} for session ${sessionId}`, e);
+        }
+        if (settlement != null) settlement.messageId = null;
+      }
+      try {
+        await this.deps.messageQueueService.enqueueHead(
+          sessionId, userId, content, images.length > 0 ? JSON.stringify(images) : null,
+          requeueArgs.scheduledTaskId, requeueArgs.source, requeueArgs.openTriggerId, requeueArgs.openCallLogId,
+        );
+        await this.sendQueueUpdated(sessionId, userId);
+      } catch (e) {
+        console.error(`Failed to re-enqueue auto-consumed message for session ${sessionId}`, e);
+      }
+    };
+    // 预算 BLOCK 检查（技术方案 §5.7）：requireOwnedSession 之后、busy 入队/占位判定之前。
+    // 子代理/边路跟随父会话准入结论，不单独检查。消息此刻尚未落库、尚未入队。
+    // 命中时必须先走 requeueIfClaimed（自动消费路径回补队首+删孤儿消息），再发显式 error。
+    if (this.isBudgetCheckable(session.sessionType)) {
+      const budgetBlock = this.deps.budgetGate
+        ? await this.deps.budgetGate.checkAdmission({ userId: session.userId ?? null, agentId: session.agentId ?? null })
+        : null;
+      if (budgetBlock) {
+        if (claimAlreadyHeld) await requeueIfClaimed();
+        this.deps.registry.send(userId, wsEvent('error', sessionId, budgetRejection(budgetBlock)));
+        return;
+      }
+    }
+    if (!replacingExecution && !isAutoConsume && this.isSessionActive(session.phase)) {
+      this.sendSessionAlreadyRunning(userId, sessionId);
+      return;
+    }
+    if (data.modelId != null) {
+      const newModelId = Number(data.modelId);
+      if (newModelId !== session.modelId) {
+        await this.deps.sessionService.updateModelId(sessionId, newModelId);
+        session.modelId = newModelId;
+      }
+    }
+    if (images.length > 0) {
+      const model = await this.resolveSessionModel(session);
+      if (!model || model.supportsVision !== 1) {
+        await requeueIfClaimed();
+        this.deps.registry.send(userId, wsEvent('error', sessionId, { message: '当前模型不支持图片输入，请切换支持视觉的模型' }));
+        return;
+      }
+      if (images.length > 10) {
+        await requeueIfClaimed();
+        this.deps.registry.send(userId, wsEvent('error', sessionId, { message: '单条消息最多支持 10 张图片', }));
+        return;
+      }
+    }
+    if (!claimAlreadyHeld && this.hasStaleExecutionClaim(sessionId)) {
+      console.warn(`Clearing stale execution claim for session ${sessionId} before send`);
+      this.releaseExecutionBookkeeping(sessionId);
+    }
+    if (!claimAlreadyHeld && this.executionClaims.has(sessionId)) {
+      this.sendSessionAlreadyRunning(userId, sessionId);
+      return;
+    }
+    if (!claimAlreadyHeld) this.executionClaims.add(sessionId);
+    if (session.executionMode === 'LOCAL') {
+      this.deps.localToolSessionRegistry.setUserForSession(sessionId, userId);
+      if (!(await this.deps.localToolSessionRegistry.isConnected(sessionId))) {
+        // 手动发送的 claim 是本方法刚自行添加的：requeueIfClaimed 只回补自动消费的
+        // 消息，对手动发送 no-op。不显式释放会让该会话后续所有发送都被
+        // session_already_running 拒绝，只能重启后端恢复。
+        if (claimAlreadyHeld) await requeueIfClaimed();
+        else this.executionClaims.delete(sessionId);
+        this.deps.registry.send(userId, wsEvent('error', sessionId, { message: 'Local client is not connected. Please ensure the desktop app is running.' }));
+        return;
+      }
+      this.deps.localSkillRegistry.report(sessionId, this.parseLocalSkills(data.localSkills));
+      this.deps.localAgentsMdRegistry.report(sessionId, typeof data.agentsMdContent === 'string' ? data.agentsMdContent : null);
+    }
+    const messageContent: unknown = images.length === 0 ? content : contentParts(content, images);
+    if (!isAutoConsume) {
+      try {
+        const savedMessage = await this.deps.sessionService.saveMessage(sessionId, 'USER', messageContent, null, null, null, 0, null);
+        this.deps.titleService.scheduleForFirstUserMessage(sessionId, savedMessage.id, messageContent);
+        const payload = userMessagePayloadOf(messageContent);
+        this.deps.registry.send(userId, wsEvent('user_message_saved', sessionId, {
+          tempEventId: eventId ?? '',
+          messageId: savedMessage.id,
+          source: 'desktop',
+          content: payload.content,
+          ...(payload.images.length > 0 ? { images: payload.images } : {}),
+        }));
+      } catch (e) {
+        // M-4：claim 添加后、执行提交前的异常路径必须释放占位，否则会话永久判定 busy。
+        this.executionClaims.delete(sessionId);
+        this.pendingCancels.delete(sessionId);
+        if (claimAlreadyHeld) {
+          await requeueIfClaimed().catch((requeueErr) => {
+            console.error(`Failed to re-enqueue auto-consumed message for session ${sessionId}`, requeueErr);
+          });
+        }
+        throw e;
+      }
+    }
+    const resolvedEventId = eventId && eventId.trim() !== '' ? eventId : await this.deps.harnessService.prepareMessage(sessionId, messageContent);
+    // 注册 cancel flag 前消费窗口期内到达的「停止」请求（M-2 竞态修复）：
+    // 注册完成后回调在下一个微任务执行，但此刻仍在同一同步段内，
+    // 通过注册时返回值立即消费，避免用户点「停止」后任务照常跑完。
+    const flag = this.deps.agentLoop.registerCancelFlag(sessionId);
+    if (this.takePendingCancel(sessionId, sendStartedAt, flag)) {
+      // 定时任务/触发器 busy 入队消息在此窗口被取消：同步回写终态并清映射，避免永久 QUEUED + 误回写
+      await this.settleQueuedBinding(sessionId, 'CANCELLED');
+      await this.finishCancelledSession(sessionId, userId, resolvedEventId ?? randomUUID());
+      return;
+    }
+    this.cancelFlags.set(sessionId, flag);
+    this.runningExecutionIds.set(sessionId, resolvedEventId);
+    this.deps.registry.subscribe(userId, sessionId);
+    this.submitExecution(sessionId, userId, resolvedEventId, (futureRef) =>
+      this.runExecution(session, userId, sessionId, resolvedEventId, flag, clearTodos, futureRef), requeueIfClaimed);
+  }
+
+  /**
+   * 提交 Agent 执行。线程池拒绝时必须回滚占位，否则该会话会被永久判定为
+   * "already running"，后续所有发送都无法启动。
+   * 返回是否提交成功；失败时已自行回滚簿记并发「服务器繁忙」事件，
+   * 调用方若在此之前推进过会话相位（如 RESUMING），需据此回滚相位。
+   */
+  private submitExecution(
+    sessionId: number,
+    userId: number,
+    executionId: string,
+    run: (futureRef: { current: unknown }) => Promise<void>,
+    requeueIfClaimed?: () => Promise<void>,
+  ): boolean {
+    const futureRef = { current: null as unknown };
+    try {
+      const future = this.deps.agentExecutor(() => run(futureRef));
+      futureRef.current = future;
+      this.runningTasks.set(sessionId, future);
+      return true;
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      console.error(`Failed to submit agent execution for session ${sessionId}: ${message}`);
+      this.executionClaims.delete(sessionId);
+      this.autoConsumingSessionIds.delete(sessionId);
+      this.runningExecutionIds.delete(sessionId);
+      this.cancelFlags.delete(sessionId);
+      this.deps.agentLoop.removeCancelFlag(sessionId);
+      void requeueIfClaimed?.().catch((requeueErr) => {
+        console.error(`Failed to re-enqueue auto-consumed message for session ${sessionId}`, requeueErr);
+      });
+      this.deps.registry.send(userId, wsEvent('error', sessionId, {
+        message: '服务器繁忙，请稍后重试', executionId,
+      }));
+      return false;
+    }
+  }
+
+  private async runExecution(
+    session: Session, userId: number, sessionId: number, executionId: string,
+    cancelFlag: { get(): boolean; set(v: boolean): void }, clearTodos: boolean, futureRef: { current: unknown },
+  ): Promise<void> {
+    await this.withLock(this.sessionLocks, sessionId, async () => {
+      // 本执行绑定的队列回写绑定（定时任务 lastExecutionStatus / Webhook 触发器失败计数）：
+      // finally 按「值未易主」判定回收与回写，避免迟到的旧执行体消费下一次执行的绑定
+      const boundSettlement = this.queueSettlements.get(sessionId) ?? null;
+      // 本次执行的收件箱来源：优先 liveExecution 绑定（定时任务直跑 / 开放接口直跑），
+      // 其次队列行来源（busy 入队的定时任务/Webhook 触发器消息被 autoConsume 消费）。
+      // 与 queueSettlements 同口径：入口取值，finally 按归属清理，迟到旧执行体不串味。
+      const boundLiveSource = this.liveSourceBindings.get(sessionId) ?? null;
+      const executionSource: TaskNotifySource | null = boundLiveSource?.source ?? boundSettlement?.source ?? null;
+      // 终态驱动消费门禁：FAILED 时不再自动消费队列下一条。默认 'FAILED' 保守兜底——
+      // 任何遗漏赋值的分支都倾向「不消费」，宁可暂停也不错误消耗用户消息。
+      let terminalPhase: 'COMPLETED' | 'CANCELLED' | 'FAILED' = 'FAILED';
+      const listenerRef: { current: WsStreamingEventListener | null } = { current: null };
+      try {
+        // 入口取消复查：取消发生在提交后、池真正开跑前的排队窗口时，不得覆盖 CANCELLED
+        // 并白做同步/MCP 连接。与 runRetryExecution 一致放在 try 内提前退出：finally 的
+        // 收敛职责（簿记按归属回收、定时任务绑定回写、autoConsumeQueue 消费队列下一条）
+        // 必须照常执行——裸 return 在 try 外会让排队消息的自动消费停滞、绑定残留被
+        // 下一次执行 stale 回写。簿记归属已由 cancelFlags 对象身份判定（可能已被
+        // handleCancel 释放并归下一次执行所有），此处进入 finally 不会误删新执行簿记。
+        if (cancelFlag.get()) {
+          await this.finishCancelledSession(sessionId, userId, executionId, executionSource);
+          terminalPhase = 'CANCELLED';
+          return;
+        }
+        await this.deps.sessionService.updatePhase(sessionId, 'RUNNING');
+        this.deps.registry.send(userId, wsEvent('session_status', sessionId, { phase: 'RUNNING', executionId }));
+        this.deps.registry.send(userId, wsEvent('session_list_update', sessionId, { phase: 'RUNNING' }));
+        if (session.sessionType === 'SIDE_TASK') this.deps.treeSignalPublisher.publishIfSideTask(sessionId);
+        const agent = session.agentId != null ? await this.deps.agentMapper.selectById(session.agentId) : null;
+        if (session.executionMode === 'LOCAL' && agent) {
+          const syncFailure = await this.syncSkillsToClient(userId, sessionId, session, agent);
+          if (syncFailure) {
+            const message = `技能同步失败：${syncFailure}`;
+            terminalPhase = await this.finishFailedSession(sessionId, userId, executionId, message, executionSource);
+            this.deps.registry.send(userId, wsEvent('error', sessionId, { message, executionId }));
+            return;
+          }
+          await this.syncMcpServersToClient(userId, sessionId, session, agent);
+        }
+        if (session.executionMode === 'CLOUD' && agent) {
+          try { await this.deps.skillSyncService.syncToSession(agent, userId, sessionId); } catch { /* ignore */ }
+        }
+        if (clearTodos) {
+          await this.deps.sessionTodoMapper.deleteBySessionId(sessionId);
+          this.deps.registry.send(userId, wsEvent('todo_updated', sessionId, { todos: [] }));
+        }
+        const listener = new WsStreamingEventListener(
+          { registry: this.deps.registry, activityService: this.deps.activityService, activityHeartbeat: this.deps.activityHeartbeat, sessionTodoMapper: this.deps.sessionTodoMapper, sessionService: this.deps.sessionService },
+          sessionId, userId, executionId, await this.resolveSupportsVision(session),
+        );
+        listenerRef.current = listener;
+        await this.deps.harnessService.executeFromEvent(sessionId, executionId, listener, cancelFlag);
+        if (cancelFlag.get()) {
+          await this.finishCancelledSession(sessionId, userId, executionId, executionSource);
+          terminalPhase = 'CANCELLED';
+        } else {
+          terminalPhase = await this.finishCompletedSession(sessionId, userId, executionId, executionSource);
+        }
+      } catch (e) {
+        const message = e instanceof Error ? e.message : 'Agent 执行异常';
+        this.deps.registry.send(userId, wsEvent('error', sessionId, { message, executionId }));
+        terminalPhase = await this.finishFailedSession(sessionId, userId, executionId, message, executionSource);
+      } finally {
+        listenerRef.current?.dispose();
+        try {
+          this.releaseSessionExecutionResources(sessionId);
+        } catch (e) {
+          console.warn(`Failed to release execution resources for session ${sessionId}`, e);
+        }
+        this.deps.registry.clearActiveToolCalls(sessionId);
+        this.deps.registry.setSessionThinking(sessionId, false);
+        if (this.runningTasks.get(sessionId) === futureRef.current) this.runningTasks.delete(sessionId);
+        if (this.runningExecutionIds.get(sessionId) === executionId) this.runningExecutionIds.delete(sessionId);
+        // 簿记按归属回收：executionClaims 无对象身份，而它与 cancelFlags 始终成对增删，
+        // 用 flag 的对象身份判定整套簿记是否仍属于本次执行。取消排队中的执行后立即重发时，
+        // 迟到的旧执行体若无条件回收，会删掉新执行的 claim/cancelFlag 并把停止标记一并清掉。
+        if (this.cancelFlags.get(sessionId) === cancelFlag) {
+          this.executionClaims.delete(sessionId);
+          this.cancelFlags.delete(sessionId);
+          this.pendingCancels.delete(sessionId);
+          this.deps.agentLoop.removeCancelFlag(sessionId);
+          this.deps.activityHeartbeat.clear(sessionId);
+        }
+        // busy 入队的带来源消息：队列真正执行到终态后按绑定回写（定时任务 lastExecutionStatus /
+        // Webhook 触发器连续失败计数），避免永久停在 QUEUED / 失败计数丢失
+        if (boundSettlement != null && this.queueSettlements.get(sessionId) === boundSettlement) {
+          await this.settleQueuedBinding(sessionId, terminalPhase);
+        }
+        // liveExecution 来源绑定按归属清理：值未易主才删，迟到的旧执行体
+        // 不得清掉下一次执行的来源标记（否则新执行会被误标成手工触发）
+        if (boundLiveSource != null && this.liveSourceBindings.get(sessionId) === boundLiveSource) {
+          this.liveSourceBindings.delete(sessionId);
+        }
+        if (terminalPhase !== 'FAILED') await this.autoConsumeQueue(sessionId, userId);
+      }
+    });
+  }
+
+  /**
+   * Run an already-persisted USER prompt on the live WS path (scheduled tasks / open triggers).
+   * Does not re-submit to the agent executor — caller must already be on that pool.
+   *
+   * `scheduledTaskId` 由定时任务调度方传入（busy 入队路径的 liveExecution 同源）：
+   * 写入调度簿记，runExecution 据此给 finishExecution 传 SCHEDULED，
+   * 收件箱条目 payload 因此带上「定时任务」来源（前端据此显示徽标）。
+   * `source` 为开放接口域扩展：WEBHOOK / API 直跑时显式传入，未传而 scheduledTaskId
+   * 非空时按 SCHEDULED 处理（定时任务装配线保持 6 参调用不破坏）。
+   */
+  async executePersistedUserPrompt(
+    session: Session,
+    userId: number,
+    executionId: string,
+    savedMessage: Message,
+    startedAt?: number,
+    scheduledTaskId?: number | null,
+    source?: 'SCHEDULED' | 'WEBHOOK' | 'API' | 'SIGNAL' | null,
+  ): Promise<void> {
+    const sessionId = session.id!;
+    this.deps.titleService.scheduleForFirstUserMessage(sessionId, savedMessage.id, savedMessage.content ?? '');
+    if (session.executionMode === 'LOCAL') {
+      this.deps.localToolSessionRegistry.setUserForSession(sessionId, userId);
+      if (!(await this.deps.localToolSessionRegistry.isConnected(sessionId))) {
+        throw new Error('Local client is not connected. Please ensure the desktop app is running.');
+      }
+    }
+    // 来源绑定必须在任何早退之前登记：takePendingCancel 命中时收件箱来源也要正确；
+    // runExecution 的 finally 按归属清理，不会残留到手工执行。对象身份即归属判定。
+    const liveSource: QueuedSource | null = source ?? (scheduledTaskId != null ? 'SCHEDULED' : null);
+    const sourceBinding = liveSource != null ? { source: liveSource } : null;
+    if (sourceBinding != null) {
+      this.liveSourceBindings.set(sessionId, sourceBinding);
+    }
+    this.deps.registry.send(userId, wsEvent('user_message_saved', sessionId, {
+      messageId: savedMessage.id,
+      source: 'scheduled',
+      tempEventId: '',
+      ...(() => {
+        const payload = userMessagePayloadOf(savedMessage.content);
+        return { content: payload.content, ...(payload.images.length > 0 ? { images: payload.images } : {}) };
+      })(),
+    }));
+    this.deps.registry.subscribe(userId, sessionId);
+    const flag = this.deps.agentLoop.registerCancelFlag(sessionId);
+    // startedAt 由定时任务在 updatePhase(RUNNING) 之前记下。窗口内的停止早于本方法入口，
+    // 用入口时间会把标记当成陈旧清掉，随后 runExecution 又把 CANCELLED 盖回 RUNNING。
+    if (this.takePendingCancel(sessionId, startedAt ?? Date.now(), flag)) {
+      await this.finishCancelledSession(sessionId, userId, executionId);
+      if (sourceBinding != null && this.liveSourceBindings.get(sessionId) === sourceBinding) {
+        this.liveSourceBindings.delete(sessionId);
+      }
+      // busy 入队的簿记同样要在本早退分支收敛：漏掉会让定时任务 lastExecutionStatus
+      // 永久停在 QUEUED，且残留绑定可能被下一次执行 stale 回写。
+      await this.settleQueuedBinding(sessionId, 'CANCELLED');
+      return;
+    }
+    this.cancelFlags.set(sessionId, flag);
+    this.runningExecutionIds.set(sessionId, executionId);
+    if (!this.executionClaims.has(sessionId)) this.executionClaims.add(sessionId);
+    const futureRef = { current: null as unknown };
+    const run = this.runExecution(session, userId, sessionId, executionId, flag, false, futureRef);
+    futureRef.current = run;
+    this.runningTasks.set(sessionId, run);
+    await run;
+  }
+
+  private async handleEditAndResend(userId: number, root: Record<string, unknown>): Promise<void> {
+    const sessionId = this.getLong(root, 'sessionId');
+    const messageId = this.getLong(root, 'messageId');
+    if (sessionId == null || messageId == null) return;
+    const content = typeof root.content === 'string' ? root.content : '';
+    const images = Array.isArray(root.images) ? root.images.map(String) : [];
+    const session = await this.requireOwnedSession(userId, sessionId);
+    if (!session) return;
+    if (this.isSessionActive(session.phase)) {
+      this.sendSessionAlreadyRunning(userId, sessionId);
+      return;
+    }
+    // 按 id 单调序定位最后一条用户消息：created_at 在跨节点时钟偏移下可能乱序，
+    // 误判目标会导致 editMessageAndTruncate 逻辑删除大量无辜消息
+    const lastUser = await this.deps.sessionService.getLastUserMessage(sessionId);
+    if (!lastUser || lastUser.id !== messageId) {
+      this.deps.registry.send(userId, wsEvent('error', sessionId, { message: '只能编辑最后一条用户消息' }));
+      return;
+    }
+    if (images.length > 0) {
+      const model = await this.resolveSessionModel(session);
+      if (!model || model.supportsVision !== 1) {
+        this.deps.registry.send(userId, wsEvent('error', sessionId, { message: '当前模型不支持图片输入，请切换支持视觉的模型' }));
+        return;
+      }
+      if (images.length > 10) {
+        this.deps.registry.send(userId, wsEvent('error', sessionId, { message: '单条消息最多支持 10 张图片' }));
+        return;
+      }
+    }
+    if (this.hasStaleExecutionClaim(sessionId)) {
+      console.warn(`Clearing stale execution claim for session ${sessionId} before edit-and-resend`);
+      this.releaseExecutionBookkeeping(sessionId);
+    }
+    if (this.executionClaims.has(sessionId)) {
+      this.sendSessionAlreadyRunning(userId, sessionId);
+      return;
+    }
+    const editStartedAt = Date.now();
+    this.executionClaims.add(sessionId);
+    // 预算 BLOCK 检查（技术方案 §5.7）：占位之后、editMessageAndTruncate 之前——
+    // 早退并释放已持占位，消息不落库、不入队、原消息不被截断。
+    if (this.isBudgetCheckable(session.sessionType)) {
+      const budgetBlock = this.deps.budgetGate
+        ? await this.deps.budgetGate.checkAdmission({ userId: session.userId ?? null, agentId: session.agentId ?? null })
+        : null;
+      if (budgetBlock) {
+        this.executionClaims.delete(sessionId);
+        this.deps.registry.send(userId, wsEvent('error', sessionId, budgetRejection(budgetBlock)));
+        return;
+      }
+    }
+    if (session.executionMode === 'LOCAL') {
+      this.deps.localToolSessionRegistry.setUserForSession(sessionId, userId);
+      if (!(await this.deps.localToolSessionRegistry.isConnected(sessionId))) {
+        this.executionClaims.delete(sessionId);
+        this.deps.registry.send(userId, wsEvent('error', sessionId, { message: 'Local client is not connected. Please ensure the desktop app is running.' }));
+        return;
+      }
+      this.deps.localSkillRegistry.report(sessionId, this.parseLocalSkills(root.localSkills));
+      this.deps.localAgentsMdRegistry.report(sessionId, typeof root.agentsMdContent === 'string' ? root.agentsMdContent : null);
+    }
+    try {
+      await this.deps.sessionService.editMessageAndTruncate(sessionId, messageId, content, images);
+    } catch (e) {
+      this.executionClaims.delete(sessionId);
+      this.deps.registry.send(userId, wsEvent('error', sessionId, { message: `编辑消息失败: ${e instanceof Error ? e.message : String(e)}` }));
+      return;
+    }
+    const messageContent: unknown = images.length === 0 ? content : contentParts(content, images);
+    try {
+      const resolvedEventId = await this.deps.harnessService.prepareMessage(sessionId, messageContent);
+      this.deps.registry.subscribe(userId, sessionId);
+      const flag = this.deps.agentLoop.registerCancelFlag(sessionId);
+      if (this.takePendingCancel(sessionId, editStartedAt, flag)) {
+        await this.finishCancelledSession(sessionId, userId, resolvedEventId);
+        return;
+      }
+      this.cancelFlags.set(sessionId, flag);
+      this.runningExecutionIds.set(sessionId, resolvedEventId);
+      this.submitExecution(sessionId, userId, resolvedEventId, (futureRef) =>
+        this.runExecution(session, userId, sessionId, resolvedEventId, flag, true, futureRef));
+    } catch (e) {
+      // claim 添加后、执行提交前的异常路径必须释放占位，否则会话永久判定 busy。
+      // submitExecution 提交被拒时已自行回滚并发事件，仅当占位仍在时才收敛，避免重复发 error。
+      if (!this.executionClaims.has(sessionId)) return;
+      this.cancelFlags.delete(sessionId);
+      this.runningExecutionIds.delete(sessionId);
+      this.deps.agentLoop.removeCancelFlag(sessionId);
+      this.executionClaims.delete(sessionId);
+      this.deps.registry.send(userId, wsEvent('error', sessionId, {
+        message: `编辑重发失败: ${e instanceof Error ? e.message : String(e)}`,
+      }));
+    }
+  }
+
+  private async handleToolResult(userId: number, root: Record<string, unknown>): Promise<void> {
+    const sessionId = this.getLong(root, 'sessionId');
+    const requestId = typeof root.requestId === 'string' ? root.requestId : null;
+    const result = typeof root.result === 'string' ? root.result : '{}';
+    if (sessionId == null || requestId == null) return;
+    if (!(await this.requireOwnedSession(userId, sessionId))) return;
+    this.deps.localToolSessionRegistry.completeToolRequest(sessionId, requestId, result);
+  }
+
+  /** LOCAL 审批卡片点「执行/拒绝」后立即恢复 RUNNING，不必等命令真正跑完。 */
+  private async handleToolApproval(userId: number, root: Record<string, unknown>): Promise<void> {
+    const sessionId = this.getLong(root, 'sessionId');
+    const requestId = typeof root.requestId === 'string' ? root.requestId : null;
+    if (sessionId == null || requestId == null) return;
+    if (!(await this.requireOwnedSession(userId, sessionId))) return;
+    // 「总是允许」（V135）：客户端只回传布尔位，pattern 由服务端按 requestId 取回自己生成的 hint。
+    // deny 帧（approved=false）永不落规则；hint 不在缓存（超时/重启/同帧重发已消费）→ 静默忽略只执行。
+    if (root.alwaysAllow === true && root.approved === true) {
+      const hint = this.deps.approvalRegistry.takeHint?.(sessionId, requestId) ?? null;
+      if (hint && this.deps.approvalRuleService) {
+        try {
+          await this.deps.approvalRuleService.createSessionRuleFromAlwaysAllow(userId, sessionId, hint);
+        } catch (e) {
+          console.error(`Failed to create approval rule from always-allow (sessionId=${sessionId})`, e);
+        }
+      }
+    }
+    await Promise.resolve(this.deps.approvalRegistry.unregister(sessionId, requestId));
+    await Promise.resolve(this.deps.treeSignalPublisher.publishForSession(sessionId));
+    // 批准后命令还要跑。抑制必须发生在这一帧，不能等 tool_result，否则长命令会在人已经点过之后仍被提醒。
+    if (this.deps.approvalEscalationSuppressor) {
+      try {
+        await this.deps.approvalEscalationSuppressor.suppressByRequest(sessionId, requestId);
+      } catch (e) {
+        console.warn(`Failed to suppress approval escalation: sessionId=${sessionId}, requestId=${requestId}, error=${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  }
+
+  private async handlePageToolResult(session: WsSocket, userId: number, root: Record<string, unknown>): Promise<void> {
+    const sessionId = this.getLong(root, 'sessionId');
+    const requestId = typeof root.requestId === 'string' ? root.requestId : null;
+    const data = root.data && typeof root.data === 'object' ? root.data as Record<string, unknown> : null;
+    if (sessionId == null || !requestId || !data || !(await this.requireOwnedSession(userId, sessionId))) return;
+    // 只接受该会话绑定的页面连接回包；同用户其他标签页/其他客户端不能完成请求。
+    if (!this.deps.registry.getEmbedSessionsForConnection(session).includes(sessionId)) return;
+    const error = data.error != null && typeof data.error === 'object' ? data.error as Record<string, unknown> : null;
+    this.deps.embedPageToolRegistry.complete(sessionId, requestId, session, {
+      success: data.success === true,
+      result: data.result,
+      error: error == null ? undefined : {
+        code: typeof error.code === 'string' ? error.code : 'page_tool_failed',
+        message: typeof error.message === 'string' ? error.message : '页面操作失败',
+        ...(typeof error.elementId === 'string' ? { elementId: error.elementId } : {}),
+      },
+      ...(typeof data.snapshotId === 'string' ? { snapshotId: data.snapshotId } : {}),
+      ...(typeof data.pageVersion === 'string' ? { pageVersion: data.pageVersion } : {}),
+    });
+  }
+  private async handleToolError(userId: number, root: Record<string, unknown>): Promise<void> {
+    const sessionId = this.getLong(root, 'sessionId');
+    const requestId = typeof root.requestId === 'string' ? root.requestId : null;
+    const error = typeof root.error === 'string' ? root.error : 'Unknown error';
+    if (sessionId == null || requestId == null) return;
+    if (!(await this.requireOwnedSession(userId, sessionId))) return;
+    this.deps.localToolSessionRegistry.completeToolRequestError(sessionId, requestId, error);
+  }
+
+  private async handleAskUserQuestionsResult(userId: number, root: Record<string, unknown>): Promise<void> {
+    const sessionId = this.getLong(root, 'sessionId');
+    const data = root.data as Record<string, unknown> | undefined;
+    if (sessionId == null || !data) return;
+    if (!(await this.requireOwnedSession(userId, sessionId))) return;
+    const requestId = typeof data.requestId === 'string' ? data.requestId : null;
+    if (!requestId) return;
+    const answers = Array.isArray(data.answers) ? data.answers : [];
+    const resultJson = JSON.stringify({ answers });
+    const completed = this.deps.askUserQuestionsRegistry.complete(sessionId, requestId, resultJson);
+    if (completed) {
+      const executionId = this.currentExecutionId(sessionId);
+      this.deps.registry.send(userId, wsEvent('ask_user_questions_cancelled', sessionId, { requestId }));
+      this.deps.registry.send(userId, wsEvent('session_status', sessionId, {
+        phase: 'RUNNING',
+        ...(executionId ? { executionId } : {}),
+      }));
+      this.deps.registry.send(userId, wsEvent('session_list_update', sessionId, { phase: 'RUNNING' }));
+      this.deps.treeSignalPublisher.publishForSession(sessionId);
+    }
+  }
+
+  private async handleCreateSideSession(userId: number, root: Record<string, unknown>): Promise<void> {
+    const parentSessionId = this.getLong(root, 'sessionId');
+    if (parentSessionId == null) return;
+    const data = (root.data ?? {}) as Record<string, unknown>;
+    if (typeof data.content !== 'string') return;
+    const content = data.content;
+    const contextMode = data.contextMode === 'fork' || data.contextMode === 'summary'
+      ? data.contextMode
+      : 'none';
+    // 按轮分叉的切点（被点击那一轮的助手最终回复 id）。非正整数一律按全量分叉处理。
+    const forkFromMessageId = typeof data.forkFromMessageId === 'number'
+      && Number.isInteger(data.forkFromMessageId) && data.forkFromMessageId > 0
+      ? data.forkFromMessageId
+      : null;
+    const modelId = data.modelId != null ? Number(data.modelId) : null;
+    const images = Array.isArray(data.images) ? data.images.map(String) : [];
+    if ((!content || content.trim() === '') && images.length === 0) return;
+    const parentSession = await this.requireOwnedSession(userId, parentSessionId);
+    if (!parentSession) return;
+    this.deps.registry.subscribe(userId, parentSessionId);
+    if (parentSession.executionMode === 'LOCAL' && !this.deps.registry.hasLocalClientConnection(userId)) {
+      this.deps.registry.send(userId, wsEvent('error', parentSessionId, sideRejection('Local client is not connected. Please ensure the desktop app is running.')));
+      return;
+    }
+    const resolvedModelId = modelId ?? parentSession.modelId ?? null;
+    if (images.length > 0) {
+      const probe: Session = { modelId: resolvedModelId ?? undefined, agentId: parentSession.agentId };
+      const model = await this.resolveSessionModel(probe);
+      if (!model || model.supportsVision !== 1) {
+        this.deps.registry.send(userId, wsEvent('error', parentSessionId, sideRejection('当前模型不支持图片输入，请切换支持视觉的模型')));
+        return;
+      }
+      if (images.length > 10) {
+        this.deps.registry.send(userId, wsEvent('error', parentSessionId, sideRejection('单条消息最多支持 10 张图片')));
+        return;
+      }
+    }
+    // 切点校验必须发生在创建边路会话之前：点击到发送之间可能隔很久，
+    // 若先建会话再发现切点失效，会留下一个空的边路任务。
+    if (contextMode === 'fork' && forkFromMessageId != null) {
+      const forkFrom = await this.deps.sessionService.findOwnedMessage(parentSessionId, forkFromMessageId);
+      if (forkFrom == null) {
+        this.deps.registry.send(userId, wsEvent('error', parentSessionId, sideRejection('分叉来源消息不存在或已被删除，请刷新后重试')));
+        return;
+      }
+    }
+    const sideSession: Session = {
+      userId, agentId: parentSession.agentId, executionMode: parentSession.executionMode,
+      workspace: parentSession.workspace, projectKey: parentSession.projectKey,
+      permissionLevel: sidePermissionLevel(data.permissionLevel, parentSession.permissionLevel),
+      modelId: resolvedModelId ?? undefined, isGit: parentSession.isGit, platform: parentSession.platform,
+      shellPath: parentSession.shellPath, osVersion: parentSession.osVersion, status: 'ACTIVE',
+      parentSessionId, sessionType: 'SIDE_TASK', title: '任务',
+    };
+    await this.deps.sessionService.save(sideSession);
+    const sideSessionId = sideSession.id!;
+    const sideStartedAt = Date.now();
+    const clientRequestId = typeof data.clientRequestId === 'string' ? data.clientRequestId : null;
+    // Fork 复制历史可能很久，且发生在注册 cancel flag 之前。先把会话 id 交给客户端，
+    // 这段时间点的停止会进 pendingCancels；复制结束后必须消费，否则新 flag 仍是 false，任务照跑。
+    this.deps.registry.send(userId, wsEvent('side_session_created', parentSessionId, {
+      sideSessionId, title: sideSession.title, ...(clientRequestId ? { clientRequestId } : {}),
+    }));
+    // 先复制主会话历史，再落边路首问。否则首问 id 更小：无压缩时排在历史前面，
+    // 有压缩边界时会被 id > boundary 整段排除，模型看不到这次提问。
+    if (contextMode === 'fork') {
+      await this.deps.harnessService.forkParentMessages(parentSessionId, sideSessionId, forkFromMessageId);
+    }
+    const sideRunMode = contextMode === 'fork' ? 'none' : contextMode;
+    if (sideSession.executionMode === 'LOCAL') {
+      this.deps.localToolSessionRegistry.setUserForSession(sideSessionId, userId);
+      this.deps.localSkillRegistry.report(sideSessionId, this.parseLocalSkills(data.localSkills));
+      this.deps.localAgentsMdRegistry.report(sideSessionId, typeof data.agentsMdContent === 'string' ? data.agentsMdContent : null);
+    }
+    const messageContent = images.length === 0 ? content : contentParts(content, images);
+    const savedMessage = await this.deps.sessionService.saveMessage(sideSessionId, 'USER', messageContent, null, null, null, 0, null);
+    this.deps.titleService.scheduleForFirstUserMessage(sideSessionId, savedMessage.id, messageContent);
+    const sidePayload = userMessagePayloadOf(messageContent);
+    this.deps.registry.send(userId, wsEvent('user_message_saved', sideSessionId, {
+      messageId: savedMessage.id,
+      source: 'desktop',
+      content: sidePayload.content,
+      ...(sidePayload.images.length > 0 ? { images: sidePayload.images } : {}),
+    }));
+    this.executionClaims.add(sideSessionId);
+    const flag = this.deps.agentLoop.registerCancelFlag(sideSessionId);
+    if (this.takePendingCancel(sideSessionId, sideStartedAt, flag)) {
+      await this.finishCancelledSession(sideSessionId, userId, randomUUID());
+      return;
+    }
+    this.cancelFlags.set(sideSessionId, flag);
+    const sideExecutionId = randomUUID();
+    this.runningExecutionIds.set(sideSessionId, sideExecutionId);
+    let sideListener: WsStreamingEventListener | null = null;
+    const futureRef = { current: null as unknown };
+    try {
+      const future = this.deps.agentExecutor(async () => {
+      await this.withLock(this.sessionLocks, sideSessionId, async () => {
+        let terminalPhase: 'COMPLETED' | 'CANCELLED' | 'FAILED' = 'FAILED';
+        try {
+          if (flag.get()) {
+            await this.deps.taskTerminalService.finishExecution(sideSessionId, userId, 'CANCELLED', sideExecutionId);
+            terminalPhase = 'CANCELLED';
+            return;
+          }
+          await this.deps.sessionService.updatePhase(sideSessionId, 'RUNNING');
+          this.deps.registry.send(userId, wsEvent('session_status', sideSessionId, { phase: 'RUNNING', executionId: sideExecutionId }));
+          this.deps.treeSignalPublisher.publishIfSideTask(sideSessionId);
+          if (sideSession.executionMode === 'LOCAL' && sideSession.agentId != null) {
+            const sideAgent = await this.deps.agentMapper.selectById(sideSession.agentId);
+            if (sideAgent) {
+              const syncFailure = await this.syncSkillsToClient(userId, sideSessionId, sideSession, sideAgent);
+              if (syncFailure) {
+                const message = `技能同步失败：${syncFailure}`;
+                terminalPhase = await this.finishFailedSession(sideSessionId, userId, sideExecutionId, message);
+                this.deps.registry.send(userId, wsEvent('error', sideSessionId, { message, executionId: sideExecutionId }));
+                return;
+              }
+              await this.syncMcpServersToClient(userId, sideSessionId, sideSession, sideAgent);
+            }
+          }
+          const listener = new WsStreamingEventListener(
+            { registry: this.deps.registry, activityService: this.deps.activityService, activityHeartbeat: this.deps.activityHeartbeat, sessionTodoMapper: this.deps.sessionTodoMapper, sessionService: this.deps.sessionService },
+            sideSessionId, userId, sideExecutionId, await this.resolveSupportsVision(sideSession),
+          );
+          sideListener = listener;
+          await this.deps.harnessService.executeSideFirstMessage(parentSessionId, sideSessionId, sideRunMode, listener, flag);
+          if (flag.get()) {
+            await this.deps.taskTerminalService.finishExecution(sideSessionId, userId, 'CANCELLED', sideExecutionId);
+            terminalPhase = 'CANCELLED';
+          } else {
+            terminalPhase = await this.finishCompletedSession(sideSessionId, userId, sideExecutionId);
+          }
+        } catch (e) {
+          const message = e instanceof Error ? e.message : '未知错误';
+          terminalPhase = await this.finishFailedSession(sideSessionId, userId, sideExecutionId, message);
+          this.deps.registry.send(userId, wsEvent('error', sideSessionId, { message }));
+        } finally {
+          sideListener?.dispose();
+          try {
+            this.releaseSessionExecutionResources(sideSessionId);
+          } catch (e) {
+            console.warn(`Failed to release execution resources for session ${sideSessionId}`, e);
+          }
+          this.deps.registry.clearActiveToolCalls(sideSessionId);
+          this.deps.registry.setSessionThinking(sideSessionId, false);
+          if (this.runningTasks.get(sideSessionId) === futureRef.current) this.runningTasks.delete(sideSessionId);
+          if (this.runningExecutionIds.get(sideSessionId) === sideExecutionId) this.runningExecutionIds.delete(sideSessionId);
+          // 簿记按归属回收（同 runExecution finally）：flag 身份不匹配说明簿记已易主
+          if (this.cancelFlags.get(sideSessionId) === flag) {
+            this.executionClaims.delete(sideSessionId);
+            this.cancelFlags.delete(sideSessionId);
+            this.deps.agentLoop.removeCancelFlag(sideSessionId);
+            this.deps.activityHeartbeat.clear(sideSessionId);
+          }
+          if (terminalPhase !== 'FAILED') await this.autoConsumeQueue(sideSessionId, userId);
+        }
+      });
+    });
+      futureRef.current = future;
+      this.runningTasks.set(sideSessionId, future);
+    } catch {
+      this.executionClaims.delete(sideSessionId);
+      this.cancelFlags.delete(sideSessionId);
+      this.runningExecutionIds.delete(sideSessionId);
+      this.deps.agentLoop.removeCancelFlag(sideSessionId);
+      await this.finishFailedSession(sideSessionId, userId, sideExecutionId, '服务器繁忙，请稍后重试');
+      this.deps.registry.send(userId, wsEvent('error', sideSessionId, { message: '服务器繁忙，请稍后重试' }));
+      this.deps.registry.send(userId, wsEvent('error', parentSessionId, { message: '服务器繁忙，请稍后重试' }));
+    }
+  }
+
+  private async handleCancelSideTask(userId: number, root: Record<string, unknown>): Promise<void> {
+    const sideSessionId = this.getLong(root, 'sideSessionId');
+    if (sideSessionId == null) return;
+    if (!(await this.requireOwnedSession(userId, sideSessionId))) return;
+    const executionId = this.currentExecutionId(sideSessionId) ?? '';
+    this.abortRunningExecution(sideSessionId, userId);
+    await this.finishCancelledSession(sideSessionId, userId, executionId);
+    // 与 handleCancel 一致：DB 终态之外必须回收内存簿记，否则边路会话的「继续」按钮
+    // 会被 already_running 永久拒绝。
+    this.releaseExecutionBookkeeping(sideSessionId, { future: this.runningTasks.get(sideSessionId) });
+  }
+
+  /**
+   * 处理用户点击「重试」按钮的请求。
+   * 以宕机恢复语义重新执行：清理未完成尾巴消息 → 基于已有会话历史续跑，不插入新 user message。
+   */
+  private async handleRetryExecution(userId: number, root: Record<string, unknown>): Promise<void> {
+    const sessionId = this.getLong(root, 'sessionId');
+    if (sessionId == null) return;
+    const session = await this.requireOwnedSession(userId, sessionId);
+    if (!session) return;
+    // 只有终态（FAILED）且没有正在运行的其他执行时才能重试
+    if (!this.isTerminalPhase(session.phase)) {
+      this.deps.registry.send(userId, wsEvent('error', sessionId, {
+        message: '任务尚未结束，无法重试',
+      }));
+      return;
+    }
+    // 入口保证为终态（COMPLETED/FAILED/CANCELLED），供异常路径收敛回该状态。
+    const entryPhase: string = session.phase!;
+    // 陈旧占位自愈：claim 在但没有任何在途执行 future，说明上一次执行的 finally 未跑到
+    // （取消时 LLM 流卡死即此类）。此时不能拒绝用户——那会让会话除重启服务外永远无法恢复，
+    // 必须先回收簿记再放行重试。
+    if (this.hasStaleExecutionClaim(sessionId)) {
+      console.warn(`Clearing stale execution claim for session ${sessionId} before retry`);
+      this.releaseExecutionBookkeeping(sessionId);
+    }
+    if (this.executionClaims.has(sessionId)) {
+      this.sendSessionAlreadyRunning(userId, sessionId);
+      return;
+    }
+    this.executionClaims.add(sessionId);
+    let phaseAdvanced = false;
+    // beginRetry 成功后 execution 已置 RUNNING 并纳入跟踪；此后任何失败出口
+    // （LOCAL 检查/提交前异常）都必须收敛回 FAILED，否则记录永久卡 RUNNING。
+    let retryTaskId: number | null = null;
+    try {
+      // 后台子代理会话的重试：先在子代理管理器做开始簿记（execution 置回 RUNNING 并纳入
+      // 运行跟踪），否则主代理 check_subagent/wait_subagents 感知不到这次重试执行。
+      if (session.sessionType === 'SUBAGENT' && session.parentSessionId != null) {
+        const manager = this.deps.backgroundSubagentManager;
+        if (!manager?.beginRetry || !manager.completeRetry) {
+          this.executionClaims.delete(sessionId);
+          this.deps.registry.send(userId, wsEvent('error', sessionId, { message: '子代理重试功能不可用' }));
+          return;
+        }
+        const began = await manager.beginRetry(session.parentSessionId, sessionId);
+        if (!began.ok) {
+          this.executionClaims.delete(sessionId);
+          this.deps.registry.send(userId, wsEvent('error', sessionId, { message: began.error ?? '无法重试该子代理' }));
+          return;
+        }
+        retryTaskId = began.taskId ?? null;
+      }
+      // 防御性订阅，确保客户端能收到流式事件
+      this.deps.registry.subscribe(userId, sessionId);
+      // LOCAL 模式：注册会话到用户映射并检查桌面端连接
+      if (session.executionMode === 'LOCAL') {
+        this.deps.localToolSessionRegistry.setUserForSession(sessionId, userId);
+        if (!(await this.deps.localToolSessionRegistry.isConnected(sessionId))) {
+          this.executionClaims.delete(sessionId);
+          await this.rollbackSubagentRetry(session, retryTaskId);
+          this.deps.registry.send(userId, wsEvent('error', sessionId, {
+            message: 'Local client is not connected. Please ensure the desktop app is running.',
+          }));
+          return;
+        }
+        // 注意：不重新同步 skills — 复用已有会话上下文（有意为之）
+      }
+      // 补齐缺失的 tool output（与 CrashRecoveryRunner 一致），避免重试再次 400
+      const deleted = await this.deps.sessionService.cleanupIncompleteTail(sessionId);
+      if (deleted > 0) {
+        console.info(`Session ${sessionId}: filled ${deleted} missing tool output(s) before retry`);
+      }
+      // 置为 RESUMING 状态
+      await this.deps.sessionService.updatePhase(sessionId, 'RESUMING');
+      phaseAdvanced = true;
+      this.deps.registry.send(userId, wsEvent('session_status', sessionId, { phase: 'RESUMING' }));
+      // 分配新的 executionId
+      const executionId = randomUUID();
+      const cancelFlag = this.deps.agentLoop.registerCancelFlag(sessionId);
+      this.cancelFlags.set(sessionId, cancelFlag);
+      this.runningExecutionIds.set(sessionId, executionId);
+      // 清除残留的 tool calls 和 ask questions 状态
+      this.deps.registry.clearActiveToolCalls(sessionId);
+      this.deps.registry.setSessionThinking(sessionId, false);
+      this.deps.askUserQuestionsRegistry.failAllForSession(sessionId);
+      const submitted = this.submitExecution(sessionId, userId, executionId, (futureRef) =>
+        this.runRetryExecution(session, userId, sessionId, executionId, cancelFlag, futureRef, retryTaskId));
+      if (!submitted) {
+        // 线程池拒绝：submitExecution 已回滚簿记并发「服务器繁忙」事件，
+        // 这里把相位收敛回进入时的终态（入口已校验 isTerminalPhase），
+        // 避免 phase 滞留 RESUMING 后被孤儿巡检以崩溃恢复语义自动执行。
+        try {
+          await this.deps.sessionService.updatePhase(sessionId, entryPhase);
+        } catch { /* ignore */ }
+        await this.rollbackSubagentRetry(session, retryTaskId);
+      }
+    } catch (e) {
+      // claim 添加后、执行提交前的异常路径必须释放占位（同 M-4），否则会话永久判定 busy。
+      // submitExecution 提交被拒时已自行回滚并发事件，这里仅在实际删除到 claim 时才补发 error，避免重复。
+      if (phaseAdvanced) {
+        // 置为 RESUMING 后、提交执行前异常：收敛回进入时的终态（入口已校验 isTerminalPhase），
+        // 避免会话永久卡在 RESUMING。先恢复再释放 claim，缩小并发窗口。
+        try {
+          await this.deps.sessionService.updatePhase(sessionId, entryPhase);
+        } catch { /* ignore */ }
+      }
+      this.cancelFlags.delete(sessionId);
+      this.runningExecutionIds.delete(sessionId);
+      this.deps.agentLoop.removeCancelFlag(sessionId);
+      await this.rollbackSubagentRetry(session, retryTaskId);
+      if (this.executionClaims.delete(sessionId)) {
+        console.error(`Retry execution setup failed for session ${sessionId}`, e);
+        this.deps.registry.send(userId, wsEvent('error', sessionId, {
+          message: e instanceof Error ? e.message : '重试执行失败',
+        }));
+      }
+    }
+  }
+
+  private async runRetryExecution(
+    session: Session, userId: number, sessionId: number, executionId: string,
+    cancelFlag: { get(): boolean; set(v: boolean): void }, futureRef: { current: unknown },
+    retryTaskId: number | null,
+  ): Promise<void> {
+    await this.withLock(this.sessionLocks, sessionId, async () => {
+      let terminalPhase: 'COMPLETED' | 'CANCELLED' | 'FAILED' = 'FAILED';
+      const listenerRef: { current: WsStreamingEventListener | null } = { current: null };
+      try {
+        // 入口取消复查：取消发生在提交后、池真正开跑前的排队窗口时，不得覆盖 CANCELLED
+        // 并白做执行。finishExecution 对已终态会话是 no-op；finally 仍收敛子代理重试簿记。
+        if (cancelFlag.get()) {
+          await this.finishCancelledSession(sessionId, userId, executionId);
+          terminalPhase = 'CANCELLED';
+          return;
+        }
+        await this.deps.sessionService.updatePhase(sessionId, 'RUNNING');
+        this.deps.registry.send(userId, wsEvent('session_status', sessionId, { phase: 'RUNNING', executionId }));
+        this.deps.registry.send(userId, wsEvent('session_list_update', sessionId, { phase: 'RUNNING' }));
+        if (session.sessionType === 'SIDE_TASK') this.deps.treeSignalPublisher.publishIfSideTask(sessionId);
+        // 不重新同步 skills/todos — 复用已有会话上下文
+        const listener = new WsStreamingEventListener(
+          { registry: this.deps.registry, activityService: this.deps.activityService, activityHeartbeat: this.deps.activityHeartbeat, sessionTodoMapper: this.deps.sessionTodoMapper, sessionService: this.deps.sessionService },
+          sessionId, userId, executionId, await this.resolveSupportsVision(session),
+        );
+        listenerRef.current = listener;
+        if (session.sessionType === 'SUBAGENT') {
+          // 子代理重试与后台执行/崩溃恢复同构：经 buildSubContext 裁剪工具/技能面。
+          // 直连标准 buildContext 会把 spawn_subagent / ask_user_questions 等重新交回子代理，
+          // 可派生无人消费的嵌套任务或把重试挂起在提问上。
+          const manager = this.deps.backgroundSubagentManager;
+          if (!manager?.buildRetryContext) throw new Error('子代理重试上下文构建能力不可用');
+          const context = await manager.buildRetryContext(sessionId);
+          await this.deps.harnessService.executePrepared(context, listener);
+        } else {
+          await this.deps.harnessService.executeFromEvent(sessionId, executionId, listener, cancelFlag);
+        }
+        if (cancelFlag.get()) {
+          await this.finishCancelledSession(sessionId, userId, executionId);
+          terminalPhase = 'CANCELLED';
+        } else {
+          terminalPhase = await this.finishCompletedSession(sessionId, userId, executionId);
+        }
+      } catch (e) {
+        const message = e instanceof Error ? e.message : 'Agent 重试执行异常';
+        this.deps.registry.send(userId, wsEvent('error', sessionId, { message, executionId }));
+        terminalPhase = await this.finishFailedSession(sessionId, userId, executionId, message);
+      } finally {
+        listenerRef.current?.dispose();
+        try {
+          this.releaseSessionExecutionResources(sessionId);
+        } catch (e) {
+          console.warn(`Failed to release execution resources for session ${sessionId}`, e);
+        }
+        this.deps.registry.clearActiveToolCalls(sessionId);
+        this.deps.registry.setSessionThinking(sessionId, false);
+        if (this.runningTasks.get(sessionId) === futureRef.current) this.runningTasks.delete(sessionId);
+        if (this.runningExecutionIds.get(sessionId) === executionId) this.runningExecutionIds.delete(sessionId);
+        // 簿记按归属回收（同 runExecution finally 的说明）：取消排队中的重试后立即重发时，
+        // 迟到的旧执行体不得删掉新执行的 claim/cancelFlag。
+        if (this.cancelFlags.get(sessionId) === cancelFlag) {
+          this.executionClaims.delete(sessionId);
+          this.cancelFlags.delete(sessionId);
+          this.pendingCancels.delete(sessionId);
+          this.deps.agentLoop.removeCancelFlag(sessionId);
+          this.deps.activityHeartbeat.clear(sessionId);
+        }
+        if (retryTaskId != null && session.parentSessionId != null) {
+          // 重试结束后收敛子代理 execution 记录并按需向主代理投递结果；
+          // 簿记失败不影响会话终态（session.phase 已由 finishXxxSession 落库）。
+          try {
+            await this.deps.backgroundSubagentManager?.completeRetry?.(session.parentSessionId, retryTaskId, terminalPhase);
+          } catch (e) {
+            console.error(`Failed to finalize subagent retry for task ${retryTaskId}`, e);
+          }
+        }
+        if (terminalPhase !== 'FAILED') await this.autoConsumeQueue(sessionId, userId);
+      }
+    });
+  }
+
+  /** beginRetry 成功但重试未能启动时的收敛：execution 置回 FAILED，释放运行跟踪。 */
+  private async rollbackSubagentRetry(session: Session, retryTaskId: number | null): Promise<void> {
+    if (retryTaskId == null || session.parentSessionId == null) return;
+    try {
+      await this.deps.backgroundSubagentManager?.completeRetry?.(session.parentSessionId, retryTaskId, 'FAILED');
+    } catch (e) {
+      console.error(`Failed to roll back subagent retry for task ${retryTaskId}`, e);
+    }
+  }
+
+  /**
+   * 消费「登记时间不早于本次提交开始」的停止标记。
+   * 命中时置位 flag 并摘掉占位，调用方负责落 CANCELLED、不再提交执行。
+   * 更早的残留标记在此清掉，避免误杀下一次发送。
+   */
+  private takePendingCancel(
+    sessionId: number,
+    startedAt: number,
+    flag: { get(): boolean; set(v: boolean): void },
+  ): boolean {
+    const pendingCancelAt = this.pendingCancels.get(sessionId);
+    this.pendingCancels.delete(sessionId);
+    if (pendingCancelAt == null || pendingCancelAt < startedAt) return false;
+    flag.set(true);
+    this.executionClaims.delete(sessionId);
+    this.autoConsumingSessionIds.delete(sessionId);
+    this.runningExecutionIds.delete(sessionId);
+    this.cancelFlags.delete(sessionId);
+    // 执行从未提交，取消标志必须一并摘除：AgentLoop 的取消标志集合是"本实例在途执行"的
+    // 唯一判据（停机收尾据此等待/标记、孤儿巡检据此排除本地活跃会话），泄漏会让该会话
+    // 永久被当成"仍在执行"。
+    this.deps.agentLoop.removeCancelFlag(sessionId);
+    return true;
+  }
+
+  /**
+   * busy 入队的带来源消息簿记收敛（`queueSettlements`）：
+   * 删除绑定并按绑定分发回写（定时任务 → lastExecutionStatus；Webhook 触发器 →
+   * 连续失败计数），避免任务永久停在 `QUEUED` / 触发器计数丢失，
+   * 也避免陈旧绑定被下一次无关执行 stale 回写。
+   *
+   * 三个早退路径共用同一实现（历史上各写一份、漏改一处即为缺陷）：
+   * 1. `handleSendMessage` 的 takePendingCancel 分支（busy 入队消息在提交前窗口被取消）；
+   * 2. `executePersistedUserPrompt` 的 takePendingCancel 分支（liveExecution 到点被取消）；
+   * 3. `runExecution` 的 finally（队列真正执行到终态后回收，调用方先做「值未易主」归属判定）。
+   *
+   * 无绑定可收敛时静默返回；回写失败仅告警，不影响调用方的终态收敛。
+   * 回写目标行可能已被删除（定时任务/触发器在排队期间被用户删掉）：照
+   * `onScheduledTaskQueueConsumed` 对已删任务的容错写法，由回调实现侧静默跳过。
+   */
+  private async settleQueuedBinding(
+    sessionId: number,
+    phase: 'COMPLETED' | 'FAILED' | 'CANCELLED',
+  ): Promise<void> {
+    const settlement = this.queueSettlements.get(sessionId) ?? null;
+    if (settlement == null) return;
+    this.queueSettlements.delete(sessionId);
+    try {
+      if (settlement.taskId != null) {
+        await this.deps.onScheduledTaskQueueConsumed?.(settlement.taskId, phase);
+      }
+      if (settlement.triggerId != null) {
+        await this.deps.onOpenTriggerQueueConsumed?.(settlement.triggerId, phase);
+      }
+      if (settlement.callLogId != null) {
+        await this.deps.onOpenApiCallQueueSettled?.(settlement.callLogId, phase, settlement.queueWaitMs, settlement.messageId);
+      }
+    } catch (e) {
+      console.warn(`Failed to settle queued source binding after ${phase}`, e);
+    }
+  }
+
+  /**
+   * 替换会话上的队列回写绑定。插队会覆盖正在执行的那一份；覆盖前先把旧流水标成 cancelled，
+   * 否则旧执行体因对象身份对不上而永远不会 settle。
+   */
+  private async adoptQueueSettlement(sessionId: number, next: QueueSettlement): Promise<void> {
+    const previous = this.queueSettlements.get(sessionId);
+    if (previous != null && previous !== next && previous.callLogId != null) {
+      try {
+        await this.deps.onOpenApiCallQueueSettled?.(previous.callLogId, 'CANCELLED', previous.queueWaitMs, previous.messageId);
+      } catch (e) {
+        console.warn(`Failed to cancel replaced open call log ${previous.callLogId}`, e);
+      }
+    }
+    this.queueSettlements.set(sessionId, next);
+  }
+
+  private async handleCancel(userId: number, root: Record<string, unknown>): Promise<void> {
+    const sessionId = this.getLong(root, 'sessionId');
+    if (sessionId == null) return;
+    const session = await this.requireOwnedSession(userId, sessionId);
+    if (!session) return;
+    // 用户点击停止：立刻取消该会话等待中的页面操作，不让工具挂到超时。
+    this.deps.embedPageToolRegistry.failSession(sessionId, '用户已停止任务，页面操作已取消');
+    if (!this.cancelFlags.has(sessionId) && this.deps.agentLoop.getCancelFlag?.(sessionId) == null) {
+      // 执行尚未提交（send 的模型校验/LOCAL 检查/saveMessage await 期间，或 autoConsume 的 500ms 延迟窗口）：
+      // cancel flag 尚未注册，直接 set(true) 会空转。记录待取消标记（注册标志时按时间判定消费），
+      // 同时落 CANCELLED 终态，保证 DB 状态收敛。
+      // claim 已持有但 flag 未注册的窗口同样适用：否则 send 从 await 恢复后会照常提交执行，
+      // 并把此处写入的 CANCELLED 覆盖回 RUNNING，用户的取消被静默丢弃。
+      // 注意：崩溃恢复 / 通道入站的执行不在本 handler 簿记里，但 flag 已注册在 agentLoop 上，
+      // 必须走下面的 abort 路径真正中止执行，不能落进 pendingCancels（无人消费，执行照跑）。
+      this.pendingCancels.set(sessionId, Date.now());
+      this.deps.registry.send(userId, wsEvent('cancelled', sessionId, { pending: true, executionId: this.currentExecutionId(sessionId) ?? '' }));
+      // 仅在确有在途执行时落终态：IDLE 既不在活跃集合也不在终态集合，
+      // finishExecution 会放行 IDLE→CANCELLED，把从未运行过的会话标成「已取消」。
+      const inFlight = this.executionClaims.has(sessionId)
+        || this.runningTasks.has(sessionId)
+        || this.isSessionActive(session.phase);
+      if (inFlight) {
+        await this.finishCancelledSession(sessionId, userId, this.currentExecutionId(sessionId) ?? randomUUID());
+      }
+      // 注意：此处不能回收簿记。pendingCancels 正是用来让「尚未注册取消标志」的在途提交
+      // 在恢复后自行收敛的（见 takePendingCancel），提前删掉会让取消被静默丢弃。
+      return;
+    }
+    const executionId = this.currentExecutionId(sessionId) ?? '';
+    this.abortRunningExecution(sessionId, userId);
+    await this.finishCancelledSession(sessionId, userId, executionId);
+    // 取消标志已注册，执行体理论上会靠自己的 finally 回收簿记；但它可能因 LLM 流卡死
+    // 永远走不到 finally。若不在此主动回收，claim/future 会永久残留，该会话后续的发送与
+    // 重试全被 session_already_running 拒绝（只能重启服务恢复）。
+    this.releaseExecutionBookkeeping(sessionId, { future: this.runningTasks.get(sessionId) });
+  }
+
+  /**
+   * 手动整理上下文（技术方案 5.4 / 决策 11）。运行中：置位信号交 loop 在下一工具轮边界消费，
+   * ws 回执「已排队」；空闲：先占 claim 再动作（与占坑之间无 await，Node 单线程同拍完成），全程
+   * 持有直至 finally 释放——压缩期间 send_message 被 session_already_running 拒绝，消除竞态。
+   * 空闲路径须合成一个执行级 listener，否则压缩全程 UI 失明（无 compaction_start/end、水位不刷新）。
+   * 已知限制：压缩为单次 LLM 短任务，无取消通道。
+   */
+  private async handleCompactNow(userId: number, root: Record<string, unknown>): Promise<void> {
+    const sessionId = this.getLong(root, 'sessionId');
+    if (sessionId == null) return;
+    if (!(await this.requireOwnedSession(userId, sessionId))) return;
+
+    // 运行中路径：已有 claim/在途执行 → 排队信号，交由 AgentLoop 工具轮边界消费。
+    if (this.hasExecutionClaim(sessionId)) {
+      if (!this.deps.compactionSignalBus) {
+        // 手动整理的失败必须走压缩通道（compaction_result），不能用通用 error——
+        // error 语义是"执行失败"，前端据此把整条会话标 FAILED。整理上下文失败只是维护动作失败。
+        this.deps.registry.send(userId, wsEvent('compaction_result', sessionId, {
+          compacted: false, failed: true, message: '手动整理上下文当前不可用，请稍后重试',
+        }));
+        return;
+      }
+      // signal 幂等（Set 语义）：重复点击不会叠加多次压缩。
+      this.deps.compactionSignalBus.signal(sessionId);
+      this.deps.registry.send(userId, wsEvent('compaction_queued', sessionId, {
+        queued: true, message: '已排队，将在本轮工具结束后整理上下文',
+      }));
+      return;
+    }
+
+    // 空闲路径：与占坑之间不留 await，claim 全程持有。
+    this.executionClaims.add(sessionId);
+    const executionId = `manual_compact_${Date.now()}`;
+    let listener: WsStreamingEventListener | null = null;
+    try {
+      listener = new WsStreamingEventListener(
+        {
+          registry: this.deps.registry, activityService: this.deps.activityService,
+          activityHeartbeat: this.deps.activityHeartbeat, sessionTodoMapper: this.deps.sessionTodoMapper,
+          sessionService: this.deps.sessionService,
+        },
+        sessionId, userId, executionId, false,
+      );
+      const compacted = await this.deps.harnessService.requestCompaction(sessionId, listener);
+      this.deps.registry.send(userId, wsEvent('compaction_result', sessionId, { compacted, executionId }));
+    } catch (e) {
+      const message = e instanceof Error ? e.message : '手动整理上下文失败';
+      // 同 signalBus 缺失分支：失败经压缩通道回传，不用通用 error，避免把维护动作失败误标整条会话 FAILED。
+      this.deps.registry.send(userId, wsEvent('compaction_result', sessionId, {
+        compacted: false, failed: true, message, executionId,
+      }));
+    } finally {
+      listener?.dispose();
+      // 仅回收本次自行占的 claim；runningTasks/cancelFlags/registry 在途簿记未触碰，勿用 releaseExecutionBookkeeping。
+      this.executionClaims.delete(sessionId);
+    }
+  }
+
+  private async handleEnqueueMessage(userId: number, root: Record<string, unknown>): Promise<void> {
+    const sessionId = this.getLong(root, 'sessionId');
+    if (sessionId == null) return;
+    if (!(await this.requireOwnedSession(userId, sessionId))) return;
+    const data = root.data as Record<string, unknown> | undefined;
+    if (!data || typeof data.content !== 'string') return;
+    const images = Array.isArray(data.images) && data.images.length > 0 ? JSON.stringify(data.images) : null;
+    await this.deps.messageQueueService.enqueue(sessionId, userId, data.content, images);
+    await this.sendQueueUpdated(sessionId, userId);
+  }
+
+  private async handleInsertMessage(userId: number, root: Record<string, unknown>): Promise<void> {
+    const sessionId = this.getLong(root, 'sessionId');
+    if (sessionId == null) return;
+    if (!(await this.requireOwnedSession(userId, sessionId))) return;
+    const data = root.data as Record<string, unknown> | undefined;
+    if (!data || data.queueId == null) return;
+    const queueId = Number(data.queueId);
+    this.suppressAutoConsumeSend.add(sessionId);
+    try {
+      this.deps.agentExecutor(async () => {
+        await this.withLock(this.insertLocks, sessionId, async () => {
+          // 早退（已消费、取消超时、会话仍占用、窗口期停止、二次校验失败）也必须摘掉抑制标记，
+          // 否则 autoConsumeQueue 会一直把这个会话的队列当成「插队进行中」而永远不消费。
+          try {
+          const item = await this.deps.messageQueueService.getById(queueId);
+          // 仅允许插队仍处于 PENDING 的队列项：已消费/已删除（status=DELETED）不得再次执行
+          if (!item || item.sessionId !== sessionId || item.status !== 'PENDING') {
+            await this.sendQueueUpdated(sessionId, userId);
+            return;
+          }
+          // 校验通过后才终止旧执行：对无效/已消费的队列消息不应误杀正在运行的任务
+          this.abortRunningExecution(sessionId, userId);
+          if (!(await this.awaitExecutionRelease(sessionId, 30_000))) {
+            this.deps.registry.send(userId, wsEvent('error', sessionId, { message: '旧任务取消超时，消息仍保留在队列中' }));
+            return;
+          }
+          // awaitExecutionRelease 超时返回时簿记可能仍未回收；此处与其它入口对齐做陈旧占位自愈，
+          // 否则插队消息会被已失效的 claim 挡住，队列看起来永远卡住。
+          // 刚执行过 abortRunningExecution，取消标志必然已置位，故只按标志判定即可。
+          if (this.hasStaleExecutionClaim(sessionId)) {
+            console.warn(`Clearing stale execution claim for session ${sessionId} before queue insert`);
+            this.releaseExecutionBookkeeping(sessionId);
+          }
+          if (this.executionClaims.has(sessionId)) {
+            this.sendSessionAlreadyRunning(userId, sessionId);
+            return;
+          }
+          if (this.pendingCancels.delete(sessionId)) {
+            // 窗口期内有过「停止」：不执行插队消息，保留在队列
+            this.executionClaims.delete(sessionId);
+            await this.sendQueueUpdated(sessionId, userId);
+            return;
+          }
+          // abort 等待期间该项可能已被 autoConsume 消费：二次校验 status，避免重复执行
+          {
+            const latest = await this.deps.messageQueueService.getById(queueId);
+            if (!latest || latest.status !== 'PENDING') {
+              this.executionClaims.delete(sessionId);
+              await this.sendQueueUpdated(sessionId, userId);
+              return;
+            }
+          }
+          const insertStartedAt = Date.now();
+          this.executionClaims.add(sessionId);
+          // 插队消费带来源的消息（定时任务/Webhook 触发器）：与 autoConsume 对齐，
+          // 绑定后由 runExecution finally 回写
+          const insertSettlement = queueSettlementOf(item);
+          if (insertSettlement != null) {
+            await this.adoptQueueSettlement(sessionId, insertSettlement);
+          }
+          const content = item.content ?? '';
+          let imageList: string[] = [];
+          if (item.images) {
+            try { imageList = JSON.parse(item.images) as string[]; } catch { /* ignore */ }
+          }
+          const messageContent: unknown = imageList.length === 0 ? content : contentParts(content, imageList);
+          // M-3 同源约束：落库/删队列行之后的失败必须补偿，否则表现为孤儿 USER 消息永不执行、
+          // 队列项静默丢失、定时任务永久 QUEUED。按已推进到的位置精确回滚
+          // （对照 autoConsumeQueue 的 compensate；handleSendMessage 自身的早退路径有
+          // requeueIfClaimed 自愈，能抛出到这里的都是它未覆盖的窗口）。
+          let savedMessageId: number | null = null;
+          let queueRowDeleted = false;
+          try {
+            const savedMessage = await this.deps.sessionService.saveMessage(sessionId, 'USER', messageContent, null, null, null, 0, null);
+            savedMessageId = savedMessage.id ?? null;
+            if (insertSettlement != null) insertSettlement.messageId = savedMessage.id ?? null;
+            await this.deps.messageQueueService.delete(queueId);
+            queueRowDeleted = true;
+            await this.sendQueueUpdated(sessionId, userId);
+            this.deps.titleService.scheduleForFirstUserMessage(sessionId, savedMessage.id, messageContent);
+            const consumed: Record<string, unknown> = { messageId: String(savedMessage.id), content };
+            if (imageList.length > 0) consumed.images = imageList;
+            this.deps.registry.send(userId, wsEvent('queue_message_consumed', sessionId, consumed));
+            this.autoConsumingSessionIds.add(sessionId);
+            this.suppressAutoConsumeSend.delete(sessionId);
+            await this.handleSendMessage(userId, {
+              sessionId,
+              data: {
+                content, eventId: randomUUID(), clearTodos: false, replaceExecution: true, executionClaimHeld: true,
+                autoConsumeStartedAt: insertStartedAt,
+                images: imageList, ...(savedMessage.id != null ? { autoSavedMessageId: savedMessage.id } : {}),
+              },
+            }, false);
+          } catch (e) {
+            console.error(`Queue insert failed after claim for session ${sessionId}, compensating`, e);
+            this.autoConsumingSessionIds.delete(sessionId);
+            this.executionClaims.delete(sessionId);
+            // 清来源绑定，避免陈旧 taskId/triggerId 被下次无关执行误回写
+            this.queueSettlements.delete(sessionId);
+            if (savedMessageId != null) {
+              try {
+                await this.deps.sessionService.deleteMessageById(sessionId, savedMessageId);
+              } catch (delErr) {
+                console.error(`Failed to delete orphan inserted message ${savedMessageId} for session ${sessionId}`, delErr);
+              }
+              if (insertSettlement != null) insertSettlement.messageId = null;
+            }
+            // 队列行已删才回补队首（透传来源绑定 scheduledTaskId/source/openTriggerId）；
+            // 未删则原行仍在队列，不重复入队
+            if (queueRowDeleted) {
+              try {
+                const requeueArgs = settlementToEnqueueArgs(insertSettlement);
+                await this.deps.messageQueueService.enqueueHead(
+                  sessionId, userId, content, item.images ?? null,
+                  requeueArgs.scheduledTaskId, requeueArgs.source, requeueArgs.openTriggerId, requeueArgs.openCallLogId,
+                );
+                await this.sendQueueUpdated(sessionId, userId);
+              } catch (requeueErr) {
+                console.error(`Failed to re-enqueue inserted queue message ${queueId} for session ${sessionId}`, requeueErr);
+              }
+            }
+          }
+          } finally {
+            this.suppressAutoConsumeSend.delete(sessionId);
+          }
+        });
+      });
+    } catch {
+      this.suppressAutoConsumeSend.delete(sessionId);
+      this.executionClaims.delete(sessionId);
+      this.autoConsumingSessionIds.delete(sessionId);
+      this.queueSettlements.delete(sessionId);
+    }
+  }
+
+  private async handleDeleteQueueMessage(userId: number, root: Record<string, unknown>): Promise<void> {
+    const sessionId = this.getLong(root, 'sessionId');
+    if (sessionId == null) return;
+    if (!(await this.requireOwnedSession(userId, sessionId))) return;
+    const data = root.data as Record<string, unknown> | undefined;
+    if (!data || data.queueId == null) return;
+    const queueId = Number(data.queueId);
+    const item = await this.deps.messageQueueService.getById(queueId);
+    if (!item || item.sessionId !== sessionId) return;
+    const pending = item.status == null || item.status === 'PENDING';
+    await this.deps.messageQueueService.delete(queueId);
+    if (pending && item.openCallLogId != null) {
+      try {
+        await this.deps.onOpenApiCallQueueSettled?.(item.openCallLogId, 'CANCELLED', null, null);
+      } catch (e) {
+        console.warn(`Failed to cancel open call log ${item.openCallLogId} after queue delete`, e);
+      }
+    }
+    await this.sendQueueUpdated(sessionId, userId);
+  }
+
+  private async handleReorderQueueMessage(userId: number, root: Record<string, unknown>): Promise<void> {
+    const sessionId = this.getLong(root, 'sessionId');
+    if (sessionId == null) return;
+    if (!(await this.requireOwnedSession(userId, sessionId))) return;
+    const data = root.data as Record<string, unknown> | undefined;
+    if (!data || data.queueId == null || data.targetIndex == null) return;
+    const targetIndex = Number(data.targetIndex);
+    if (!Number.isInteger(targetIndex) || targetIndex < 0) return;
+    const item = await this.deps.messageQueueService.getById(Number(data.queueId));
+    if (!item || item.sessionId !== sessionId) return;
+    try {
+      await this.deps.messageQueueService.moveToIndex(Number(data.queueId), targetIndex);
+    } finally {
+      // 失败（如死锁重试耗尽）也推送一次队列刷新，保证前端状态与库内收敛；
+      // 推送自身失败仅记日志，避免替换 reorder 的原始异常导致归因失真
+      try {
+        await this.sendQueueUpdated(sessionId, userId);
+      } catch (e) {
+        console.error(`Failed to push queue update after reorder for session ${sessionId}`, e);
+      }
+    }
+  }
+
+  private async sendQueueUpdated(sessionId: number, userId: number): Promise<void> {
+    const queue = await this.deps.messageQueueService.listPending(sessionId);
+    const queueData: Array<Record<string, unknown>> = [];
+    for (const item of queue) {
+      const map: Record<string, unknown> = {
+        id: String(item.id), sessionId: String(item.sessionId), content: item.content,
+        sortOrder: item.sortOrder, createdAt: item.createdAt != null ? String(item.createdAt) : null,
+      };
+      if (item.images) {
+        try { map.images = JSON.parse(item.images); } catch { /* skip */ }
+      }
+      queueData.push(map);
+    }
+    this.deps.registry.send(userId, wsEvent('queue_updated', sessionId, { queue: queueData }));
+  }
+
+  async autoConsumeQueue(sessionId: number, userId: number): Promise<void> {
+    try {
+      const queue = await this.deps.messageQueueService.listPending(sessionId);
+      if (queue.length === 0) return;
+      if (this.suppressAutoConsumeSend.has(sessionId)) return;
+      // 先查占用再出队：若会话仍被占用则原位保留队头，
+      // 避免先 dequeue 再 enqueue 把队头消息搬到队尾破坏 FIFO
+      if (this.executionClaims.has(sessionId) || this.runningTasks.has(sessionId)) {
+        await this.sendQueueUpdated(sessionId, userId);
+        return;
+      }
+      // 原子占位后再出队：占位与出队之间无 await，手动 send_message 无法插队。
+      // 若不占位，出队与延迟执行之间可能被手动发送抢占，导致消息被消费却永不执行。
+      // 占位时刻即 autoConsume 取消窗口起点：saveMessage/500ms 延迟内的取消都必须被识别。
+      const autoConsumeStartedAt = Date.now();
+      this.executionClaims.add(sessionId);
+      const head = await this.deps.messageQueueService.dequeue(sessionId);
+      if (!head) {
+        this.executionClaims.delete(sessionId);
+        return;
+      }
+      const content = head.content ?? '';
+      let imageList: string[] = [];
+      if (head.images) {
+        try { imageList = JSON.parse(head.images) as string[]; } catch { /* ignore */ }
+      }
+      // M-3：dequeue 已把队列行删除，之后任一步失败都必须统一补偿——回补队首 + 删掉可能
+      // 已落库的 USER 消息，否则分别表现为消息静默丢失、无执行的孤儿消息、或下次消费重复落库。
+      let savedMessageId: number | null = null;
+      // 来源绑定在 dequeue 后立即登记：后续任一步失败由 compensate 统一回补（保源回补队首）
+      const headSettlement = queueSettlementOf(head);      const compensate = async (stage: string, error: unknown): Promise<void> => {
+        console.error(`Auto-consume failed after dequeue for session ${sessionId} at ${stage}, rolling back`, error);
+        this.executionClaims.delete(sessionId);
+        this.autoConsumingSessionIds.delete(sessionId);
+        // 回补时透传来源绑定，并清内存映射，避免绑定丢失与陈旧回写
+        this.queueSettlements.delete(sessionId);
+        if (savedMessageId != null) {
+          try {
+            await this.deps.sessionService.deleteMessageById(sessionId, savedMessageId);
+          } catch (e) {
+            console.error(`Failed to delete orphan auto-saved message ${savedMessageId} for session ${sessionId}`, e);
+          }
+          if (headSettlement != null) headSettlement.messageId = null;
+        }
+        const requeueArgs = settlementToEnqueueArgs(headSettlement);
+        try {
+          await this.deps.messageQueueService.enqueueHead(
+            sessionId, userId, content, head.images ?? null,
+            requeueArgs.scheduledTaskId, requeueArgs.source, requeueArgs.openTriggerId, requeueArgs.openCallLogId,
+          );
+          await this.sendQueueUpdated(sessionId, userId);
+        } catch (e) {
+          console.error(`Failed to re-enqueue auto-consumed message for session ${sessionId}`, e);
+        }
+      };
+      try {
+        // 预算 BLOCK 检查（技术方案 §5.7）：dequeue 取出队头之后、来源绑定登记/落库之前。
+        // 命中：显式 error + 收件箱提醒一次（去重），随后复用 compensate 链路释放占位并
+        // 原位回补（语义 = 留在队列）；不得抛 BusinessException 依赖外层 catch。
+        if (this.deps.budgetGate != null) {
+          const session = await this.deps.sessionService.getSession(sessionId);
+          if (session != null && this.isBudgetCheckable(session.sessionType)) {
+            const budgetBlock = await this.deps.budgetGate.checkAdmission({ userId: session.userId ?? null, agentId: session.agentId ?? null });
+            if (budgetBlock) {
+              await this.deps.budgetGate.noticeQueueBlocked(budgetBlock, session.userId ?? null).catch((e) => {
+                console.warn(`Failed to record budget queue-blocked notice for session ${sessionId}: ${(e as Error).message}`);
+              });
+              await compensate('budget_blocked', new Error(budgetBlockMessage(budgetBlock)));
+              this.deps.registry.send(userId, wsEvent('error', sessionId, budgetRejection(budgetBlock)));
+              return;
+            }
+          }
+        }
+        // 定时任务/触发器 busy 入队来源：执行终态后按绑定回写（lastExecutionStatus / 失败计数）
+        if (headSettlement != null) {
+          await this.adoptQueueSettlement(sessionId, headSettlement);
+        }
+        await this.sendQueueUpdated(sessionId, userId);
+        const messageContent: unknown = imageList.length === 0 ? content : contentParts(content, imageList);
+        const savedMessage = await this.deps.sessionService.saveMessage(sessionId, 'USER', messageContent, null, null, null, 0, null);
+        savedMessageId = savedMessage.id ?? null;
+        if (headSettlement != null) headSettlement.messageId = savedMessage.id ?? null;
+        this.deps.titleService.scheduleForFirstUserMessage(sessionId, savedMessage.id, messageContent);
+        const consumed: Record<string, unknown> = { messageId: String(savedMessage.id), content };
+        if (imageList.length > 0) consumed.images = imageList;
+        this.deps.registry.send(userId, wsEvent('queue_message_consumed', sessionId, consumed));
+        this.autoConsumingSessionIds.add(sessionId);
+        this.deps.agentExecutor(async () => {
+          await new Promise((r) => setTimeout(r, 500));
+          await this.handleSendMessage(userId, {
+            sessionId,
+            data: {
+              content, eventId: randomUUID(), images: imageList, executionClaimHeld: true,
+              autoConsumeStartedAt,
+              ...(savedMessage.id != null ? { autoSavedMessageId: savedMessage.id } : {}),
+            },
+          }, true);
+        });
+      } catch (e) {
+        await compensate('post-dequeue', e);
+        return;
+      }
+    } catch (e) {
+      console.error(`Failed to auto-consume queue for session ${sessionId}`, e);
+      this.executionClaims.delete(sessionId);
+      this.autoConsumingSessionIds.delete(sessionId);
+      // 映射已设置但后续异常（如 sendQueueUpdated 抛出）时清掉，避免陈旧 taskId/triggerId 被下次无关执行误回写
+      this.queueSettlements.delete(sessionId);
+    }
+  }
+
+  /** 预算准入只查主会话：子代理/边路跟随父会话准入结论，不单独检查（技术方案 §5.7）。 */
+  private isBudgetCheckable(sessionType: string | null | undefined): boolean {
+    return sessionType !== 'SUBAGENT' && sessionType !== 'SIDE_TASK';
+  }
+
+  private async handleSkillSyncDone(userId: number, root: Record<string, unknown>): Promise<void> {
+    const sessionId = this.getLong(root, 'sessionId');
+    const success = root.success !== false;
+    const error = typeof root.error === 'string' ? root.error : null;
+    const reportSyncId = typeof root.syncId === 'string' ? root.syncId : null;
+    console.info(`Received skill_sync_done from userId=${userId}, sessionId=${sessionId}, success=${success}, syncId=${reportSyncId ?? ''}`);
+    if (sessionId == null) return;
+    if (!(await this.requireOwnedSession(userId, sessionId))) return;
+    const pending = this.pendingSkillSyncs.get(sessionId);
+    // L-8：按 syncId 匹配轮次——迟到的旧轮次信号不得放行新一轮技能同步（MCP 侧已用 syncId，技能侧对齐）
+    if (pending && reportSyncId != null && reportSyncId === pending.syncId) {
+      if (success) pending.resolve();
+      else pending.reject(new Error(error && error.trim() !== '' ? error : 'Skill sync failed on client'));
+    } else if (pending && reportSyncId == null) {
+      // 无法判定属于哪一轮同步，但客户端确实回过信号：立即以真实原因结束本轮，
+      // 否则会空等到 60s 超时并报出误导性的「超时」（真实原因是客户端版本过旧）。
+      pending.reject(new Error('客户端未回带技能同步标识 syncId，请升级桌面端或 mao-agent 后重试'));
+    } else {
+      console.warn(`No pending skill sync for session=${sessionId}`);
+    }
+  }
+
+  private async handleMcpToolsReport(userId: number, root: Record<string, unknown>): Promise<void> {
+    const sessionId = this.getLong(root, 'sessionId');
+    if (sessionId == null) return;
+    if (!(await this.requireOwnedSession(userId, sessionId))) return;
+    const pending = this.pendingMcpSyncs.get(sessionId);
+    const reportSyncId = typeof root.syncId === 'string' ? root.syncId : null;
+    if (!pending) return;
+    if (reportSyncId == null || reportSyncId !== pending.syncId) return;
+    const tools: McpToolRef[] = [];
+    const connectionErrors: McpConnectionError[] = [];
+    const servers = root.servers;
+    if (Array.isArray(servers)) {
+      for (const serverNode of servers as Array<Record<string, unknown>>) {
+        const connected = serverNode.connected !== false;
+        const name = typeof serverNode.name === 'string' ? serverNode.name : null;
+        if (!name) continue;
+        const serverId = this.deps.mcpSyncService.resolveServerIdByName(name);
+        if (!connected) {
+          // 失败名单必须显式收集：工作集要把它标注为「当前不可用」，
+          // 静默丢弃会让服务端对着一份「少了一台 server」的清单猜原因。
+          const reason = typeof serverNode.error === 'string' && serverNode.error.trim() !== ''
+            ? serverNode.error
+            : '连接失败';
+          connectionErrors.push({ serverId, serverName: name, reason });
+          continue;
+        }
+        const toolArray = serverNode.tools;
+        if (!Array.isArray(toolArray)) continue;
+        for (const toolNode of toolArray as Array<Record<string, unknown>>) {
+          const toolName = typeof toolNode.name === 'string' ? toolNode.name : null;
+          if (!toolName) continue;
+          tools.push({
+            serverId: serverId ?? 0,
+            serverName: name,
+            toolName,
+            description: typeof toolNode.description === 'string' ? toolNode.description : '',
+            inputSchema: (toolNode.schema as Record<string, unknown> | undefined)
+              ?? (toolNode.inputSchema as Record<string, unknown> | undefined)
+              ?? {},
+            annotations: (toolNode.annotations as { readOnlyHint?: boolean } | null | undefined) ?? null,
+          });
+        }
+      }
+    }
+    this.deps.mcpSyncService.recordReport(sessionId, tools, connectionErrors);
+    const current = this.pendingMcpSyncs.get(sessionId);
+    if (current && current.syncId === reportSyncId) current.resolve();
+  }
+
+  /** 成功返回 null；失败返回具体原因（同时用于终态失败原因与前端 error 文案）。 */
+  private async syncSkillsToClient(userId: number, sessionId: number, session: Session, agent: Agent): Promise<string | null> {
+    if (!this.deps.registry.hasLocalClientConnection(userId)) {
+      console.warn(`Skip skill sync for session ${sessionId}: no local client connected`);
+      return '没有可执行本机工具的客户端连接（桌面端 / mao-agent 未连接）';
+    }
+    const syncUrl = `/v1/skills/sync-package?sessionId=${sessionId}`;
+    const removed = this.deps.skillSyncService.getRemovedSkillNames(agent, userId, sessionId);
+    console.info(`Syncing skills to client for session=${sessionId}, userId=${userId}, syncUrl=${syncUrl}, workspace=${session.workspace ?? ''}, removed=${JSON.stringify(removed)}`);
+    const syncId = randomUUID();
+    const done = new Promise<void>((resolve, reject) => {
+      this.pendingSkillSyncs.set(sessionId, { syncId, resolve, reject });
+    });
+    this.deps.registry.sendToLocalClients(userId, wsEvent('skill_sync_required', sessionId, {
+      syncUrl, removed, workspace: session.workspace ?? '', syncId,
+    }));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        done,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('客户端 60 秒内未回报技能同步结果')), 60_000);
+        }),
+      ]);
+      return null;
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      console.warn(`Skill sync failed for session ${sessionId}: ${message}`);
+      return message;
+    } finally {
+      if (timer) clearTimeout(timer);
+      this.pendingSkillSyncs.delete(sessionId);
+    }
+  }
+
+  private async syncMcpServersToClient(userId: number, sessionId: number, _session: Session, agent: Agent): Promise<void> {
+    try {
+      const servers = await this.deps.mcpSyncService.loadAgentServers(agent, userId);
+      if (servers.length === 0) {
+        this.deps.mcpSyncService.clearLocalSession(sessionId);
+        return;
+      }
+      if (!this.deps.registry.hasLocalClientConnection(userId)) {
+        this.deps.mcpSyncService.clearLocalSession(sessionId);
+        return;
+      }
+      const payload = this.deps.mcpSyncService.buildSyncPayload(servers);
+      const syncId = randomUUID();
+      payload.syncId = syncId;
+      const done = new Promise<void>((resolve, reject) => {
+        this.pendingMcpSyncs.set(sessionId, { syncId, resolve, reject });
+      });
+      this.deps.registry.sendToLocalClients(userId, wsEvent('mcp_sync_required', sessionId, payload));
+      await Promise.race([
+        done,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), this.mcpSyncTimeoutSeconds * 1000)),
+      ]);
+    } catch {
+      this.deps.mcpSyncService.clearLocalSession(sessionId);
+    } finally {
+      this.pendingMcpSyncs.delete(sessionId);
+    }
+  }
+
+  private releaseSessionExecutionResources(sessionId: number): void {
+    this.deps.shellSessionManager.closeByConversation(sessionId);
+    this.deps.localToolSessionRegistry.failAllForSession(sessionId);
+    this.deps.askUserQuestionsRegistry.failAllForSession(sessionId);
+    this.deps.localSkillRegistry.clear(sessionId);
+    this.deps.localAgentsMdRegistry.clear(sessionId);
+    // CLOUD MCP 快照是会话级记忆：连接每次执行结束都会断（mcpClientManager），
+    // 但快照必须跨执行存活，否则同一会话下一轮某 server 连接失败时无法沿用上次
+    // 成功的工具集（技术方案 §4.5）。快照只在会话删除路径回收。
+    this.deps.mcpSyncService.clearLocalSession(sessionId);
+    this.deps.mcpClientManager.closeSession(sessionId);
+  }
+
+  private abortRunningExecution(sessionId: number, userId: number, aggressive = false): void {
+    this.cancelFlags.get(sessionId)?.set(true);
+    this.deps.agentLoop.requestCancel(sessionId);
+    this.deps.shellSessionManager.closeByConversation(sessionId);
+    this.deps.localToolSessionRegistry.failAllForSession(sessionId);
+    const skillSync = this.pendingSkillSyncs.get(sessionId);
+    if (skillSync) skillSync.reject(new Error('会话已被取消'));
+    const mcpSync = this.pendingMcpSyncs.get(sessionId);
+    if (mcpSync) mcpSync.reject(new Error('会话已被取消'));
+    void aggressive;
+    this.deps.askUserQuestionsRegistry.failAllForSession(sessionId);
+    void this.abortSubagentChildren(sessionId);
+    void userId;
+  }
+
+  /**
+   * 回收会话在 WS handler 内存中的执行簿记。
+   *
+   * 正常路径由执行体自己的 finally 负责；但取消路径只改 DB phase，若执行体因 LLM 流卡死
+   * 等原因走不到 finally，这些字段就永久残留，此后该会话的所有发送/重试都会被
+   * `session_already_running` 拒绝（只能重启服务恢复）。取消与陈旧占位自愈都必须走这里。
+   *
+   * `runningTasks` 只在 future 确实是当前记录到的那一个时才摘除：并发执行被后来的
+   * 提交替换时，旧执行体的 finally 不能把新执行的 future 一起删掉。
+   */
+  private releaseExecutionBookkeeping(
+    sessionId: number,
+    options: { future?: unknown } = {},
+  ): void {
+    if (options.future === undefined || this.runningTasks.get(sessionId) === options.future) {
+      this.runningTasks.delete(sessionId);
+    }
+    this.runningExecutionIds.delete(sessionId);
+    this.executionClaims.delete(sessionId);
+    this.cancelFlags.delete(sessionId);
+    this.pendingCancels.delete(sessionId);
+    this.autoConsumingSessionIds.delete(sessionId);
+    this.deps.agentLoop.removeCancelFlag(sessionId);
+  }
+
+  /**
+   * 判定 executionClaims 是否为陈旧占位：取消标志已置位。
+   *
+   * 用户点「停止」后 abortRunningExecution 会置位 cancel flag。正常执行体随后会靠自己的
+   * finally 回收簿记；若它因 LLM 流卡死等原因走不到 finally，claim/future 就永久残留，
+   * 此后该会话的发送与重试全被 `session_already_running` 拒绝（只能重启服务恢复）。
+   *
+   * 此时 claim 已不再对应任何合法执行，应自愈回收而非拒绝用户。反过来，执行中的会话
+   * 没有取消标志，判定为 false，重试照常被拒绝——DB phase 不作为判据：它由执行体自己写，
+   * 在途执行的 RUNNING 与已取消的 CANCELLED 都可能出现在这个位置。
+   */
+  private hasStaleExecutionClaim(sessionId: number): boolean {
+    if (!this.executionClaims.has(sessionId)) return false;
+    return this.cancelFlags.get(sessionId)?.get() === true;
+  }
+
+  private async abortSubagentChildren(parentSessionId: number): Promise<void> {
+    try {
+      await this.deps.backgroundSubagentManager?.cancelAllForParent(parentSessionId);
+      const children = await this.deps.sessionService.listSubagentSessions(parentSessionId);
+      for (const child of children) {
+        if (child.id == null) continue;
+        this.cancelFlags.get(child.id)?.set(true);
+        this.deps.agentLoop.requestCancel(child.id);
+        this.deps.shellSessionManager.closeByConversation(child.id);
+        this.deps.localToolSessionRegistry.failAllForSession(child.id);
+        this.deps.askUserQuestionsRegistry.failAllForSession(child.id);
+      }
+    } catch { /* ignore */ }
+  }
+
+  private isSessionActive(phase: string | null | undefined): boolean {
+    return isActivePhase(phase);
+  }
+
+  /**
+   * 会话当前在途执行的 executionId。
+   * runningExecutionIds 只登记本 handler 提交的执行；崩溃恢复 / 通道入站的执行登记在
+   * registry（WsStreamingEventListener 构造时写入）。所有对外帧都必须取到恢复执行的新
+   * executionId，否则重连客户端无法把陈旧的 activeExecutionId 换掉，恢复执行的流式帧
+   * 会被前端 isStaleExecution 当陈旧帧全部丢弃（表现为进度永久卡住）。
+   */
+  private currentExecutionId(sessionId: number): string | undefined {
+    return this.runningExecutionIds.get(sessionId) ?? this.deps.registry.getSessionExecution?.(sessionId);
+  }
+
+  private isTerminalPhase(phase: string | null | undefined): boolean {
+    return phase === 'COMPLETED' || phase === 'FAILED' || phase === 'CANCELLED';
+  }
+
+  private sendSessionAlreadyRunning(userId: number, sessionId: number): void {
+    const data: Record<string, unknown> = { code: 'session_already_running', message: '该任务仍在运行，请先停止当前执行后再继续' };
+    const executionId = this.currentExecutionId(sessionId);
+    if (executionId) data.executionId = executionId;
+    this.deps.registry.send(userId, wsEvent('session_already_running', sessionId, data));
+  }
+
+  private async awaitExecutionRelease(sessionId: number, timeoutMillis: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMillis;
+    while ((this.executionClaims.has(sessionId) || this.runningTasks.has(sessionId)) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return !this.executionClaims.has(sessionId) && !this.runningTasks.has(sessionId);
+  }
+
+  /**
+   * 收尾任务为 COMPLETED；返回实际生效的终态：
+   * 会话已被并发取消（phase=CANCELLED）时返回 'CANCELLED'，供调用方（finally 消费门禁）准确判定。
+   */
+  private async finishCompletedSession(
+    sessionId: number, userId: number, executionId: string, source: TaskNotifySource | null = null,
+  ): Promise<'COMPLETED' | 'CANCELLED'> {
+    const session = await this.deps.sessionService.getSession(sessionId);
+    if (session?.phase === 'CANCELLED') return 'CANCELLED';
+    if (source != null) {
+      await this.deps.taskTerminalService.finishExecution(sessionId, userId, 'COMPLETED', executionId, undefined, source);
+    } else {
+      await this.deps.taskTerminalService.finishExecution(sessionId, userId, 'COMPLETED', executionId);
+    }
+    return 'COMPLETED';
+  }
+
+  /**
+   * 收尾任务为 FAILED；返回实际生效的终态：
+   * 会话已被并发取消（phase=CANCELLED）时返回 'CANCELLED'（此时队列消费不受阻）。
+   */
+  private async finishFailedSession(
+    sessionId: number, userId: number, executionId: string, reason: string, source: TaskNotifySource | null = null,
+  ): Promise<'FAILED' | 'CANCELLED'> {
+    const session = await this.deps.sessionService.getSession(sessionId);
+    if (session?.phase === 'CANCELLED') return 'CANCELLED';
+    if (source != null) {
+      await this.deps.taskTerminalService.finishExecution(sessionId, userId, 'FAILED', executionId, reason, source);
+    } else {
+      await this.deps.taskTerminalService.finishExecution(sessionId, userId, 'FAILED', executionId, reason);
+    }
+    return 'FAILED';
+  }
+
+  private async finishCancelledSession(
+    sessionId: number, userId: number, executionId: string, _source: TaskNotifySource | null = null,
+  ): Promise<'CANCELLED'> {
+    const session = await this.deps.sessionService.getSession(sessionId);
+    if (session && this.isTerminalPhase(session.phase)) return 'CANCELLED';
+    await this.deps.sessionService.cleanupIncompleteTail(sessionId);
+    // CANCELLED 不写收件箱，notifySource 对本终态无意义：保持 5 参调用，
+    // 不因签名扩展给这一路塞无意义的 SCHEDULED
+    await this.deps.taskTerminalService.finishExecution(sessionId, userId, 'CANCELLED', executionId);
+    return 'CANCELLED';
+  }
+
+  private async resolveSessionModel(session: Session): Promise<LlmModel | null> {
+    if (session.modelId != null) return this.deps.llmModelMapper.selectById(session.modelId);
+    return this.deps.llmModelMapper.selectDefault();
+  }
+
+  private async resolveSupportsVision(session: Session): Promise<boolean> {
+    const model = await this.resolveSessionModel(session);
+    return model != null && model.supportsVision === 1;
+  }
+
+  private getLong(root: Record<string, unknown>, field: string): number | null {
+    const v = root[field];
+    if (v == null) return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  private parseLocalSkills(node: unknown): LocalSkillRef[] {
+    if (!Array.isArray(node)) return [];
+    const result: LocalSkillRef[] = [];
+    for (const item of node as Array<Record<string, unknown>>) {
+      if (!item || typeof item.name !== 'string' || typeof item.folderName !== 'string') continue;
+      result.push({ name: item.name, folderName: item.folderName, description: typeof item.description === 'string' ? item.description : '' });
+    }
+    return result;
+  }
+
+  private async requireOwnedSession(userId: number, sessionId: number): Promise<Session | null> {
+    let session: Session | null;
+    try {
+      session = await this.deps.sessionService.getSession(sessionId);
+    } catch {
+      this.deps.registry.send(userId, wsEvent('error', sessionId, { message: '会话不存在' }));
+      return null;
+    }
+    if (!session || session.userId !== userId) {
+      this.deps.registry.send(userId, wsEvent('error', sessionId, { message: '无权操作该会话' }));
+      return null;
+    }
+    return session;
+  }
+
+  private async handleAuthRefresh(session: WsSocket, root: Record<string, unknown>): Promise<void> {
+    const { requestId, token } = root;
+    if (typeof requestId !== 'string' || !requestId.trim() || requestId.length > 256
+      || typeof token !== 'string' || !token) {
+      this.deps.registry.closeConnection(session, 'Invalid auth refresh');
+      return;
+    }
+    const previous = this.deps.registry.getRefreshResult(session, requestId);
+    if (previous !== undefined) {
+      this.deps.registry.sendToConnection(session, { type: 'auth_refreshed', requestId, expiresAt: previous });
+      return;
+    }
+    const metadata = this.deps.jwtService.getAccessTokenMetadata(token);
+    if (!metadata || this.deps.jwtService.getTokenType(token) !== 'access') {
+      this.deps.registry.closeConnection(session, 'Invalid auth refresh');
+      return;
+    }
+    // 连接内换发的新 token 同样要过账号状态（BUG-C3）：停用后不得借续期留在流上
+    if (this.deps.accountStatusChecker != null && !(await this.deps.accountStatusChecker(metadata.userId))) {
+      this.deps.registry.closeConnection(session, 'Account disabled');
+      return;
+    }
+    if (!this.deps.registry.refreshAuthentication(session, requestId, metadata)) {
+      this.deps.registry.closeConnection(session, 'Invalid auth refresh');
+      return;
+    }
+    this.deps.registry.sendToConnection(session, { type: 'auth_refreshed', requestId, expiresAt: metadata.expiresAt });
+  }
+
+  private normalizeClient(client: string | undefined): string {
+    if (client?.toLowerCase() === 'electron') return 'electron';
+    if (client?.toLowerCase() === 'android') return 'android';
+    if (client?.toLowerCase() === 'cli') return 'cli';
+    if (client?.toLowerCase() === 'embed') return 'embed';
+    return 'browser';
+  }
+
+  private async withLock(map: Map<number, Promise<void>>, id: number, fn: () => Promise<void>): Promise<void> {
+    const prev = map.get(id) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((r) => { release = r; });
+    map.set(id, prev.then(() => current));
+    await prev;
+    try {
+      await fn();
+    } finally {
+      release();
+    }
+  }
+}
+
+void cancelFlag;

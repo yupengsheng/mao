@@ -1,0 +1,108 @@
+import type { NotificationChannel, WebhookMessage, WebhookSendResult } from './types.js';
+import { webhookFailure, webhookSuccess } from './types.js';
+
+/** Webhook 请求显式超时：不依赖 undici 默认空闲超时，慢速滴流对端也将在此时限内失败并进入重试。 */
+const REQUEST_TIMEOUT_MS = 10_000;
+
+export type FetchLike = (url: string, init: {
+  method: string;
+  headers: Record<string, string>;
+  body: string;
+  signal?: AbortSignal;
+}) => Promise<{
+  ok: boolean;
+  status: number;
+  text(): Promise<string>;
+}>;
+
+export interface WebhookSender {
+  channel(): NotificationChannel;
+  send(webhookUrl: string, message: WebhookMessage): Promise<WebhookSendResult>;
+}
+
+export class DingTalkWebhookSender implements WebhookSender {
+  constructor(private readonly fetchImpl: FetchLike = fetch) {}
+
+  channel(): NotificationChannel {
+    return 'DINGTALK';
+  }
+
+  async send(webhookUrl: string, message: WebhookMessage): Promise<WebhookSendResult> {
+    try {
+      // 钉钉渠道保持文本消息形态：卡片交互仅按需在飞书侧提供。
+      const json = JSON.stringify({ msgtype: 'text', text: { content: message.text } });
+      const response = await this.fetchImpl(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        body: json,
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      const body = await response.text();
+      const root = body.trim() === '' ? {} : JSON.parse(body) as Record<string, unknown>;
+      const code = root.errcode != null ? String(root.errcode) : null;
+      if (response.ok && code === '0') {
+        return webhookSuccess(response.status, code);
+      }
+      const retryable = response.status === 429 || response.status >= 500;
+      const errorMessage = typeof root.errmsg === 'string' ? root.errmsg : '钉钉 Webhook 请求失败';
+      return webhookFailure(retryable, response.status, code, errorMessage);
+    } catch {
+      return webhookFailure(true, null, null, '钉钉 Webhook 网络请求失败');
+    }
+  }
+}
+
+export class FeishuWebhookSender implements WebhookSender {
+  constructor(private readonly fetchImpl: FetchLike = fetch) {}
+
+  channel(): NotificationChannel {
+    return 'FEISHU';
+  }
+
+  async send(webhookUrl: string, message: WebhookMessage): Promise<WebhookSendResult> {
+    try {
+      const payload = message.card != null
+        ? { msg_type: 'interactive', card: message.card }
+        : { msg_type: 'text', content: { text: message.text } };
+      const json = JSON.stringify(payload);
+      const response = await this.fetchImpl(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        body: json,
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      const body = await response.text();
+      const root = body.trim() === '' ? {} : JSON.parse(body) as Record<string, unknown>;
+      const codeNode = root.code ?? root.StatusCode;
+      const code = codeNode != null ? String(codeNode) : null;
+      if (response.ok && code === '0') {
+        return webhookSuccess(response.status, code);
+      }
+      const retryable = response.status === 429 || response.status >= 500;
+      const errorMessage = typeof root.msg === 'string' ? root.msg
+        : typeof root.StatusMessage === 'string' ? root.StatusMessage
+          : '飞书 Webhook 请求失败';
+      return webhookFailure(retryable, response.status, code, errorMessage);
+    } catch {
+      return webhookFailure(true, null, null, '飞书 Webhook 网络请求失败');
+    }
+  }
+}
+
+export class WebhookSenderRegistry {
+  private readonly senders = new Map<NotificationChannel, WebhookSender>();
+
+  constructor(senders: WebhookSender[]) {
+    for (const sender of senders) {
+      this.senders.set(sender.channel(), sender);
+    }
+  }
+
+  get(channel: NotificationChannel): WebhookSender {
+    const sender = this.senders.get(channel);
+    if (!sender) {
+      throw new Error(`Missing webhook sender for ${channel}`);
+    }
+    return sender;
+  }
+}

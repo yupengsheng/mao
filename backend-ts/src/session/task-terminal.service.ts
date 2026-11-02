@@ -1,0 +1,363 @@
+import type { Session } from './types.js';
+import type { SessionService } from './session.service.js';
+import type { StreamingWsRegistry } from './ws/streaming-ws-registry.js';
+import { delivered } from './ws/streaming-ws-registry.js';
+import { wsEvent } from './ws/ws-event.js';
+import type { SessionTreeSignalPublisher } from '../harness/approval/session-tree-signal-publisher.js';
+import type { TaskNotificationDeliveryService } from '../notification/task/delivery.service.js';
+import type { TaskNotificationDelivery } from '../notification/task/types.js';
+import type { ExtractionSessionInput } from '../memory/memory-extraction.service.js';
+import { WEIXIN_PROJECT_KEY } from '../domain/types.js';
+import { isFeishuChannelSession } from '../harness/tool/feishu-channel-tool.js';
+import { isDingtalkChannelSession } from '../harness/tool/dingtalk-channel-tool.js';
+
+const TERMINAL = new Set(['COMPLETED', 'FAILED', 'CANCELLED']);
+
+/**
+ * 任务终态通知来源：MANUAL=手工触发（默认）、SCHEDULED=定时任务、
+ * WEBHOOK=入站 Webhook 触发器、API=开放 API Token、SIGNAL=信号哨兵探针变化触发（signal 域）。
+ */
+export type TaskNotifySource = 'MANUAL' | 'SCHEDULED' | 'WEBHOOK' | 'API' | 'SIGNAL';
+
+/** 记忆抽取依赖（可选注入；接口化避免 session 域反向依赖 memory 域实现）。 */
+export interface MemoryExtractionInvoker {
+  extractForSession(input: ExtractionSessionInput): Promise<void>;
+}
+
+/** 收件箱记录依赖（可选注入；接口化避免 session 域反向依赖 inbox 域实现）。 */
+export interface TaskTerminalInboxRecorder {
+  recordTaskTerminal(input: {
+    userId: number;
+    sessionId: number;
+    title: string | null;
+    phase: string;
+    executionId: string | null;
+    failureReason?: string | null;
+    source?: TaskNotifySource;
+  }): Promise<void>;
+}
+
+/** 预算 WARN 结算依赖（技术方案 §5.8，可选注入；接口化避免 session 域反向依赖 budget 域实现）。 */
+export interface TaskTerminalBudgetWarner {
+  settleWarn(target: { userId: number | null; agentId: number | null }, notifyUserId: number | null): Promise<void>;
+}
+
+/**
+ * 回复引用溯源依赖（技术方案 2026-10-12，可选注入；接口化避免 session 域反向依赖具体实现）。
+ * 任务完成时从本轮联网工具结果构建 URL 白名单并校验回复里的 [^n^] 标记。
+ * 注意：必须在终态 WS 事件之前 await 完成（见 finishExecution 内的调用点注释）。
+ */
+export interface CitationRegistryInvoker {
+  buildForSession(sessionId: number): Promise<void>;
+}
+
+/**
+ * 出站订阅分发依赖（可选注入；接口化避免 session 域反向依赖 openapi 域实现）。
+ * 任务终态泛化为用户可配置的通用 HTTP 订阅（task.completed / task.failed）。
+ */
+export interface OutboundEventDispatcher {
+  dispatchTaskTerminal(input: {
+    userId: number;
+    sessionId: number;
+    phase: string;
+    executionId: string | null;
+    title: string | null;
+    failureReason?: string | null;
+    source?: TaskNotifySource;
+  }): void;
+}
+
+export class TaskTerminalService {
+  constructor(
+    private readonly sessionService: SessionService,
+    private readonly registry: StreamingWsRegistry,
+    private readonly deliveryService: TaskNotificationDeliveryService,
+    private readonly treeSignalPublisher: SessionTreeSignalPublisher,
+    private readonly notificationExecutor: (fn: () => void | Promise<void>) => void = (fn) => {
+      void Promise.resolve().then(fn);
+    },
+    private readonly memoryExtraction?: MemoryExtractionInvoker | null,
+    private readonly memoryExecutor: (fn: () => void | Promise<void>) => void = (fn) => {
+      void Promise.resolve().then(fn);
+    },
+    private readonly inboxRecorder?: TaskTerminalInboxRecorder | null,
+    private readonly notifySource: TaskNotifySource = 'MANUAL',
+    private readonly outboundEvents?: OutboundEventDispatcher | null,
+    private readonly budgetWarner?: TaskTerminalBudgetWarner | null,
+    private readonly citationRegistry?: CitationRegistryInvoker | null,
+  ) {}
+
+  async finishExecution(
+    sessionId: number,
+    userId: number | null | undefined,
+    phase: string,
+    executionId: string,
+    failureReason?: string | null,
+    notifySource: TaskNotifySource = 'MANUAL',
+  ): Promise<void> {
+    if (!TERMINAL.has(phase)) {
+      throw new Error(`Unsupported terminal phase: ${phase}`);
+    }
+    const previous = await this.sessionService.getSession(sessionId);
+    if (isTerminalPhase(previous.phase)) {
+      console.info(
+        `Ignoring terminal transition for already-terminal session: sessionId=${sessionId}, from=${previous.phase}, to=${phase}`,
+      );
+      return;
+    }
+    // FAILED 时将错误信息持久化到 runtimeStatusJson，刷新后前端可恢复
+    if (phase === 'FAILED' && failureReason != null && failureReason.trim().length > 0) {
+      await this.sessionService.updateRuntimeStatus(sessionId, { executionError: failureReason });
+    } else {
+      await this.sessionService.updateRuntimeStatus(sessionId, null);
+    }
+    await this.sessionService.updatePhase(sessionId, phase);
+    // 在途执行登记随终态清除，避免订阅快照回放已结束执行的 executionId。
+    this.registry.clearSessionExecution?.(sessionId);
+    await this.sessionService.markLastMessageFinished(sessionId);
+    const session = await this.sessionService.getSession(sessionId);
+    const ownerId = userId ?? session.userId;
+
+    // 引用溯源（技术方案 2026-10-12 §5.3）：citations 必须在下方终态 WS 事件之前
+    // 落库。桌面端收到 session_status(COMPLETED) 即全量重拉消息，晚于事件的 UPDATE
+    // 会与重拉竞态——DB 拥塞时前端先落地，来源区/上标首屏静默缺失，而 session_status
+    // 只发一次、不会自愈，用户只能手动刷新。改为内联 await：仅 COMPLETED（FAILED /
+    // CANCELLED 没有最终回复行可挂），纯 DB 计算无 LLM 调用，代价是几次索引查询；
+    // 不筛 sessionType——主会话 / 边路 / 子代理各自独立构建、天然隔离。异常全吞，
+    // 不影响任务完成事件链。
+    await this.buildCitations(session, phase);
+
+    // 微信/飞书/钉钉通道会话与信号哨兵会话由机器触发，终态不计未读，与 updatePhase 的 DB 写入保持一致
+    const statusData: Record<string, unknown> = {
+      phase,
+      unread: session.projectKey !== WEIXIN_PROJECT_KEY
+        && !isFeishuChannelSession(session.projectKey, session.workspace)
+        && !isDingtalkChannelSession(session.projectKey, session.workspace)
+        && session.source !== 'signal',
+    };
+    if (executionId != null && executionId.trim() !== '') {
+      statusData.executionId = executionId;
+    }
+
+    const delivery = await this.prepareDelivery(session, phase, executionId, failureReason ?? null);
+    if (ownerId != null) {
+      this.registry.send(ownerId, wsEvent('session_list_update', sessionId, { phase }));
+      void this.registry.sendWithResult(ownerId, wsEvent('session_status', sessionId, statusData)).then((result) => {
+        if (delivery == null) return;
+        this.notificationExecutor(async () => {
+          try {
+            await this.deliveryService.resolveWebSocket(delivery, delivered(result));
+          } catch (e) {
+            console.warn(
+              `Failed to resolve WS result for task notification: deliveryId=${delivery.id}, error=${(e as Error).message}`,
+            );
+          }
+        });
+      });
+    }
+
+    this.recordInbox(session, phase, executionId, failureReason ?? null, ownerId, notifySource);
+    this.dispatchOutboundEvent(session, phase, executionId, failureReason ?? null, ownerId, notifySource);
+    this.settleBudgetWarn(session, phase, ownerId);
+
+    if (session.sessionType === 'SIDE_TASK' && session.parentSessionId != null) {
+      // 边路（含深层）终态：沿父链上溯到根主会话，在根上聚合发布唯一信号
+      this.treeSignalPublisher.publishAtRoot(sessionId);
+    } else if (session.sessionType !== 'SUBAGENT') {
+      // 主任务自身进入终态时也要重算并下发 treeRunning，否则前端列表里的
+      // treeRunning 会停留在旧值（true），导致蓝色“执行中”圆点不转绿。
+      this.treeSignalPublisher.publish(sessionId);
+    }
+
+    this.dispatchMemoryExtraction(session, phase);
+  }
+
+  /**
+   * 回复引用溯源（技术方案 2026-10-12 §5.3）：仅 COMPLETED 构建，内联 await 于
+   * finishExecution 的终态 WS 事件之前（时序要求见调用点注释）。异常全吞——
+   * citations 缺失只表现为「这轮没有来源区」，绝不能影响任务完成事件链。
+   */
+  private async buildCitations(session: Session, phase: string): Promise<void> {
+    if (phase !== 'COMPLETED') return;
+    const builder = this.citationRegistry;
+    const sessionId = session.id;
+    if (builder == null || sessionId == null) return;
+    try {
+      await builder.buildForSession(sessionId);
+    } catch (e) {
+      console.warn(`[citations] failed to build registry: sessionId=${sessionId}, error=${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * 站内收件箱写入（任务完成/失败时给在线用户一个「结果回来了」的入口）。
+   *
+   * 显式排除，与仓内双条件口径一致（不得用 parentSessionId 近似）：
+   * - SUBAGENT：完成统一由 SUBAGENT_DONE 承载，避免同一完成两条通知；
+   * - SIDE_TASK：侧任务面板未读徽标已承载（SIDE_TASK 可被提升为 parentSessionId=null
+   *   的主会话，用 parentSessionId 判定会漏判，故必须读 sessionType）；
+   * - CANCELLED：取消多由用户自己发起，无通知价值；
+   * - 微信/飞书/钉钉通道会话：由机器人触发，没有「用户等着看站内」的语义；
+   * - 未知用户：notification.user_id NOT NULL。
+   *
+   * 异常全吞：收件箱是补充通知，绝不能影响任务完成事件链。
+   */
+  private recordInbox(
+    session: Session,
+    phase: string,
+    executionId: string,
+    failureReason: string | null,
+    ownerId: number | null,
+    notifySource: TaskNotifySource,
+  ): void {
+    const recorder = this.inboxRecorder;
+    if (recorder == null) return;
+    if (phase !== 'COMPLETED' && phase !== 'FAILED') return;
+    if (session.sessionType === 'SUBAGENT' || session.sessionType === 'SIDE_TASK') return;
+    if (session.projectKey === WEIXIN_PROJECT_KEY) return;
+    if (isFeishuChannelSession(session.projectKey, session.workspace)) return;
+    if (isDingtalkChannelSession(session.projectKey, session.workspace)) return;
+    if (ownerId == null) return;
+    const sessionId = session.id;
+    if (sessionId == null) return;
+    try {
+      this.notificationExecutor(() => {
+        void Promise.resolve()
+          .then(() => recorder.recordTaskTerminal({
+            userId: ownerId,
+            sessionId,
+            title: session.title ?? null,
+            phase,
+            executionId,
+            failureReason,
+            source: notifySource,
+          }))
+          .catch((e) => {
+            console.warn(`[inbox] failed to record task terminal notification: sessionId=${sessionId}, error=${(e as Error).message}`);
+          });
+      });
+    } catch (e) {
+      // 与 dispatchMemoryExtraction 同口径：executor 同步抛错（agentExecutor 队列饱和
+      // 抛 AgentExecutorRejectedError）不得穿出 finishExecution——那会落在终态相位
+      // 落库之后，上层把已完成任务改判 FAILED 并污染连败计数与队列回写。
+      console.warn(`[inbox] failed to submit task terminal notification: sessionId=${sessionId}, error=${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * 预算 WARN 结算（技术方案 §5.8）：任务终态后比对 enabled 的 WARN 预算行，越线写
+   * BUDGET_WARN 收件箱（InboxService 内按 budgetId+周期幂等）。与 recordInbox 同口径排除
+   * SUBAGENT / SIDE_TASK / CANCELLED（CANCELLED 在 finishExecution 入口已被 TERMINAL 前置放行，
+   * 这里按 phase 过滤）；通道会话不排除——USER 预算把群聊代执行消耗计入本人，越线仍须提醒。
+   * fire-and-forget：任何异常都不影响任务终态事件链。
+   */
+  private settleBudgetWarn(session: Session, phase: string, ownerId: number | null): void {
+    const warner = this.budgetWarner;
+    if (warner == null) return;
+    if (phase !== 'COMPLETED' && phase !== 'FAILED') return;
+    if (session.sessionType === 'SUBAGENT' || session.sessionType === 'SIDE_TASK') return;
+    if (ownerId == null) return;
+    try {
+      this.notificationExecutor(() => {
+        void Promise.resolve()
+          .then(() => warner.settleWarn(
+            { userId: session.userId ?? null, agentId: session.agentId ?? null },
+            ownerId,
+          ))
+          .catch((e) => {
+            console.warn(`[budget] failed to settle warn on task terminal: sessionId=${session.id}, error=${(e as Error).message}`);
+          });
+      });
+    } catch (e) {
+      // executor 同步抛错（线程池饱和拒绝等）不得穿出 finishExecution：终态相位在此之前
+      // 已落库，这里抛出会让上层把已完成任务改判 FAILED 并错写队列回写与连败计数。
+      console.warn(`[budget] budget warn submit failed sessionId=${session.id}: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * 出站订阅分发（task.completed / task.failed）：与 recordInbox 同条件口径
+   * （主会话、COMPLETED/FAILED、已知属主），fire-and-forget，绝不影响终态链。
+   * 通道会话（微信/飞书机器人触发）不排除——出站订阅是用户显式配置的机器回调，
+   * 与「站内未读」语义无关。
+   */
+  private dispatchOutboundEvent(
+    session: Session,
+    phase: string,
+    executionId: string,
+    failureReason: string | null,
+    ownerId: number | null,
+    notifySource: TaskNotifySource,
+  ): void {
+    const dispatcher = this.outboundEvents;
+    if (dispatcher == null) return;
+    if (phase !== 'COMPLETED' && phase !== 'FAILED') return;
+    if (session.sessionType === 'SUBAGENT' || session.sessionType === 'SIDE_TASK') return;
+    if (ownerId == null) return;
+    const sessionId = session.id;
+    if (sessionId == null) return;
+    try {
+      dispatcher.dispatchTaskTerminal({
+        userId: ownerId,
+        sessionId,
+        phase,
+        executionId,
+        title: session.title ?? null,
+        failureReason,
+        source: notifySource,
+      });
+    } catch (e) {
+      console.warn(`[outbound] failed to dispatch task terminal event: sessionId=${sessionId}, error=${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * 任务收尾自动沉淀记忆（技术方案 5.6）：仅 COMPLETED 主会话派发（FAILED/CANCELLED、
+   * SUBAGENT/SIDE_TASK 不抽取），fire-and-forget，绝不影响上方任务完成事件链；
+   * 用户开关在抽取服务内部判断。直接复用本方法已查得的 session 对象，不追加查询。
+   */
+  private dispatchMemoryExtraction(session: Session, phase: string): void {
+    if (phase !== 'COMPLETED') return;
+    if (session.sessionType === 'SUBAGENT' || session.sessionType === 'SIDE_TASK') return;
+    const extraction = this.memoryExtraction;
+    if (extraction == null) return;
+    try {
+      this.memoryExecutor(() => {
+        // 兜底 catch：抽取服务内部虽已全量吞异常，这里再保一道，确保 fire-and-forget
+        // 不会产生 unhandled rejection 或同步抛出破坏任务完成事件链
+        void Promise.resolve()
+          .then(() => extraction.extractForSession({
+            sessionId: session.id!,
+            userId: session.userId,
+            projectKey: session.projectKey ?? null,
+            workspace: session.workspace ?? null,
+            agentId: session.agentId ?? null,
+          }))
+          .catch((e) => {
+            console.warn(`[memory-extraction] dispatch failed sessionId=${session.id}: ${(e as Error).message}`);
+          });
+      });
+    } catch (e) {
+      // executor 本身（线程池饱和拒绝等）同步抛错也不能影响任务完成事件链
+      console.warn(`[memory-extraction] submit failed sessionId=${session.id}: ${(e as Error).message}`);
+    }
+  }
+
+  private async prepareDelivery(
+    session: Session,
+    phase: string,
+    executionId: string,
+    failureReason: string | null,
+  ): Promise<TaskNotificationDelivery | null> {
+    try {
+      return await this.deliveryService.prepare(session as never, phase, executionId, failureReason);
+    } catch (e) {
+      console.warn(`Failed to prepare task notification delivery: sessionId=${session.id}, error=${(e as Error).message}`);
+      return null;
+    }
+  }
+}
+
+function isTerminalPhase(phase: string | null | undefined): boolean {
+  return phase === 'COMPLETED' || phase === 'FAILED' || phase === 'CANCELLED';
+}

@@ -1,0 +1,465 @@
+import { describe, expect, it, vi } from 'vitest';
+import { FeishuMessageService, senderName } from './message.service.js';
+import type { FeishuInboundContext, FeishuNormalizedMessage } from './types.js';
+
+function makeContext(overrides: Partial<FeishuInboundContext> = {}): FeishuInboundContext {
+  return {
+    eventId: 'evt1', messageId: 'om_1', chatId: 'oc_group', chatType: 'group',
+    senderId: 'ou_user', senderUnionId: 'on_user', senderType: 'user', messageType: 'text',
+    text: 'hello', mentions: [], isBotMentioned: true, content: {}, rawEvent: {},
+    accountId: '1', ...overrides,
+  };
+}
+
+describe('FeishuMessageService', () => {
+  function makeRepo(overrides: Partial<Record<string, unknown>> = {}) {
+    return {
+      findGroupConversation: vi.fn(async () => ({ id: 1, appId: '1', chatId: 'oc_group', sessionId: 9, ownerUserId: 3, lastContextLogId: 0 })),
+      findMediaByMessageId: vi.fn(),
+      saveConversation: vi.fn(),
+      claimInboundMessage: vi.fn(),
+      releaseInboundMessage: vi.fn(),
+      completeInboundMessage: vi.fn(),
+      appendGroupMessage: vi.fn(),
+      updateGroupContextWatermark: vi.fn(async () => undefined),
+      updateThreadContextWatermark: vi.fn(async () => undefined),
+      updateGroupContextSummary: vi.fn(async () => undefined),
+      markGroupMessageEnriched: vi.fn(async () => undefined),
+      findThreadSession: vi.fn(async () => null),
+      listGroupMessages: vi.fn(async () => []),
+      listOverflowGroupMessages: vi.fn(async () => []),
+      findOldestPendingGroupMessageId: vi.fn(async () => null),
+      addGroupMember: vi.fn(),
+      recordP2pMessage: vi.fn(async () => undefined),
+      findP2pMessageSession: vi.fn(async () => null),
+      upsertSessionChannel: vi.fn(async () => undefined),
+      findSessionChannel: vi.fn(async () => null),
+      clearAwaitingFirstMessageTitle: vi.fn(async () => undefined),
+      findLatestInboundMessageId: vi.fn(async () => null),
+      findThreadRootMessageId: vi.fn(async () => null),
+      ...overrides,
+    };
+  }
+
+  it('builds group context excluding the triggering message itself', async () => {
+    const repository = makeRepo({
+      listGroupMessages: vi.fn(async () => [
+        { id: 1, appId: '1', chatId: 'oc_group', senderOpenId: 'ou_a', senderName: '张三', isMention: false, messageId: 'om_old', content: '昨天讨论' },
+        { id: 2, appId: '1', chatId: 'oc_group', senderOpenId: 'ou_b', senderName: '王五', isMention: true, messageId: 'om_previous_mention', content: '机器人之前的问题' },
+        { id: 3, appId: '1', chatId: 'oc_group', senderOpenId: 'ou_user', senderName: '李四', isMention: true, messageId: 'om_1', content: 'hello' },
+      ]),
+    });
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120);
+    const group = await service.buildGroupContext('1', makeContext());
+    expect(group.prompt).toContain('昨天讨论');
+    expect(group.prompt).not.toContain('机器人之前的问题');
+    expect(group.prompt).not.toContain('hello');
+    expect(group.messages.map((m) => m.messageId)).toEqual(['om_old']);
+    // 注入后水位线推进到当前最大 log id，避免下轮重复注入。
+    expect(repository.updateGroupContextWatermark).toHaveBeenCalledWith('1', 'oc_group', 3);
+  });
+
+  it('only injects messages newer than the watermark (incremental context)', async () => {
+    const repository = makeRepo({
+      findGroupConversation: vi.fn(async () => ({ id: 1, appId: '1', chatId: 'oc_group', sessionId: 9, ownerUserId: 3, lastContextLogId: 2 })),
+      listGroupMessages: vi.fn(async () => [
+        { id: 2, appId: '1', chatId: 'oc_group', senderOpenId: 'ou_a', senderName: '张三', isMention: false, messageId: 'om_injected', content: '上一轮已注入' },
+        { id: 3, appId: '1', chatId: 'oc_group', senderOpenId: 'ou_a', senderName: '张三', isMention: false, messageId: 'om_new', content: '新增讨论', createdAt: '2026-08-26 13:18:00' },
+      ]),
+    });
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120);
+    const group = await service.buildGroupContext('1', makeContext({ messageId: 'om_trigger' }));
+    expect(group.prompt).toBe('[2026-08-26 13:18] 张三：新增讨论');
+    expect(repository.updateGroupContextWatermark).toHaveBeenCalledWith('1', 'oc_group', 3);
+  });
+
+  it('records group message with media type and file key', async () => {
+    const repository = { appendGroupMessage: vi.fn(async () => 5) };
+    const service = new FeishuMessageService(repository as never, {} as never, 20, 120);
+    const id = await service.recordGroupMessage('1', makeContext({
+      messageType: 'file', fileKey: 'file_9', fileName: 'a.pdf', text: '[文件:a.pdf]',
+    }), true);
+    expect(id).toBe(5);
+    expect(repository.appendGroupMessage).toHaveBeenCalledWith(expect.objectContaining({
+      appId: '1', chatId: 'oc_group', senderOpenId: 'ou_user', isMention: true,
+      msgType: 'file', fileKey: 'file_9', fileName: 'a.pdf', content: '[文件:a.pdf]',
+    }));
+  });
+
+  it('creates conversation under lock on first group message', async () => {
+    const repository = makeRepo({
+      findGroupConversation: vi.fn(async () => null),
+      saveConversation: vi.fn(async (c: unknown) => ({ id: 1, ...c })),
+      appendGroupMessage: vi.fn(),
+    });
+    const sessionFactory = { create: vi.fn(async () => ({ sessionId: 9, ownerUserId: 3, workspace: '/ws' })) };
+    const service = new FeishuMessageService(repository as never, sessionFactory as never, 20, 120);
+    const conv = await service.getOrCreateGroup('1', makeContext());
+    expect(conv.sessionId).toBe(9);
+    expect(sessionFactory.create).toHaveBeenCalledOnce();
+    expect(repository.saveConversation).toHaveBeenCalledWith(expect.objectContaining({ appId: '1', chatId: 'oc_group', sessionId: 9, ownerUserId: 3 }));
+  });
+
+  it('creates p2p conversation keyed by prefixed identity with owner isolation', async () => {
+    const repository = makeRepo({
+      findGroupConversation: vi.fn(async (appId: string, chatId: string, userId?: number) => {
+        expect(appId).toBe('1');
+        // 身份形态在建会话时确定并编码进前缀：优先 union，缺失回退 open。
+        expect(chatId).toBe('p2p:union:on_user');
+        expect(userId).toBe(3);
+        return null;
+      }),
+      saveConversation: vi.fn(async (c: unknown) => ({ id: 2, ...c })),
+    });
+    const sessionFactory = { create: vi.fn(async () => ({ sessionId: 10, ownerUserId: 3 })) };
+    const service = new FeishuMessageService(repository as never, sessionFactory as never, 20, 120);
+    const conv = await service.getOrCreateP2p('1', makeContext({ chatType: 'p2p' }), 3);
+    expect(conv.id).toBe(2);
+  });
+
+  it('falls back to open_id prefix when the event carries no union id', async () => {
+    const repository = makeRepo({
+      findGroupConversation: vi.fn(async (_appId: string, chatId: string) => {
+        expect(chatId).toBe('p2p:open:ou_user');
+        return { id: 4, appId: '1', chatId, sessionId: 11, ownerUserId: 5 };
+      }),
+    });
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120);
+    const conv = await service.getOrCreateP2p('1', makeContext({ chatType: 'p2p', senderUnionId: null }));
+    expect(conv.id).toBe(4);
+  });
+
+  it('throws when group message lacks chat or sender', async () => {
+    const service = new FeishuMessageService({} as never, {} as never, 20, 120);
+    await expect(service.recordGroupMessage('1', makeContext({ chatId: null }), false)).rejects.toThrow();
+    await expect(service.recordGroupMessage('1', makeContext({ senderId: null }), false)).rejects.toThrow();
+  });
+
+  it('summarizes overflow messages and prepends the summary to the prompt', async () => {
+    const repository = makeRepo({
+      findGroupConversation: vi.fn(async () => ({ id: 1, appId: '1', chatId: 'oc_group', sessionId: 9, ownerUserId: 3, lastContextLogId: 0 })),
+      listGroupMessages: vi.fn(async () => [
+        { id: 101, appId: '1', chatId: 'oc_group', senderOpenId: 'ou_a', senderName: '张三', isMention: false, messageId: 'om_recent', content: '最近讨论', createdAt: '2026-08-26 13:18:00' },
+      ]),
+      listOverflowGroupMessages: vi.fn(async () => [
+        { id: 50, appId: '1', chatId: 'oc_group', senderOpenId: 'ou_a', senderName: '张三', isMention: false, messageId: 'om_overflow', content: '更早的讨论', createdAt: '2026-08-25 09:00:00' },
+      ]),
+    });
+    const summarize = vi.fn(async () => '此前讨论了部署方案，决定周五上线。');
+    const summarizer = { summarize } as never;
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120, summarizer, 100);
+    const group = await service.buildGroupContext('1', makeContext({ messageId: 'om_trigger' }));
+    // 溢出查询以最近窗口最小 id 为上界，且不受时间窗限制。
+    expect(repository.listOverflowGroupMessages).toHaveBeenCalledWith('1', 'oc_group', 0, 101, 100, null);
+    expect(summarize).toHaveBeenCalledWith(expect.stringContaining('[2026-08-25 09:00] 张三：更早的讨论'), 9);
+    expect(group.prompt).toBe(
+      '[更早历史消息摘要]\n此前讨论了部署方案，决定周五上线。\n[2026-08-26 13:18] 张三：最近讨论',
+    );
+    expect(repository.updateGroupContextSummary).toHaveBeenCalledWith('1', 'oc_group', '此前讨论了部署方案，决定周五上线。', 50);
+    // 水位线仍推进到最近窗口最大 id，摘要后的溢出消息下轮不再重复处理。
+    expect(repository.updateGroupContextWatermark).toHaveBeenCalledWith('1', 'oc_group', 101);
+  });
+
+  it('reuses the cached overflow summary when it already covers the overflow range', async () => {
+    const repository = makeRepo({
+      findGroupConversation: vi.fn(async () => ({
+        id: 1, appId: '1', chatId: 'oc_group', sessionId: 9, ownerUserId: 3, lastContextLogId: 0,
+        contextSummary: '缓存摘要', contextSummaryLogId: 50,
+      })),
+      listGroupMessages: vi.fn(async () => [
+        { id: 101, appId: '1', chatId: 'oc_group', senderOpenId: 'ou_a', senderName: '张三', isMention: false, messageId: 'om_recent', content: '最近讨论', createdAt: '2026-08-26 13:18:00' },
+      ]),
+      listOverflowGroupMessages: vi.fn(async () => [
+        { id: 50, appId: '1', chatId: 'oc_group', senderOpenId: 'ou_a', senderName: '张三', isMention: false, messageId: 'om_overflow', content: '更早的讨论', createdAt: '2026-08-25 09:00:00' },
+      ]),
+    });
+    const summarize = vi.fn();
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120, { summarize } as never, 100);
+    const group = await service.buildGroupContext('1', makeContext({ messageId: 'om_trigger' }));
+    expect(group.prompt).toBe('[更早历史消息摘要]\n缓存摘要\n[2026-08-26 13:18] 张三：最近讨论');
+    expect(summarize).not.toHaveBeenCalled();
+    expect(repository.updateGroupContextSummary).not.toHaveBeenCalled();
+  });
+
+  it('skips the summary injection when summarization fails', async () => {
+    const repository = makeRepo({
+      findGroupConversation: vi.fn(async () => ({ id: 1, appId: '1', chatId: 'oc_group', sessionId: 9, ownerUserId: 3, lastContextLogId: 0 })),
+      listGroupMessages: vi.fn(async () => [
+        { id: 101, appId: '1', chatId: 'oc_group', senderOpenId: 'ou_a', senderName: '张三', isMention: false, messageId: 'om_recent', content: '最近讨论', createdAt: '2026-08-26 13:18:00' },
+      ]),
+      listOverflowGroupMessages: vi.fn(async () => [
+        { id: 50, appId: '1', chatId: 'oc_group', senderOpenId: 'ou_a', senderName: '张三', isMention: false, messageId: 'om_overflow', content: '更早的讨论', createdAt: '2026-08-25 09:00:00' },
+      ]),
+    });
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120, { summarize: vi.fn(async () => null) } as never, 100);
+    const group = await service.buildGroupContext('1', makeContext({ messageId: 'om_trigger' }));
+    expect(group.prompt).toBe('[2026-08-26 13:18] 张三：最近讨论');
+    expect(repository.updateGroupContextSummary).not.toHaveBeenCalled();
+    expect(repository.updateGroupContextWatermark).toHaveBeenCalledWith('1', 'oc_group', 101);
+  });
+
+  it('does not query overflow or call the summarizer when none is configured', async () => {
+    const repository = makeRepo({
+      listGroupMessages: vi.fn(async () => [
+        { id: 101, appId: '1', chatId: 'oc_group', senderOpenId: 'ou_a', senderName: '张三', isMention: false, messageId: 'om_recent', content: '最近讨论', createdAt: '2026-08-26 13:18:00' },
+      ]),
+    });
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120);
+    const group = await service.buildGroupContext('1', makeContext({ messageId: 'om_trigger' }));
+    expect(group.prompt).toBe('[2026-08-26 13:18] 张三：最近讨论');
+    expect(repository.listOverflowGroupMessages).not.toHaveBeenCalled();
+  });
+
+  it('names bot senders with the 机器人_ prefix instead of raw open_id', () => {
+    const bot = { senderType: 'app', senderId: 'ou_253023b99594e591a156de428e110823', rawEvent: {} } as never;
+    expect(senderName(bot)).toBe('机器人_253023b9');
+    // 兼容部分事件文档的 bot 取值。
+    expect(senderName({ senderType: 'bot', senderId: 'ou_abcdefgh1234', rawEvent: {} } as never)).toBe('机器人_abcdefgh');
+    // 上游显式提供的名字优先。
+    expect(senderName({ senderType: 'app', senderId: 'ou_253023b9', senderName: '告警机器人', rawEvent: {} } as never)).toBe('告警机器人');
+    // 用户发送者不受影响。
+    expect(senderName({ senderType: 'user', senderId: 'ou_user1', rawEvent: {} } as never)).toBe('ou_user1');
+  });
+
+  it('creates a p2p session and switches the active pointer to it', async () => {
+    const repository = makeRepo({
+      saveConversation: vi.fn(async (c: unknown) => ({ id: 9, ...c })),
+    });
+    const sessionFactory = { create: vi.fn(async () => ({ sessionId: 20, ownerUserId: 3, workspace: '/ws/private-3' })) };
+    const service = new FeishuMessageService(repository as never, sessionFactory as never, 20, 120);
+    const conv = await service.createP2pSession('1', makeContext({ chatType: 'p2p' }), 3);
+    expect(conv.sessionId).toBe(20);
+    expect(sessionFactory.create).toHaveBeenCalledWith('1', expect.objectContaining({ chatType: 'p2p' }));
+    // 指针更新 = saveConversation upsert（唯一键 app_id+chat_id，保留 owner 与 workspace）。
+    expect(repository.saveConversation).toHaveBeenCalledWith(expect.objectContaining({
+      appId: '1', chatId: 'p2p:union:on_user', sessionId: 20, ownerUserId: 3, workspace: '/ws/private-3',
+    }));
+    // 新会话标记「等待首条消息命名」（持久化，重启安全）。
+    expect(repository.upsertSessionChannel).toHaveBeenCalledWith(20, '1', 'p2p:union:on_user', 'p2p', true);
+  });
+
+  it('finds session channel and clears the awaiting-title flag tolerantly', async () => {
+    const repository = makeRepo({
+      findSessionChannel: vi.fn(async () => ({ sessionId: 7, appId: '1', chatId: 'p2p:union:on_user', chatType: 'p2p', awaitingFirstMessageTitle: 1 })),
+    });
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120);
+    expect(await service.findSessionChannel(7)).toEqual(expect.objectContaining({ awaitingFirstMessageTitle: 1 }));
+    await service.clearAwaitingFirstMessageTitle(7);
+    expect(repository.clearAwaitingFirstMessageTitle).toHaveBeenCalledWith(7);
+    // DB 异常降级 null / 不抛。
+    const failing = makeRepo({
+      findSessionChannel: vi.fn(async () => { throw new Error('db down'); }),
+      clearAwaitingFirstMessageTitle: vi.fn(async () => { throw new Error('db down'); }),
+    });
+    const serviceFailing = new FeishuMessageService(failing as never, { create: vi.fn() } as never, 20, 120);
+    expect(await serviceFailing.findSessionChannel(7)).toBeNull();
+    await expect(serviceFailing.clearAwaitingFirstMessageTitle(7)).resolves.toBeUndefined();
+  });
+
+  it('switches the p2p active pointer preserving owner and workspace', async () => {
+    const repository = makeRepo({
+      findGroupConversation: vi.fn(async () => ({ id: 1, appId: '1', chatId: 'p2p:union:on_user', sessionId: 7, ownerUserId: 3, workspace: '/ws/private-3' })),
+      saveConversation: vi.fn(async (c: unknown) => ({ id: 1, ...c })),
+    });
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120);
+    const conv = await service.switchP2pSession('1', makeContext({ chatType: 'p2p' }), 5, 3);
+    expect(conv?.sessionId).toBe(5);
+    expect(repository.saveConversation).toHaveBeenCalledWith(expect.objectContaining({
+      appId: '1', chatId: 'p2p:union:on_user', sessionId: 5, ownerUserId: 3, workspace: '/ws/private-3',
+    }));
+  });
+
+  it('returns null when switching without a pointer row or onto the current session', async () => {
+    const repository = makeRepo({
+      findGroupConversation: vi.fn(async () => ({ id: 1, appId: '1', chatId: 'p2p:union:on_user', sessionId: 7, ownerUserId: 3 })),
+      saveConversation: vi.fn(),
+    });
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120);
+    // 目标即当前会话：不切换。
+    expect(await service.switchP2pSession('1', makeContext({ chatType: 'p2p' }), 7, 3)).toBeNull();
+    // 指针行不存在（换绑/未建会话）：不切换。
+    const repositoryEmpty = makeRepo({ findGroupConversation: vi.fn(async () => null) });
+    const serviceEmpty = new FeishuMessageService(repositoryEmpty as never, { create: vi.fn() } as never, 20, 120);
+    expect(await serviceEmpty.switchP2pSession('1', makeContext({ chatType: 'p2p' }), 5, 3)).toBeNull();
+    expect(repository.saveConversation).not.toHaveBeenCalled();
+    expect(repositoryEmpty.saveConversation).not.toHaveBeenCalled();
+  });
+
+  it('finds the active p2p conversation without creating one', async () => {
+    const repository = makeRepo({
+      findGroupConversation: vi.fn(async () => ({ id: 1, appId: '1', chatId: 'p2p:union:on_user', sessionId: 7, ownerUserId: 3 })),
+    });
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120);
+    const conv = await service.findActiveP2p('1', makeContext({ chatType: 'p2p' }), 3);
+    expect(conv?.sessionId).toBe(7);
+    expect(repository.findGroupConversation).toHaveBeenCalledWith('1', 'p2p:union:on_user', 3);
+  });
+
+  it('records p2p message mapping tolerantly and skips empty message ids', async () => {
+    const repository = makeRepo({ recordP2pMessage: vi.fn(async () => undefined) });
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120);
+    await service.recordP2pMessage('1', 'om_1', 7, 'IN');
+    expect(repository.recordP2pMessage).toHaveBeenCalledWith('1', 'om_1', 7, 'IN');
+    // 空消息 ID 直接跳过。
+    await service.recordP2pMessage('1', null, 7, 'IN');
+    expect(repository.recordP2pMessage).toHaveBeenCalledTimes(1);
+    // DB 异常不向上抛（映射失败不阻断主流程）。
+    const failing = makeRepo({ recordP2pMessage: vi.fn(async () => { throw new Error('db down'); }) });
+    const serviceFailing = new FeishuMessageService(failing as never, { create: vi.fn() } as never, 20, 120);
+    await expect(serviceFailing.recordP2pMessage('1', 'om_2', 7, 'OUT')).resolves.toBeUndefined();
+  });
+
+  it('finds p2p message session and degrades to null on failure', async () => {
+    const repository = makeRepo({ findP2pMessageSession: vi.fn(async () => 7) });
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120);
+    expect(await service.findP2pMessageSession('1', 'om_1')).toBe(7);
+    expect(await service.findP2pMessageSession('1', null)).toBeNull();
+    const failing = makeRepo({ findP2pMessageSession: vi.fn(async () => { throw new Error('db down'); }) });
+    const serviceFailing = new FeishuMessageService(failing as never, { create: vi.fn() } as never, 20, 120);
+    expect(await serviceFailing.findP2pMessageSession('1', 'om_1')).toBeNull();
+  });
+
+  it('finds the topic root message id and degrades to null on failure', async () => {
+    const repository = makeRepo({ findThreadRootMessageId: vi.fn(async () => 'om_root') });
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120);
+    expect(await service.findThreadRootMessageId(7)).toBe('om_root');
+    // 空串视为未命中（避免拿空 ID 去 reply）。
+    const empty = makeRepo({ findThreadRootMessageId: vi.fn(async () => '') });
+    expect(await new FeishuMessageService(empty as never, { create: vi.fn() } as never, 20, 120).findThreadRootMessageId(7)).toBeNull();
+    const failing = makeRepo({ findThreadRootMessageId: vi.fn(async () => { throw new Error('db down'); }) });
+    const serviceFailing = new FeishuMessageService(failing as never, { create: vi.fn() } as never, 20, 120);
+    expect(await serviceFailing.findThreadRootMessageId(7)).toBeNull();
+  });
+
+  it('finds thread session mapping and degrades to null on failure', async () => {
+    const repository = makeRepo({ findThreadSession: vi.fn(async () => ({ sessionId: 5, rootMessageId: 'om_root' })) });
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120);
+    const result = await service.findThreadSession('1', 'omt_abc');
+    expect(result?.sessionId).toBe(5);
+    expect(await service.findThreadSession('1', null)).toBeNull();
+    expect(await service.findThreadSession('1', '')).toBeNull();
+    const failing = makeRepo({ findThreadSession: vi.fn(async () => { throw new Error('db down'); }) });
+    const serviceFailing = new FeishuMessageService(failing as never, { create: vi.fn() } as never, 20, 120);
+    expect(await serviceFailing.findThreadSession('1', 'omt_abc')).toBeNull();
+  });
+
+  it('getOrCreateThreadSession returns existing mapping when found', async () => {
+    const repository = makeRepo({
+      findThreadSession: vi.fn(async () => ({ sessionId: 5, rootMessageId: 'om_root' })),
+      findGroupConversation: vi.fn(async () => ({ id: 1, appId: '1', chatId: 'oc_group', sessionId: 5, ownerUserId: 3, workspace: '/ws/group' })),
+    });
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120);
+    const result = await service.getOrCreateThreadSession('1', makeContext({ threadId: 'omt_abc' }));
+    expect(result?.sessionId).toBe(5);
+    expect(result?.rootMessageId).toBe('om_root');
+  });
+
+  it('getOrCreateThreadSession creates new session for thread root message', async () => {
+    const repository = makeRepo({
+      findThreadSession: vi.fn(async () => null),
+      recordThreadSession: vi.fn(async () => undefined),
+      upsertSessionChannel: vi.fn(async () => undefined),
+    });
+    const sessionFactory = { create: vi.fn(async () => ({ sessionId: 10, ownerUserId: 3, workspace: '/ws/new' })) };
+    const service = new FeishuMessageService(repository as never, sessionFactory as never, 20, 120);
+    // 话题根消息：parentId 为空 → 创建新会话，rootMessageId = messageId。
+    const result = await service.getOrCreateThreadSession('1', makeContext({ threadId: 'omt_abc', messageId: 'om_root', parentId: null }));
+    expect(result?.sessionId).toBe(10);
+    expect(repository.recordThreadSession).toHaveBeenCalledWith({
+      appId: '1', chatId: 'oc_group', threadId: 'omt_abc', rootMessageId: 'om_root', sessionId: 10,
+    });
+  });
+
+  it('getOrCreateThreadSession creates session for @bot reply using rootId as rootMessageId', async () => {
+    const repository = makeRepo({
+      findThreadSession: vi.fn(async () => null),
+      recordThreadSession: vi.fn(async () => undefined),
+      upsertSessionChannel: vi.fn(async () => undefined),
+    });
+    const sessionFactory = { create: vi.fn(async () => ({ sessionId: 11, ownerUserId: 3, workspace: '/ws/new' })) };
+    const service = new FeishuMessageService(repository as never, sessionFactory as never, 20, 120);
+    // 话题内回复（先建话题不 @bot，后在话题内 @bot）：parentId 非空，rootMessageId 用 rootId。
+    const result = await service.getOrCreateThreadSession('1', makeContext({
+      threadId: 'omt_abc', messageId: 'om_reply', parentId: 'om_root', rootId: 'om_root',
+    }));
+    expect(result?.sessionId).toBe(11);
+    expect(result?.rootMessageId).toBe('om_root');
+    expect(repository.recordThreadSession).toHaveBeenCalledWith({
+      appId: '1', chatId: 'oc_group', threadId: 'omt_abc', rootMessageId: 'om_root', sessionId: 11,
+    });
+  });
+
+  it('buildGroupContext passes threadId to listGroupMessages', async () => {
+    const repository = makeRepo();
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120);
+    await service.buildGroupContext('1', makeContext({ threadId: 'omt_abc' }));
+    expect(repository.listGroupMessages).toHaveBeenCalledWith('1', 'oc_group', 20, 120, 'omt_abc');
+  });
+
+  it('buildGroupContext passes null threadId for non-thread messages', async () => {
+    const repository = makeRepo();
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120);
+    await service.buildGroupContext('1', makeContext());
+    expect(repository.listGroupMessages).toHaveBeenCalledWith('1', 'oc_group', 20, 120, null);
+  });
+
+  it('水位线不越过未富化完成的占位行，避免图片回填后永远进不了上下文', async () => {
+    const repository = makeRepo({
+      findGroupConversation: vi.fn(async () => ({ id: 1, appId: '1', chatId: 'oc_group', sessionId: 9, ownerUserId: 3, lastContextLogId: 0 })),
+      listGroupMessages: vi.fn(async () => [
+        { id: 10, appId: '1', chatId: 'oc_group', senderOpenId: 'ou_a', senderName: '张三', isMention: false, messageId: 'om_img', content: '[图片 msg=om_img]', enrichPending: 1 },
+        { id: 11, appId: '1', chatId: 'oc_group', senderOpenId: 'ou_b', senderName: '王五', isMention: false, messageId: 'om_txt', content: '后续文字', enrichPending: 0 },
+      ]),
+    });
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120);
+    const group = await service.buildGroupContext('1', makeContext({ messageId: 'om_trigger' }));
+    // 未富化行不注入；其后的就绪行也不能把水位线推过去（否则占位行被永久跳过）
+    expect(group.prompt).not.toContain('[图片 msg=om_img]');
+    expect(group.prompt).not.toContain('后续文字');
+    expect(repository.updateGroupContextWatermark).not.toHaveBeenCalled();
+  });
+
+  it('窗口外仍在富化的行也会挡住水位线，展开后的摘录还能进上下文', async () => {
+    const pendingId = vi.fn<[], Promise<number | null>>()
+      .mockResolvedValueOnce(1)
+      .mockResolvedValueOnce(null);
+    const overflow = vi.fn(async () => [] as Array<Record<string, unknown>>);
+    const repository = makeRepo({
+      findGroupConversation: vi.fn(async () => ({ id: 1, appId: '1', chatId: 'oc_group', sessionId: 9, ownerUserId: 3, lastContextLogId: 0 })),
+      listGroupMessages: vi.fn(async () => [
+        { id: 4, appId: '1', chatId: 'oc_group', senderOpenId: 'ou_a', senderName: '张三', isMention: false, messageId: 'om_4', content: '闲聊', enrichPending: 0, createdAt: '2026-10-08 10:00:00' },
+      ]),
+      findOldestPendingGroupMessageId: pendingId,
+      listOverflowGroupMessages: overflow,
+    });
+    const summarizer = { summarize: vi.fn(async (record: string) => record) };
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120, summarizer as never, 100);
+
+    const blocked = await service.buildGroupContext('1', makeContext({ messageId: 'om_trigger' }));
+    expect(blocked.prompt).not.toContain('闲聊');
+    expect(repository.updateGroupContextWatermark).not.toHaveBeenCalled();
+    // 溢出上界收到未富化行，占位英文不会被当成更早历史摘要掉。
+    expect(overflow).toHaveBeenCalledWith('1', 'oc_group', 0, 1, 100, null);
+
+    overflow.mockResolvedValueOnce([
+      { id: 1, appId: '1', chatId: 'oc_group', senderOpenId: 'ou_a', senderName: '张三', isMention: false, messageId: 'om_mf', content: '【合并转发】告警已处理', enrichPending: 0, createdAt: '2026-10-08 09:12:00' },
+    ]);
+    const later = await service.buildGroupContext('1', makeContext({ messageId: 'om_trigger_b' }));
+    expect(later.prompt).toContain('告警已处理');
+    expect(repository.updateGroupContextWatermark).toHaveBeenCalledWith('1', 'oc_group', 4);
+  });
+
+  it('话题上下文水位线与群级水位线分离', async () => {
+    const repository = makeRepo({
+      findThreadSession: vi.fn(async () => ({ sessionId: 11, rootMessageId: 'om_root', lastContextLogId: 5 })),
+      listGroupMessages: vi.fn(async () => [
+        { id: 6, appId: '1', chatId: 'oc_group', senderOpenId: 'ou_a', senderName: '张三', isMention: false, messageId: 'om_t1', content: '话题内消息', threadId: 'omt_abc', enrichPending: 0 },
+      ]),
+    });
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120);
+    const group = await service.buildGroupContext('1', makeContext({ threadId: 'omt_abc', messageId: 'om_trigger' }));
+    expect(group.prompt).toContain('话题内消息');
+    expect(repository.updateGroupContextWatermark).not.toHaveBeenCalled();
+    expect(repository.updateThreadContextWatermark).toHaveBeenCalledWith('1', 'omt_abc', 6);
+  });
+});

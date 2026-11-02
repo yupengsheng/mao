@@ -1,0 +1,280 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { setActivePinia, createPinia } from 'pinia'
+import { useSessionStore } from './session'
+
+vi.mock('../api', () => ({
+  api: {
+    get: vi.fn(),
+    put: vi.fn(),
+    patch: vi.fn(),
+    delete: vi.fn(),
+    post: vi.fn(),
+  },
+}))
+
+/**
+ * 逻辑回归用例（round2 审查修复后转正）：
+ * 1. 边路任务首发：占位 key → 真实 sid 迁移用 setMessages + clearMessages 整体搬运，
+ *    两个 action 都会删掉 streamingAssistantMessageIds 注册，导致首个 content_delta
+ *    重新建一个 assistant 气泡——同一轮流式回复被劈成「空白气泡 + 新气泡」。
+ * 2. 文本流式中点「停止」：finishInterruptedStreamingMessage 删注册后，终态重拉
+ *    （不传 preserveLiveStream）把未落库的部分回复气泡整体丢弃，内容永久丢失。
+ */
+
+describe('桌面消息 store 流式气泡生命周期', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+  })
+
+  it('边路会话占位→转正迁移后，流式气泡必须被复用而不是新建', () => {
+    const store = useSessionStore()
+    // 首发：占位 key 下乐观用户消息 + 流式占位气泡（SideChatPanel.vue:964-971）
+    store.addUserMessage('tab-7', {
+      id: 'side_user_1', role: 'user', content: '帮我审查', createdAt: '2026-10-12 10:00:00',
+    })
+    const bubble = store.ensureStreamingAssistantMessage('tab-7')
+    expect(store.getMessages('tab-7')).toHaveLength(2)
+
+    // side_session_created → watcher 迁移（SideChatPanel.vue:529-533）
+    const tempMsgs = store.getMessages('tab-7')
+    store.setMessages('42', [...tempMsgs])
+    store.clearMessages('tab-7')
+
+    // user_message_saved 替换乐观 ID（useStreamWS.ts:877-878）
+    store.updateLastMessageId('42', 'user', '501')
+
+    // 首个 content_delta
+    store.appendDelta('42', '第一段回复')
+
+    const msgs = store.getMessages('42')
+    // 期望：['user','assistant'] 且复用迁移来的气泡。当前实际：['user','assistant','assistant']
+    expect(msgs.map((m) => m.role)).toEqual(['user', 'assistant'])
+    expect(msgs[1].id).toBe(bubble.id)
+    expect(msgs[1].content).toContain('第一段回复')
+  })
+
+  it('CANCELLED 终态重拉不丢弃已流式输出的部分回复（服务端不落库被中止轮次）', () => {
+    const store = useSessionStore()
+    store.setMessages('9', [{
+      id: '100', role: 'user', content: '写个快排', createdAt: '2026-10-12 10:00:00',
+    }])
+    store.ensureStreamingAssistantMessage('9')
+    store.appendDelta('9', '好的，这是快速排序实现：')
+
+    // 服务端确认 CANCELLED（useStreamWS.ts:705）
+    store.finishInterruptedStreamingMessage('9', '执行已被中止')
+
+    // 终态重拉（useChat.ts:833 未传 preserveLiveStream）；被中止轮次 REST 不返回 assistant
+    store.applyFetchedMessages('9', [
+      { id: '100', role: 'user', content: '写个快排', createdAt: '2026-10-12 10:00:00' },
+    ])
+
+    const msgs = store.getMessages('9')
+    // 期望：['user','assistant'] 部分回复保留可见。当前实际：['user']
+    expect(msgs.map((m) => m.role)).toEqual(['user', 'assistant'])
+    expect(msgs[1].content).toContain('快速排序')
+  })
+
+  it('对照组：正常完成后终态重拉按 REST 覆盖（现有行为不回退）', () => {
+    const store = useSessionStore()
+    store.setMessages('8', [{
+      id: '200', role: 'user', content: '你好', createdAt: '2026-10-12 10:00:00',
+    }])
+    const bubble = store.ensureStreamingAssistantMessage('8')
+    store.appendDelta('8', '完整回复')
+    // 正常完成：markMessageComplete 清注册，REST 已含该 assistant
+    store.markMessageComplete('8', { total_tokens: 10 })
+    store.applyFetchedMessages('8', [
+      { id: '200', role: 'user', content: '你好', createdAt: '2026-10-12 10:00:00' },
+      { id: '201', role: 'assistant', content: '完整回复', createdAt: '2026-10-12 10:00:01' },
+    ])
+    const msgs = store.getMessages('8')
+    expect(msgs.map((m) => m.role)).toEqual(['user', 'assistant'])
+    expect(msgs[1].id).toBe('201')
+    expect(bubble.content).toContain('完整回复')
+  })
+
+  // round 1 BUG-1 修复的竞态面：停止点击与服务端落库/完成广播竞态时，这一轮其实
+  // 已持久化（REST 该用户消息之后的第一条助手消息正是同一回复）。中断气泡若一并
+  // 保留，对话区出现「部分回复 + 完整回复」两条相同内容的气泡。
+  it('同轮已落库时中断气泡是本地回显，不重复保留', () => {
+    const store = useSessionStore()
+    store.setMessages('9', [{
+      id: '100', role: 'user', content: '写个快排', createdAt: '2026-10-12 10:00:00',
+    }])
+    store.ensureStreamingAssistantMessage('9')
+    store.appendDelta('9', '好的，这是快速排序实现：')
+    store.finishInterruptedStreamingMessage('9', '执行已被中止')
+
+    // 停止竞态：REST 里这一轮已落库（id 201）
+    store.applyFetchedMessages('9', [
+      { id: '100', role: 'user', content: '写个快排', createdAt: '2026-10-12 10:00:00' },
+      { id: '201', role: 'assistant', content: '好的，这是快速排序实现：', createdAt: '2026-10-12 10:00:05' },
+    ])
+
+    const msgs = store.getMessages('9')
+    expect(msgs.map((m) => m.role)).toEqual(['user', 'assistant'])
+    expect(msgs[1].id).toBe('201')
+    expect(msgs.filter((m) => m.role === 'assistant')).toHaveLength(1)
+  })
+
+  // round2 遗留观察：工具轮的 REST 形状是同轮两条助手消息（先落空 content 的
+  // 工具调用消息，再落最终文本消息）。停止竞态下中断气泡携带最终文本，只比
+  // 第一条（空 content）比不中，最终回复会展示两份（气泡 + REST 版）。
+  it('同轮已落库的工具轮竞态时，携带最终文本的中断气泡也是回显', () => {
+    const store = useSessionStore()
+    store.setMessages('9', [{
+      id: '100', role: 'user', content: '看下 a.txt', createdAt: '2026-10-12 10:00:00',
+    }])
+    store.ensureStreamingAssistantMessage('9')
+    store.appendToolCallStart('9', { tool_call_id: 't1', tool_name: 'read_file', arguments: '{"path":"a.txt"}' })
+    store.updateToolCallResult('9', { tool_call_id: 't1', tool_name: 'read_file', result: 'hello', status: 'success' })
+    store.appendDelta('9', 'a.txt 的内容是 hello')
+    store.finishInterruptedStreamingMessage('9', '执行已被中止')
+
+    // 停止竞态：这一轮已完整落库。TOOL 结果在映射阶段合并进工具调用消息，
+    // 同轮剩两条助手消息：空 content 的工具调用消息 + 最终文本消息
+    store.applyFetchedMessages('9', [
+      { id: '100', role: 'user', content: '看下 a.txt', createdAt: '2026-10-12 10:00:00' },
+      {
+        id: '201', role: 'assistant', content: '', createdAt: '2026-10-12 10:00:03',
+        toolCalls: [{ id: 't1', name: 'read_file', status: 'success', result: 'hello', isExpanded: false, argsStreaming: false }],
+      },
+      { id: '202', role: 'assistant', content: 'a.txt 的内容是 hello', createdAt: '2026-10-12 10:00:05' },
+    ])
+
+    const msgs = store.getMessages('9')
+    expect(msgs.map((m) => m.role)).toEqual(['user', 'assistant', 'assistant'])
+    expect(msgs[1]!.id).toBe('201')
+    expect(msgs[2]!.id).toBe('202')
+    // 中断气泡是最终文本的本地副本，不得与 REST 版重复展示
+    expect(msgs.filter((m) => m.interrupted === true)).toHaveLength(0)
+  })
+
+  // 上条的负向看守（round3 复审建议转正）：停止竞态也可能只落库了工具调用消息、
+  // 最终文本没落库。此时气泡是最终文本的唯一副本，同轮没有任何助手消息与它内容
+  // 相等，必须保留——守住「比遍同轮」不会把比较放宽成前缀/包含后误删。
+  it('工具轮只落库了工具消息（最终文本未落库）时，中断气泡是唯一副本必须保留', () => {
+    const store = useSessionStore()
+    store.setMessages('9', [{
+      id: '100', role: 'user', content: '看下 a.txt', createdAt: '2026-10-12 10:00:00',
+    }])
+    store.ensureStreamingAssistantMessage('9')
+    store.appendToolCallStart('9', { tool_call_id: 't1', tool_name: 'read_file', arguments: '{"path":"a.txt"}' })
+    store.updateToolCallResult('9', { tool_call_id: 't1', tool_name: 'read_file', result: 'hello', status: 'success' })
+    store.appendDelta('9', 'a.txt 的内容是 hello')
+    store.finishInterruptedStreamingMessage('9', '执行已被中止')
+
+    store.applyFetchedMessages('9', [
+      { id: '100', role: 'user', content: '看下 a.txt', createdAt: '2026-10-12 10:00:00' },
+      {
+        id: '201', role: 'assistant', content: '', createdAt: '2026-10-12 10:00:03',
+        toolCalls: [{ id: 't1', name: 'read_file', status: 'success', result: 'hello', isExpanded: false, argsStreaming: false }],
+      },
+    ])
+
+    const msgs = store.getMessages('9')
+    expect(msgs.map((m) => m.role)).toEqual(['user', 'assistant', 'assistant'])
+    expect(msgs[2]!.interrupted).toBe(true)
+    expect(msgs[2]!.content).toBe('a.txt 的内容是 hello')
+  })
+
+  it('下一轮完成后再重拉，中止轮次的气泡按原位置插回、不重复', () => {
+    const store = useSessionStore()
+    store.setMessages('9', [{
+      id: '100', role: 'user', content: '写个快排', createdAt: '2026-10-12 10:00:00',
+    }])
+    store.ensureStreamingAssistantMessage('9')
+    store.appendDelta('9', '半段回复')
+    store.finishInterruptedStreamingMessage('9', '执行已被中止')
+    // 用户又发了一轮：乐观用户消息落库后 user_message_saved 换成本身 id
+    store.addUserMessage('9', {
+      id: 'msg_2_user', role: 'user', content: '再写个归并', createdAt: '2026-10-12 10:01:00',
+    })
+    store.updateLastMessageId('9', 'user', '101')
+    store.ensureStreamingAssistantMessage('9')
+    store.appendDelta('9', '归并排序实现')
+    store.markMessageComplete('9', { total_tokens: 10 })
+
+    // REST：第一轮未落库（无 assistant），第二轮已落库
+    store.applyFetchedMessages('9', [
+      { id: '100', role: 'user', content: '写个快排', createdAt: '2026-10-12 10:00:00' },
+      { id: '101', role: 'user', content: '再写个归并', createdAt: '2026-10-12 10:01:00' },
+      { id: '202', role: 'assistant', content: '归并排序实现', createdAt: '2026-10-12 10:01:05' },
+    ])
+
+    const msgs = store.getMessages('9')
+    // 半段回复插回第一轮之后、第二轮之前，位置与内容都不丢
+    expect(msgs.map((m) => m.content)).toEqual([
+      '写个快排', '半段回复', '再写个归并', '归并排序实现',
+    ])
+  })
+
+  // round2 审查 BUG-A：回显去重只认同轮。旧实现从本轮 user 向后找第一条 assistant
+  // 时不认轮边界，会拿「下一轮已落库的回复」与本轮中断气泡比内容，两者相同即误判
+  // 回显——而中断气泡是服务端不落库轮次的唯一副本，删掉即永久丢失。
+  it('下一轮已落库且文本内容相同时，中止轮次的中断气泡不得被当回显删除', () => {
+    const store = useSessionStore()
+    store.setMessages('9', [{
+      id: '100', role: 'user', content: '1+1=?', createdAt: '2026-10-12 10:00:00',
+    }])
+    store.ensureStreamingAssistantMessage('9')
+    store.appendDelta('9', '1+1=2')
+    store.finishInterruptedStreamingMessage('9', '执行已被中止')
+    // 用户重发同一问题，第二轮完整落库、回复内容与第一轮半段恰好相同
+    store.addUserMessage('9', {
+      id: 'msg_2_user', role: 'user', content: '1+1=?', createdAt: '2026-10-12 10:01:00',
+    })
+    store.updateLastMessageId('9', 'user', '101')
+    store.ensureStreamingAssistantMessage('9')
+    store.appendDelta('9', '1+1=2')
+    store.markMessageComplete('9', { total_tokens: 10 })
+
+    store.applyFetchedMessages('9', [
+      { id: '100', role: 'user', content: '1+1=?', createdAt: '2026-10-12 10:00:00' },
+      { id: '101', role: 'user', content: '1+1=?', createdAt: '2026-10-12 10:01:00' },
+      { id: '202', role: 'assistant', content: '1+1=2', createdAt: '2026-10-12 10:01:05' },
+    ])
+
+    const msgs = store.getMessages('9')
+    // 第一轮的中断气泡是唯一副本，必须留在原位；第二轮用 REST 版本
+    expect(msgs.map((m) => m.content)).toEqual(['1+1=?', '1+1=2', '1+1=?', '1+1=2'])
+    expect(msgs[1]!.interrupted).toBe(true)
+    expect(msgs[3]!.id).toBe('202')
+  })
+
+  it('下一轮是已落库工具轮（content 为空）时，中止的工具轮气泡不得被当回显删除', () => {
+    const store = useSessionStore()
+    store.setMessages('9', [{
+      id: '100', role: 'user', content: '看下 a.txt', createdAt: '2026-10-12 10:00:00',
+    }])
+    store.ensureStreamingAssistantMessage('9')
+    store.appendToolCallStart('9', { tool_call_id: 't1', tool_name: 'read_file', arguments: '{"path":"a.txt"}' })
+    store.finishInterruptedStreamingMessage('9', '执行已被中止')
+    store.addUserMessage('9', {
+      id: 'msg_2_user', role: 'user', content: '再看下 b.txt', createdAt: '2026-10-12 10:01:00',
+    })
+    store.updateLastMessageId('9', 'user', '101')
+    store.ensureStreamingAssistantMessage('9')
+    store.appendToolCallStart('9', { tool_call_id: 't2', tool_name: 'read_file', arguments: '{"path":"b.txt"}' })
+    store.updateToolCallResult('9', { tool_call_id: 't2', tool_name: 'read_file', result: 'file b', status: 'success' })
+    store.markMessageComplete('9', { total_tokens: 10 })
+
+    // 工具轮落库 content 为空（后端 persistAssistant 写 NULL，桌面映射为 ''）：
+    // 空 content 互相相等，旧实现会把第一轮的气泡误判成第二轮的回显
+    store.applyFetchedMessages('9', [
+      { id: '100', role: 'user', content: '看下 a.txt', createdAt: '2026-10-12 10:00:00' },
+      { id: '101', role: 'user', content: '再看下 b.txt', createdAt: '2026-10-12 10:01:00' },
+      {
+        id: '202', role: 'assistant', content: '', createdAt: '2026-10-12 10:01:05',
+        toolCalls: [{ id: 't2', name: 'read_file', status: 'success', isExpanded: false, argsStreaming: false }],
+      },
+    ])
+
+    const msgs = store.getMessages('9')
+    expect(msgs.map((m) => m.role)).toEqual(['user', 'assistant', 'user', 'assistant'])
+    expect(msgs[1]!.interrupted).toBe(true)
+    expect(msgs[1]!.toolCalls?.map((c) => c.id)).toEqual(['t1'])
+    expect(msgs[3]!.toolCalls?.map((c) => c.id)).toEqual(['t2'])
+  })
+})

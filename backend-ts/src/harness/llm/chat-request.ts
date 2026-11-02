@@ -1,0 +1,223 @@
+export interface ChatReasoning {
+  effort?: string;
+}
+
+export interface ChatThinking {
+  type?: string;
+}
+
+export interface ChatAudio {
+  data?: string;
+  format?: string;
+  transcript?: string;
+  duration?: number;
+}
+
+export interface ImageUrl {
+  url?: string;
+}
+
+export interface ContentPart {
+  type?: string;
+  text?: string;
+  imageUrl?: ImageUrl;
+}
+
+export interface FunctionDef {
+  name?: string;
+  description?: string;
+  parameters?: Record<string, unknown>;
+}
+
+export interface FunctionCall {
+  name?: string;
+  arguments?: string;
+}
+
+export interface ToolCall {
+  index?: number;
+  id?: string;
+  type?: string;
+  function?: FunctionCall;
+  summary?: string;
+  /** Mao 扩展（仅 openai-responses 协议）：本工具轮 reasoning 项的往返引用。
+   *  只挂在轮内首个 toolCall 上，随 tool_calls JSON 持久化；其余协议序列化时忽略。 */
+  reasoning?: ReasoningItemRef;
+}
+
+/** OpenAI Responses API reasoning 项引用：stateless 多轮回传 function_call 时必须携带配对的 reasoning 项。 */
+export interface ReasoningItemRef {
+  id?: string;
+  encryptedContent?: string;
+}
+
+export interface ToolDefinition {
+  type?: string;
+  function?: FunctionDef;
+}
+
+export interface ChatMessage {
+  role?: string;
+  content?: unknown;
+  name?: string;
+  toolCallId?: string;
+  toolCalls?: ToolCall[];
+  audio?: ChatAudio;
+  reasoningContent?: string;
+  /**
+   * Mao 内部字段（不参与任何协议序列化，与 ToolCall.summary 同一约定）：该消息在 DB 中的
+   * 发送日期（`created_at` 前 10 位）。仅供提示词渲染的 `<date-change>` 跨天提示比较使用，
+   * 三个适配器都按显式字段白名单序列化，故不会外泄。
+   */
+  senderYmd?: string;
+}
+
+export interface ChatRequest {
+  messages?: ChatMessage[];
+  tools?: ToolDefinition[];
+  temperature?: number;
+  stream?: boolean;
+  reasoning?: ChatReasoning;
+  thinking?: ChatThinking;
+  enableThinking?: boolean;
+  audio?: Record<string, unknown>;
+  /** 会话级前缀缓存路由键（OpenAI Responses 的 prompt_cache_key）。按会话注入，
+   *  网关据此做上游粘性路由，缺失时多上游负载均衡会导致前缀缓存命中随机。其他协议忽略。 */
+  promptCacheKey?: string;
+}
+
+export interface PromptTokensDetails {
+  /** 缓存命中的输入 token 数（OpenAI prompt_tokens_details.cached_tokens / Anthropic cache_read_input_tokens）。 */
+  cachedTokens?: number | null;
+  /** 缓存写入的输入 token 数（Anthropic cache_creation_input_tokens）。OpenAI 系协议无此概念，恒 0。 */
+  cacheCreationTokens?: number | null;
+}
+
+export interface ChatUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  promptTokensDetails?: PromptTokensDetails | null;
+}
+
+export function emptyUsage(): ChatUsage {
+  return { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+}
+
+export interface ChatChoice {
+  index?: number;
+  message?: ChatMessage;
+  finishReason?: string;
+}
+
+export interface ChatResponse {
+  id?: string;
+  model?: string;
+  choices?: ChatChoice[];
+  usage?: ChatUsage;
+}
+
+export interface StreamDelta {
+  role?: string;
+  content?: string;
+  toolCalls?: ToolCall[];
+  reasoningContent?: string;
+}
+
+export interface DeltaChoice {
+  index?: number;
+  delta?: StreamDelta;
+  finishReason?: string;
+}
+
+export interface StreamChunk {
+  id?: string;
+  model?: string;
+  choices?: DeltaChoice[];
+}
+
+import type { ClientImpersonation } from '@mao/contracts';
+
+export interface LlmModelConfig {
+  id?: number;
+  name?: string;
+  provider?: string;
+  apiProtocol?: string;
+  /** reasoning effort：none/low/medium/high/xhigh/max，缺失/空串=协议默认值（high） */
+  effort?: string;
+  baseUrl?: string;
+  apiKey?: string;
+  modelId?: string;
+  contextWindowTokens?: number;
+  /**
+   * 供应商允许的请求体上限（字节）。用于推导会话压缩的体积触发阈值（上限 × 0.8）；
+   * 0/undefined 表示未知，回退全局阈值。
+   */
+  maxRequestBodyBytes?: number | null;
+  supportsVision?: boolean;
+  clientImpersonation?: ClientImpersonation;
+  /** 每百万「非缓存」输入 token 价格（成本单位）。随模型解析链下发用于成本快照；缺失时落库侧走兜底价格缓存。 */
+  priceInput?: number | null;
+  /** 每百万缓存命中输入 token 价格（成本单位）。语义同 priceInput。 */
+  priceCacheRead?: number | null;
+  /** 每百万缓存写入输入 token 价格（成本单位；Anthropic cache_creation，OpenAI 系恒 0）。语义同 priceInput。 */
+  priceCacheWrite?: number | null;
+  /** 每百万输出 token 价格（成本单位）。语义同 priceInput。 */
+  priceOutput?: number | null;
+}
+
+export interface LlmRetryConfig {
+  rateLimitMaxRetries: number;
+  rateLimitRetryDelaySeconds: number;
+  rateLimitMaxRetryDelaySeconds: number;
+  callTimeoutSeconds: number;
+  httpCallTimeoutSeconds: number;
+  streamIdleTimeoutSeconds: number;
+}
+
+export const DEFAULT_LLM_RETRY: LlmRetryConfig = {
+  rateLimitMaxRetries: 10,
+  rateLimitRetryDelaySeconds: 2,
+  rateLimitMaxRetryDelaySeconds: 30,
+  callTimeoutSeconds: 120,
+  httpCallTimeoutSeconds: 180,
+  streamIdleTimeoutSeconds: 300,
+};
+
+export interface StreamCallback {
+  onChunk(chunk: StreamChunk): void;
+  onComplete(usage: ChatUsage): void;
+  onError(t: unknown): void;
+  /**
+   * 流未正常结束、但上游已经带回 usage 时调用。不表示本轮成功完成，监听器不得把它当成 onComplete。
+   * 记账方据此给失败调用计价（技术方案 §5.2）。
+   */
+  onUsage?(usage: ChatUsage): void;
+  onStreamReset?(): void;
+  onWaiting?(phase: string, elapsedSeconds: number): void;
+  onRetry?(reason: string, statusCode: number | null, attempt: number, maxRetries: number, delaySeconds: number): void;
+}
+
+/** 把已观察到的 usage 交给记账方。复制一份，避免随后改写同一个对象。 */
+export function notifyPartialUsage(callback: StreamCallback, usage: ChatUsage): void {
+  callback.onUsage?.({
+    promptTokens: usage.promptTokens,
+    completionTokens: usage.completionTokens,
+    totalTokens: usage.totalTokens,
+    ...(usage.promptTokensDetails != null
+      ? { promptTokensDetails: { ...usage.promptTokensDetails } }
+      : {}),
+  });
+}
+
+export type ChatCallback = Pick<StreamCallback, 'onWaiting' | 'onRetry'>;
+
+export interface LlmAdapter {
+  chat(request: ChatRequest, config: LlmModelConfig, cancelFlag?: { get(): boolean } | null, callback?: ChatCallback | null): Promise<ChatResponse>;
+  stream(
+    request: ChatRequest,
+    config: LlmModelConfig,
+    callback: StreamCallback,
+    cancelFlag?: { get(): boolean } | null,
+  ): Promise<void>;
+}

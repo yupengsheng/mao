@@ -1,0 +1,300 @@
+import { ref, watch } from 'vue'
+import type {
+  RunTrace,
+  TraceLiveRound,
+  TraceLiveTool,
+  TraceLoadedRecord,
+  TraceThresholds,
+  UnattributedGroup
+} from '../../types/trace'
+import { DEFAULT_TRACE_THRESHOLDS } from '../../types/trace'
+import { safeSetItem } from '../../utils/safe-storage'
+
+/**
+ * 阈值存储 key 换版（v2）：旧 key 里是 `{ slowMs, expensiveTokens }`，
+ * 沿用会把 50000 读成 50000 元（clamp 到上限后「所有轮都贵」），
+ * 正好是本次改成本口径要消除的现象。换 key 让老用户回到默认 0.5 元，
+ * slowMs 一并回到 60s——一次性重置，属可接受的展示参数成本。
+ */
+const THRESHOLDS_KEY = 'mao:trace-thresholds:v2'
+
+function loadThresholds(): TraceThresholds {
+  try {
+    const raw = localStorage.getItem(THRESHOLDS_KEY)
+    if (!raw) return { ...DEFAULT_TRACE_THRESHOLDS }
+    const parsed = JSON.parse(raw) as Partial<TraceThresholds>
+    return {
+      slowMs: typeof parsed.slowMs === 'number' && parsed.slowMs > 0 ? parsed.slowMs : DEFAULT_TRACE_THRESHOLDS.slowMs,
+      // 金额可以是 0.001 这类小数：只判 > 0，不要用 Number.isInteger
+      expensiveCost: typeof parsed.expensiveCost === 'number' && parsed.expensiveCost > 0
+        ? parsed.expensiveCost
+        : DEFAULT_TRACE_THRESHOLDS.expensiveCost
+    }
+  } catch {
+    return { ...DEFAULT_TRACE_THRESHOLDS }
+  }
+}
+
+/**
+ * run 轨迹状态：REST 完成态快照 + 进行中临时态。
+ * 临时态按 `${sessionId}|${executionId}` 隔离——崩溃恢复 / 重跑会换 executionId，
+ * 陈旧执行的 round_* / tool_call_* 帧不得画进当前 run（WS 侧已有陈旧过滤兜底）。
+ */
+export function createTraceModule() {
+  const traceRuns = ref<Map<string, RunTrace[]>>(new Map())
+  const traceHasMore = ref<Map<string, boolean>>(new Map())
+  const traceUnattributed = ref<Map<string, UnattributedGroup | null>>(new Map())
+  const traceLoading = ref<Map<string, boolean>>(new Map())
+  /** 慢 / 贵阈值：localStorage 持久化，改完带 query 重拉 */
+  const traceThresholds = ref<TraceThresholds>(loadThresholds())
+  /** 本次执行的轮次临时行（round_start / round_end 驱动） */
+  const liveRounds = ref<Map<string, TraceLiveRound>>(new Map())
+  /** 进行中工具计时（tool_call_start 起表，结果回来或执行结束清除） */
+  const liveTools = ref<Map<string, TraceLiveTool[]>>(new Map())
+  /**
+   * 记录详情抽屉的加载态缓存（技术方案 2026-10-22-run-trace-deep-dive §5.6）：
+   * key = `tool:${toolCallId}` / `call:${llmCallId}`，按 sessionId 分桶——切会话不串。
+   * 空态 VO（记录不存在）也缓存：重复点同一行不再打请求。
+   * 存的是带 kind 判别的包装（TraceLoadedRecord），与抽屉直接渲染同型。
+   */
+  const traceRecords = ref<Map<string, Map<string, TraceLoadedRecord>>>(new Map())
+
+  /**
+   * 单会话记录详情的条数上限：记录正文可能很大（read_file 大文件 / shell 长输出），
+   * 而缓存只在删除会话 / 登出时清理，正常使用路径下无上界增长会让正文长期常驻。
+   * 按插入序淘汰最旧（Map 保持插入序，重写同 key 不改变既有位置）——记录详情是
+   * 「点开才拉、短期内可能反复看」的数据，LRU 的收益不足以换取复杂度。
+   */
+  const TRACE_RECORDS_CAP = 200
+  /**
+   * 跨会话桶上限：单会话有 200 条上限，但用户一天里点开很多会话的抽屉时，
+   * 每个会话都会留一个桶；不设总量上限仍会无界增长。超过上限时按插入序淘汰最旧会话。
+   */
+  const TRACE_RECORDS_SESSION_CAP = 20
+
+  watch(traceThresholds, (value) => {
+    safeSetItem(THRESHOLDS_KEY, JSON.stringify(value))
+  }, { deep: true })
+
+  function getTraceRuns(sessionId: string): RunTrace[] {
+    return traceRuns.value.get(String(sessionId)) ?? []
+  }
+
+  function getTraceHasMore(sessionId: string): boolean {
+    return traceHasMore.value.get(String(sessionId)) ?? false
+  }
+
+  function getTraceUnattributed(sessionId: string): UnattributedGroup | null {
+    return traceUnattributed.value.get(String(sessionId)) ?? null
+  }
+
+  function isTraceLoading(sessionId: string): boolean {
+    return traceLoading.value.get(String(sessionId)) ?? false
+  }
+
+  /** 首页整页替换（首次打开 / 阈值变更 / 执行结束后重拉） */
+  function setTracePage(sessionId: string, page: { runs: RunTrace[]; hasMore: boolean; unattributed: UnattributedGroup | null }) {
+    const sid = String(sessionId)
+    traceRuns.value.set(sid, page.runs)
+    traceHasMore.value.set(sid, page.hasMore)
+    traceUnattributed.value.set(sid, page.unattributed)
+    traceRuns.value = new Map(traceRuns.value)
+    traceHasMore.value = new Map(traceHasMore.value)
+    traceUnattributed.value = new Map(traceUnattributed.value)
+  }
+
+  /** 翻页追加：unattributed 只在第一页，追加时保持原值 */
+  function appendTracePage(sessionId: string, page: { runs: RunTrace[]; hasMore: boolean }) {
+    const sid = String(sessionId)
+    traceRuns.value.set(sid, [...getTraceRuns(sid), ...page.runs])
+    traceHasMore.value.set(sid, page.hasMore)
+    traceRuns.value = new Map(traceRuns.value)
+    traceHasMore.value = new Map(traceHasMore.value)
+  }
+
+  function setTraceLoading(sessionId: string, loading: boolean) {
+    traceLoading.value.set(String(sessionId), loading)
+    traceLoading.value = new Map(traceLoading.value)
+  }
+
+  function setTraceThresholds(thresholds: TraceThresholds) {
+    traceThresholds.value = { ...thresholds }
+  }
+
+  function clearTrace(sessionId: string) {
+    const sid = String(sessionId)
+    traceRuns.value.delete(sid)
+    traceHasMore.value.delete(sid)
+    traceUnattributed.value.delete(sid)
+    traceLoading.value.delete(sid)
+    // 记录详情缓存一并释放：切会话 / 重拉后旧记录不会再被点开，
+    // 而正文是敏感数据（读过的文件内容、命令输出），不该在轨迹清掉后继续常驻。
+    traceRecords.value.delete(sid)
+    traceRuns.value = new Map(traceRuns.value)
+    traceHasMore.value = new Map(traceHasMore.value)
+    traceUnattributed.value = new Map(traceUnattributed.value)
+    traceLoading.value = new Map(traceLoading.value)
+    traceRecords.value = new Map(traceRecords.value)
+  }
+
+  function liveKey(sessionId: string, executionId: string): string {
+    return `${sessionId}|${executionId}`
+  }
+
+  /** 记录详情缓存读取：未命中返回 null（调用方去拉取）。 */
+  function getTraceRecord(sessionId: string, key: string): TraceLoadedRecord | null {
+    return traceRecords.value.get(String(sessionId))?.get(key) ?? null
+  }
+
+  /** 记录详情缓存写入：同 key 覆盖（重拉后刷新）；超上限时淘汰最早写入的一条。 */
+  function setTraceRecord(sessionId: string, key: string, record: TraceLoadedRecord) {
+    const sid = String(sessionId)
+    const existing = traceRecords.value.get(sid)
+    const bucket = existing ?? new Map<string, TraceLoadedRecord>()
+    if (existing == null && traceRecords.value.size >= TRACE_RECORDS_SESSION_CAP) {
+      const oldestSession = traceRecords.value.keys().next()
+      if (oldestSession.done !== true) traceRecords.value.delete(oldestSession.value)
+    }
+    bucket.set(key, record)
+    while (bucket.size > TRACE_RECORDS_CAP) {
+      const oldest = bucket.keys().next()
+      if (oldest.done === true) break
+      bucket.delete(oldest.value)
+    }
+    traceRecords.value.set(sid, bucket)
+    traceRecords.value = new Map(traceRecords.value)
+  }
+
+  /** 会话级清理（删除会话 / 登出）：缓存随会话一起丢，不跨会话残留正文。 */
+  function clearTraceRecords(sessionId: string) {
+    const sid = String(sessionId)
+    if (!traceRecords.value.delete(sid)) return
+    traceRecords.value = new Map(traceRecords.value)
+  }
+
+  function getLiveRound(sessionId: string, executionId: string): TraceLiveRound | null {
+    return liveRounds.value.get(liveKey(sessionId, executionId)) ?? null
+  }
+
+  function getLiveTools(sessionId: string, executionId: string): TraceLiveTool[] {
+    return liveTools.value.get(liveKey(sessionId, executionId)) ?? []
+  }
+
+  /**
+   * 会话当前进行中的 executionId：崩溃恢复 / 重跑会换 executionId，
+   * 面板据此只取本次执行的临时行，陈旧帧不画进当前 run。
+   * 残留键可能短暂存在（重连终态等路径清脏有先后），Map 按插入顺序迭代，
+   * 取最后一个匹配键 = 最新一次执行，避免面板钉在上一次执行的残留行上。
+   */
+  function getLiveExecutionId(sessionId: string): string | null {
+    const prefix = `${String(sessionId)}|`
+    for (const key of Array.from(liveRounds.value.keys()).reverse()) {
+      if (key.startsWith(prefix)) return key.slice(prefix.length)
+    }
+    for (const key of Array.from(liveTools.value.keys()).reverse()) {
+      if (key.startsWith(prefix)) return key.slice(prefix.length)
+    }
+    return null
+  }
+
+  function setLiveRound(sessionId: string, executionId: string, round: TraceLiveRound | null) {
+    const key = liveKey(sessionId, executionId)
+    if (round == null) liveRounds.value.delete(key)
+    else liveRounds.value.set(key, round)
+    liveRounds.value = new Map(liveRounds.value)
+  }
+
+  /** round_start：进入新轮（仍在模型调用中）；round_end：本轮模型调用结束 */
+  function applyLiveRoundStart(sessionId: string, executionId: string, round: number) {
+    setLiveRound(sessionId, executionId, { round, inModelCall: true })
+  }
+
+  function applyLiveRoundEnd(sessionId: string, executionId: string, round: number) {
+    const current = getLiveRound(sessionId, executionId)
+    if (current != null && current.round === round) {
+      setLiveRound(sessionId, executionId, { round, inModelCall: false })
+    }
+  }
+
+  function applyLiveToolStart(sessionId: string, executionId: string, toolCallId: string, name: string) {
+    if (!toolCallId) return
+    const key = liveKey(sessionId, executionId)
+    const list = [...(liveTools.value.get(key) ?? [])]
+    const existing = list.find(t => t.toolCallId === toolCallId)
+    if (existing) {
+      existing.name = name || existing.name
+    } else {
+      list.push({ toolCallId, name, startedAt: Date.now() })
+    }
+    liveTools.value.set(key, list)
+    liveTools.value = new Map(liveTools.value)
+  }
+
+  function applyLiveToolEnd(sessionId: string, executionId: string, toolCallId: string) {
+    const key = liveKey(sessionId, executionId)
+    const list = liveTools.value.get(key)
+    if (list == null) return
+    const next = list.filter(t => t.toolCallId !== toolCallId)
+    if (next.length === list.length) return
+    if (next.length === 0) liveTools.value.delete(key)
+    else liveTools.value.set(key, next)
+    liveTools.value = new Map(liveTools.value)
+  }
+
+  /** 执行终止（IDLE / COMPLETED / FAILED / CANCELLED）：丢掉临时行，REST 为准 */
+  function clearLiveState(sessionId: string, executionId?: string) {
+    const sid = String(sessionId)
+    if (executionId == null) {
+      for (const key of [...liveRounds.value.keys()]) {
+        if (key.startsWith(`${sid}|`)) liveRounds.value.delete(key)
+      }
+      for (const key of [...liveTools.value.keys()]) {
+        if (key.startsWith(`${sid}|`)) liveTools.value.delete(key)
+      }
+    } else {
+      liveRounds.value.delete(liveKey(sid, executionId))
+      liveTools.value.delete(liveKey(sid, executionId))
+    }
+    liveRounds.value = new Map(liveRounds.value)
+    liveTools.value = new Map(liveTools.value)
+  }
+
+  function reset() {
+    traceRuns.value = new Map()
+    traceHasMore.value = new Map()
+    traceUnattributed.value = new Map()
+    traceLoading.value = new Map()
+    liveRounds.value = new Map()
+    liveTools.value = new Map()
+    traceRecords.value = new Map()
+  }
+
+  return {
+    traceRuns,
+    traceHasMore,
+    traceUnattributed,
+    traceLoading,
+    traceThresholds,
+    getTraceRuns,
+    getTraceHasMore,
+    getTraceUnattributed,
+    isTraceLoading,
+    setTracePage,
+    appendTracePage,
+    setTraceLoading,
+    setTraceThresholds,
+    clearTrace,
+    getTraceRecord,
+    setTraceRecord,
+    clearTraceRecords,
+    getLiveRound,
+    getLiveTools,
+    getLiveExecutionId,
+    applyLiveRoundStart,
+    applyLiveRoundEnd,
+    applyLiveToolStart,
+    applyLiveToolEnd,
+    clearLiveState,
+    reset,
+  }
+}

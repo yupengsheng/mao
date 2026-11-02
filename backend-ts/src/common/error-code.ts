@@ -1,0 +1,87 @@
+export const ErrorCode = {
+  UNAUTHORIZED: { code: 1001, message: '未登录或登录已过期' },
+  FORBIDDEN: { code: 1002, message: '无权限访问' },
+  TOKEN_EXPIRED: { code: 1003, message: 'Token 已过期' },
+  TOKEN_INVALID: { code: 1004, message: 'Token 无效' },
+  LOGIN_FAILED: { code: 1005, message: '用户名或密码错误' },
+  ACCOUNT_DISABLED: { code: 1006, message: '账号已被禁用' },
+  RATE_LIMITED: { code: 1007, message: '请求过于频繁，请稍后重试' },
+
+  PARAM_INVALID: { code: 2001, message: '参数校验失败' },
+  PARAM_MISSING: { code: 2002, message: '缺少必要参数' },
+
+  AGENT_NOT_FOUND: { code: 3001, message: 'Agent 不存在' },
+  SESSION_NOT_FOUND: { code: 3002, message: '会话不存在' },
+  MODEL_NOT_FOUND: { code: 3003, message: '模型配置不存在' },
+  SKILL_NOT_FOUND: { code: 3004, message: 'Skill 不存在' },
+  AGENT_ACCESS_DENIED: { code: 3005, message: '无权访问该 Agent' },
+  MODEL_IS_DEFAULT: { code: 3006, message: '不能删除默认模型，请先修改默认模型' },
+  LLM_CALL_FAILED: { code: 3007, message: 'LLM 调用失败' },
+  LLM_TIMEOUT: { code: 3008, message: 'LLM 调用超时' },
+  AGENT_IS_DEFAULT: { code: 3009, message: '不能删除默认 Agent，请先修改默认 Agent' },
+  SKILL_NAME_DUPLICATE: { code: 3010, message: 'Skill 名称已存在' },
+  COMMAND_NOT_FOUND: { code: 3011, message: '指令不存在' },
+  COMMAND_NAME_DUPLICATE: { code: 3012, message: '指令名称已存在' },
+  COMMAND_NAME_INVALID: { code: 3013, message: '指令名称只能包含字母、数字、中文、下划线和连字符' },
+  USER_NOT_FOUND: { code: 3014, message: '用户不存在' },
+  USERNAME_DUPLICATE: { code: 3015, message: '用户名已存在' },
+  CANNOT_DISABLE_SELF: { code: 3016, message: '不能禁用当前登录用户' },
+  CANNOT_REMOVE_LAST_ADMIN: { code: 3017, message: '不能移除最后一个管理员' },
+  USER_PASSWORD_MANAGED_BY_LDAP: { code: 3018, message: 'LDAP 用户密码由目录服务管理' },
+  PASSWORD_INVALID: { code: 3019, message: '密码格式不符合要求' },
+  COMMAND_SYSTEM_READONLY: { code: 3020, message: '系统预置指令不可编辑或删除' },
+  GIT_CREDENTIAL_NOT_FOUND: { code: 3021, message: 'Git 凭证不存在' },
+  GIT_CREDENTIAL_DOMAIN_DUPLICATE: { code: 3022, message: '该域名的凭证已存在' },
+  AGENT_EXPERIENCE_CONTENT_INVALID: { code: 3023, message: '最佳实践经验内容无效（需 1～300 字）' },
+  AGENT_EXPERIENCE_NOT_FOUND: { code: 3024, message: '最佳实践经验不存在' },
+  AGENT_SUGGESTED_QUESTION_CONTENT_INVALID: { code: 3028, message: '推荐问题内容无效（需 1～100 字）' },
+  AGENT_SUGGESTED_QUESTION_LIMIT_EXCEEDED: { code: 3029, message: '推荐问题最多 5 条' },
+  SCHEDULED_TASK_NOT_FOUND: { code: 3025, message: '定时任务不存在' },
+  SCHEDULED_TASK_ACCESS_DENIED: { code: 3026, message: '无权操作该定时任务' },
+  MESSAGE_ALREADY_COMPACTED: { code: 3027, message: '该消息已进入会话摘要，无法编辑' },
+  MESSAGE_NOT_FOUND: { code: 3030, message: '消息不存在' },
+  MESSAGE_ACCESS_DENIED: { code: 3031, message: '无权操作该消息' },
+  PREFERENCE_CONFLICT: { code: 3032, message: '偏好设置已在其他端被修改，请刷新后重试' },
+  MEMORY_ITEM_NOT_FOUND: { code: 3033, message: '记忆不存在' },
+  MEMORY_CONTENT_INVALID: { code: 3034, message: '记忆内容无效' },
+  MEMORY_CONTENT_DUPLICATE: { code: 3035, message: '已存在相同内容的记忆' },
+  MEMORY_LIMIT_EXCEEDED: { code: 3036, message: '生效中的记忆数量已达上限（200 条），请先清理不需要的记忆' },
+  APPROVAL_RULE_NOT_FOUND: { code: 3037, message: '审批规则不存在' },
+  APPROVAL_RULE_VALUE_INVALID: { code: 3038, message: '审批规则值无效' },
+
+  /** 入站 Webhook 触发器：不存在/停用/验签失败统一 404 + 固定短语（技术方案决策 10，不暴露区分）。 */
+  OPEN_HOOK_NOT_FOUND: { code: 3040, message: 'not found' },
+  /** 分享链接：不存在/撤销/过期/会话已删/属主停用统一此码，响应不可区分。 */
+  SHARE_NOT_FOUND: { code: 3041, message: '链接不存在或已撤销' },
+  /** 会话导出体超过 5MB。HTTP 413，见 handleError。 */
+  EXPORT_TOO_LARGE: { code: 3042, message: '导出内容过大，请改用分享链接' },
+  /** API Token 连续失败自动停用。HTTP 403，见 handleError。 */
+  TOKEN_AUTO_DISABLED: { code: 3043, message: 'Token 已因连续失败被自动停用，请手动重新启用' },
+  /** 用户文件操作碰到 Agent 正在写同一路径（或祖先/子孙）。HTTP 200，message 带冲突路径。 */
+  WORKSPACE_WRITE_CONFLICT: { code: 3044, message: '文件正在被 Agent 写入' },
+  /** 写目标已存在且本次不允许覆盖。HTTP 200。 */
+  WORKSPACE_TARGET_EXISTS: { code: 3045, message: '目标已存在' },
+  /** 点踩反馈已被其他管理员处理（并发 convert/dismiss，CAS 影响行数不符）。HTTP 409。 */
+  FEEDBACK_ALREADY_HANDLED: { code: 3046, message: '该反馈已被处理，请刷新后重试' },
+
+  /** 三级环境变量：不存在 / 同层重名 / 超条数上限 / 保留键（技术方案 §8.1）。 */
+  ENV_VARIABLE_NOT_FOUND: { code: 3047, message: '环境变量不存在' },
+  ENV_VARIABLE_KEY_DUPLICATE: { code: 3048, message: '同名变量已存在' },
+  ENV_VARIABLE_LIMIT_EXCEEDED: { code: 3049, message: '单层最多配置 50 个变量' },
+  ENV_VARIABLE_KEY_RESERVED: { code: 3050, message: '该变量名为平台保留变量，不允许配置' },
+
+  /** 自定义 HTTP 工具：不存在 / 属主不符 / 重名 / 保留字 / 启用数超上限。 */
+  HTTP_TOOL_NOT_FOUND: { code: 3051, message: '自定义工具不存在' },
+  HTTP_TOOL_NAME_DUPLICATE: { code: 3052, message: '同名工具已存在' },
+  HTTP_TOOL_NAME_RESERVED: { code: 3053, message: '工具名与内置工具冲突或含保留前缀' },
+
+  /** 用量预算 BLOCK 超线：message 动态携带 scope/当期消耗/上限（技术方案 §5.7）。 */
+  BUDGET_EXCEEDED: { code: 3041, message: '用量预算已超限' },
+
+  INTERNAL_ERROR: { code: 5001, message: '服务内部错误' },
+  DATABASE_ERROR: { code: 5002, message: '数据库错误' },
+  FILE_UPLOAD_ERROR: { code: 5004, message: '文件上传失败' },
+  GIT_CLONE_FAILED: { code: 5005, message: 'Git 仓库克隆失败' },
+} as const;
+
+export type ErrorCodeDef = { readonly code: number; readonly message: string };

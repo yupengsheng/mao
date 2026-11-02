@@ -1,0 +1,114 @@
+:root {
+  --mao-ink: #1d1d1f;
+  /* muted 需满足小字 AA：白底/画布上 ≥4.5:1（#86868b 仅约 3.5:1，已弃用） */
+  --mao-muted: #6e6e73;
+  --mao-canvas: #f5f5f7;
+  --mao-surface: #ffffff;
+  --mao-border: #e0e0e0;
+  --mao-accent: #0066cc;
+  --mao-accent-bg: rgba(0, 102, 204, 0.08);
+  --mao-accent-ring: rgba(0, 102, 204, 0.28);
+  --mao-danger: #d70015;
+  --mao-danger-bg: rgba(215, 0, 21, 0.08);
+  --mao-warn: #b25000;
+  --mao-success: #1a7f37;
+  /* 文件变更「重命名」标记紫；与成功/告警/危险区分 */
+  --mao-renamed: #6b46c1;
+  /* 关闭按钮等小块 hover 底色（与 desktop --aw-surface-chip 同值） */
+  --mao-chip: #d2d2d7;
+  --el-color-primary: #0066cc;
+  --el-color-primary-light-3: #3385d6;
+  --el-color-primary-light-5: #66a3e0;
+  --el-color-primary-light-7: #99c2eb;
+  --el-color-primary-light-8: #b3d1f0;
+  --el-color-primary-light-9: #e6f0fa;
+  --el-color-primary-dark-2: #0052a3;
+  font-family: system-ui, 'Segoe UI', Roboto, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  color: var(--mao-ink);
+}
+
+body {
+  margin: 0;
+  background: var(--mao-canvas);
+}
+
+.el-button--primary {
+  --el-button-bg-color: var(--mao-accent);
+  --el-button-border-color: var(--mao-accent);
+  --el-button-hover-bg-color: #0071e3;
+  --el-button-hover-border-color: #0071e3;
+}
+
+.el-menu {
+  --el-menu-bg-color: var(--mao-surface);
+  --el-menu-hover-bg-color: var(--mao-canvas);
+  --el-menu-active-color: var(--mao-accent);
+}
+
+.mobile-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.mobile-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.mobile-card-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--mao-ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mobile-card-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 0;
+  line-height: 1.5;
+  font-size: 14px;
+}
+
+.mobile-card-label {
+  width: 52px;
+  flex-shrink: 0;
+  color: var(--mao-muted);
+}
+
+.mobile-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 10px;
+  border-top: 1px solid var(--mao-border);
+  padding-top: 10px;
+}
+
+/* 表单内灰色小字提示：全局统一，组件不再各自 scoped 重复声明或写内联样式 */
+.form-hint {
+  font-size: 12px;
+  color: var(--mao-muted);
+  line-height: 1.6;
+  margin-top: 4px;
+}
+
+/* 跟在控件后面的行内提示（单选组/开关右侧） */
+.form-hint-inline {
+  margin-left: 8px;
+  font-size: 12px;
+  color: var(--mao-muted);
+}

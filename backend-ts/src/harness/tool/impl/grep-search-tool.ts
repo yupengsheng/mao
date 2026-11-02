@@ -1,0 +1,256 @@
+import { spawnSync } from 'node:child_process';
+import { createReadStream } from 'node:fs';
+import { lstat, readdir } from 'node:fs/promises';
+import { createInterface } from 'node:readline';
+import path from 'node:path';
+import { BaseTool } from '../tool.js';
+import { asBool, asInt, asText, parseObject, toJson } from '../json.js';
+import { SearchScope } from '../search-scope.js';
+import type { PathSandbox } from '../../safety/path-sandbox.js';
+import { SecurityException } from '../../safety/path-sandbox.js';
+import { harnessLog } from '../../log.js';
+import { IGNORED_DIRS } from './glob-search-tool.js';
+
+const DEFAULT_MAX_OUTPUT_CHARS = 10000;
+
+export class GrepSearchTool extends BaseTool {
+  private rgAvailable: boolean | null = null;
+
+  constructor(private readonly pathSandbox: PathSandbox) {
+    super();
+  }
+
+  getName(): string { return 'grep_search'; }
+  getDescription(): string {
+    return '按文本或正则表达式搜索文件内容。返回匹配行及其文件路径和行号。';
+  }
+  getInputSchema(): Record<string, unknown> {
+    return {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: '要搜索的文本或正则表达式' },
+        path: { type: 'string', description: '搜索目录或文件，可选；默认使用当前会话的工作区根目录。相对路径按工作区解析，绝对路径可搜索工作区外目录' },
+        glob: { type: 'string', description: '文件过滤 glob，例如 *.java、*.md' },
+        ignore_case: { type: 'boolean', description: '是否忽略大小写，默认 false' },
+        context_lines: { type: 'integer', description: '上下文行数，默认 0' },
+        max_output_chars: { type: 'integer', description: '最多输出字符数，默认 10000' },
+      },
+      required: ['pattern'],
+    };
+  }
+  getOutputSchema(): Record<string, unknown> {
+    return {
+      type: 'object',
+      properties: {
+        matches: { type: 'array' },
+        truncated: { type: 'boolean' },
+        total_matches: { type: 'integer' },
+      },
+    };
+  }
+
+  protected async executeWithWorkspace(argumentsJson: string, workspace: string | null): Promise<string> {
+    try {
+      const args = parseObject(argumentsJson);
+      if (!args) return toJson({ matches: [], error: '无效的JSON参数' });
+      const pattern = asText(args.pattern);
+      if (pattern == null) return toJson({ matches: [], error: '缺少必填参数: pattern' });
+      const glob = asText(args.glob);
+      // 与 edit_file 的 replace_all 同口径：asBool 接受字符串布尔，模型把布尔字段
+      // 输出成 "true" 时不能静默退回大小写敏感（搜索结果为空会让模型误判"不存在"）
+      const ignoreCase = asBool(args.ignore_case, false);
+      const contextLines = args.context_lines != null ? asInt(args.context_lines, 0) : 0;
+      const maxOutputChars = args.max_output_chars != null ? asInt(args.max_output_chars, DEFAULT_MAX_OUTPUT_CHARS) : DEFAULT_MAX_OUTPUT_CHARS;
+      const pathArg = asText(args.path);
+      const resolvedPath = pathArg && pathArg !== ''
+        ? this.pathSandbox.resolveLenient(pathArg, workspace)
+        : this.pathSandbox.getEffectiveWorkspaceRoot(workspace);
+      const workspaceRoot = this.pathSandbox.getEffectiveWorkspaceRoot(workspace);
+      const scope = SearchScope.from(resolvedPath);
+      const result = this.isRgAvailable()
+        ? this.searchWithRg(pattern, scope, workspaceRoot, glob, ignoreCase, contextLines, maxOutputChars)
+        : await this.searchWithJs(pattern, scope, workspaceRoot, glob, ignoreCase, contextLines, maxOutputChars);
+      return toJson({ matches: result.matches, truncated: result.truncated, total_matches: result.totalMatches });
+    } catch (e) {
+      if (e instanceof SecurityException) harnessLog('warn', `GrepSearchTool blocked by sandbox: ${(e as Error).message}`);
+      else harnessLog('error', 'GrepSearchTool execution failed', e);
+      return toJson({ matches: [], error: (e as Error).message });
+    }
+  }
+
+  private searchWithRg(
+    pattern: string, scope: SearchScope, workspaceRoot: string, glob: string | null,
+    ignoreCase: boolean, contextLines: number, maxOutputChars: number,
+  ): { matches: Record<string, unknown>[]; totalMatches: number; truncated: boolean } {
+    // --json 输出为结构化事件（match/context 行各自带 path/line_number/lines），
+    // 规避按冒号切分时路径含 ":" 解析错乱、以及上下文行被误计为匹配行的问题
+    const cmd = ['rg', '--json'];
+    if (ignoreCase) cmd.push('--ignore-case');
+    if (contextLines > 0) cmd.push('--context', String(contextLines));
+    if (glob) cmd.push('--glob', glob);
+    cmd.push(pattern, scope.rgTarget);
+    const spawned = spawnSync(cmd[0], cmd.slice(1), {
+      cwd: scope.cwd, encoding: 'utf8', timeout: 30_000, maxBuffer: 10 * 1024 * 1024,
+    });
+    // rg 退出码语义：0=有匹配，1=无匹配，≥2=出错（非法正则/目标消失）；error 非空=spawn 失败
+    // 或被 timeout/maxBuffer 中途杀死。失败不能吞成「0 命中成功」——与 JS 回退分支
+    // （new RegExp 抛 SyntaxError → error JSON）对齐，否则模型会在错误前提下继续推进。
+    const rgFailed = spawned.error != null || (spawned.status != null && spawned.status >= 2);
+    if (rgFailed && !(spawned.stdout ?? '').trim()) {
+      const detail = String(spawned.stderr ?? spawned.error?.message ?? '').trim().slice(0, 300);
+      const exitInfo = spawned.status != null ? String(spawned.status) : String((spawned.error as NodeJS.ErrnoException | null)?.code ?? 'unknown');
+      throw new Error(`ripgrep 搜索失败（exit ${exitInfo}）：${detail || '无错误输出'}`);
+    }
+    const matches: Record<string, unknown>[] = [];
+    let totalMatches = 0;
+    let charsUsed = 0;
+    // 进程异常终止但已产出部分 stdout（超时/maxBuffer 中途被杀）：结果不完整，必须标记 truncated
+    let truncated = rgFailed;
+    for (const line of (spawned.stdout ?? '').split('\n')) {
+      if (!line || !line.startsWith('{')) continue;
+      let event: { type?: string; data?: { path?: { text?: string }; line_number?: number; lines?: { text?: string } } };
+      try {
+        event = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (event.type !== 'match' && event.type !== 'context') continue;
+      const d = event.data;
+      if (!d?.path?.text || d.line_number == null) continue;
+      // 去掉行文本自带的结尾换行
+      const content = (d.lines?.text ?? '').replace(/\r?\n$/, '');
+      const entry: Record<string, unknown> = {
+        file: scope.outputFilePath(d.path.text, workspaceRoot),
+        line: d.line_number,
+        content,
+      };
+      if (event.type === 'context') entry.contextual = true;
+      const entrySize = JSON.stringify(entry).length + d.path.text.length + content.length;
+      if (charsUsed + entrySize > maxOutputChars) {
+        truncated = true;
+        break;
+      }
+      matches.push(entry);
+      charsUsed += entrySize;
+      if (event.type === 'match') totalMatches++;
+    }
+    return { matches, totalMatches, truncated };
+  }
+
+  private async searchWithJs(
+    pattern: string, scope: SearchScope, workspaceRoot: string, glob: string | null,
+    ignoreCase: boolean, contextLines: number, maxOutputChars: number,
+  ): Promise<{ matches: Record<string, unknown>[]; totalMatches: number; truncated: boolean }> {
+    const flags = ignoreCase ? 'mi' : 'm';
+    const compiled = new RegExp(pattern, flags);
+    const globRe = glob ? globToFileRe(glob) : null;
+    const matches: Record<string, unknown>[] = [];
+    let totalMatches = 0;
+    let charsUsed = 0;
+    let truncated = false;
+    const pushEntry = (entry: Record<string, unknown>): boolean => {
+      const entrySize = JSON.stringify(entry).length;
+      if (charsUsed + entrySize > maxOutputChars) {
+        truncated = true;
+        return false;
+      }
+      matches.push(entry);
+      charsUsed += entrySize;
+      return true;
+    };
+    const files = scope.isSingleFile() && scope.singleFile
+      ? [scope.singleFile]
+      : collectGrepFiles(scope.cwd, globRe, scope.cwd);
+    for await (const file of files) {
+      const relativePath = scope.outputFilePath(file, workspaceRoot);
+      const input = createReadStream(file, { encoding: 'utf8' });
+      const reader = createInterface({ input, crlfDelay: Infinity });
+      const before: { line: number; content: string }[] = [];
+      let lineNumber = 0;
+      let afterUntil = 0;
+      try {
+        for await (const content of reader) {
+          lineNumber++;
+          const matched = compiled.test(content);
+          if (matched) {
+            for (const previous of before) {
+              if (!pushEntry({ file: relativePath, ...previous, contextual: true })) break;
+            }
+            before.length = 0;
+            if (truncated || !pushEntry({ file: relativePath, line: lineNumber, content })) break;
+            totalMatches++;
+            afterUntil = lineNumber + contextLines;
+          } else if (lineNumber <= afterUntil) {
+            if (!pushEntry({ file: relativePath, line: lineNumber, content, contextual: true })) break;
+          } else if (contextLines > 0) {
+            before.push({ line: lineNumber, content });
+            if (before.length > contextLines) before.shift();
+          }
+        }
+      } finally {
+        reader.close();
+        input.destroy();
+      }
+      if (truncated) break;
+    }
+    return { matches, totalMatches, truncated };
+  }
+
+  private isRgAvailable(): boolean {
+    if (this.rgAvailable != null) return this.rgAvailable;
+    try {
+      this.rgAvailable = spawnSync('rg', ['--version'], { timeout: 5000 }).status === 0;
+    } catch {
+      this.rgAvailable = false;
+    }
+    return this.rgAvailable;
+  }
+}
+
+// 把 glob 编译为整路径正则：'*' 不跨目录段，'**' 匹配零层或多层目录段
+// （对齐 rg --glob 的 gitignore 语义：'**/*.md' 也要命中根目录文件；注意块注释里
+// 不能出现该序列，'**/' 含 '*/' 会提前终止注释，故此处用行注释）。
+function globToFileRe(glob: string): RegExp {
+  const segments = glob.split('/');
+  let source = '';
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i];
+    if (segment === '**') {
+      source += i === segments.length - 1 ? '.*' : '(?:[^/]+/)*';
+      continue;
+    }
+    source += segment
+      .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+      .replace(/\*/g, '[^/]*')
+      .replace(/\?/g, '[^/]');
+    if (i < segments.length - 1) source += '/';
+  }
+  return new RegExp(`^${source}$`);
+}
+
+/** 不跟随符号链接：断链会让整次搜索失败，环路会递归爆栈，指向目录外的链接会读出工作区之外的文件。 */
+export async function* collectGrepFiles(dir: string, globRe: RegExp | null, root: string): AsyncGenerator<string> {
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const full = path.join(dir, name);
+    let st;
+    try {
+      st = await lstat(full);
+    } catch {
+      continue;
+    }
+    if (st.isSymbolicLink()) continue;
+    if (st.isDirectory()) {
+      if (IGNORED_DIRS.has(name)) continue;
+      yield* collectGrepFiles(full, globRe, root);
+    } else if (st.isFile()) {
+      const rel = path.relative(root, full).split(path.sep).join('/');
+      if (!globRe || globRe.test(rel) || globRe.test(name)) yield full;
+    }
+  }
+}

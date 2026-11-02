@@ -1,0 +1,530 @@
+import { test, expect } from '@playwright/test'
+
+const ADMIN_USER = 'admin'
+const ADMIN_PASS = 'admin123'
+
+/** Login helper: navigates to login, fills form, submits, waits for analytics homepage */
+async function login(page: import('@playwright/test').Page) {
+  await page.goto('/admin/login')
+  await page.waitForSelector('.login-card', { timeout: 10_000 })
+
+  await page.fill('input[placeholder="用户名"]', ADMIN_USER)
+  await page.fill('input[placeholder="密码"]', ADMIN_PASS)
+  await page.click('button:has-text("登录")')
+
+  // Wait for redirect to analytics homepage
+  await page.waitForURL(/\/admin\/analytics/, { timeout: 10_000 })
+  // Wait for layout to be fully rendered
+  await page.waitForSelector('.layout-container', { timeout: 10_000 })
+}
+
+// ─────────────────────────────────────────────────────────
+// Login Page
+// ─────────────────────────────────────────────────────────
+test.describe('Login Page', () => {
+  test('should render login form', async ({ page }) => {
+    await page.goto('/admin/login')
+    await expect(page.locator('.login-card h2')).toHaveText('Mao 管理后台')
+    await expect(page.locator('input[placeholder="用户名"]')).toBeVisible()
+    await expect(page.locator('input[placeholder="密码"]')).toBeVisible()
+    await expect(page.locator('button:has-text("登录")')).toBeVisible()
+  })
+
+  test('should login successfully and redirect to analytics homepage', async ({ page }) => {
+    await login(page)
+    // Should show user info in header
+    await expect(page.locator('.username')).toBeVisible()
+    // Sidebar should have active menu
+    await expect(page.locator('.sidebar-menu .is-active')).toContainText('用量分析')
+  })
+
+  test('should show error with wrong credentials', async ({ page }) => {
+    await page.goto('/admin/login')
+    await page.fill('input[placeholder="用户名"]', 'admin')
+    await page.fill('input[placeholder="密码"]', 'wrongpass')
+    await page.click('button:has-text("登录")')
+    // Element Plus error message appears
+    await expect(page.locator('.el-message--error').first()).toBeVisible({ timeout: 10_000 })
+  })
+
+  test('should not submit with empty fields', async ({ page }) => {
+    await page.goto('/admin/login')
+    await page.click('button:has-text("登录")')
+    // Should still be on login page, no redirect
+    await expect(page).toHaveURL(/\/login/)
+  })
+})
+
+// ─────────────────────────────────────────────────────────
+// Analytics Homepage
+// ─────────────────────────────────────────────────────────
+test.describe('Analytics Homepage', () => {
+  test.beforeEach(async ({ page }) => {
+    await login(page)
+  })
+
+  test('should show period control and overview metrics', async ({ page }) => {
+    await expect(page.locator('.layout-header .page-title')).toHaveText('用量分析')
+    await expect(page.getByText('统计周期', { exact: true })).toBeVisible()
+    await expect(page.locator('.page-toolbar .period-text')).toBeVisible({ timeout: 10_000 })
+    const metrics = page.locator('.metric-strip .metric')
+    await expect(metrics.first()).toBeVisible({ timeout: 10_000 })
+    // 0.0.243 起总览新增「成本」指标卡（口径 llm_call 成本快照，单位与模型价格一致）
+    // 0.0.292 起再新增「缓存命中率」指标卡（llm_call 命中 / 入 Token，环比按百分点）
+    await expect(metrics).toHaveCount(6)
+    await expect(page.locator('.metric.primary .label')).toHaveText('Token 消耗')
+    await expect(page.locator('.metric', { hasText: '成本' })).toBeVisible()
+    await expect(page.locator('.metric', { hasText: '缓存命中率' })).toBeVisible()
+  })
+
+  test('should show auto-refresh control default off', async ({ page }) => {
+    await expect(page.locator('text=自动刷新')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.auto-refresh-select')).toBeVisible()
+    await expect(page.locator('.auto-refresh-select')).not.toHaveClass(/is-on/)
+  })
+
+  test('should show overview live sections and insights', async ({ page }) => {
+    await expect(page.locator('.live-block-label').filter({ hasText: '实时快照' })).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.live-block-label').filter({ hasText: '窗口结果' })).toBeVisible()
+    await expect(page.locator('.compose-title')).toContainText('窗口构成')
+    await expect(page.locator('.el-card__header').filter({ hasText: '窗口洞察' })).toBeVisible()
+  })
+
+  test('should open trends tab charts', async ({ page }) => {
+    await page.locator('.el-tabs__item:has-text("趋势")').click()
+    const titles = page.locator('.trends-tab .chart-title')
+    await expect(titles.filter({ hasText: '流量' })).toBeVisible({ timeout: 10_000 })
+    await expect(titles.filter({ hasText: 'Token' })).toBeVisible()
+    await expect(titles.filter({ hasText: '调用' })).toBeVisible()
+    await expect(titles.filter({ hasText: '质量' })).toBeVisible()
+    const grain = page.locator('.trends-tab .grain-bar')
+    await expect(grain).toBeVisible()
+    await expect(grain.locator('.el-segmented__item.is-selected')).toHaveText('小时')
+    await grain.locator('.el-segmented__item', { hasText: '天' }).click()
+    await expect(page).toHaveURL(/grain=day/)
+    await expect(grain.locator('.el-segmented__item.is-selected')).toHaveText('天')
+  })
+
+  // 统计周期选择器：弹层预设（日历周期 / 滚动窗口）+ 自定义区间内联日期条
+  test('should switch calendar period from the picker panel', async ({ page }) => {
+    const periodText = page.locator('.page-toolbar .period-text')
+    await expect(periodText).toBeVisible({ timeout: 10_000 })
+
+    await page.locator('.period-trigger').click()
+    const panel = page.locator('.period-picker-popper')
+    await expect(panel).toBeVisible()
+    await expect(panel.locator('.period-group-title')).toHaveText(['日历周期', '最近'])
+    await expect(panel.locator('.period-chip')).toHaveCount(10)
+
+    // 本周：触发器文案、URL 与工具栏摘要一起换
+    await panel.locator('.period-chip', { hasText: '本周' }).click()
+    await expect(panel).toBeHidden()
+    await expect(page).toHaveURL(/period=week/)
+    await expect(page.locator('.period-trigger-label')).toHaveText('本周')
+    await expect(periodText).toContainText('本周')
+
+    // 上周 / 本月 / 上月同样走 URL 语义周期
+    for (const [label, value] of [
+      ['上周', 'lastWeek'],
+      ['本月', 'month'],
+      ['上月', 'lastMonth']
+    ] as const) {
+      await page.locator('.period-trigger').click()
+      await panel.locator('.period-chip', { hasText: label }).click()
+      await expect(page).toHaveURL(new RegExp(`period=${value}`))
+      await expect(page.locator('.period-trigger-label')).toHaveText(label)
+    }
+  })
+
+  test('should apply a custom date range inline', async ({ page }) => {
+    await expect(page.locator('.page-toolbar .period-text')).toBeVisible({ timeout: 10_000 })
+
+    await page.locator('.period-trigger').click()
+    await page.locator('.period-picker-popper .period-custom-entry').click()
+
+    // 自定义周期：内联两个日期选择器 + URL 带起止日
+    await expect(page).toHaveURL(/period=custom/)
+    await expect(page).toHaveURL(/start=\d{4}-\d{2}-\d{2}/)
+    await expect(page).toHaveURL(/end=\d{4}-\d{2}-\d{2}/)
+    await expect(page.locator('.period-trigger-label')).toHaveText('自定义')
+    const pickers = page.locator('.toolbar-actions .period-date')
+    await expect(pickers).toHaveCount(2)
+
+    // 改起点：面板里最早的可选日期（必不是当前选中的起点），URL 的 start 跟着变
+    const startBefore = new URL(page.url()).searchParams.get('start')!
+    await pickers.nth(0).click()
+    await page.locator('.el-picker-panel td.available:not(.selected)').first().click()
+    await expect(page).not.toHaveURL(new RegExp(`start=${startBefore}`))
+    await expect(page).toHaveURL(/period=custom/)
+  })
+
+  test('should restore period from the URL', async ({ page }) => {
+    // 分享链接：语义周期与自定义区间都能还原（自定义区间按今天推算，避免硬编码日期过期）
+    const pad = (n: number) => String(n).padStart(2, '0')
+    const ymd = (offset: number) => {
+      const d = new Date()
+      d.setDate(d.getDate() + offset)
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+    }
+    const customStart = ymd(-40)
+    const customEnd = ymd(-20)
+
+    await page.goto('/admin/analytics?period=lastWeek')
+    await expect(page.locator('.period-trigger-label')).toHaveText('上周')
+    await expect(page.locator('.page-toolbar .period-text')).toContainText('上周')
+
+    await page.goto(`/admin/analytics?period=custom&start=${customStart}&end=${customEnd}`)
+    await expect(page.locator('.period-trigger-label')).toHaveText('自定义')
+    const pickers = page.locator('.toolbar-actions .period-date')
+    await expect(pickers).toHaveCount(2)
+    await expect(pickers.nth(0).locator('input')).toHaveValue(customStart)
+    await expect(pickers.nth(1).locator('input')).toHaveValue(customEnd)
+    await expect(page.locator('.page-toolbar .period-text')).toContainText(`${customStart} ~ ${customEnd}`)
+
+    // 旧链接 days=7 仍按滚动窗口还原
+    await page.goto('/admin/analytics?days=7')
+    await expect(page.locator('.period-trigger-label')).toHaveText('近 7 天')
+  })
+})
+
+// ─────────────────────────────────────────────────────────
+// Agent Management
+// ─────────────────────────────────────────────────────────
+test.describe('Agent Management', () => {
+  test.beforeEach(async ({ page }) => {
+    await login(page)
+    await page.click('.sidebar-menu .el-menu-item:has-text("Agent 管理")')
+    await page.waitForSelector('.agent-list', { timeout: 10_000 })
+  })
+
+  test('should display agent list page', async ({ page }) => {
+    await expect(page.locator('.card-header span').first()).toContainText('Agent 列表')
+    await expect(page.locator('button:has-text("创建 Agent")')).toBeVisible()
+  })
+
+  test('should show search input and table', async ({ page }) => {
+    await expect(page.locator('input[placeholder="Agent 名称"]')).toBeVisible()
+    const table = page.locator('.el-table')
+    await expect(table).toBeVisible()
+    // Table should have column headers
+    await expect(table.locator('thead th')).toContainText(['ID', '名称', '描述', '创建人', 'Skills', '经验数', '创建时间', '操作'])
+  })
+
+  test('should show agent data rows', async ({ page }) => {
+    // Wait for data to load
+    await page.waitForSelector('.el-table__body tr', { timeout: 15_000 })
+    const rows = page.locator('.el-table__body tr')
+    const count = await rows.count()
+    expect(count).toBeGreaterThanOrEqual(1)
+  })
+
+  test('should open create dialog on button click', async ({ page }) => {
+    await page.click('button:has-text("创建 Agent")')
+    await expect(page.locator('.el-dialog')).toBeVisible()
+    await expect(page.locator('.el-dialog__header')).toContainText('创建 Agent')
+    // Dialog should have name field
+    await expect(page.locator('.el-dialog input[placeholder="请输入 Agent 名称"]')).toBeVisible()
+    // Close dialog
+    await page.click('.el-dialog button:has-text("取消")')
+    await expect(page.locator('.el-dialog')).not.toBeVisible()
+  })
+})
+
+// ─────────────────────────────────────────────────────────
+// Model Management
+// ─────────────────────────────────────────────────────────
+test.describe('Model Management', () => {
+  test.beforeEach(async ({ page }) => {
+    await login(page)
+    await page.click('.sidebar-menu .el-menu-item:has-text("模型管理")')
+    await page.waitForSelector('.model-list', { timeout: 10_000 })
+  })
+
+  test('should display model list page', async ({ page }) => {
+    await expect(page.locator('.card-header span').first()).toContainText('模型配置')
+    await expect(page.locator('button:has-text("添加模型")')).toBeVisible()
+  })
+
+  test('should show model table with data', async ({ page }) => {
+    const table = page.locator('.el-table')
+    await expect(table).toBeVisible()
+    await expect(table.locator('thead th')).toContainText(['ID', '名称', '供应商', '模型标识', 'API 地址', '上下文窗口', '操作'])
+    await expect(page.locator('.el-table__inner-wrapper')).toBeVisible({ timeout: 15_000 })
+  })
+
+  test('should show model search filters', async ({ page }) => {
+    const searchForm = page.locator('.model-list .search-form')
+    await expect(page.locator('input[placeholder="名称 / 模型标识 / 供应商"]')).toBeVisible()
+    await expect(searchForm).toContainText('关键词')
+    await expect(searchForm).toContainText('供应商')
+    await expect(searchForm).toContainText('状态')
+    await expect(searchForm).toContainText('视觉')
+    await expect(searchForm).toContainText('默认')
+    await expect(page.locator('button:has-text("查询")')).toBeVisible()
+    await expect(page.getByRole('button', { name: '重置', exact: true })).toBeVisible()
+  })
+
+  test('should open add model dialog', async ({ page }) => {
+    await page.click('button:has-text("添加模型")')
+    await expect(page.locator('.el-dialog')).toBeVisible()
+    await expect(page.locator('.el-dialog__header')).toContainText('添加模型')
+    await page.click('.el-dialog button:has-text("取消")')
+  })
+})
+
+// ─────────────────────────────────────────────────────────
+// User Management
+// ─────────────────────────────────────────────────────────
+test.describe('User Management', () => {
+  test.beforeEach(async ({ page }) => {
+    await login(page)
+    await page.click('.sidebar-menu .el-menu-item:has-text("用户管理")')
+    await page.waitForSelector('.user-list', { timeout: 10_000 })
+  })
+
+  test('should display user list page', async ({ page }) => {
+    await expect(page.locator('.card-header span').first()).toContainText('用户管理')
+    await expect(page.locator('button:has-text("新建用户")')).toBeVisible()
+  })
+
+  test('should show user table with data', async ({ page }) => {
+    await page.waitForSelector('.el-table__body tr', { timeout: 15_000 })
+    const rows = page.locator('.el-table__body tr')
+    const count = await rows.count()
+    expect(count).toBeGreaterThanOrEqual(1)
+  })
+
+  test('should show search filters', async ({ page }) => {
+    await expect(page.locator('input[placeholder="用户名 / 显示名 / 邮箱"]')).toBeVisible()
+    await expect(page.locator('button:has-text("查询")')).toBeVisible()
+    await expect(page.getByRole('button', { name: '重置', exact: true })).toBeVisible()
+  })
+
+  test('should open create user dialog', async ({ page }) => {
+    await page.click('button:has-text("新建用户")')
+    await expect(page.locator('.el-dialog')).toBeVisible()
+    await expect(page.locator('.el-dialog__header')).toContainText('新建用户')
+    await page.click('.el-dialog button:has-text("取消")')
+  })
+})
+
+// ─────────────────────────────────────────────────────────
+// Skills Management
+// ─────────────────────────────────────────────────────────
+test.describe('Skills Management', () => {
+  test.beforeEach(async ({ page }) => {
+    await login(page)
+    await page.click('.sidebar-menu .el-menu-item:has-text("Skills 管理")')
+    await page.waitForSelector('.skill-list', { timeout: 10_000 })
+  })
+
+  test('should display skills page with upload zone', async ({ page }) => {
+    await expect(page.locator('.card-header span').first()).toContainText('Skills 管理')
+    // Upload zone should be visible
+    await expect(page.locator('.upload-zone')).toBeVisible()
+    await expect(page.locator('.upload-text')).toContainText(/拖动或点击上传/)
+  })
+
+  test('should show skill table', async ({ page }) => {
+    const table = page.locator('.el-table')
+    await expect(table).toBeVisible()
+    await expect(table.locator('thead th')).toContainText(['名称', '描述', '路径', '操作'])
+  })
+
+  test('should switch between system and personal skill tabs', async ({ page }) => {
+    await expect(page.locator('.skill-tabs .el-tabs__item')).toContainText(['系统 Skills', '个人 Skills'])
+    await page.click('.skill-tabs .el-tabs__item:has-text("个人 Skills")')
+    await expect(page.locator('.el-tabs__item.is-active')).toContainText('个人 Skills')
+    await expect(page.getByText('目标用户')).toBeVisible()
+    await expect(page.locator('.search-form').getByText('用户', { exact: true })).toBeVisible()
+    // el-select 占位符渲染为 .el-select__placeholder 文本节点而非 input placeholder
+    await expect(page.locator('.search-form .el-select__placeholder', { hasText: '全部用户' })).toBeVisible()
+    await expect(page.locator('.upload-text')).toContainText('拖动或点击上传到所选用户')
+    await expect(page.locator('.el-table thead th')).toContainText(['用户', '名称', '描述'])
+    await page.click('.skill-tabs .el-tabs__item:has-text("系统 Skills")')
+    await expect(page.locator('.upload-text')).toContainText('拖动或点击上传 Skills 目录')
+    await expect(page.locator('.search-form').getByText('用户', { exact: true })).toHaveCount(0)
+  })
+})
+
+// ─────────────────────────────────────────────────────────
+// Session Management
+// ─────────────────────────────────────────────────────────
+test.describe('Session Management', () => {
+  test.beforeEach(async ({ page }) => {
+    await login(page)
+    await page.click('.sidebar-menu .el-menu-item:has-text("会话管理")')
+    await page.waitForSelector('.session-list', { timeout: 10_000 })
+  })
+
+  test('should display session list page', async ({ page }) => {
+    await expect(page.locator('.card-header span').first()).toContainText('会话管理')
+  })
+
+  test('should show session table with data', async ({ page }) => {
+    await page.waitForSelector('.el-table__body tr', { timeout: 15_000 })
+    const rows = page.locator('.el-table__body tr')
+    const count = await rows.count()
+    expect(count).toBeGreaterThanOrEqual(1)
+    // Should have session columns
+    const headerTexts = await page.locator('.el-table thead th').allTextContents()
+    expect(headerTexts.join(' ')).toMatch(/ID|标题|用户|Agent|执行模式|任务阶段/)
+  })
+
+  test('should have filter form elements', async ({ page }) => {
+    await expect(page.locator('input[placeholder="标题/摘要/对话消息"]')).toBeVisible()
+    // 默认只搜对话双方消息，工具输出不再刷屏；需要反查工具输出时切「全部消息」
+    await expect(page.locator('.search-form')).toContainText('搜索范围')
+    await expect(page.locator('.search-form')).toContainText('仅对话消息')
+    await expect(page.locator('button:has-text("查询")')).toBeVisible()
+    await expect(page.getByRole('button', { name: '重置', exact: true })).toBeVisible()
+  })
+
+  test('should navigate to session detail on click', async ({ page }) => {
+    // Wait for data
+    await page.waitForSelector('.el-table__body tr', { timeout: 15_000 })
+    // Check if there's a "查看" button
+    const viewBtn = page.locator('.el-table__body tr:first-child button:has-text("查看")')
+    if (await viewBtn.isVisible()) {
+      await viewBtn.click()
+      // Should navigate to detail page
+      await page.waitForURL(/\/admin\/sessions\/\d+/, { timeout: 10_000 })
+      await expect(page.locator('.session-detail')).toBeVisible()
+      // Should show session info
+      await expect(page.locator('.info-card')).toBeVisible({ timeout: 10_000 })
+    }
+  })
+})
+
+// ─────────────────────────────────────────────────────────
+// Sidebar Navigation
+// ─────────────────────────────────────────────────────────
+test.describe('Sidebar Navigation', () => {
+  test.beforeEach(async ({ page }) => {
+    await login(page)
+  })
+
+  test('should show grouped sidebar sections', async ({ page }) => {
+    await expect(page.locator('.el-menu-item-group__title')).toContainText(['能力', '运行', '安全', '系统'])
+  })
+
+  test('should place feishu bot above skills and commands below', async ({ page }) => {
+    const labels = (await page.locator('.sidebar-menu .el-menu-item').allTextContents())
+      .map(text => text.replace(/\s+/g, ' ').trim())
+    const skillIdx = labels.findIndex(text => text.includes('Skills 管理'))
+    const feishuIdx = labels.findIndex(text => text.includes('飞书机器人'))
+    const dingtalkIdx = labels.findIndex(text => text.includes('钉钉机器人'))
+    const commandIdx = labels.findIndex(text => text.includes('指令管理'))
+    expect(skillIdx).toBeGreaterThanOrEqual(0)
+    expect(feishuIdx).toBe(skillIdx - 2)
+    expect(dingtalkIdx).toBe(skillIdx - 1)
+    expect(commandIdx).toBe(skillIdx + 1)
+  })
+
+  test('should navigate between all pages via sidebar', async ({ page }) => {
+    const navItems = [
+      { label: '用量分析', url: /\/analytics$/ },
+      { label: 'Agent 管理', url: /\/agents$/ },
+      { label: '模型管理', url: /\/models$/ },
+      { label: '飞书机器人', url: /\/feishu-bots$/ },
+      { label: 'Skills 管理', url: /\/skills$/ },
+      { label: '指令管理', url: /\/system-commands$/ },
+      { label: '会话管理', url: /\/sessions$/ },
+      { label: '调用流水', url: /\/llm-calls$/ },
+      { label: '用户管理', url: /\/users$/ },
+      { label: '角色权限', url: /\/roles$/ },
+      { label: '审计日志', url: /\/audit-logs$/ },
+      { label: '系统设置', url: /\/settings$/ },
+    ]
+
+    for (const item of navItems) {
+      await page.click(`.sidebar-menu .el-menu-item:has-text("${item.label}")`)
+      // Wait for route change
+      await page.waitForURL(item.url, { timeout: 10_000 })
+      // The active menu item indicator should be visible
+      await expect(page.locator('.sidebar-menu .is-active')).toContainText(item.label)
+    }
+  })
+})
+
+// ─────────────────────────────────────────────────────────
+// Governance Console
+// ─────────────────────────────────────────────────────────
+test.describe('Governance Console', () => {
+  test.beforeEach(async ({ page }) => {
+    await login(page)
+  })
+
+  test('should render role permission page', async ({ page }) => {
+    await page.click('.sidebar-menu .el-menu-item:has-text("角色权限")')
+    await page.waitForURL(/\/roles$/)
+    await expect(page.locator('text=角色列表')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('text=权限分配')).toBeVisible()
+  })
+
+  test('should render audit log page with filters', async ({ page }) => {
+    await page.click('.sidebar-menu .el-menu-item:has-text("审计日志")')
+    await page.waitForURL(/\/audit-logs$/)
+    await expect(page.locator('.audit-log')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('button:has-text("查询")')).toBeVisible()
+  })
+
+  test('should render analytics homepage and settings pages', async ({ page }) => {
+    await expect(page.getByText('统计周期', { exact: true })).toBeVisible({ timeout: 10_000 })
+
+    await page.click('.sidebar-menu .el-menu-item:has-text("系统设置")')
+    await page.waitForURL(/\/settings$/)
+    await expect(page.locator('.system-settings')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.group-card').first()).toBeVisible()
+  })
+})
+
+// ─────────────────────────────────────────────────────────
+// Tab Bar
+// ─────────────────────────────────────────────────────────
+test.describe('Tab Bar', () => {
+  test.beforeEach(async ({ page }) => {
+    await login(page)
+  })
+
+  test('should show tabs when navigating between pages', async ({ page }) => {
+    // Open a few pages
+    await page.click('.sidebar-menu .el-menu-item:has-text("Agent 管理")')
+    await page.waitForURL(/\/agents$/)
+    await page.click('.sidebar-menu .el-menu-item:has-text("模型管理")')
+    await page.waitForURL(/\/models$/)
+
+    // Tab bar should have multiple tabs
+    const tabs = page.locator('.tab-item')
+    const count = await tabs.count()
+    expect(count).toBeGreaterThanOrEqual(2)
+  })
+
+  test('should switch pages by clicking tabs', async ({ page }) => {
+    await page.click('.sidebar-menu .el-menu-item:has-text("Agent 管理")')
+    await page.waitForURL(/\/agents$/)
+
+    // Click analytics homepage tab to go back
+    await page.locator('.tab-item:has-text("用量分析")').click()
+    await page.waitForURL(/\/analytics$/)
+  })
+})
+
+// ─────────────────────────────────────────────────────────
+// Logout
+// ─────────────────────────────────────────────────────────
+test.describe('Logout', () => {
+  test('should logout and redirect to login page', async ({ page }) => {
+    await login(page)
+
+    // Click user dropdown
+    await page.click('.user-info')
+    // Click logout
+    await page.locator('.el-dropdown-menu__item:has-text("退出登录")').click()
+    // Confirm logout in ElMessageBox
+    await page.getByRole('button', { name: '退出', exact: true }).click()
+    // Should redirect to login
+    await page.waitForURL(/\/login/, { timeout: 10_000 })
+    await expect(page.locator('.login-card')).toBeVisible()
+  })
+})

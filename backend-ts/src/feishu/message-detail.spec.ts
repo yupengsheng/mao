@@ -1,0 +1,155 @@
+import { describe, expect, it, vi } from 'vitest';
+import { fetchFeishuMessageDetail } from './message-detail.js';
+import type * as Lark from '@larksuiteoapi/node-sdk';
+
+function makeClient(items: unknown[]): Lark.Client {
+  return { request: vi.fn(async () => ({ code: 0, data: { items } })) } as never;
+}
+
+async function fetchDetail(message: Record<string, unknown>) {
+  return fetchFeishuMessageDetail(makeClient([{ message_id: 'om_card', ...message }]), 'om_card');
+}
+
+describe('fetchFeishuMessageDetail 卡片文本提取', () => {
+  it('requests original card JSON to avoid Feishu client-upgrade fallback text', async () => {
+    const client = makeClient([{ message_id: 'om_card', msg_type: 'interactive', body: { content: JSON.stringify({ elements: [{ tag: 'markdown', content: '真实卡片内容' }] }) } }]);
+    await fetchFeishuMessageDetail(client, 'om_card');
+    expect((client.request as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(expect.objectContaining({
+      params: { card_msg_content_type: 'user_card_content' },
+    }));
+  });
+
+  it('extracts text from schema 2.0 card (header.title + body.elements markdown)', async () => {
+    const card = {
+      schema: '2.0',
+      config: { update_multi: true },
+      header: { template: 'blue', title: { tag: 'plain_text', content: 'Mao Agent' } },
+      body: {
+        direction: 'vertical',
+        elements: [
+          { tag: 'markdown', content: '**状态：处理完成** · 第 2 轮' },
+          { tag: 'markdown', content: '任务已完成，文件保存在 /tmp/a.zip' },
+          { tag: 'img', img_key: 'img_v3_x' },
+        ],
+      },
+    };
+    const detail = await fetchDetail({ msg_type: 'interactive', body: { content: JSON.stringify(card) } });
+    expect(detail?.msgType).toBe('interactive');
+    expect(detail?.text).toContain('Mao Agent');
+    expect(detail?.text).toContain('状态：处理完成');
+    expect(detail?.text).toContain('文件保存在 /tmp/a.zip');
+  });
+
+  it('extracts text from classic card (div/lark_md, markdown, note)', async () => {
+    const card = {
+      config: { wide_screen_mode: true },
+      header: { title: { tag: 'plain_text', content: '告警通知' } },
+      elements: [
+        { tag: 'div', text: { tag: 'lark_md', content: '服务 [api-gateway](https://example.com) 出现 5xx' } },
+        { tag: 'markdown', content: '请及时处理' },
+        { tag: 'hr' },
+        { tag: 'note', elements: [{ tag: 'plain_text', content: '来自监控平台' }] },
+      ],
+    };
+    const detail = await fetchDetail({ msg_type: 'interactive', body: { content: JSON.stringify(card) } });
+    expect(detail?.text).toContain('告警通知');
+    expect(detail?.text).toContain('服务 apigateway 出现 5xx');
+    expect(detail?.text).toContain('请及时处理');
+    expect(detail?.text).toContain('来自监控平台');
+  });
+
+  it('keeps post at placeholders so mention names can be restored', async () => {
+    const post = {
+      content: [[
+        { tag: 'at', user_id: '@_user_1', user_name: '李四' },
+        { tag: 'text', text: ' 大家好' },
+      ]],
+    };
+    const detail = await fetchDetail({ msg_type: 'post', body: { content: JSON.stringify(post) } });
+    expect(detail?.text).toBe('@李四 大家好');
+  });
+
+  it('extracts post rich text with image placeholders instead of dropping media', async () => {
+    const post = {
+      title: '',
+      content: [
+        [{ tag: 'text', text: '这个图片的内容是什么?' }, { tag: 'img', image_key: 'img_v3_abc' }],
+      ],
+    };
+    const detail = await fetchDetail({ msg_type: 'post', body: { content: JSON.stringify(post) } });
+    expect(detail?.text).toBe('这个图片的内容是什么? [图片]');
+  });
+
+  it('surfaces the first embedded post image key as an image so lazy download can fetch it', async () => {
+    const post = {
+      title: '',
+      content: [
+        [{ tag: 'text', text: '这个图片的内容是什么?' }, { tag: 'img', image_key: 'img_v3_abc' }],
+        [{ tag: 'img', image_key: 'img_v3_second' }],
+      ],
+    };
+    const detail = await fetchDetail({ msg_type: 'post', body: { content: JSON.stringify(post) } });
+    expect(detail?.msgType).toBe('image');
+    expect(detail?.fileKey).toBe('img_v3_abc');
+    expect(detail?.text).toContain('这个图片的内容是什么?');
+    expect(detail?.text?.match(/\[图片\]/g)).toHaveLength(2);
+  });
+
+  it('keeps a post without images as post', async () => {
+    const post = { title: '', content: [[{ tag: 'text', text: '纯文字' }]] };
+    const detail = await fetchDetail({ msg_type: 'post', body: { content: JSON.stringify(post) } });
+    expect(detail?.msgType).toBe('post');
+    expect(detail?.fileKey).toBeNull();
+  });
+
+  it('falls back to placeholder when card has no text elements', async () => {
+    const card = { elements: [{ tag: 'img', img_key: 'img_v3_x' }, { tag: 'hr' }] };
+    const detail = await fetchDetail({ msg_type: 'interactive', body: { content: JSON.stringify(card) } });
+    expect(detail?.text).toBe('[卡片消息]');
+  });
+
+  it('ignores Feishu card upgrade-fallback text and falls back to placeholder', async () => {
+    const detail = await fetchDetail({
+      msg_type: 'interactive',
+      body: { content: JSON.stringify({ text: '请升级至最新版本客户端，以查看内容' }) },
+    });
+    expect(detail?.text).toBe('[卡片消息]');
+  });
+
+  it('reads image_key only from items[0] when later items exist', async () => {
+    const detail = await fetchFeishuMessageDetail(makeClient([
+      { message_id: 'om_img', msg_type: 'image', body: { content: JSON.stringify({ image_key: 'img_first' }) } },
+      { message_id: 'om_child', msg_type: 'image', body: { content: JSON.stringify({ image_key: 'img_child' }) } },
+    ]), 'om_img');
+    expect(detail?.messageId).toBe('om_img');
+    expect(detail?.fileKey).toBe('img_first');
+    expect(detail?.text).toBe('[图片 msg=om_img]');
+  });
+
+  it('extracts sticker placeholder with message id and file_key', async () => {
+    const detail = await fetchDetail({ msg_type: 'sticker', body: { content: JSON.stringify({ file_key: 'v3_0013m_abc' }) } });
+    expect(detail?.msgType).toBe('sticker');
+    expect(detail?.text).toBe('[表情包 msg=om_card]');
+    expect(detail?.fileKey).toBe('v3_0013m_abc');
+  });
+
+  it('surfaces the Feishu business code instead of a bare HTTP 400', async () => {
+    const client = {
+      request: vi.fn(async () => {
+        throw Object.assign(new Error('Request failed with status code 400'), {
+          response: { status: 400, data: { code: 230002, msg: 'Bot/User can NOT be out of the chat.' } },
+        });
+      }),
+    } as unknown as Lark.Client;
+    await expect(fetchFeishuMessageDetail(client, 'om_child')).rejects.toThrow(
+      '获取飞书消息失败: om_child (code=230002 msg=Bot/User can NOT be out of the chat.)',
+    );
+  });
+
+  it('keeps the original error when no Feishu business code is present', async () => {
+    const client = {
+      request: vi.fn(async () => { throw new Error('socket hang up'); }),
+    } as unknown as Lark.Client;
+    await expect(fetchFeishuMessageDetail(client, 'om_child')).rejects.toThrow('socket hang up');
+  });
+});

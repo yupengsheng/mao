@@ -1,0 +1,678 @@
+import { mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync } from 'node:fs';
+import { join, relative, dirname } from 'node:path';
+import { describe, expect, it } from 'vitest';
+import sharp from 'sharp';
+import { useTmpDir } from '../../../testing/tmp-dir.js';
+import { PathSandbox } from '../../safety/path-sandbox.js';
+import { ReadFileTool } from './read-file-tool.js';
+import { WriteFileTool } from './write-file-tool.js';
+import { EditFileTool } from './edit-file-tool.js';
+import { GlobSearchTool } from './glob-search-tool.js';
+import { GrepSearchTool } from './grep-search-tool.js';
+import { normalizeToolResult } from '../../tool/tool-result.js';
+import { PRIVATE_DIFF_FIELD } from '../file-change-diff-util.js';
+
+function tmp(): string {
+  return useTmpDir('mao-file-tools-');
+}
+
+describe('ReadFileTool', () => {
+  it('readsWholeFileAndSupportsAliasPathFields', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'a.txt'), 'one\ntwo\nthree');
+    const tool = new ReadFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ file_path: 'a.txt' })));
+    expect(result.content).toBe('one\ntwo\nthree');
+    expect(result.total_lines).toBe(3);
+  });
+
+  it('readsOffsetAndLimitWindow', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'a.txt'), 'one\ntwo\nthree\nfour');
+    const tool = new ReadFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ path: 'a.txt', offset: 1, limit: 2 })));
+    expect(result.content).toBe('two\nthree');
+    expect(result.total_lines).toBe(4);
+  });
+
+  // 回归：读取侧曾不剥 BOM，模型把首行 \uFEFF 复制进 edit_file 的 old_string 必然匹配失败。
+  // 写回侧（write/edit）都以 stripBom 后的文本匹配，读取侧必须同口径。
+  it('strips the BOM so read and edit agree on the first line', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'bom.txt'), '\uFEFFalpha\nbeta\ngamma\n');
+    const readTool = new ReadFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await readTool.execute(JSON.stringify({ path: 'bom.txt' })));
+    expect(result.content).toBe('alpha\nbeta\ngamma');
+    // read→edit 往返：以读到的首行作 old_string 必须命中（修复前报「文件中未找到 old_string」）
+    const editTool = new EditFileTool(new PathSandbox(dir));
+    const edited = JSON.parse(await editTool.execute(JSON.stringify({
+      path: 'bom.txt', old_string: 'alpha', new_string: 'ALPHA',
+    })));
+    expect(edited.success).toBe(true);
+    // 写回仍保留原 BOM 与 CRLF（detectEol 在原文上取，不受读取侧影响）
+    expect(readFileSync(join(dir, 'bom.txt'), 'utf8')).toBe('\uFEFFALPHA\nbeta\ngamma\n');
+  });
+
+  it('keeps a BOM-only first line from shifting the line count', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'bom-only.txt'), '\uFEFF');
+    const tool = new ReadFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ path: 'bom-only.txt' })));
+    // 剥掉 BOM 后是空串，与空文件同口径（splitLines('') → []）
+    expect(result.total_lines).toBe(0);
+    expect(result.content).toBe('');
+  });
+
+  // 回归：负 limit 曾被 Math.max(0, ...) 静默钳成 0 行窗口，返回空 content 且不带 error 键，
+  // normalizeToolResult 判 success，模型据此误判「文件为空」并用 write_file 整体覆写清空它。
+  it('rejects a negative limit instead of silently returning an empty window', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'big.txt'), Array.from({ length: 100 }, (_, i) => `line-${i}`).join('\n'));
+    const tool = new ReadFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ path: 'big.txt', limit: -5 })));
+    expect(result.error).toContain('limit');
+    expect(result.error).toContain('非负整数');
+    // error 键在，normalizeToolResult 据此判失败态，模型知道要重试而不是当成空文件
+    expect(result.content).toBe('错误：参数 limit 必须是非负整数，收到 -5');
+  });
+
+  it('rejects a negative offset and a non-numeric limit', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'a.txt'), 'one\ntwo\nthree\n');
+    const tool = new ReadFileTool(new PathSandbox(dir));
+    const offset = JSON.parse(await tool.execute(JSON.stringify({ path: 'a.txt', offset: -3 })));
+    expect(offset.error).toContain('offset');
+    const limit = JSON.parse(await tool.execute(JSON.stringify({ path: 'a.txt', limit: 'abc' })));
+    expect(limit.error).toContain('limit');
+  });
+
+  it('treats limit 0 as a legal empty window without erroring', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'a.txt'), 'one\ntwo\nthree');
+    const tool = new ReadFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ path: 'a.txt', limit: 0 })));
+    expect(result.error).toBeUndefined();
+    expect(result.content).toBe('');
+    expect(result.total_lines).toBe(3);
+  });
+
+  it('does not count a trailing newline as an extra line', async () => {
+    const dir = tmp();
+    const tool = new ReadFileTool(new PathSandbox(dir));
+    writeFileSync(join(dir, 'trailing.txt'), 'one\ntwo\n');
+    expect(JSON.parse(await tool.execute(JSON.stringify({ path: 'trailing.txt' }))).total_lines).toBe(2);
+    writeFileSync(join(dir, 'blank-tail.txt'), 'one\n\n');
+    expect(JSON.parse(await tool.execute(JSON.stringify({ path: 'blank-tail.txt' }))).total_lines).toBe(2);
+    writeFileSync(join(dir, 'empty.txt'), '');
+    expect(JSON.parse(await tool.execute(JSON.stringify({ path: 'empty.txt' }))).total_lines).toBe(0);
+  });
+
+  it('normalizes CRLF line endings', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'crlf.txt'), 'one\r\ntwo\r\n');
+    const tool = new ReadFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ path: 'crlf.txt' })));
+    expect(result.total_lines).toBe(2);
+    expect(result.content).toBe('one\ntwo');
+  });
+
+  it('returnsFriendlyErrorsForMissingPathMissingFileAndDirectories', async () => {
+    const dir = tmp();
+    mkdirSync(join(dir, 'dir'));
+    const tool = new ReadFileTool(new PathSandbox(dir));
+    expect(JSON.parse(await tool.execute('{}')).content).toContain('缺少必填参数');
+    expect(JSON.parse(await tool.execute(JSON.stringify({ path: 'missing.txt' }))).content).toContain('文件不存在');
+    expect(JSON.parse(await tool.execute(JSON.stringify({ path: 'dir' }))).content).toContain('不是普通文件');
+  });
+
+  it('truncatesVeryLargeOutput', async () => {
+    const dir = tmp();
+    const content = Array.from({ length: 6000 }, (_, i) => `line-${i}-abcdefghijklmnopqrstuvwxyz`).join('\n');
+    writeFileSync(join(dir, 'large.txt'), content);
+    const tool = new ReadFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ path: 'large.txt' })));
+    expect(result.content).toContain('[output truncated]');
+    // 技术方案 5.6：截断时补结构化顶层字段，供 loop 嗅探落截断徽标（与 grep/glob 口径对齐）。
+    expect(result.truncated).toBe(true);
+  });
+
+  it('doesNotSetTruncatedFlagWhenOutputFits', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'small.txt'), 'line-1\nline-2');
+    const tool = new ReadFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ path: 'small.txt' })));
+    expect(result.content).not.toContain('[output truncated]');
+    // 未截断不得出现 truncated 字段（避免前端把 undefined 误当截断）。
+    expect('truncated' in result).toBe(false);
+  });
+
+  it('readsPngImageWithDataUri', async () => {
+    const dir = tmp();
+    await sharp({ create: { width: 32, height: 24, channels: 3, background: { r: 0, g: 0, b: 255 } } })
+      .png().toFile(join(dir, 'shot.png'));
+    const tool = new ReadFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ path: 'shot.png' })));
+    expect(result.media_type).toBe('image');
+    expect(result.mime).toBe('image/png');
+    expect(result.data_uri).toMatch(/^data:image\/png;base64,/);
+    expect(result.width).toBe(32);
+    expect(result.height).toBe(24);
+    expect(result.content).toContain('图片读取成功');
+  });
+
+  it('resizesLargePngForPromptBudget', async () => {
+    const dir = tmp();
+    await sharp({ create: { width: 2048, height: 2048, channels: 3, background: { r: 10, g: 20, b: 30 } } })
+      .png().toFile(join(dir, 'huge.png'));
+    const tool = new ReadFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ path: 'huge.png' })));
+    expect(result.media_type).toBe('image');
+    expect(result.width).toBe(1600);
+    expect(result.height).toBe(1600);
+    expect(result.content).toContain('2048×2048→1600×1600');
+    expect(result.data_uri).toMatch(/^data:image\/png;base64,/);
+  });
+
+  it('rejectsFakePngExtensionWithInvalidContent', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'fake.png'), 'not an image');
+    const tool = new ReadFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ path: 'fake.png' })));
+    expect(result.content).toContain('不支持的图片格式');
+  });
+
+  it('readsAbsolutePathOutsideWorkspace', async () => {
+    const dir = tmp();
+    const outside = await tmp();
+    writeFileSync(join(outside, 'pic.txt'), 'outside content');
+    const tool = new ReadFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ path: join(outside, 'pic.txt') })));
+    expect(result.content).toBe('outside content');
+  });
+
+  // round 1 BUG-11：错误返回必须带 error 键。normalizeToolResult 的既定规则是
+  // 「JSON 顶层含 error 键即 error」，read_file 曾把错误只写进 content，导致所有
+  // 失败被判成 success、渲染成绿色成功卡（路径写错是模型的高频错误）。
+  it('classifies every error branch as an error result', async () => {
+    const dir = tmp();
+    mkdirSync(join(dir, 'dir'));
+    writeFileSync(join(dir, 'fake.png'), 'not an image');
+    const tool = new ReadFileTool(new PathSandbox(dir));
+    const cases: Array<[string, string]> = [
+      ['缺少 path', '{}'],
+      ['文件不存在', JSON.stringify({ path: 'missing.txt' })],
+      ['目标是目录', JSON.stringify({ path: 'dir' })],
+      ['伪造图片扩展名', JSON.stringify({ path: 'fake.png' })],
+    ];
+    for (const [name, argsJson] of cases) {
+      const raw = await tool.execute(argsJson, 11, 1, dir);
+      const result = normalizeToolResult('call-readerr', raw);
+      expect(result.status, name).toBe('error');
+      expect(result.errorMessage, name).toBeTruthy();
+      // content 仍保留原文，模型能直接读到失败原因
+      expect(JSON.parse(raw).content, name).toContain('错误');
+    }
+  });
+});
+
+describe('WriteFileTool', () => {
+  it('writesAbsolutePathOutsideWorkspace', async () => {
+    const dir = tmp();
+    const outside = await tmp();
+    const target = join(outside, 'outside.txt');
+    const tool = new WriteFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ path: target, content: 'outside content' })));
+    expect(result.success).toBe(true);
+    expect(result.file_change.type).toBe('CREATED');
+    expect(readFileSync(target, 'utf8')).toBe('outside content');
+  });
+
+  it('writesRelativeTraversalPathOutsideWorkspace', async () => {
+    const dir = tmp();
+    const sandboxRoot = dirname(dir);
+    writeFileSync(join(sandboxRoot, 'sibling.txt'), 'old');
+    const tool = new WriteFileTool(new PathSandbox(dir));
+    const rel = relative(dir, join(sandboxRoot, 'sibling.txt'));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ path: rel, content: 'new' })));
+    expect(result.success).toBe(true);
+    expect(readFileSync(join(sandboxRoot, 'sibling.txt'), 'utf8')).toBe('new');
+    expect(join(dir, 'sibling.txt')).not.toBe(join(sandboxRoot, 'sibling.txt'));
+  });
+
+  it('reportsLineDeltasWhenOverwritingExistingFile', async () => {
+    const dir = tmp();
+    const lines = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, i) => `line ${from + i}`).join('\n');
+    writeFileSync(join(dir, 'sample.txt'), lines(1, 100));
+    const tool = new WriteFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ path: 'sample.txt', content: lines(1, 150) })));
+    expect(result.file_change.lines_added).toBe(50);
+    expect(result.file_change.lines_deleted).toBe(0);
+  });
+
+  it('reportsTotalLinesWhenCreatingFile', async () => {
+    const dir = tmp();
+    const tool = new WriteFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({
+      path: 'created.txt',
+      content: 'line 1\nline 2\nline 3',
+    })));
+    expect(result.file_change.lines_added).toBe(3);
+    expect(result.file_change.lines_deleted).toBe(0);
+    expect(existsSync(join(dir, 'created.txt'))).toBe(true);
+  });
+
+  it('does not count a trailing newline as an extra line', async () => {
+    const dir = tmp();
+    const tool = new WriteFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ path: 't.txt', content: 'one\ntwo\n' })));
+    expect(result.file_change.total_lines).toBe(2);
+  });
+
+  it('preserves original BOM and CRLF when overwriting an existing file', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'legacy.txt'), '\uFEFFold\r\nline\r\n');
+    const tool = new WriteFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ path: 'legacy.txt', content: 'new\nline\n' })));
+    expect(result.success).toBe(true);
+    expect(readFileSync(join(dir, 'legacy.txt'), 'utf8')).toBe('\uFEFFnew\r\nline\r\n');
+  });
+
+  it('invokes onFileChanged after a successful write and survives callback failures', async () => {
+    const dir = tmp();
+    const seen: string[] = [];
+    const tool = new WriteFileTool(new PathSandbox(dir), (absPath) => { seen.push(absPath); });
+    const ok = JSON.parse(await tool.execute(JSON.stringify({ path: 'a.md', content: 'x' })));
+    expect(ok.success).toBe(true);
+    expect(seen).toHaveLength(1);
+    // 回调抛错不影响写结果（索引刷新失败不该让工具报错）
+    const boom = new WriteFileTool(new PathSandbox(dir), () => { throw new Error('callback boom'); });
+    const still = JSON.parse(await boom.execute(JSON.stringify({ path: 'b.md', content: 'x' })));
+    expect(still.success).toBe(true);
+    expect(readFileSync(join(dir, 'b.md'), 'utf8')).toBe('x');
+    // 无回调时行为与改造前一致
+    const plain = JSON.parse(await new WriteFileTool(new PathSandbox(dir)).execute(JSON.stringify({ path: 'c.md', content: 'x' })));
+    expect(plain.success).toBe(true);
+  });
+});
+
+describe('EditFileTool', () => {
+  it('editsAbsolutePathOutsideWorkspace', async () => {
+    const dir = tmp();
+    const outside = await tmp();
+    const target = join(outside, 'outside.txt');
+    writeFileSync(target, 'alpha\nold\nbeta\n');
+    const tool = new EditFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({
+      path: target, old_string: 'old', new_string: 'new',
+    })));
+    expect(result.success).toBe(true);
+    expect(result.replacements).toBe(1);
+    expect(readFileSync(target, 'utf8')).toBe('alpha\nnew\nbeta\n');
+  });
+
+  it('replacesAUniqueMatchAndReportsDiffPayload', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'a.txt'), 'alpha\nold\nbeta\n');
+    const tool = new EditFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({
+      path: 'a.txt', old_string: 'old', new_string: 'new',
+    })));
+    expect(result.success).toBe(true);
+    expect(result.replacements).toBe(1);
+    expect(result.file_change.lines_added).toBe(1);
+    expect(result[PRIVATE_DIFF_FIELD]).toBeTruthy();
+    expect(readFileSync(join(dir, 'a.txt'), 'utf8')).toBe('alpha\nnew\nbeta\n');
+  });
+
+  it('preserves original BOM and CRLF on a unique replacement', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'a.txt'), '\uFEFFalpha\r\nold\r\nbeta\r\n');
+    const tool = new EditFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({
+      path: 'a.txt', old_string: 'old', new_string: 'new',
+    })));
+    expect(result.success).toBe(true);
+    expect(readFileSync(join(dir, 'a.txt'), 'utf8')).toBe('\uFEFFalpha\r\nnew\r\nbeta\r\n');
+  });
+
+  it('invokes onFileChanged only after a successful edit', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'a.md'), 'alpha\nold\nbeta\n');
+    const seen: string[] = [];
+    const tool = new EditFileTool(new PathSandbox(dir), (absPath) => { seen.push(absPath); });
+    const ok = JSON.parse(await tool.execute(JSON.stringify({
+      path: 'a.md', old_string: 'old', new_string: 'new',
+    })));
+    expect(ok.success).toBe(true);
+    expect(seen).toHaveLength(1);
+    // 匹配失败：不写盘也不回调
+    const failed = JSON.parse(await tool.execute(JSON.stringify({
+      path: 'a.md', old_string: 'nope', new_string: 'x',
+    })));
+    expect(failed.success).toBe(false);
+    expect(seen).toHaveLength(1);
+  });
+
+  it('rejectsAmbiguousMatchWithoutReplaceAllAndLeavesFileUnchanged', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'a.txt'), 'alpha\nold\nbeta\nold\n');
+    const tool = new EditFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({
+      path: 'a.txt', old_string: 'old', new_string: 'new',
+    })));
+    expect(result.success).toBe(false);
+    expect(result.replacements).toBe(0);
+    expect(result.occurrences).toBe(2);
+    expect(result.occurrence_lines).toEqual([2, 4]);
+    expect(result.error).toContain('出现 2 次');
+    expect(result.error).toContain('replace_all=true');
+    expect(result.error).toContain('第 2 行');
+    expect(readFileSync(join(dir, 'a.txt'), 'utf8')).toBe('alpha\nold\nbeta\nold\n');
+  });
+
+  it('replacesAllOccurrencesWhenReplaceAllIsTrue', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'a.txt'), 'alpha\nold\nbeta\nold\n');
+    const tool = new EditFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({
+      path: 'a.txt', old_string: 'old', new_string: 'new', replace_all: true,
+    })));
+    expect(result.success).toBe(true);
+    expect(result.replacements).toBe(2);
+    expect(result.file_change.lines_added).toBe(2);
+    expect(result[PRIVATE_DIFF_FIELD]).toBeTruthy();
+    expect(readFileSync(join(dir, 'a.txt'), 'utf8')).toBe('alpha\nnew\nbeta\nnew\n');
+  });
+
+  it('acceptsReplaceAllAsStringTrue', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'a.txt'), 'old old');
+    const tool = new EditFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({
+      path: 'a.txt', old_string: 'old', new_string: 'new', replace_all: 'true',
+    })));
+    expect(result.success).toBe(true);
+    expect(result.replacements).toBe(2);
+    expect(readFileSync(join(dir, 'a.txt'), 'utf8')).toBe('new new');
+  });
+
+  it('truncatesLongOccurrencePreviewInAmbiguousError', async () => {
+    const dir = tmp();
+    const long = `prefix-${'x'.repeat(200)}`;
+    writeFileSync(join(dir, 'a.txt'), `${long}\n${long}`);
+    const tool = new EditFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({
+      path: 'a.txt', old_string: 'prefix-', new_string: 'p-',
+    })));
+    expect(result.success).toBe(false);
+    expect(result.occurrences).toBe(2);
+    expect(result.error).toContain('…');
+  });
+
+  it('rejectsIdenticalOldAndNewStringsWithoutEditingFile', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'a.txt'), 'alpha');
+    const tool = new EditFileTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({
+      path: 'a.txt', old_string: 'alpha', new_string: 'alpha',
+    })));
+    expect(result.success).toBe(false);
+    expect(result.replacements).toBe(0);
+    expect(result.error).toContain('完全相同');
+    expect(result.error).toContain('未执行编辑');
+    expect(readFileSync(join(dir, 'a.txt'), 'utf8')).toBe('alpha');
+  });
+
+  it('returnsErrorsWhenFileMissingOrNeedleMissing', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'a.txt'), 'alpha');
+    const tool = new EditFileTool(new PathSandbox(dir));
+    const missingFile = JSON.parse(await tool.execute(JSON.stringify({
+      path: 'missing.txt', old_string: 'x', new_string: 'y',
+    })));
+    const missingNeedle = JSON.parse(await tool.execute(JSON.stringify({
+      path: 'a.txt', old_string: 'x', new_string: 'y',
+    })));
+    const emptyNeedle = JSON.parse(await tool.execute(JSON.stringify({
+      path: 'a.txt', old_string: '', new_string: 'y',
+    })));
+    expect(missingFile.success).toBe(false);
+    expect(missingFile.error).toContain('文件不存在');
+    expect(missingNeedle.success).toBe(false);
+    expect(missingNeedle.error).toContain('未找到');
+    expect(emptyNeedle.success).toBe(false);
+    expect(emptyNeedle.error).toContain('不能为空');
+  });
+});
+
+describe('SearchTools', () => {
+  it('searchToolsReachOutsideTheWorkspace', async () => {
+    const dir = tmp();
+    const outside = await tmp();
+    writeFileSync(join(outside, 'outside.txt'), 'needle outside\n');
+    const glob = new GlobSearchTool(new PathSandbox(dir));
+    const globResult = JSON.parse(await glob.execute(JSON.stringify({ pattern: '*.txt', path: outside })));
+    expect(globResult.error).toBeUndefined();
+    expect(globResult.files).toEqual(['outside.txt']);
+    expect(globResult.search_root).toBe(outside);
+
+    const rel = relative(dir, join(outside, 'outside.txt'));
+    const grep = new GrepSearchTool(new PathSandbox(dir));
+    (grep as unknown as { rgAvailable: boolean }).rgAvailable = false;
+    const grepResult = JSON.parse(await grep.execute(JSON.stringify({ pattern: 'needle', path: outside })));
+    expect(grepResult.error).toBeUndefined();
+    expect(grepResult.total_matches).toBe(1);
+    expect(grepResult.matches[0].file).toBe('outside.txt');
+
+    // 相对穿越同样可达
+    const relGlob = JSON.parse(await glob.execute(JSON.stringify({ pattern: '*.txt', path: rel })));
+    expect(relGlob.error).toBeUndefined();
+    expect(relGlob.files).toEqual(['outside.txt']);
+  });
+
+  it('globSearchFindsNestedPathPatternRegardlessOfProcessCwd', async () => {
+    const dir = tmp();
+    mkdirSync(join(dir, 'desktop'));
+    writeFileSync(join(dir, 'desktop/package.json'), '{}');
+    const tool = new GlobSearchTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ pattern: 'desktop/package.json' })));
+    expect(result.files).toHaveLength(1);
+    expect(result.files[0]).toBe('desktop/package.json');
+    expect(result.search_root).toBe(dir);
+  });
+
+  it('globSearchDoesNotMarkExactLimitAsTruncated', async () => {
+    const dir = tmp();
+    mkdirSync(join(dir, 'src/main'), { recursive: true });
+    writeFileSync(join(dir, 'src/main/App.java'), 'class App {}');
+    writeFileSync(join(dir, 'README.md'), 'docs');
+    const tool = new GlobSearchTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ pattern: '**/*.java', head_limit: 1 })));
+    expect(result.files).toHaveLength(1);
+    expect(result.files[0]).toContain('App.java');
+    expect(result.truncated).toBe(false);
+    expect(result.total_matched).toBe(1);
+  });
+
+  it('globSearchSupportsBracesClassesAndLiteralDots', async () => {
+    const dir = tmp();
+    mkdirSync(join(dir, 'src/nested'), { recursive: true });
+    for (const file of ['src/a.ts', 'src/nested/b.js', 'src/nested/c.ts', 'src/catalog', 'src/a.log']) {
+      writeFileSync(join(dir, file), '');
+    }
+    const tool = new GlobSearchTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ pattern: 'src/**/[ab].{ts,js}' })));
+    expect(result.files.sort()).toEqual(['src/a.ts', 'src/nested/b.js']);
+    const logs = JSON.parse(await tool.execute(JSON.stringify({ pattern: '*.log' })));
+    expect(logs.files).toEqual(['src/a.log']);
+  });
+
+  it('globSearchMarksOnlyAdditionalMatchesAsTruncated', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'a.txt'), '');
+    writeFileSync(join(dir, 'b.txt'), '');
+    const tool = new GlobSearchTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ pattern: '*.txt', head_limit: 1 })));
+    expect(result.files).toHaveLength(1);
+    expect(result.total_matched).toBe(1);
+    expect(result.truncated).toBe(true);
+  });
+
+  it('globSearchUsesExplicitIgnoreRulesAndSkipsSymlinkLoops', async () => {
+    const dir = tmp();
+    mkdirSync(join(dir, 'node_modules'));
+    writeFileSync(join(dir, 'node_modules/a.txt'), '');
+    writeFileSync(join(dir, '.hidden.txt'), '');
+    writeFileSync(join(dir, 'ignored.txt'), '');
+    writeFileSync(join(dir, '.gitignore'), '*.txt\n');
+    symlinkSync(dir, join(dir, 'loop'));
+    const tool = new GlobSearchTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ pattern: '*.txt' })));
+    expect(result.files.sort()).toEqual(['.hidden.txt', 'ignored.txt']);
+  });
+
+  it('globSearchRestrictsSingleFileScope', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'a.txt'), '');
+    writeFileSync(join(dir, 'b.txt'), '');
+    const tool = new GlobSearchTool(new PathSandbox(dir));
+    const result = JSON.parse(await tool.execute(JSON.stringify({ path: 'a.txt', pattern: '*.txt' })));
+    expect(result.files).toEqual(['a.txt']);
+  });
+
+  it('globSearchReportsMissingPathsAndInvalidLimits', async () => {
+    const dir = tmp();
+    const tool = new GlobSearchTool(new PathSandbox(dir));
+    const missing = JSON.parse(await tool.execute(JSON.stringify({ path: 'missing', pattern: '*' })));
+    expect(missing.error).toBeTruthy();
+    for (const head_limit of [0, -1, 1.5, '2']) {
+      const result = JSON.parse(await tool.execute(JSON.stringify({ pattern: '*', head_limit })));
+      expect(result.error).toContain('head_limit');
+    }
+  });
+
+  it('grepSearchFindsMatchesInSingleFilePath', async () => {
+    const dir = tmp();
+    mkdirSync(join(dir, 'desktop/src'), { recursive: true });
+    writeFileSync(join(dir, 'desktop/src/useChat.ts'), 'export function useChat() {}\nneedle line\n');
+    const tool = new GrepSearchTool(new PathSandbox(dir));
+    (tool as unknown as { rgAvailable: boolean }).rgAvailable = false;
+    const result = JSON.parse(await tool.execute(
+      JSON.stringify({ pattern: 'needle', path: 'desktop/src/useChat.ts' }),
+      dir,
+    ));
+    expect(result.total_matches).toBe(1);
+    expect(result.matches[0].file).toBe('desktop/src/useChat.ts');
+  });
+
+  it('grepSearchFindsMatchesWithContextAndIgnoreCase', async () => {
+    const dir = tmp();
+    mkdirSync(join(dir, 'src'));
+    writeFileSync(join(dir, 'src/a.txt'), 'before\nNeedle here\nafter\n');
+    writeFileSync(join(dir, 'src/b.md'), 'needle ignored by glob\n');
+    const tool = new GrepSearchTool(new PathSandbox(dir));
+    (tool as unknown as { rgAvailable: boolean }).rgAvailable = false;
+    const result = JSON.parse(await tool.execute(JSON.stringify({
+      pattern: 'needle', glob: '*.txt', ignore_case: true, context_lines: 1,
+    })));
+    expect(result.total_matches).toBe(1);
+    expect(result.matches.length).toBe(3);
+    expect(result.matches[0].file).toContain('a.txt');
+    expect(result.matches[0].line).toBe(1);
+    expect(result.matches[0].contextual).toBe(true);
+    expect(result.matches[1].line).toBe(2);
+    expect(result.matches[1].contextual).toBeUndefined();
+    expect(result.matches[2].line).toBe(3);
+    expect(result.matches[2].contextual).toBe(true);
+  });
+
+  it('grepSearchRecursiveGlobMatchesRootFilesWithoutRg', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'README.md'), 'needle root\n');
+    mkdirSync(join(dir, 'docs'), { recursive: true });
+    writeFileSync(join(dir, 'docs/guide.md'), 'needle nested\n');
+    const tool = new GrepSearchTool(new PathSandbox(dir));
+    (tool as unknown as { rgAvailable: boolean }).rgAvailable = false;
+    const result = JSON.parse(await tool.execute(JSON.stringify({
+      pattern: 'needle', glob: '**/*.md',
+    })));
+    expect(result.total_matches).toBe(2);
+  });
+
+  it('grepSearchStreamsLargeLogsWithoutRg', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'fin.log'), `${'ordinary log line\n'.repeat(700000)}before\nNeedle 中文\nafter`);
+    const tool = new GrepSearchTool(new PathSandbox(dir));
+    (tool as unknown as { rgAvailable: boolean }).rgAvailable = false;
+    const result = JSON.parse(await tool.execute(JSON.stringify({
+      path: dir, glob: 'fin.log', pattern: '^needle 中文$', ignore_case: true, context_lines: 1,
+    })));
+    expect(result.error).toBeUndefined();
+    expect(result.total_matches).toBe(1);
+    expect(result.matches.map((entry: { line: number }) => entry.line)).toEqual([700001, 700002, 700003]);
+    expect(result.matches.map((entry: { content: string }) => entry.content)).toEqual(['before', 'Needle 中文', 'after']);
+  });
+
+  it('grepSearchDeduplicatesOverlappingContextWithoutRg', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'a.txt'), 'before\r\nneedle\r\nneedle\r\nbetween\r\nneedle\r\nafter\r\n');
+    const tool = new GrepSearchTool(new PathSandbox(dir));
+    (tool as unknown as { rgAvailable: boolean }).rgAvailable = false;
+    const result = JSON.parse(await tool.execute(JSON.stringify({ pattern: '^needle$', context_lines: 2 })));
+    expect(result.total_matches).toBe(3);
+    expect(result.matches.map((entry: { line: number }) => entry.line)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(result.matches.map((entry: { contextual?: boolean }) => !!entry.contextual)).toEqual([true, false, false, true, false, true]);
+  });
+
+  it('grepSearchDoesNotInventAnEmptyLineAtEofWithoutRg', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'a.txt'), 'text\n');
+    const tool = new GrepSearchTool(new PathSandbox(dir));
+    (tool as unknown as { rgAvailable: boolean }).rgAvailable = false;
+    const result = JSON.parse(await tool.execute(JSON.stringify({ pattern: '^$' })));
+    expect(result.total_matches).toBe(0);
+  });
+
+  it('grepSearchReportsMissingPathsWithoutRg', async () => {
+    const dir = tmp();
+    const tool = new GrepSearchTool(new PathSandbox(dir));
+    (tool as unknown as { rgAvailable: boolean }).rgAvailable = false;
+    const result = JSON.parse(await tool.execute(JSON.stringify({ pattern: 'needle', path: join(dir, 'missing') })));
+    expect(result.error).toBeTruthy();
+    expect(result.total_matches).toBeUndefined();
+  });
+
+  it('grepSearchSkipsBrokenSymlinksWithoutRg', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'ok.txt'), 'needle\n');
+    symlinkSync(join(dir, 'missing'), join(dir, 'broken.txt'));
+    const tool = new GrepSearchTool(new PathSandbox(dir));
+    (tool as unknown as { rgAvailable: boolean }).rgAvailable = false;
+    const result = JSON.parse(await tool.execute(JSON.stringify({ pattern: 'needle' })));
+    // 断链符号链接被跳过，不再让整次搜索失败（见 collectGrepFiles）
+    expect(result.error).toBeUndefined();
+    expect(result.total_matches).toBe(1);
+  });
+
+  it('grepSearchStopsBeforeTraversingMoreFilesOnceTruncated', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'a.txt'), 'needle\n');
+    symlinkSync(join(dir, 'missing'), join(dir, 'z.txt'));
+    const tool = new GrepSearchTool(new PathSandbox(dir));
+    (tool as unknown as { rgAvailable: boolean }).rgAvailable = false;
+    const result = JSON.parse(await tool.execute(JSON.stringify({ pattern: 'needle', max_output_chars: 1 })));
+    expect(result.error).toBeUndefined();
+    expect(result.truncated).toBe(true);
+  });
+
+  it('grepSearchMarksTruncatedWhenOutputLimitIsExceeded', async () => {
+    const dir = tmp();
+    writeFileSync(join(dir, 'a.txt'), 'needle one\nneedle two\n');
+    const tool = new GrepSearchTool(new PathSandbox(dir));
+    (tool as unknown as { rgAvailable: boolean }).rgAvailable = false;
+    const result = JSON.parse(await tool.execute(JSON.stringify({
+      pattern: 'needle', max_output_chars: 1,
+    })));
+    expect(result.truncated).toBe(true);
+  });
+});

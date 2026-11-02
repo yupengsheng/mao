@@ -1,0 +1,462 @@
+import { connect, type Socket } from 'node:net';
+import { existsSync, lstatSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  FrameDecoder, encodeFrame,
+  type PtyOpenOptions, type RuntimeEnvelope, type RuntimeFrame, type RuntimeRequestFrame,
+} from './runtime-channel-protocol.js';
+import { ContainerToolExecutor, type ContainerRoots } from './container-tool-executor.js';
+import { ContainerMcpBridge } from './container-mcp-bridge.js';
+import { PtyHub, type ContainerPtyFactory } from './pty-hub.js';
+import { loadRuntimeBuildId } from './runtime-build.js';
+
+/**
+ * 容器内常驻 runtime agent（技术方案 §5.5）。
+ * 容器启动命令：node {distDir}/harness/container/runtime-agent.js --socket <path>
+ * 只依赖挂载的 dist 与本镜像内的 bash/git/sharp/node-pty；不得触及 MySQL/JWT/LLM key。
+ */
+
+const STATUS_INTERVAL_MS = 10_000;
+const RECONNECT_BASE_MS = 500;
+const RECONNECT_MAX_MS = 15_000;
+/** 宿主机迟迟不回 hello_result 的兜底：超时销毁连接，交给 connectLoop 退避重连。 */
+const HANDSHAKE_TIMEOUT_MS = 15_000;
+/** 容器时区：与后端日志时间戳 / 系统提示「当前日期」/ Cron 调度等全站口径一致。 */
+const CONTAINER_TIME_ZONE = 'Asia/Shanghai';
+
+function parseArgs(argv: string[]): { socketPath: string } {
+  let socketPath = process.env.MAO_CHANNEL_SOCKET ?? '';
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--socket' && argv[i + 1]) socketPath = argv[i + 1];
+  }
+  if (socketPath === '') {
+    console.error('[runtime-agent] missing --socket path');
+    process.exit(1);
+  }
+  return { socketPath };
+}
+
+function resolveRoots(): ContainerRoots {
+  const workspaceRoot = process.env.MAO_WORKSPACE_ROOT ?? '/opt/mao-data/workspace';
+  const runtimeDir = process.env.MAO_RUNTIME_DIR ?? '/opt/mao-data/runtime';
+  const userHomeDir = process.env.MAO_USER_HOME_DIR ?? '/opt/mao-data/users';
+  const userSkillsDir = process.env.MAO_USER_SKILLS_DIR ?? '/opt/mao-data/userskills';
+  const skillsDir = process.env.MAO_SKILLS_DIR ?? '/opt/mao-data/skills';
+  const uploadDir = process.env.MAO_UPLOAD_DIR ?? '/opt/mao-data/uploads';
+  const shareDir = process.env.MAO_SHARE_DIR ?? '/opt/mao-data/share';
+  return { workspaceRoot, runtimeDir, userHomeDir, userSkillsDir, skillsDir, uploadDir, shareDir };
+}
+
+function readToken(socketPath: string): string {
+  const fromEnv = process.env.MAO_CHANNEL_TOKEN ?? '';
+  if (fromEnv !== '') return fromEnv;
+  const tokenPath = path.join(path.dirname(socketPath), '.token');
+  if (existsSync(tokenPath)) return readFileSync(tokenPath, 'utf8').trim();
+  console.error('[runtime-agent] missing channel token (env MAO_CHANNEL_TOKEN or {dir}/.token)');
+  process.exit(1);
+}
+
+export class RuntimeAgent {
+  private readonly executor: ContainerToolExecutor;
+  private readonly mcpBridge: ContainerMcpBridge;
+  private readonly ptyHub: PtyHub;
+  /** 容器内运行时闭包版本：hello 帧上报，宿主机据此判断代码漂移（缺失则不上报）。 */
+  private readonly runtimeBuildId: string | null;
+  private socket: Socket | null = null;
+  private closedByShutdown = false;
+  private reconnectAttempt = 0;
+  private statusTimer: NodeJS.Timeout | null = null;
+
+  constructor(
+    private readonly socketPath: string,
+    private readonly token: string,
+    private readonly userId: number,
+    /** pty spawn 工厂（生产用 node-pty；宿主机单测注入 fake 验证 pty_open 往返）。 */
+    private readonly ptyFactory?: ContainerPtyFactory,
+    /** 容器内代码版本（默认读模块同目录 runtime-build.json；测试可注入；null = 不上报）。 */
+    buildId: string | null = loadRuntimeBuildId(import.meta.url),
+  ) {
+    this.runtimeBuildId = buildId;
+    if (this.runtimeBuildId == null) {
+      console.warn('[runtime-agent] runtime-build.json missing next to module; build id will not be reported');
+    }
+    this.executor = new ContainerToolExecutor(resolveRoots(), this.userId);
+    this.mcpBridge = new ContainerMcpBridge();
+    this.ptyHub = new PtyHub({
+      sendData: (ptyId, data) => this.send({ v: 1, type: 'pty_data', ptyId, data }),
+      sendExit: (ptyId, exitCode) => this.send({ v: 1, type: 'pty_exit', ptyId, exitCode }),
+    }, ptyFactory);
+  }
+
+  async run(): Promise<void> {
+    this.statusTimer = setInterval(() => this.reportStatus(), STATUS_INTERVAL_MS);
+    this.statusTimer.unref?.();
+    await this.connectLoop();
+  }
+
+  /** 停止 agent：停状态上报、标记关机并断开当前连接（connectLoop 随即退出）。 */
+  stop(): void {
+    this.closedByShutdown = true;
+    if (this.statusTimer) { clearInterval(this.statusTimer); this.statusTimer = null; }
+    this.socket?.destroy();
+  }
+
+  /** 释放容器内资源：shell 会话、MCP stdio 子进程、pty（宿主机单测收尾与 shutdown 帧共用）。 */
+  dispose(): void {
+    this.stop();
+    this.executor.closeAll();
+    this.mcpBridge.closeAll();
+    this.ptyHub.closeAll();
+  }
+
+  /** 容器内活跃状态上报（§5.3.1 idle 忙等保护的唯一数据源）。 */
+  private reportStatus(): void {
+    this.send({
+      v: 1, type: 'runtime_status',
+      shellSessions: this.executor.activeShellSessions,
+      pendingTasks: this.executor.unfinishedBackgroundTasks,
+      attachedTerminals: this.ptyHub.activeCount,
+    });
+  }
+
+  private async connectLoop(): Promise<void> {
+    while (!this.closedByShutdown) {
+      try {
+        // connectOnce 只在连接就绪后真正断开时 resolve：连接存活期间本循环一直 await，
+        // 不会连上又立刻重连（指数退避只作用于"断开之后"）
+        await this.connectOnce();
+        this.reconnectAttempt = 0;
+      } catch (e) {
+        console.error(`[runtime-agent] connection ended: ${(e as Error).message}`);
+      }
+      if (this.closedByShutdown) return;
+      const delay = Math.min(RECONNECT_BASE_MS * 2 ** this.reconnectAttempt, RECONNECT_MAX_MS);
+      this.reconnectAttempt += 1;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+
+  private connectOnce(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const socket = connect(this.socketPath);
+      const decoder = new FrameDecoder();
+      let settled = false;
+      // hello_result 已到达：此后的 close 才算"就绪连接断开"，resolve 交给 connectLoop 重连
+      let ready = false;
+      let handshakeTimer: NodeJS.Timeout | null = null;
+      const clearHandshakeTimer = () => {
+        if (handshakeTimer) { clearTimeout(handshakeTimer); handshakeTimer = null; }
+      };
+      const fail = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        clearHandshakeTimer();
+        socket.destroy();
+        reject(error);
+      };
+      socket.on('connect', () => {
+        // 兜底销毁可能残留的旧 socket（正常路径下 connectLoop 已等旧连接结束）
+        if (this.socket && this.socket !== socket && !this.socket.destroyed) {
+          this.socket.destroy();
+        }
+        this.socket = socket;
+        // hello：token 认证（宿主机校验失败会立即断开）+ 容器内代码版本上报（旧宿主忽略未知字段）
+        socket.write(encodeFrame({
+          v: 1, type: 'hello', userId: this.userId, token: this.token,
+          ...(this.runtimeBuildId != null ? { build: this.runtimeBuildId } : {}),
+        }));
+        handshakeTimer = setTimeout(() => fail(new Error('hello handshake timeout')), HANDSHAKE_TIMEOUT_MS);
+        handshakeTimer.unref?.();
+      });
+      socket.on('data', (chunk: Buffer) => {
+        let frames: RuntimeFrame[];
+        try {
+          frames = decoder.push(chunk);
+        } catch (e) {
+          console.error(`[runtime-agent] frame decode failed: ${(e as Error).message}`);
+          socket.destroy();
+          return;
+        }
+        for (const frame of frames) {
+          if (frame.type === 'hello_result') {
+            if (!ready) {
+              ready = true;
+              clearHandshakeTimer();
+              console.log('[runtime-agent] channel ready');
+              // 重连后立即补报一次状态：宿主机 idle 忙等判定不等下一个 10s 周期
+              this.reportStatus();
+            }
+            continue;
+          }
+          void this.handleFrame(frame);
+        }
+      });
+      socket.on('error', (e) => fail(e));
+      socket.on('close', () => {
+        clearHandshakeTimer();
+        // 身份判断：旧连接晚到的 close 不得把新连接的 this.socket 置空，
+        // 否则容器→宿主机帧（tool_result/pty_*/runtime_status/pong）被静默丢弃
+        if (this.socket === socket) this.socket = null;
+        if (ready) resolve();
+        else fail(new Error('connection closed before ready'));
+      });
+    });
+  }
+
+  private send(frame: RuntimeFrame): void {
+    if (!this.socket || this.socket.destroyed) return;
+    try {
+      this.socket.write(encodeFrame(frame));
+    } catch { /* 连接关闭时静默 */ }
+  }
+
+  private handleFrame(frame: RuntimeFrame): void {
+    switch (frame.type) {
+      case 'hello_result':
+        break;
+      case 'ping':
+        this.send({ v: 1, type: 'pong', id: frame.id });
+        break;
+      case 'shutdown':
+        this.closedByShutdown = true;
+        this.send({ v: 1, type: 'shutdown_ack', id: frame.id });
+        // 给 ack 一点写出时间再退出
+        setTimeout(() => {
+          this.dispose();
+          process.exit(0);
+        }, 200);
+        break;
+      case 'tool_call':
+        void this.handleToolCall(frame.id, frame.tool, frame.args, frame.envelope);
+        break;
+      case 'read_bytes':
+        this.handleReadBytes(frame.id, frame.path, frame.maxBytes, frame.envelope);
+        break;
+      case 'mcp_connect':
+        void this.handleMcpConnect(frame.id, frame.sessionId, frame.server, frame.env, frame.envelope);
+        break;
+      case 'mcp_call':
+        void this.handleMcpCall(frame.id, frame.sessionId, frame.serverId, frame.toolName, frame.argumentsJson);
+        break;
+      case 'mcp_close_session':
+        void this.handleMcpClose(frame.id, frame.sessionId);
+        break;
+      case 'pty_open':
+        void this.handlePtyOpen(frame.id, frame.ptyId, frame.options);
+        break;
+      case 'pty_data':
+        this.ptyHub.write(frame.ptyId, frame.data);
+        break;
+      case 'pty_resize':
+        this.ptyHub.resize(frame.ptyId, frame.cols, frame.rows);
+        break;
+      case 'pty_close':
+        this.ptyHub.close(frame.ptyId);
+        break;
+      default:
+        console.warn(`[runtime-agent] unexpected frame type: ${(frame as { type: string }).type}`);
+    }
+  }
+
+  private async handleToolCall(id: string, tool: string, args: string, envelope: RuntimeEnvelope): Promise<void> {
+    const started = Date.now();
+    try {
+      const result = await this.executor.handleToolCall(tool, args, envelope);
+      this.send({ v: 1, type: 'tool_result', id, ok: true, result, durationMs: Date.now() - started });
+    } catch (e) {
+      this.send({ v: 1, type: 'tool_result', id, ok: false, result: null, error: (e as Error).message, durationMs: Date.now() - started });
+    }
+  }
+
+  private handleReadBytes(id: string, filePath: string, maxBytes: number, envelope: RuntimeEnvelope): void {
+    const outcome = this.executor.handleReadBytes(filePath, maxBytes, envelope);
+    if (outcome.ok) {
+      this.send({ v: 1, type: 'read_bytes_result', id, ok: true, base64: outcome.base64 });
+    } else {
+      this.send({ v: 1, type: 'read_bytes_result', id, ok: false, error: outcome.error });
+    }
+  }
+
+  private async handleMcpConnect(
+    id: string, sessionId: number,
+    server: { id: number; name: string; serverType: string; command?: string | null; argsJson?: string | null; url?: string | null },
+    env: Record<string, string>,
+    envelope: RuntimeEnvelope,
+  ): Promise<void> {
+    try {
+      // envelope 必须透传：容器内 MCP stdio 子进程的用户凭据（git token / MAO_TOKEN /
+      // ECP / larkUat）与 §5.13 depsEnv 全部由它注入（§5.10）
+      const refs = await this.mcpBridge.connectAndListTools(sessionId, server, env, envelope);
+      this.send({ v: 1, type: 'mcp_result', id, ok: true, payload: refs });
+    } catch (e) {
+      this.send({ v: 1, type: 'mcp_result', id, ok: false, error: (e as Error).message });
+    }
+  }
+
+  private async handlePtyOpen(id: string, ptyId: string, options: PtyOpenOptions): Promise<void> {
+    // pty_open 是请求/响应语义：宿主机 PtyChannelHub.open 等同名 pty_open_result，
+    // 只处理不回帧会让宿主机干等到超时（终端永远打不开）
+    const outcome = await this.ptyHub.open(ptyId, options);
+    if (outcome.ok) {
+      this.send({ v: 1, type: 'pty_open_result', id, ok: true, pid: outcome.pid });
+    } else {
+      this.send({ v: 1, type: 'pty_open_result', id, ok: false, error: outcome.error });
+    }
+  }
+
+  private async handleMcpCall(id: string, sessionId: number, serverId: number, toolName: string, argumentsJson: string): Promise<void> {
+    try {
+      const result = await this.mcpBridge.callTool(sessionId, serverId, toolName, argumentsJson);
+      this.send({ v: 1, type: 'mcp_result', id, ok: true, payload: result });
+    } catch (e) {
+      this.send({ v: 1, type: 'mcp_result', id, ok: false, error: (e as Error).message });
+    }
+  }
+
+  private async handleMcpClose(id: string, sessionId: number): Promise<void> {
+    try {
+      await this.mcpBridge.closeSession(sessionId);
+      this.send({ v: 1, type: 'mcp_result', id, ok: true, payload: null });
+    } catch (e) {
+      this.send({ v: 1, type: 'mcp_result', id, ok: false, error: (e as Error).message });
+    }
+  }
+}
+
+/**
+ * 容器初始化：把容器时区对齐到 Asia/Shanghai（glibc 配置层：/etc/localtime + /etc/timezone）。
+ *
+ * 为什么需要：运行时镜像（node:22-bookworm-slim）默认 Etc/UTC，且创建容器时未注入时区，
+ * 容器内 date、脚本时间戳、Node 本地时间、git commit 全部按 UTC 落——比北京时间慢 8 小时，
+ * 北京时间 00:00–08:00 时段日期还会少一天；与后端全站 Asia/Shanghai 口径（日志时间戳、
+ * 系统提示「当前日期」、Cron 调度）打架，Agent 自查时间时自相矛盾。
+ *
+ * 对齐后容器内「之后启动」的所有进程（含 docker exec、非 agent 派生进程）都拿到正确时区；
+ * 已运行进程的时区缓存不随文件刷新，故入口处同时设置 process.env.TZ（优先级最高、立即
+ * 生效）兜住 agent 自身与其子进程。幂等；返回是否发生修改，异常由调用方兜底。
+ *
+ * 与 alignPasswdHome 同一防护前提：只在容器入口（isMainModule + MAO_CONTAINER_USER_ID
+ * 校验后）调用，避免该模块被其它方式拉起时误改所在机器的时区配置。
+ */
+export function alignContainerTimeZone(options: {
+  timeZone?: string;
+  localtimePath?: string;
+  timezonePath?: string;
+  zoneinfoDir?: string;
+} = {}): boolean {
+  const timeZone = options.timeZone ?? CONTAINER_TIME_ZONE;
+  const localtimePath = options.localtimePath ?? '/etc/localtime';
+  const timezonePath = options.timezonePath ?? '/etc/timezone';
+  const zoneinfoPath = path.join(options.zoneinfoDir ?? '/usr/share/zoneinfo', timeZone);
+  if (!existsSync(zoneinfoPath)) {
+    console.warn(`[runtime-agent] zoneinfo 不存在，跳过时区对齐（${zoneinfoPath}）`);
+    return false;
+  }
+  let changed = false;
+  // localtime 走「临时链接 + rename」原子替换：被半写会让容器内程序时区异常
+  const currentTarget = lstatSync(localtimePath, { throwIfNoEntry: false })?.isSymbolicLink()
+    ? readlinkSync(localtimePath)
+    : null;
+  if (currentTarget !== zoneinfoPath) {
+    const tmpPath = `${localtimePath}.mao-tmp`;
+    rmSync(tmpPath, { force: true });
+    symlinkSync(zoneinfoPath, tmpPath);
+    renameSync(tmpPath, localtimePath);
+    changed = true;
+  }
+  const currentTimeZone = existsSync(timezonePath) ? readFileSync(timezonePath, 'utf8').trim() : null;
+  if (currentTimeZone !== timeZone) {
+    const tmpPath = `${timezonePath}.mao-tmp`;
+    writeFileSync(tmpPath, `${timeZone}\n`);
+    renameSync(tmpPath, timezonePath);
+    changed = true;
+  }
+  return changed;
+}
+
+/**
+ * 容器初始化：把 /etc/passwd 中 root 的 home 对齐到注入的 HOME（用户数据目录）。
+ *
+ * 为什么需要：Java 在 Linux 上经 getpwuid 取 user.home（不认 $HOME 环境变量），不对齐则
+ * Maven / Gradle 的 ~/.m2、~/.gradle 落在容器内 /root（容器重建即丢），也读不到用户目录下
+ * 挂载的 settings.xml 与本地仓库。幂等；返回是否发生修改，IO 异常由调用方兜底。
+ *
+ * 写入走「同目录临时文件 + rename」原子替换：passwd 被半写/清空会让容器内 su/id 与 Java 的
+ * getpwuid 一并异常，且下次启动读到无 root 行的残缺文件会静默跳过、无法自愈。
+ */
+export function alignPasswdHome(passwdPath: string, home: string): boolean {
+  const raw = readFileSync(passwdPath, 'utf8');
+  let changed = false;
+  let foundRoot = false;
+  const next = raw.split('\n').map((line) => {
+    const parts = line.split(':');
+    if (parts[0] !== 'root' || parts.length < 7) return line;
+    foundRoot = true;
+    if (parts[5] === home) return line;
+    parts[5] = home;
+    changed = true;
+    return parts.join(':');
+  });
+  if (!foundRoot) {
+    console.warn(`[runtime-agent] /etc/passwd 中未找到 root 行，跳过 HOME 对齐（${passwdPath}）`);
+    return false;
+  }
+  if (changed) {
+    const tmpPath = `${passwdPath}.mao-tmp`;
+    writeFileSync(tmpPath, next.join('\n'));
+    renameSync(tmpPath, passwdPath);
+  }
+  return changed;
+}
+
+// 仅作为容器入口脚本直接执行时运行；被 import（宿主机单测驱动）时不自动启动
+function isMainModule(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return path.resolve(entry) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
+  const { socketPath } = parseArgs(process.argv.slice(2));
+  const token = readToken(socketPath);
+  const userId = Number(process.env.MAO_CONTAINER_USER_ID ?? 0);
+  if (!Number.isFinite(userId) || userId <= 0) {
+    console.error('[runtime-agent] missing MAO_CONTAINER_USER_ID');
+    process.exit(1);
+  }
+  // 容器时区对齐（镜像默认 Etc/UTC）：process.env.TZ 优先级最高、立即生效（agent 自身与其
+  // 派生进程）；/etc/localtime + /etc/timezone 覆盖 agent 之外启动的进程（docker exec 等）。
+  // 失败仅告警，不阻塞 agent 启动。
+  process.env.TZ = CONTAINER_TIME_ZONE;
+  try {
+    if (alignContainerTimeZone()) {
+      console.log(`[runtime-agent] container timezone aligned to ${CONTAINER_TIME_ZONE}`);
+    }
+  } catch (e) {
+    console.error('[runtime-agent] align container timezone failed (non-fatal):', (e as Error).message);
+  }
+  // 容器 HOME 对齐（容器创建参数 -e HOME={userHomeDir}/{userId}）：npm/pip/git 等直接读 $HOME；
+  // Java 经 getpwuid 取 user.home，需要 /etc/passwd 同步。失败仅告警，不阻塞 agent 启动。
+  // 放在 userId 校验之后：以「容器内 agent」硬依赖作为执行前提，避免该脚本被其它方式
+  // 拉起时误改所在机器的 /etc/passwd。
+  const home = process.env.HOME;
+  if (home && home !== '/root') {
+    try {
+      if (alignPasswdHome('/etc/passwd', home)) {
+        console.log(`[runtime-agent] /etc/passwd root home aligned to ${home}`);
+      }
+    } catch (e) {
+      console.error('[runtime-agent] align /etc/passwd failed (non-fatal):', (e as Error).message);
+    }
+  }
+  const agent = new RuntimeAgent(socketPath, token, userId);
+  void agent.run().catch((e) => {
+    console.error('[runtime-agent] fatal:', e);
+    process.exit(1);
+  });
+}

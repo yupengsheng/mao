@@ -1,0 +1,735 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createPinia, setActivePinia } from 'pinia'
+import { ref } from 'vue'
+
+vi.mock('../utils/auth-storage', () => ({
+  getToken: () => 'test-token',
+}))
+vi.mock('../api', () => ({
+  api: {
+    get: vi.fn().mockResolvedValue({ data: [] }),
+    post: vi.fn(),
+    put: vi.fn(),
+    patch: vi.fn(),
+    delete: vi.fn(),
+  },
+  // inbox store 通过命名导出调用；这里给稳定空实现，避免 onopen 未读数重拉抛 TypeError
+  fetchInboxUnreadCount: vi.fn().mockResolvedValue({ unreadCount: 0 }),
+  fetchInboxList: vi.fn().mockResolvedValue({ records: [], total: 0, page: 1, size: 20 }),
+  markInboxItemRead: vi.fn(),
+  markInboxAllRead: vi.fn(),
+  removeInboxItem: vi.fn(),
+  getInboxPreference: vi.fn().mockResolvedValue({
+    taskCompletedEnabled: true,
+    questionPendingEnabled: true,
+    approvalPendingEnabled: true,
+    subagentDoneEnabled: false,
+    budgetWarnEnabled: true,
+    openApiCallFailedEnabled: false,
+    systemNotifyEnabled: true,
+  }),
+  saveInboxPreference: vi.fn(),
+}))
+vi.mock('../utils/localSkills', () => ({ collectLocalUnsyncedSkills: vi.fn(async () => []) }))
+vi.mock('../utils/agentsMd', () => ({ collectAgentsMdContent: vi.fn(async () => undefined) }))
+
+const sockets: FakeWebSocket[] = []
+
+class FakeWebSocket {
+  static readonly CONNECTING = 0
+  static readonly OPEN = 1
+  static readonly CLOSING = 2
+  static readonly CLOSED = 3
+  readyState = FakeWebSocket.CONNECTING
+  onopen: (() => void) | null = null
+  onmessage: ((e: { target: unknown; data: string }) => void) | null = null
+  onclose: ((e: { target: unknown }) => void) | null = null
+  onerror: (() => void) | null = null
+  readonly sent: Array<Record<string, unknown>> = []
+  readonly url: string
+  /** 收到服务端 connected 鉴权确认帧（测试默认自动回，模拟正常服务端） */
+  autoAck = true
+
+  constructor(url: string) {
+    this.url = url
+    sockets.push(this)
+  }
+
+  open() {
+    this.readyState = FakeWebSocket.OPEN
+    this.onopen?.()
+    if (this.autoAck) this.message({ type: 'connected', data: { userId: 7 } })
+  }
+
+  message(payload: Record<string, unknown>) {
+    this.onmessage?.({ target: this, data: JSON.stringify(payload) })
+  }
+
+  send(data: string) {
+    this.sent.push(JSON.parse(data))
+  }
+
+  close() {
+    this.readyState = FakeWebSocket.CLOSED
+    this.onclose?.({ target: this })
+  }
+}
+
+;(globalThis as any).WebSocket = FakeWebSocket
+
+// useStreamWS 通过 window 广播 side_session_created / side_session_rejected；
+// 测试跑在 node 环境，用一个最小 EventTarget 替身顶上。
+class WindowEventTarget extends EventTarget {}
+const windowStub = new WindowEventTarget()
+Object.defineProperty(globalThis, 'window', {
+  value: windowStub, writable: true, configurable: true,
+})
+
+const { useStreamWS } = await import('./useStreamWS')
+const { useSessionStore } = await import('../stores/session')
+const { useChat } = await import('./useChat')
+const { api } = await import('../api')
+
+type ChatMessageLike = { id: string; role: 'user' | 'assistant' | 'system'; content: string; createdAt: string; images?: string[] }
+
+beforeEach(() => {
+  setActivePinia(createPinia())
+  vi.useFakeTimers()
+  useStreamWS().disconnect()
+  sockets.length = 0
+})
+
+afterEach(() => {
+  useStreamWS().disconnect()
+  sockets.length = 0
+  vi.useRealTimers()
+})
+
+describe('useStreamWS reconnect', () => {
+  it('重连握手失败会结束在途 connect Promise，后续连通可重新发送', async () => {
+    const { connect } = useStreamWS()
+    const first = connect()
+    sockets[0].open()
+    await first
+
+    sockets[0].close()
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(sockets).toHaveLength(2)
+
+    const pendingSend = connect()
+    sockets[1].close()
+    await expect(pendingSend).rejects.toThrow('WebSocket connection closed')
+
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(sockets).toHaveLength(3)
+    sockets[2].open()
+    await expect(connect()).resolves.toBeUndefined()
+  })
+
+  it('服务端未回 connected 确认帧前不置已连接，也不发送 subscribe', async () => {
+    const { connect, subscribe, connected } = useStreamWS()
+    const pending = connect()
+    sockets[0].autoAck = false
+    sockets[0].open()
+
+    expect(connected.value).toBe(false)
+    expect(sockets[0].sent.map(m => m.type)).toEqual(['auth'])
+
+    // 业务帧必须等鉴权确认：subscribe 在 ack 前不得落到 socket 上
+    const sub = subscribe('501')
+    expect(sockets[0].sent.map(m => m.type)).toEqual(['auth'])
+
+    sockets[0].message({ type: 'connected', data: { userId: 7 } })
+    await pending
+    await sub
+
+    expect(connected.value).toBe(true)
+    expect(sockets[0].sent.map(m => m.type)).toContain('subscribe')
+  })
+
+  it('心跳判死后 onclose 迟迟不触发（半开连接）时，兜底定时器强制重连', async () => {
+    const { connect, connected } = useStreamWS()
+    const first = connect()
+    sockets[0].open()
+    await first
+    expect(connected.value).toBe(true)
+
+    // 模拟半开连接：close() 后 onclose 永远不触发
+    sockets[0].close = () => {}
+    // 心跳每 5s 一次，超过 30s 静默后判死并 close()
+    await vi.advanceTimersByTimeAsync(35_000)
+    expect(connected.value).toBe(true) // onclose 未触发，尚未走重连
+
+    await vi.advanceTimersByTimeAsync(3_000) // 兜底：强制按断开处理
+    expect(connected.value).toBe(false)
+    await vi.advanceTimersByTimeAsync(1_000) // scheduleReconnect 首轮延迟
+    expect(sockets).toHaveLength(2)
+
+    sockets[1].open()
+    await expect(connect()).resolves.toBeUndefined()
+    expect(connected.value).toBe(true)
+  })
+})
+
+describe('useStreamWS user_message_saved', () => {
+  it('side_user_ 前缀的边路任务乐观消息只替换 ID，不追加重复回显', async () => {
+    const { connect, subscribe } = useStreamWS()
+    const pending = connect()
+    sockets[0].open()
+    await pending
+    await subscribe('501')
+
+    const sessionStore = useSessionStore()
+    sessionStore.addUserMessage('501', {
+      id: 'side_user_1786850982000',
+      role: 'user',
+      content: '/var/log/btmp1 看下这个文件是什么文件',
+      createdAt: '2026-09-20 19:21:12',
+    } satisfies ChatMessageLike)
+
+    sockets[0].onmessage?.({
+      target: sockets[0],
+      data: JSON.stringify({
+        type: 'user_message_saved',
+        sessionId: 501,
+        data: { content: '/var/log/btmp1 看下这个文件是什么文件', messageId: 77 },
+      }),
+    })
+
+    const msgs = (sessionStore.getMessages('501') ?? []) as ChatMessageLike[]
+    expect(msgs.filter(m => m.role === 'user')).toHaveLength(1)
+    expect(msgs[0].id).toBe('77')
+  })
+
+  it('msg_ 前缀的主会话乐观消息同样只替换 ID，不追加重复回显', async () => {
+    const { connect, subscribe } = useStreamWS()
+    const pending = connect()
+    sockets[0].open()
+    await pending
+    await subscribe('9')
+
+    const sessionStore = useSessionStore()
+    sessionStore.addUserMessage('9', {
+      id: 'msg_1786850982000_user',
+      role: 'user',
+      content: '你好',
+      createdAt: '2026-09-20 19:21:12',
+    })
+
+    sockets[0].onmessage?.({
+      target: sockets[0],
+      data: JSON.stringify({
+        type: 'user_message_saved',
+        sessionId: 9,
+        data: { content: '你好', messageId: 88 },
+      }),
+    })
+
+    const msgs = (sessionStore.getMessages('9') ?? []) as ChatMessageLike[]
+    expect(msgs.filter(m => m.role === 'user')).toHaveLength(1)
+    expect(msgs[0].id).toBe('88')
+  })
+
+  it('纯图片乐观消息不会把带文字的远端消息吞掉', async () => {
+    const { connect, subscribe } = useStreamWS()
+    const pending = connect()
+    sockets[0].open()
+    await pending
+    await subscribe('9')
+
+    const sessionStore = useSessionStore()
+    sessionStore.addUserMessage('9', {
+      id: 'msg_1786850982000_user',
+      role: 'user',
+      content: '',
+      createdAt: '2026-09-20 19:21:12',
+      images: ['blob:local'],
+    })
+
+    sockets[0].onmessage?.({
+      target: sockets[0],
+      data: JSON.stringify({
+        type: 'user_message_saved',
+        sessionId: 9,
+        data: { content: '另一端发来的文字', messageId: 99 },
+      }),
+    })
+
+    const msgs = (sessionStore.getMessages('9') ?? []) as ChatMessageLike[]
+    const users = msgs.filter(m => m.role === 'user')
+    expect(users).toHaveLength(2)
+    expect(users[0].id).toBe('msg_1786850982000_user')
+    expect(users[1].content).toBe('另一端发来的文字')
+    expect(users[1].id).toBe('99')
+  })
+
+  it('连续两组提问按到达顺序保留，后到的不清空先到的', async () => {
+    const { connect, subscribe } = useStreamWS()
+    const pending = connect()
+    sockets[0].open()
+    await pending
+    await subscribe('9')
+
+    const sessionStore = useSessionStore()
+    const push = (requestId: string) => {
+      sockets[0].onmessage?.({
+        target: sockets[0],
+        data: JSON.stringify({
+          type: 'ask_user_questions',
+          sessionId: 9,
+          data: { requestId, questions: [{ id: requestId, prompt: requestId }] },
+        }),
+      })
+    }
+    push('first')
+    push('second')
+
+    const queued = sessionStore.sessionPendingQuestions.get('9') ?? []
+    expect(queued.map(q => q.requestId)).toEqual(['first', 'second'])
+  })
+})
+
+describe('useStreamWS side session creation', () => {
+  it('createSideSession 带切点时才下发 forkFromMessageId', async () => {
+    const { connect, createSideSession } = useStreamWS()
+    const pending = connect()
+    sockets[0].open()
+    await pending
+
+    await createSideSession('11', '继续深挖', 'fork', 3, undefined, undefined, [], 'READ_ONRITE' as string, 77)
+    await createSideSession('11', '全量分叉', 'fork')
+
+    const sideSends = sockets[0].sent.filter(m => m.type === 'create_side_session')
+    expect(sideSends).toHaveLength(2)
+    expect((sideSends[0].data as Record<string, unknown>).forkFromMessageId).toBe(77)
+    expect((sideSends[1].data as Record<string, unknown>).forkFromMessageId).toBeUndefined()
+  })
+
+  it('创建被拒时抛 side_session_rejected 事件，且不把父会话标成 FAILED', async () => {
+    const { connect, subscribe } = useStreamWS()
+    const pending = connect()
+    sockets[0].open()
+    await pending
+    await subscribe('11')
+
+    const sessionStore = useSessionStore()
+    sessionStore.updateSessionPhase('11', 'RUNNING')
+    const events: CustomEvent[] = []
+    const listener = (e: Event) => events.push(e as CustomEvent)
+    window.addEventListener('side_session_rejected', listener)
+
+    sockets[0].onmessage?.({
+      target: sockets[0],
+      data: JSON.stringify({
+        type: 'error',
+        sessionId: 11,
+        data: { message: '分叉来源消息不存在或已被删除，请刷新后重试', code: 'side_session_rejected' },
+      }),
+    })
+    window.removeEventListener('side_session_rejected', listener)
+
+    expect(events).toHaveLength(1)
+    expect(events[0].detail).toEqual({
+      message: '分叉来源消息不存在或已被删除，请刷新后重试',
+      parentSessionId: '11',
+    })
+    expect(sessionStore.getSessionPhase('11')).toBe('RUNNING')
+  })
+
+  it('普通 error 仍会走 FAILED 收敛路径', async () => {
+    const { connect, subscribe } = useStreamWS()
+    const pending = connect()
+    sockets[0].open()
+    await pending
+    await subscribe('11')
+
+    const sessionStore = useSessionStore()
+    const events: Event[] = []
+    const listener = (e: Event) => events.push(e)
+    window.addEventListener('side_session_rejected', listener)
+
+    sockets[0].onmessage?.({
+      target: sockets[0],
+      data: JSON.stringify({ type: 'error', sessionId: 11, data: { message: 'boom' } }),
+    })
+    window.removeEventListener('side_session_rejected', listener)
+
+    expect(events).toHaveLength(0)
+    expect(sessionStore.getSessionPhase('11')).toBe('FAILED')
+  })
+})
+
+describe('useStreamWS budget blocked (0.0.355 P3)', () => {
+  it('code=budget_exceeded 的 error 帧：派发 budget_blocked（带当前 sessionId），相位仍翻 FAILED', async () => {
+    const { connect, subscribe } = useStreamWS()
+    const pending = connect()
+    sockets[0].open()
+    await pending
+    await subscribe('11')
+
+    const sessionStore = useSessionStore()
+    sessionStore.updateSessionPhase('11', 'RUNNING')
+    sessionStore.setActiveSession('11')
+    const events: CustomEvent[] = []
+    const listener = (e: Event) => events.push(e as CustomEvent)
+    window.addEventListener('budget_blocked', listener)
+
+    sockets[0].onmessage?.({
+      target: sockets[0],
+      data: JSON.stringify({
+        type: 'error',
+        sessionId: 11,
+        data: { message: '本月全局预算已超限：当期消耗 12 / 上限 10（成本 口径），新任务已被拒绝。请调整预算或联系管理员', code: 'budget_exceeded' },
+      }),
+    })
+    window.removeEventListener('budget_blocked', listener)
+
+    expect(events).toHaveLength(1)
+    expect(events[0].detail).toEqual({ sessionId: '11' })
+    // 错误态与相位语义不变：横幅照常展示（文案已含消耗/上限），只多一个跳转信号
+    expect(sessionStore.activeExecutionError).toContain('本月全局预算已超限')
+    expect(sessionStore.getSessionPhase('11')).toBe('FAILED')
+  })
+
+  it('普通 error 不派发 budget_blocked（回归：P3 不新增噪声事件）', async () => {
+    const { connect, subscribe } = useStreamWS()
+    const pending = connect()
+    sockets[0].open()
+    await pending
+    await subscribe('11')
+
+    const events: Event[] = []
+    const listener = (e: Event) => events.push(e)
+    window.addEventListener('budget_blocked', listener)
+
+    sockets[0].onmessage?.({
+      target: sockets[0],
+      data: JSON.stringify({ type: 'error', sessionId: 11, data: { message: 'boom' } }),
+    })
+    window.removeEventListener('budget_blocked', listener)
+
+    expect(events).toHaveLength(0)
+  })
+})
+
+describe('useStreamWS inbox_updated', () => {
+  it('权威未读数写入 inbox store，非 Electron 不触发系统通知', async () => {
+    const { useStreamWS } = (await import('./useStreamWS')) as any
+    const { connect } = useStreamWS()
+    const pending = connect()
+    sockets[0].open()
+    await pending
+
+    const { useInboxStore } = await import('../stores/inbox')
+    const inboxStore = useInboxStore()
+    inboxStore.setUnreadCount(99)
+
+    sockets[0].onmessage?.({
+      target: sockets[0],
+      data: JSON.stringify({ type: 'inbox_updated', sessionId: null, data: { unreadCount: 3 } }),
+    })
+
+    expect(inboxStore.unreadCount).toBe(3)
+  })
+
+  it('onopen 重拉未读数（不进 focusLoaded 分支：未加载聚焦列表时也要更新）', async () => {
+    const { useStreamWS } = (await import('./useStreamWS')) as any
+    const { connect } = useStreamWS()
+    const first = connect()
+    sockets[0].open()
+    await first
+
+    const { useInboxStore } = await import('../stores/inbox')
+    const inboxStore = useInboxStore()
+    const spy = vi.spyOn(inboxStore, 'fetchUnreadCount')
+    const { useSessionStore } = await import('../stores/session')
+    // focusLoaded 保持 false：未读数重拉仍须发生
+    expect(useSessionStore().focusLoaded).toBe(false)
+
+    // 断线重连后第二次 onopen
+    sockets[0].close()
+    await vi.advanceTimersByTimeAsync(1000)
+    const second = useStreamWS().connect()
+    sockets[1].open()
+    await second
+
+    expect(spy).toHaveBeenCalled()
+  })
+})
+
+describe('useStreamWS session_already_running（拒绝帧不得被 stale 过滤吞掉）', () => {
+  it('占用方运行中本端发送被拒时，pendingCallbacks.reject 必须被调用', async () => {
+    const { connect, subscribe, setActiveExecution, pendingCallbacks } = useStreamWS()
+    const connecting = connect()
+    sockets[0].open()
+    await connecting
+    await subscribe('42')
+    // useChat.sendMessage 的真实时序：发送前登记本端新 eventId
+    setActiveExecution('42', 'evt-new-1')
+    const reject = vi.fn()
+    pendingCallbacks.set('42', { resolve: vi.fn(), reject })
+
+    // 后端 sendSessionAlreadyRunning：data.executionId 总是携带占用方的 executionId，
+    // 永远不等于本端刚登记的 active id——若按 stale 过滤会把拒绝帧吞掉，发送假成功
+    sockets[0].onmessage?.({
+      target: sockets[0],
+      data: JSON.stringify({
+        type: 'session_already_running',
+        sessionId: 42,
+        data: {
+          code: 'session_already_running',
+          message: '该任务仍在运行，请先停止当前执行后再继续',
+          executionId: 'exec-remote-1',
+        },
+      }),
+    })
+
+    expect(reject).toHaveBeenCalledTimes(1)
+    expect(reject.mock.calls[0]?.[0]).toBeInstanceOf(Error)
+  })
+})
+
+describe('useStreamWS 崩溃恢复 executionId 重绑（恢复帧不得被 stale 过滤吞掉）', () => {
+  const frame = (type: string, data: Record<string, unknown>) =>
+    sockets[0].onmessage?.({
+      target: sockets[0],
+      data: JSON.stringify({ type, sessionId: 42, data }),
+    })
+
+  it('session_snapshot 带恢复执行的新 executionId 后，流式帧正常进入 store', async () => {
+    const { connect, setActiveExecution } = useStreamWS()
+    const store = useSessionStore()
+    const connecting = connect()
+    sockets[0].open()
+    await connecting
+    // 后端重启前：前端登记的是旧执行的 executionId
+    setActiveExecution('42', 'exec-before-restart')
+    const shown = () => store.getMessages('42').map((m) => String(m.content)).join('')
+
+    // 崩溃恢复换了新 executionId：重绑前到达的帧仍按陈旧帧丢弃
+    frame('content_delta', { delta: '[恢复前帧]', executionId: 'exec-recovered' })
+    expect(shown()).not.toContain('[恢复前帧]')
+
+    // 重连 subscribe 的校准快照带上新 executionId → 重绑
+    frame('session_snapshot', { phase: 'RUNNING', executionId: 'exec-recovered' })
+
+    // 重绑后恢复执行的流式帧不再被丢弃
+    frame('content_delta', { delta: '[恢复执行增量]', executionId: 'exec-recovered' })
+    expect(shown()).toContain('[恢复执行增量]')
+
+    // 旧执行的迟到帧仍按陈旧帧丢弃
+    frame('content_delta', { delta: '[旧执行迟到帧]', executionId: 'exec-before-restart' })
+    expect(shown()).not.toContain('[旧执行迟到帧]')
+  })
+
+  it('恢复启动晚于重连时，session_status RUNNING 带新 executionId 同样完成重绑', async () => {
+    const { connect, setActiveExecution } = useStreamWS()
+    const store = useSessionStore()
+    const connecting = connect()
+    sockets[0].open()
+    await connecting
+    setActiveExecution('42', 'exec-before-restart')
+
+    frame('session_status', { phase: 'RUNNING', executionId: 'exec-recovered' })
+    frame('content_delta', { delta: '[恢复执行增量2]', executionId: 'exec-recovered' })
+
+    expect(store.getMessages('42').map((m) => String(m.content)).join('')).toContain('[恢复执行增量2]')
+  })
+})
+
+describe('useStreamWS 后台子代理完成通知（assistant_message_saved）', () => {
+  const noticeFrame = (data: Record<string, unknown>) =>
+    sockets[0].onmessage?.({
+      target: sockets[0],
+      data: JSON.stringify({ type: 'assistant_message_saved', sessionId: 9, data }),
+    })
+
+  const notice = {
+    messageId: 901,
+    content: '后台子代理（explorer）已完成：结论',
+    metadata: JSON.stringify({
+      backgroundSubagentCompletion: { childSessionId: 42, executionId: 7, status: 'COMPLETED', agentType: 'explorer' },
+    }),
+    childSessionId: 42,
+    executionId: 7,
+    status: 'COMPLETED',
+    agentType: 'explorer',
+  }
+
+  it('完成通知实时插入消息列表（无需刷新即可看到卡片）', async () => {
+    const { connect, subscribe } = useStreamWS()
+    const pending = connect()
+    sockets[0].open()
+    await pending
+    await subscribe('9')
+
+    const store = useSessionStore()
+    store.setMessages('9', [])
+    noticeFrame(notice)
+
+    const msgs = store.getMessages('9')
+    expect(msgs).toHaveLength(1)
+    expect(msgs[0].id).toBe('901')
+    expect(msgs[0].content).toContain('后台子代理（explorer）已完成')
+    // metadata 必须解析成对象，MessageBubble 的 backgroundSubagentCompletion 判定才成立
+    expect(msgs[0].metadata?.backgroundSubagentCompletion).toMatchObject({
+      childSessionId: 42,
+      executionId: 7,
+      status: 'COMPLETED',
+    })
+  })
+
+  it('同一条通知重复到达不产生重复气泡（刷新后 REST 历史已在缓存时去重）', async () => {
+    const { connect, subscribe } = useStreamWS()
+    const pending = connect()
+    sockets[0].open()
+    await pending
+    await subscribe('9')
+
+    const store = useSessionStore()
+    store.setMessages('9', [])
+    noticeFrame(notice)
+    noticeFrame(notice)
+
+    expect(store.getMessages('9').filter(m => m.id === '901')).toHaveLength(1)
+  })
+
+  it('缺少 messageId 或无后台子代理标记的事件不插入', async () => {
+    const { connect, subscribe } = useStreamWS()
+    const pending = connect()
+    sockets[0].open()
+    await pending
+    await subscribe('9')
+
+    const store = useSessionStore()
+    store.setMessages('9', [])
+    noticeFrame({ content: '无 id 的通知' })
+    noticeFrame({ messageId: 902, content: '普通助手消息', metadata: JSON.stringify({ other: true }) })
+
+    expect(store.getMessages('9')).toHaveLength(0)
+  })
+
+  it('metadata 损坏（非法 JSON）时安全跳过，不抛异常', async () => {
+    const { connect, subscribe } = useStreamWS()
+    const pending = connect()
+    sockets[0].open()
+    await pending
+    await subscribe('9')
+
+    const store = useSessionStore()
+    store.setMessages('9', [])
+    expect(() => noticeFrame({ ...notice, metadata: '{not-json' })).not.toThrow()
+    expect(store.getMessages('9')).toHaveLength(0)
+  })
+})
+
+// round 1 BUG-2：error 帧由客户端自行翻 FAILED，phase watcher 立即触发不带
+// preserveLiveStream 的终态重拉；error 分支若不先标记中断，已流出的部分回复
+// （服务端不落库失败轮次，唯一副本）会被当「REST 覆盖范围的尾部残留」删掉，
+// 而迟到的终态 session_status FAILED 帧再标记已空转。这是确定性顺序
+// （后端先发 error 帧再走 finishFailedSession），不是竞态。
+describe('useStreamWS error 帧（执行中失败）保留部分回复', () => {
+  const deliver = (msg: Record<string, unknown>) =>
+    sockets[0].onmessage?.({ target: sockets[0], data: JSON.stringify(msg) })
+
+  // 本组用例用真实定时器等 useChat 的 phase watcher 落库（外层 beforeEach 装了假定时器）
+  beforeEach(() => {
+    vi.useRealTimers()
+  })
+
+  /** 失败轮次服务端不落库：REST 历史只有用户消息，没有那条部分回复。 */
+  const restWithoutReply = () => {
+    vi.mocked(api.get).mockImplementation((url: string) => {
+      if (url === '/sessions/9/messages') {
+        return Promise.resolve({
+          data: { messages: [{ id: 100, role: 'user', content: '写个快排' }], hasMore: false },
+        } as never)
+      }
+      if (url === '/sessions/9/queue') return Promise.resolve({ data: [] } as never)
+      return Promise.resolve({ data: null } as never)
+    })
+  }
+
+  const flushRest = async () => {
+    for (let i = 0; i < 8; i++) await Promise.resolve()
+    await new Promise(resolve => setTimeout(resolve, 0))
+  }
+
+  const seedStreaming = (store: ReturnType<typeof useSessionStore>) => {
+    store.setMessages('9', [{
+      id: '100', role: 'user', content: '写个快排', createdAt: '2026-10-13 10:00:00',
+    }])
+    store.ensureStreamingAssistantMessage('9')
+    store.appendDelta('9', '好的，这是快速排序实现：')
+    store.setActiveSession('9')
+  }
+
+  it('error 帧置 FAILED 后的终态重拉必须保留部分回复（与 CANCELLED 帧路径对称）', async () => {
+    restWithoutReply()
+    const store = useSessionStore()
+    seedStreaming(store)
+
+    const chat = useChat(ref('1'), ref('CLOUD'))
+    chat.sessionId.value = '9'
+
+    const { connect } = useStreamWS()
+    const connected = connect()
+    sockets[0].open()
+    await connected
+
+    // 执行开始：RUNNING 帧登记 executionId
+    deliver({ type: 'session_status', sessionId: 9, data: { phase: 'RUNNING', executionId: 'e1' } })
+    await flushRest()
+
+    // 执行中后端抛错：先发 error 帧，随后 finishFailedSession 发终态 session_status FAILED
+    deliver({ type: 'error', sessionId: 9, data: { message: 'Agent 执行异常', executionId: 'e1' } })
+    await flushRest()
+    deliver({ type: 'session_status', sessionId: 9, data: { phase: 'FAILED', executionId: 'e1' } })
+    await flushRest()
+
+    const msgs = store.getMessages('9')
+    expect(msgs.map(m => m.role)).toEqual(['user', 'assistant'])
+    expect(msgs[1].content).toContain('快速排序')
+  })
+
+  it('对照组：正常完成路径 REST 已含完整回复，重拉后不重复', async () => {
+    vi.mocked(api.get).mockImplementation((url: string) => {
+      if (url === '/sessions/9/messages') {
+        return Promise.resolve({
+          data: {
+            messages: [
+              { id: 100, role: 'user', content: '写个快排' },
+              { id: 201, role: 'assistant', content: '好的，这是快速排序实现：' },
+            ],
+            hasMore: false,
+          },
+        } as never)
+      }
+      if (url === '/sessions/9/queue') return Promise.resolve({ data: [] } as never)
+      return Promise.resolve({ data: null } as never)
+    })
+    const store = useSessionStore()
+    seedStreaming(store)
+
+    const chat = useChat(ref('1'), ref('CLOUD'))
+    chat.sessionId.value = '9'
+
+    const { connect } = useStreamWS()
+    const connected = connect()
+    sockets[0].open()
+    await connected
+
+    deliver({ type: 'session_status', sessionId: 9, data: { phase: 'RUNNING', executionId: 'e1' } })
+    await flushRest()
+
+    // 正常完成：message_end 清注册，服务端已落库完整回复
+    deliver({ type: 'message_end', sessionId: 9, data: {} })
+    deliver({ type: 'session_status', sessionId: 9, data: { phase: 'COMPLETED', executionId: 'e1' } })
+    await flushRest()
+
+    const msgs = store.getMessages('9')
+    expect(msgs.map(m => m.role)).toEqual(['user', 'assistant'])
+    expect(msgs[1].id).toBe('201')
+    expect(msgs.filter(m => m.role === 'assistant')).toHaveLength(1)
+  })
+})

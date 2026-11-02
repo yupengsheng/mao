@@ -1,0 +1,444 @@
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join, resolve, sep } from 'node:path';
+import { fail } from '../common/result.js';
+import { isValidSkillName, parseSkillMdContent, validateSkillMd } from '../harness/skill/skill-md.js';
+import { isHiddenRelativePath, skillFilesPathError } from './read-skill-files.js';
+import { uploadFileMode } from './upload-file-mode.js';
+
+/** 内存文件安装用户技能的总量上限（UTF-8 字节），对齐 bundle inline 技能上限。 */
+const MAX_INSTALL_TOTAL_BYTES = 10 * 1024 * 1024;
+
+export interface UploadedSkillFile {
+  originalFilename: string | null;
+  buffer: Buffer;
+}
+
+export interface SkillDocVO {
+  name: string;
+  description?: string | null;
+  folderPath: string;
+  filePath?: string;
+}
+
+export interface AdminUserSkillVO extends SkillDocVO {
+  userId: number;
+  username?: string | null;
+  displayName?: string | null;
+}
+
+export interface SkillDocDetailVO {
+  name: string;
+  description?: string | null;
+  body?: string | null;
+  folderPath: string;
+  filePath: string;
+}
+
+export type SkillResult<T> = { code: number; message: string; data?: T };
+
+/** 系统技能名来源（SkillLoader 已实现）：用户技能上传判重需知道系统预置了哪些名字。 */
+export interface SystemSkillNames {
+  getAllNames(): string[];
+}
+
+export class UserSkillService {
+  constructor(
+    private readonly userSkillsDir: string,
+    private readonly systemSkills: SystemSkillNames,
+  ) {}
+
+  listUserSkills(userId: number): SkillDocVO[] {
+    const userDir = this.getUserSkillsDir(userId);
+    if (!existsSync(userDir) || !statSync(userDir).isDirectory()) {
+      return [];
+    }
+    const voList: SkillDocVO[] = [];
+    try {
+      for (const name of readdirSync(userDir)) {
+        const entry = join(userDir, name);
+        if (!statSync(entry).isDirectory()) continue;
+        const skillMd = join(entry, 'SKILL.md');
+        if (!existsSync(skillMd) || !statSync(skillMd).isFile()) continue;
+        try {
+          const doc = parseSkillMdContent(readFileSync(skillMd, 'utf8'));
+          if (doc != null && doc.name != null) {
+            voList.push({
+              name: doc.name,
+              description: doc.description,
+              folderPath: resolve(entry),
+            });
+          }
+        } catch (e) {
+          console.warn(`Failed to parse user skill at ${entry}: ${(e as Error).message}`);
+        }
+      }
+    } catch (e) {
+      console.warn(`Failed to scan user skills directory ${userDir}: ${(e as Error).message}`);
+    }
+    return voList;
+  }
+
+  listAllUserSkills(): AdminUserSkillVO[] {
+    if (!existsSync(this.userSkillsDir) || !statSync(this.userSkillsDir).isDirectory()) {
+      return [];
+    }
+    const result: AdminUserSkillVO[] = [];
+    let entries: string[] = [];
+    try {
+      entries = readdirSync(this.userSkillsDir);
+    } catch (e) {
+      console.warn(`Failed to scan user skills root ${this.userSkillsDir}: ${(e as Error).message}`);
+      return [];
+    }
+    for (const entry of entries) {
+      const userId = Number(entry);
+      if (!Number.isInteger(userId) || userId <= 0) continue;
+      for (const skill of this.listUserSkills(userId)) {
+        result.push({ ...skill, userId });
+      }
+    }
+    return result.sort((a, b) => a.userId - b.userId || a.name.localeCompare(b.name));
+  }
+
+  getUserSkill(userId: number, name: string, folderPath?: string): SkillResult<SkillDocDetailVO> {
+    const resolved = this.resolveUserSkillFolderByName(userId, name, folderPath);
+    if ('code' in resolved) return resolved;
+    const skillFolder = resolved.folder;
+    const skillMd = join(skillFolder, 'SKILL.md');
+    if (!existsSync(skillMd) || !statSync(skillMd).isFile()) {
+      return fail(404, `Skill not found: ${name}`);
+    }
+    try {
+      const doc = parseSkillMdContent(readFileSync(skillMd, 'utf8'));
+      if (doc == null || doc.name == null) {
+        return fail(404, `Skill not found: ${name}`);
+      }
+      return {
+        code: 0,
+        message: 'success',
+        data: {
+          name: doc.name,
+          description: doc.description,
+          body: doc.body,
+          folderPath: resolve(skillFolder),
+          filePath: resolve(skillMd),
+        },
+      };
+    } catch (e) {
+      return fail(500, `Failed to read skill: ${(e as Error).message}`);
+    }
+  }
+
+  uploadUserSkill(userId: number, files: UploadedSkillFile[] | null | undefined): SkillResult<string[]> {
+    if (files == null || files.length === 0) {
+      return fail(400, 'No files provided');
+    }
+    const grouped = groupSkillFiles(files);
+    if (grouped.size === 0) {
+      return fail(400, 'No valid skill folders found. Each skill must be in a subdirectory.');
+    }
+    for (const [skillName, group] of grouped) {
+      const validationError = validateSkillGroup(skillName, group);
+      if (validationError != null) return fail(400, validationError);
+    }
+    const conflicts = this.findSystemNameConflicts(grouped);
+    if (conflicts.length > 0) {
+      return fail(409, `与系统技能同名，禁止上传：${conflicts.join('、')}。个人技能会覆盖同名系统技能，请修改 SKILL.md 的 name 字段后重试`);
+    }
+    return this.commitSkillGroups(userId, grouped);
+  }
+
+  /**
+   * 内存文件安装用户技能（共享目录依赖一键补装）：校验链对齐 bundle 导入 inline 分支
+   * （SKILL.md 校验 + frontmatter 与技能名一致 + 隐藏路径段过滤 + 路径穿越拒绝），
+   * 落盘复用 uploadUserSkill 的暂存交换机制（stage → swap → backup → 失败恢复）。
+   * 与 uploadUserSkill 的覆盖语义不同：目标目录已存在即拒绝——自检按 frontmatter 名判缺失、
+   * 写盘按目录名落盘，"目录 A、frontmatter 名 B"的技能会让补装静默覆盖 A/。
+   */
+  installUserSkillFiles(userId: number, skillName: string, files: Record<string, string>): SkillResult<string> {
+    // skillName 来自 DB 的 agent.skillNames（不经过 bundle 解析），用作目录名前必须校验
+    if (!isValidSkillName(skillName)) {
+      return fail(400, `Invalid skill name: ${skillName}`);
+    }
+    if (this.systemSkills.getAllNames().includes(skillName)) {
+      return fail(409, `与系统技能同名，禁止上传：${skillName}。个人技能会覆盖同名系统技能，请改用其他名称`);
+    }
+    if (existsSync(join(this.getUserSkillsDir(userId), skillName))) {
+      return fail(409, `同名技能目录已存在，拒绝覆盖：${skillName}`);
+    }
+    const skillMd = files['SKILL.md'];
+    if (skillMd == null) {
+      return fail(400, `Skill '${skillName}' is missing SKILL.md file`);
+    }
+    const mdError = validateSkillMd(skillMd, skillName);
+    if (mdError != null) return fail(400, mdError);
+    const frontName = parseSkillMdContent(skillMd)?.name?.trim();
+    if (frontName !== skillName) {
+      return fail(400, `SKILL.md frontmatter name（${frontName ?? '缺失'}）与技能名（${skillName}）不一致`);
+    }
+    const pathError = skillFilesPathError(files);
+    if (pathError != null) return fail(400, pathError);
+
+    const filtered: Record<string, string> = {};
+    let totalBytes = 0;
+    for (const [path, content] of Object.entries(files)) {
+      if (isHiddenRelativePath(path)) continue;
+      const bytes = Buffer.byteLength(content, 'utf8');
+      totalBytes += bytes;
+      if (totalBytes > MAX_INSTALL_TOTAL_BYTES) {
+        return fail(400, `技能文件总量超过 ${Math.floor(MAX_INSTALL_TOTAL_BYTES / 1024 / 1024)}MB 上限`);
+      }
+      filtered[path] = content;
+    }
+    if (filtered['SKILL.md'] == null) {
+      return fail(400, `Skill '${skillName}' is missing SKILL.md file`);
+    }
+
+    const group: UploadedSkillFile[] = Object.entries(filtered).map(([path, content]) => ({
+      originalFilename: `${skillName}/${path}`,
+      buffer: Buffer.from(content, 'utf8'),
+    }));
+    const committed = this.commitSkillGroups(userId, new Map([[skillName, group]]));
+    if (committed.code !== 0) {
+      return { code: committed.code, message: committed.message };
+    }
+    return { code: 0, message: 'success', data: skillName };
+  }
+
+  /**
+   * 按 SKILL.md frontmatter 名判重：技能身份是全链路统一的 frontmatter 名（列表展示、
+   * SkillSync 合并、运行时目录名都按它），会话合并时用户技能后置覆盖系统同名技能
+   * （SkillSyncService.syncToSession 的 merged）。放行同名上传会让用户版本静默顶掉
+   * 系统预置版本，且管理员后续更新系统技能对已上传同名技能的用户不生效。
+   * 目录名与系统技能同名但 frontmatter 名不同的上传不冲突，照常放行。
+   */
+  private findSystemNameConflicts(grouped: Map<string, UploadedSkillFile[]>): string[] {
+    const systemNames = new Set(this.systemSkills.getAllNames());
+    if (systemNames.size === 0) return [];
+    const conflicts: string[] = [];
+    for (const group of grouped.values()) {
+      const skillMd = group.find((file) => relativeAfterSkill(file.originalFilename) === 'SKILL.md');
+      if (skillMd == null) continue;
+      const frontName = parseSkillMdContent(skillMd.buffer.toString('utf8'))?.name?.trim();
+      if (frontName != null && systemNames.has(frontName) && !conflicts.includes(frontName)) {
+        conflicts.push(frontName);
+      }
+    }
+    return conflicts;
+  }
+
+  /** 暂存交换写盘（stage → swap → backup → 失败恢复），uploadUserSkill 与 installUserSkillFiles 共用。 */
+  private commitSkillGroups(userId: number, grouped: Map<string, UploadedSkillFile[]>): SkillResult<string[]> {
+    const userDir = this.getUserSkillsDir(userId);
+    try {
+      mkdirSync(userDir, { recursive: true });
+    } catch (e) {
+      return fail(500, `Failed to create user skills directory: ${(e as Error).message}`);
+    }
+
+    const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    const stageRoot = join(this.userSkillsDir, '.staging', String(userId), token);
+    const backupRoot = join(this.userSkillsDir, '.staging', String(userId), `${token}-bak`);
+    const importedNames = [...grouped.keys()];
+    let committed = false;
+    let restoreFailed = false;
+    try {
+      mkdirSync(stageRoot, { recursive: true });
+      for (const [skillName, group] of grouped) {
+        writeSkillGroup(join(stageRoot, skillName), group);
+      }
+      mkdirSync(backupRoot, { recursive: true });
+      const swapped: string[] = [];
+      try {
+        for (const skillName of importedNames) {
+          swapStagedSkill(userDir, stageRoot, backupRoot, skillName);
+          swapped.push(skillName);
+        }
+        committed = true;
+      } catch (e) {
+        const detail = (e as Error).message;
+        const previousRestored = restoreSwappedSkills(userDir, backupRoot, swapped);
+        restoreFailed = !previousRestored || detail.includes('原技能恢复失败');
+        const suffix = restoreFailed ? '。原技能可能未能恢复' : '。原技能未替换';
+        console.error(`Failed to replace user skill for ${userId}: ${detail}`);
+        return fail(500, `Failed to write file: ${detail}${suffix}`);
+      }
+    } catch (e) {
+      if (committed) throw e;
+      console.error(`Failed to stage user skill for ${userId}: ${(e as Error).message}`);
+      return fail(500, `Failed to write file: ${(e as Error).message}。原技能未替换`);
+    } finally {
+      rmSync(stageRoot, { recursive: true, force: true });
+      if (committed || !restoreFailed) {
+        rmSync(backupRoot, { recursive: true, force: true });
+      }
+    }
+    console.info(`User ${userId} installed ${importedNames.length} skills: ${importedNames}`);
+    return { code: 0, message: 'success', data: importedNames };
+  }
+
+  deleteUserSkill(userId: number, name: string, folderPath?: string): SkillResult<null> {
+    const resolved = this.resolveUserSkillFolderByName(userId, name, folderPath);
+    if ('code' in resolved) return resolved;
+    const skillFolder = resolved.folder;
+    if (!existsSync(skillFolder) || !statSync(skillFolder).isDirectory()) {
+      return fail(404, `Skill not found: ${name}`);
+    }
+    try {
+      rmSync(skillFolder, { recursive: true, force: true });
+    } catch (e) {
+      console.error(`Failed to delete user skill folder ${skillFolder}: ${(e as Error).message}`);
+      return fail(500, `Failed to delete skill: ${(e as Error).message}`);
+    }
+    console.info(`User ${userId} deleted skill: ${name}`);
+    return { code: 0, message: 'success' };
+  }
+
+  getUserSkillsDir(userId: number): string {
+    return resolve(this.userSkillsDir, String(userId));
+  }
+
+  /**
+   * 按技能名定位用户技能目录（列表/运行时/SkillSync/导出全链路统一的技能身份口径）。
+   * 上传侧不校验"目录名 == frontmatter 名"（validateSkillGroup 只校验 SKILL.md 自身合法），
+   * "目录 holder、frontmatter 名 theirs"是正常上传即可达的状态；若按入参名重拼目录寻址，
+   * 这类技能在列表里可见却查看/删除必然 404（数据被锁死）。这里从 listUserSkills 的
+   * folderPath 解析，并按目录名回退以兼容按目录名传入的既有调用方。
+   *
+   * folderPath 入参（列表行级下发）做目录精确寻址：同一用户内目录名天然唯一，可穿透重名歧义。
+   * 不传 folderPath 时按技能名寻址，命中多个目录即 409 失败闭合——绝不做 find() 首个命中：
+   * 重名技能会因此删错对象（UI 删第二行实际删第一个目录）且误报已删除。
+   */
+  private resolveUserSkillFolderByName(
+    userId: number,
+    name: string,
+    folderPath?: string,
+  ): SkillResult<never> | { folder: string } {
+    if (!name || name.includes('/') || name.includes('\\') || name.includes('..') || name.startsWith('.')) {
+      return fail(400, `Invalid skill name: ${name}`);
+    }
+    const skills = this.listUserSkills(userId);
+    if (folderPath != null && folderPath.trim() !== '') {
+      const wantFolder = resolve(folderPath.trim());
+      // 只认绝对路径全等：目录 basename 兜底会把他人用户的同目录名配进来（跨用户串删），
+      // 同一用户内目录名天然唯一，全等寻址已足够穿透重名歧义
+      const exact = skills.find((s) => s.folderPath === wantFolder);
+      if (exact == null) {
+        return fail(404, `Skill not found: ${name}`);
+      }
+      return { folder: exact.folderPath };
+    }
+    const matched = [...new Map(
+      skills
+        .filter((s) => s.name === name || basename(s.folderPath) === name)
+        .map((s) => [s.folderPath, s] as const),
+    ).values()];
+    if (matched.length === 0) {
+      return fail(404, `Skill not found: ${name}`);
+    }
+    if (matched.length > 1) {
+      const detail = matched
+        .map((s) => `「${basename(s.folderPath)}」（展示名「${s.name}」）`)
+        .join('、');
+      return fail(
+        409,
+        `技能「${name}」在本人个人技能中指向多个目录（${matched.length} 个），拒绝歧义寻址：${detail}。请在列表中按该行「路径」删除指定目录`,
+      );
+    }
+    return { folder: matched[0].folderPath };
+  }
+}
+
+function groupSkillFiles(files: UploadedSkillFile[]): Map<string, UploadedSkillFile[]> {
+  const grouped = new Map<string, UploadedSkillFile[]>();
+  for (const file of files) {
+    const originalName = file.originalFilename;
+    if (originalName == null || originalName.trim().length === 0) continue;
+    const normalized = originalName.replace(/\\/g, '/');
+    const slashIdx = normalized.indexOf('/');
+    if (slashIdx <= 0) continue;
+    const skillName = normalized.slice(0, slashIdx);
+    if (skillName.startsWith('.') || skillName === '..' || skillName.includes('\0')) continue;
+    const list = grouped.get(skillName) ?? [];
+    list.push(file);
+    grouped.set(skillName, list);
+  }
+  return grouped;
+}
+
+function validateSkillGroup(skillName: string, group: UploadedSkillFile[]): string | null {
+  const hasSkillMd = group.some((file) => relativeAfterSkill(file.originalFilename) === 'SKILL.md');
+  if (!hasSkillMd) return `Skill '${skillName}' is missing SKILL.md file`;
+  const skillMdFile = group.find((file) => relativeAfterSkill(file.originalFilename) === 'SKILL.md');
+  if (skillMdFile == null) return `Skill '${skillName}' is missing SKILL.md file`;
+  return validateSkillMd(skillMdFile.buffer.toString('utf8'), skillName);
+}
+
+function writeSkillGroup(folder: string, group: UploadedSkillFile[]): void {
+  const resolvedFolder = resolve(folder);
+  for (const file of group) {
+    const relativePath = relativeAfterSkill(file.originalFilename);
+    if (relativePath.length === 0 || relativePath.includes('/.')) continue;
+    if (relativePath.split('/').some((segment) => segment === '..' || segment.length === 0)) {
+      throw new Error(`Invalid path: ${relativePath}`);
+    }
+    const targetFile = join(folder, relativePath);
+    const resolvedTarget = resolve(targetFile);
+    if (resolvedTarget !== resolvedFolder && !resolvedTarget.startsWith(resolvedFolder + sep)) {
+      throw new Error(`Invalid path: ${relativePath}`);
+    }
+    mkdirSync(dirname(targetFile), { recursive: true });
+    writeFileSync(targetFile, file.buffer, { mode: uploadFileMode(relativePath, file.buffer) });
+  }
+}
+
+function swapStagedSkill(userDir: string, stageRoot: string, backupRoot: string, skillName: string): void {
+  const finalFolder = resolve(userDir, skillName);
+  const userRoot = resolve(userDir);
+  if (finalFolder !== userRoot && !finalFolder.startsWith(userRoot + sep)) {
+    throw new Error(`Invalid skill name: ${skillName}`);
+  }
+  const stagedFolder = join(stageRoot, skillName);
+  const backupFolder = join(backupRoot, skillName);
+  let backedUp = false;
+  if (existsSync(finalFolder)) {
+    renameSync(finalFolder, backupFolder);
+    backedUp = true;
+    console.info(`Overwriting existing user skill: ${skillName}`);
+  }
+  try {
+    renameSync(stagedFolder, finalFolder);
+  } catch (e) {
+    if (backedUp) {
+      try {
+        renameSync(backupFolder, finalFolder);
+      } catch (restoreErr) {
+        throw new Error(`${(e as Error).message}；原技能恢复失败: ${(restoreErr as Error).message}`);
+      }
+    }
+    throw e;
+  }
+}
+
+function restoreSwappedSkills(userDir: string, backupRoot: string, swapped: string[]): boolean {
+  let ok = true;
+  for (const skillName of [...swapped].reverse()) {
+    const finalFolder = resolve(userDir, skillName);
+    const backupFolder = join(backupRoot, skillName);
+    try {
+      if (existsSync(finalFolder)) rmSync(finalFolder, { recursive: true, force: true });
+      if (existsSync(backupFolder)) renameSync(backupFolder, finalFolder);
+    } catch (e) {
+      ok = false;
+      console.error(`Failed to restore user skill ${skillName}: ${(e as Error).message}`);
+    }
+  }
+  return ok;
+}
+
+function relativeAfterSkill(originalName: string | null | undefined): string {
+  if (originalName == null) return '';
+  const relativePath = originalName.replace(/\\/g, '/');
+  const slashIdx = relativePath.indexOf('/');
+  return slashIdx > 0 ? relativePath.slice(slashIdx + 1) : '';
+}

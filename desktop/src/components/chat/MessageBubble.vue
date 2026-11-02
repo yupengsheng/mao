@@ -1,0 +1,1661 @@
+<template>
+  <div
+    :id="messageDomId"
+    ref="rootEl"
+    :class="['message-bubble', role, { 'tool-only': isToolOnly, 'message-locate-flash': flashing }]"
+    @click="onCitationSupClick"
+  >
+    <div class="message-content">
+      <div v-if="showTime" class="message-time-top">
+        <span class="message-time">{{ formatDateTime(message.createdAt) }}</span>
+      </div>
+
+      <!-- 后台子代理完成通知卡片 -->
+      <button
+        v-if="backgroundCompletion"
+        class="bg-subagent-card"
+        :class="`bg-${backgroundCompletion.status}`"
+        @click="openBackgroundSubagent"
+      >
+        <span class="bg-subagent-dot"></span>
+        <span class="bg-subagent-label">{{ backgroundCompletionLabel }}</span>
+      </button>
+
+      <!-- 后台子代理失败/取消的原因摘要：短内容完整展示，长内容默认压成一行、展开看全文。
+           已完成态正文默认不在主会话展开，结果详情经上面卡片进入子会话查看 -->
+      <div v-if="isBackgroundNotice && backgroundNoticeFailed && message.content" class="bg-subagent-detail">
+        <MarkdownContent
+          v-if="!backgroundNoticeLong || noticeExpanded"
+          :content="message.content"
+          body-class="assistant-text markdown-body"
+        />
+        <div v-else class="bg-subagent-detail-excerpt">{{ noticeExcerptText }}</div>
+        <button
+          v-if="backgroundNoticeLong"
+          class="bg-subagent-detail-toggle"
+          @click="noticeExpanded = !noticeExpanded"
+        >
+          {{ noticeExpanded ? '收起' : '展开全部' }}
+        </button>
+      </div>
+
+      <!-- 用户消息：正常态 -->
+      <div v-if="role === 'user' && !isEditing" class="message-text user-text" :class="{ collapsed: isUserLong && userCollapsed }">
+        <div v-if="message.images && message.images.length > 0 && !isEditing" class="message-images">
+          <el-image
+            v-for="(url, idx) in message.images"
+            :key="idx"
+            :src="url"
+            :preview-src-list="message.images"
+            :initial-index="idx"
+            fit="cover"
+            class="message-image"
+            :preview-teleported="true"
+          />
+        </div>
+        <div class="user-text-content">
+          <div v-if="userReplyQuotes.length" class="user-reply-quotes">
+            <div v-for="(quote, qIdx) in userReplyQuotes" :key="`q-${qIdx}`" class="user-reply-quote">{{ summarizeQuote(quote) }}</div>
+          </div>
+          <template v-for="(seg, idx) in userParsedSegments" :key="idx">
+            <FileReferenceTag v-if="seg.type === 'file'" :file-path="seg.filePath" :line-start="seg.lineStart" :line-end="seg.lineEnd" />
+            <QuickCommandTag v-else-if="seg.type !== 'text'" :type="seg.type" :name="seg.name" :content="seg.type === 'command' ? getCommandContent(seg.name) : undefined" />
+            <span v-else>{{ seg.content }}</span>
+          </template>
+        </div>
+        <button v-if="isUserLong" class="user-collapse-toggle" @click="userCollapsed = !userCollapsed">
+          {{ userCollapsed ? '展开全部' : '收起' }}
+        </button>
+      </div>
+
+      <!-- 用户消息：编辑态 -->
+      <div v-else-if="role === 'user' && isEditing" class="message-edit">
+        <textarea
+          ref="editInput"
+          v-model="editContent"
+          class="edit-textarea"
+          @keydown.escape="onEditKeydown($event, 'escape')"
+          @keydown.enter.ctrl="onEditKeydown($event, 'confirm')"
+          @keydown.enter.meta="onEditKeydown($event, 'confirm')"
+          rows="3"
+        />
+        <div class="edit-actions">
+          <button class="edit-confirm-btn" @click="handleConfirm" :disabled="!editContent.trim()">
+            <el-icon><Check /></el-icon> 确认
+          </button>
+          <button class="edit-cancel-btn" @click="$emit('cancelEdit')">
+            <el-icon><Close /></el-icon> 取消
+          </button>
+        </div>
+      </div>
+
+      <!-- assistant：按时间线穿插正文与工具 -->
+      <template v-else-if="renderSegments.length > 0">
+        <template v-for="(seg, idx) in renderSegments" :key="`${message.id}-seg-${idx}`">
+          <ThinkingBlock
+            v-if="seg.type === 'thinking' && seg.content"
+            :thinking="seg.content"
+            :streaming="isAssistantRunning && sessionThinkingActive && idx === lastThinkingIdx && lastRenderIsThinking"
+          />
+          <MarkdownContent
+            v-else-if="seg.type === 'text'"
+            :content="seg.content"
+            :cite-map="citeMap"
+            :streaming="isAssistantRunning"
+            body-class="assistant-text markdown-body"
+          />
+          <ToolCallGroup
+            v-else-if="seg.type === 'tool-group' && seg.toolCalls"
+            :tool-calls="seg.toolCalls"
+            :hide-process="hideSubagentProcess"
+          />
+        </template>
+      </template>
+
+      <!-- assistant 回退：无 segments 时 -->
+      <template v-else-if="role === 'assistant'">
+        <MarkdownContent
+          v-if="message.content && !isBackgroundNotice"
+          :content="message.content"
+          :cite-map="citeMap"
+          :streaming="isAssistantRunning"
+          body-class="assistant-text markdown-body"
+        />
+        <div v-if="visibleToolCalls.length > 0" class="tool-calls">
+          <ToolCallGroup :tool-calls="visibleToolCalls" :hide-process="hideSubagentProcess" />
+        </div>
+      </template>
+
+      <!-- 引用来源区（回复引用溯源）：正文之后、文件变更之前；≥4 条默认折叠 -->
+      <div v-if="showCitations" class="message-citations">
+        <button class="cite-toggle" @click="citationsExpanded = !(citationsExpanded ?? citationsAutoExpanded)">
+          <span class="cite-toggle-label">来源 {{ citations.length }}</span>
+          <span class="cite-toggle-icon">{{ (citationsExpanded ?? citationsAutoExpanded) ? '收起' : '展开' }}</span>
+        </button>
+        <ol v-show="citationsExpanded ?? citationsAutoExpanded" class="cite-list">
+          <li
+            v-for="(c, idx) in citations"
+            :key="c.n"
+            class="cite-item"
+            :data-cite-item="idx + 1"
+            @click="openCitation(c)"
+          >
+            <span class="cite-index">[{{ idx + 1 }}]</span>
+            <span class="cite-title">{{ citationDisplayTitle(c) }}</span>
+            <span v-if="citationDomain(c)" class="cite-domain">{{ citationDomain(c) }}</span>
+          </li>
+        </ol>
+      </div>
+
+      <FileChangePanel
+        v-if="!hideFileChanges && message.fileChanges && message.fileChanges.length > 0"
+        :changes="message.fileChanges"
+        mode="history"
+      />
+
+      <div v-if="message.files && message.files.length > 0" class="file-attachments">
+        <el-tag v-for="file in message.files" :key="file.id" size="small" type="info" class="file-tag">
+          <el-icon><Document /></el-icon>
+          {{ file.originalName || file.name }}
+        </el-tag>
+      </div>
+      <div v-if="isAssistantRunning && llmRetry?.attempt" class="llm-retry-bar">
+        <span class="llm-retry-spinner"></span>
+        <span class="llm-retry-text">上游响应异常{{ llmRetry.statusCode ? `（HTTP ${llmRetry.statusCode}）` : '' }}，正在第 {{ llmRetry.attempt }}/{{ llmRetry.maxRetries }} 次重试，{{ llmRetry.delaySeconds }} 秒后继续…</span>
+      </div>
+      <div v-if="showStreamIndicator" class="stream-indicator">
+        <span class="stream-dot"></span>
+        <span class="stream-dot"></span>
+        <span class="stream-dot"></span>
+      </div>
+      <div v-if="displayText && showCopy && !isAssistantRunning && !isEditing" class="message-footer">
+        <button v-if="canEdit" class="edit-btn" @click="$emit('edit')" title="编辑消息">
+          <el-icon :size="12"><Edit /></el-icon>
+        </button>
+        <button v-if="role === 'user'" class="add-command-btn" @click="$emit('addToCommand', userText)" title="添加到我的指令">
+          <el-icon :size="12"><Plus /></el-icon>
+        </button>
+        <button class="copy-btn" :class="{ copied }" @click="copyMessage">
+          <el-icon :size="12"><CopyDocument /></el-icon>
+          <span v-if="copied">已复制</span>
+        </button>
+        <el-popover
+          v-if="showDislike"
+          :visible="dislikePopoverVisible"
+          placement="top"
+          :width="220"
+          trigger="click"
+          popper-class="dislike-popover"
+        >
+          <template #reference>
+            <button
+              class="dislike-btn"
+              :class="{ disliked: messageDisliked, submitting: dislikeSubmitting }"
+              :disabled="dislikeSubmitting"
+              @click="toggleDislikePopover"
+              title="不满意此结果"
+            >
+              <svg class="dislike-icon" viewBox="0 0 24 24" width="13" height="13" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path
+                  d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3zm7-13h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+              <span v-if="messageDisliked" class="dislike-text">已点踩</span>
+            </button>
+          </template>
+          <div class="dislike-popover-body" @click.stop>
+            <div class="dislike-popover-title">{{ messageDisliked ? '已点踩，可重新选择原因' : '这个结果哪里不满意？' }}</div>
+            <div class="dislike-reason-list">
+              <button
+                v-for="option in FEEDBACK_REASON_OPTIONS"
+                :key="option.value"
+                class="dislike-reason-item"
+                :class="{ active: selectedReason === option.value }"
+                @click="chooseReason(option.value)"
+              >
+                {{ option.label }}
+              </button>
+            </div>
+            <button
+              v-if="messageDisliked"
+              class="dislike-cancel-btn"
+              :disabled="dislikeSubmitting"
+              @click="handleCancelDislike"
+            >
+              取消点踩
+            </button>
+          </div>
+        </el-popover>
+        <button v-if="showFork" class="fork-btn" @click="$emit('fork', props.message.id)" title="Fork 到边路任务">
+          <svg class="fork-icon" viewBox="0 0 24 24" width="13" height="13" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <circle cx="6" cy="6" r="2.6" stroke="currentColor" stroke-width="1.5" />
+            <circle cx="18" cy="6" r="2.6" stroke="currentColor" stroke-width="1.5" />
+            <circle cx="12" cy="18" r="2.6" stroke="currentColor" stroke-width="1.5" />
+            <path
+              d="M18 8.6v.9a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2v-.9M12 11.5v3.9"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </button>
+        <button v-if="showShare" class="share-btn-icon" @click="$emit('share')" title="分享会话">
+          <el-icon :size="12"><Link /></el-icon>
+        </button>
+      </div>
+    </div>
+  </div>
+  <Teleport to="body">
+    <button
+      v-if="quoteFloat"
+      type="button"
+      class="selection-quote-float"
+      :style="{ top: `${quoteFloat.top}px`, left: `${quoteFloat.left}px` }"
+      @mousedown.prevent
+      @click="applyFloatQuote"
+    >引用</button>
+  </Teleport>
+</template>
+
+<script lang="ts">
+import {
+  ensureCommandContent,
+  getCommandContent as lookupCommandContent
+} from '../../utils/commandContent'
+</script>
+
+<script setup lang="ts">
+import { computed, ref, watch, nextTick, inject, onMounted, onUnmounted } from 'vue'
+import { Document, CopyDocument, Edit, Check, Close, Plus, Link } from '@element-plus/icons-vue'
+import MarkdownContent from '../common/MarkdownContent.vue'
+import ToolCallGroup from './ToolCallGroup.vue'
+import ThinkingBlock from './ThinkingBlock.vue'
+import FileChangePanel from './FileChangePanel.vue'
+import QuickCommandTag from './QuickCommandTag.vue'
+import FileReferenceTag from './FileReferenceTag.vue'
+import {
+  normalizeMessageRole,
+  type ChatMessage,
+  type MessageSegment,
+  type ToolCall
+} from '../../composables/useChat'
+import { buildSegmentsFromContentAndTools, extractCitationsFromMetadata } from '../../utils/chatMessage'
+import { buildCiteMap, stripCitationMarkers } from '../../utils/citationMarkers'
+import { isAndroidCapacitor, openExternalUrl } from '../../utils/capacitor'
+import { plainTextFromRange, splitUserMessageForDisplay, summarizeQuote } from '../../utils/selection-quote'
+import type { Citation } from '../../types/chat'
+import { formatDateTime } from '../../utils/datetime'
+import { copyText } from '../../utils/clipboard'
+import { isActiveSessionPhase } from '../../utils/sessionPhase'
+import { useSessionStore } from '../../stores/session'
+import { LOCATE_FLASH_KEY } from '../../composables/useMessageLocate'
+import { subscribeReplyQuoteSelection } from '../../composables/replyQuoteSelectionBus'
+import {
+  FEEDBACK_REASON_OPTIONS,
+  isDislikeEligible,
+  isDislikeSubmitting,
+  isMessageDisliked,
+  removeDislike,
+  submitDislike
+} from '../../composables/useMessageFeedback'
+import type { FeedbackReason } from '../../api'
+import { stripInternalMarkers } from '../../utils/internalMarkers'
+import { userVisibleText } from '../../utils/imageUrlAnnotation'
+import {
+  getBackgroundCompletion,
+  isBackgroundNoticeFailed,
+  isNoticeLong,
+  noticeExcerpt,
+  type BackgroundCompletionMeta
+} from '../../utils/backgroundNotice'
+
+const props = withDefaults(defineProps<{
+  message: ChatMessage
+  showTime?: boolean
+  showCopy?: boolean
+  isLast?: boolean
+  canEdit?: boolean
+  isEditing?: boolean
+  hideThinking?: boolean
+  hideFileChanges?: boolean
+  /** 消息所属会话 ID；用于读取该会话自身的 LLM 重试状态（多会话场景，缺省回退主会话） */
+  sessionId?: string
+  /** 是否启用点踩按钮（主聊天/边路会话传入 true；子代理面板不传则不显示） */
+  dislikeEnabled?: boolean
+  /** 是否显示「Fork 到边路任务」按钮（仅主聊天传入 true） */
+  forkEnabled?: boolean
+  /** 是否显示「分享会话」入口（仅已有真实会话的主聊天/边路会话传入 true） */
+  shareEnabled?: boolean
+  /** 只读分享页隐藏 delegate「查看过程」（无会话上下文，点击无效果） */
+  hideSubagentProcess?: boolean
+}>(), {
+  showCopy: true,
+  isLast: false,
+  canEdit: false,
+  isEditing: false,
+  hideThinking: false,
+  hideFileChanges: false,
+  sessionId: '',
+  dislikeEnabled: false,
+  forkEnabled: false,
+  shareEnabled: false,
+  hideSubagentProcess: false
+})
+
+const emit = defineEmits<{
+  edit: []
+  cancelEdit: []
+  confirmEdit: [content: string]
+  addToCommand: [content: string]
+  /** 分叉到边路任务，payload 是被点击这一轮的助手最终回复 id（即切点） */
+  fork: [messageId: string]
+  /** 打开「分享会话」弹窗（与任务列表右键分享同一弹窗） */
+  share: []
+}>()
+
+// Edit mode state
+const editContent = ref(userVisibleText(props.message.content || ''))
+const editInput = ref<HTMLTextAreaElement>()
+const userCollapsed = ref(true)
+const copied = ref(false)
+const rootEl = ref<HTMLElement | null>(null)
+const quoteFloat = ref<{ top: number; left: number; text: string } | null>(null)
+const quoteReplyToChat = inject<((text: string) => void) | null>('quoteReplyToChat', null)
+
+watch(() => props.isEditing, async (editing) => {
+  if (editing) {
+    editContent.value = userVisibleText(props.message.content || '')
+    await nextTick()
+    editInput.value?.focus()
+    editInput.value?.select()
+  }
+})
+
+function handleConfirm() {
+  if (editContent.value.trim()) {
+    emit('confirmEdit', editContent.value)
+  }
+}
+
+/** 编辑态键盘处理：IME 组合态（中文候选上屏）不触发确认/取消，避免误提交或丢失未保存内容 */
+function onEditKeydown(event: KeyboardEvent, action: 'confirm' | 'escape') {
+  if (event.isComposing || event.keyCode === 229) return
+  event.preventDefault()
+  if (action === 'confirm') {
+    handleConfirm()
+  } else {
+    emit('cancelEdit')
+  }
+}
+
+const sessionStore = useSessionStore()
+const locateFlashId = inject(LOCATE_FLASH_KEY, ref<string | null>(null))
+const messageDomId = computed(() => {
+  const id = props.message.id
+  if (id == null || id === '') return undefined
+  return `msg-${id}`
+})
+const flashing = computed(() => locateFlashId.value != null && String(props.message.id) === locateFlashId.value)
+const role = computed(() => normalizeMessageRole(props.message.role))
+
+const backgroundCompletion = computed<BackgroundCompletionMeta | null>(() =>
+  getBackgroundCompletion(props.message)
+)
+
+const backgroundCompletionLabel = computed(() => {
+  const b = backgroundCompletion.value
+  if (!b) return ''
+  const status = b.status === 'COMPLETED' ? '已完成' : b.status === 'FAILED' ? '执行失败' : b.status === 'CANCELLED' ? '已取消' : (b.status || '已完成')
+  return `后台子代理（${b.agentType || '子代理'}）${status} · 点击查看详情`
+})
+
+const openSubagent = inject<(payload: { childSessionId: number; title?: string }) => void>('openSubagent', () => {})
+
+function openBackgroundSubagent() {
+  const b = backgroundCompletion.value
+  if (b?.childSessionId != null && openSubagent) {
+    openSubagent({ childSessionId: b.childSessionId, title: '后台子代理' })
+  }
+}
+
+/** 后台子代理完成通知：正文默认不在主会话展开，避免子代理输出打断主会话阅读流 */
+const isBackgroundNotice = computed(() => backgroundCompletion.value != null)
+
+/** 失败/取消时保留原因摘要；已完成态只留入口卡片，详情点击进子会话 */
+const backgroundNoticeFailed = computed(() =>
+  isBackgroundNoticeFailed(backgroundCompletion.value?.status)
+)
+
+const backgroundNoticeLong = computed(() => isNoticeLong(props.message.content))
+
+const noticeExcerptText = computed(() => noticeExcerpt(props.message.content))
+
+const noticeExpanded = ref(false)
+
+const HIDDEN_TOOL_NAMES = new Set(['todo', 'task_list', 'task_create', 'task_update', 'task_delete'])
+
+const visibleToolCalls = computed(() =>
+  props.message.toolCalls?.filter(tc => !HIDDEN_TOOL_NAMES.has(tc.name)) || []
+)
+
+// 会话级活动 phase：首轮 LLM 即被限流时无任何流式/思考事件，
+// 只有 phase 能证明会话仍在执行（重试条因此能正常显示）
+const isAssistantRunning = computed(() => {
+  if (role.value !== 'assistant') return false
+  if (props.message.toolCalls?.some(tc => tc.status === 'pending' || tc.status === 'running')) return true
+  if (!props.isLast) return false
+  // 按消息所属会话读取流式/思考状态，避免边路/子代理会话重试时漏显
+  if (props.sessionId) {
+    return sessionStore.isSessionStreaming(props.sessionId)
+      || sessionStore.isSessionThinking(props.sessionId)
+      || isActiveSessionPhase(sessionStore.getSessionPhase(props.sessionId))
+  }
+  return sessionStore.activeStreaming
+    || sessionStore.activeThinking
+    || isActiveSessionPhase(sessionStore.activeSession?.phase)
+})
+
+const showStreamIndicator = computed(() =>
+  role.value === 'assistant' &&
+  props.isLast &&
+  (props.sessionId
+    ? sessionStore.isSessionStreaming(props.sessionId)
+    : sessionStore.activeStreaming)
+)
+
+/** 当前会话是否处于思考阶段（thinking_start ~ thinking_end），用于区分“正在流式”与“已流完”的思考段 */
+const sessionThinkingActive = computed(() =>
+  props.sessionId
+    ? sessionStore.isSessionThinking(props.sessionId)
+    : sessionStore.activeThinking
+)
+
+/** 重试状态按消息所属会话读取，避免多会话（边路/子代理）串扰 */
+const llmRetry = computed(() =>
+  props.sessionId
+    ? sessionStore.getLlmRetry(props.sessionId)
+    : sessionStore.activeLlmRetry
+)
+
+const isToolOnly = computed(() =>
+  role.value === 'assistant' &&
+  visibleToolCalls.value.length > 0 &&
+  !props.message.content?.trim()
+)
+
+// ─── 回复引用溯源（技术方案 2026-10-12）───
+
+/** 本消息的引用来源（后端已做 URL 白名单校验；无 citations 的历史消息返回空数组） */
+const citations = computed<Citation[]>(() => extractCitationsFromMetadata(props.message.metadata))
+
+/** registry 序号 n → 展示序号 k（citations 已按 n 升序）；传给 markdown 渲染层转上标 */
+const citeMap = computed<Record<number, number> | undefined>(() =>
+  citations.value.length > 0 ? buildCiteMap(citations.value) : undefined
+)
+
+/** 后台子代理完成通知不渲染来源区（其正文不走主会话时间线，citations 也无展示语境） */
+const showCitations = computed(() =>
+  role.value === 'assistant' && citations.value.length > 0 && !isBackgroundNotice.value
+)
+
+/** ≥4 条默认折叠；null = 未手动操作，跟随自动态（metadata 异步到达也能正确） */
+const citationsAutoExpanded = computed(() => citations.value.length < 4)
+const citationsExpanded = ref<boolean | null>(null)
+
+/** 来源条目标题：缺失时回落域名 + 路径 */
+function citationDisplayTitle(c: Citation): string {
+  if (c.title.trim() !== '') return c.title
+  try {
+    const u = new URL(c.url)
+    return u.hostname + (u.pathname === '/' ? '' : u.pathname)
+  } catch {
+    return c.url
+  }
+}
+
+function citationDomain(c: Citation): string {
+  try {
+    return new URL(c.url).hostname
+  } catch {
+    return ''
+  }
+}
+
+/** 外跳系统浏览器：安卓 Capacitor 壳的 WebView 不支持多窗口，裸 window.open 点击无响应 */
+function openCitation(c: Citation): void {
+  void openExternalUrl(c.url)
+}
+
+/** 上标点击（事件委托）：滚动到本消息来源区对应条目并高亮，与消息定位闪烁同范式 */
+let citeFlashTimer: ReturnType<typeof setTimeout> | null = null
+function onCitationSupClick(event: MouseEvent): void {
+  const target = event.target as HTMLElement | null
+  const sup = target?.closest('.cite-ref') as HTMLElement | null
+  if (sup == null) return
+  const k = sup.getAttribute('data-cite')
+  if (k == null) return
+  const root = sup.closest('.message-bubble')
+  const item = root?.querySelector(`[data-cite-item="${k}"]`) as HTMLElement | null
+  if (item == null) return
+  item.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+  item.classList.add('cite-item-flash')
+  if (citeFlashTimer) clearTimeout(citeFlashTimer)
+  citeFlashTimer = setTimeout(() => { item.classList.remove('cite-item-flash') }, 1600)
+}
+
+const timelineSegments = computed((): MessageSegment[] => {
+  if (role.value !== 'assistant') return []
+  // 后台子代理通知的正文不走主会话时间线，由 bg-subagent-detail 单独负责折叠展示
+  if (isBackgroundNotice.value) return []
+  if (props.message.segments?.length) {
+    return props.message.segments.filter(seg =>
+      seg.type === 'text' || (!props.hideThinking && seg.type === 'thinking') || (seg.type === 'tool' && !!visibleToolCalls.value.find(tc => tc.id === seg.callId))
+    )
+  }
+  if (visibleToolCalls.value.length || props.message.content?.trim()) {
+    return buildSegmentsFromContentAndTools(
+      props.message.content || '',
+      visibleToolCalls.value
+    )
+  }
+  return []
+})
+
+type RenderSegment =
+  | { type: 'text'; content: string }
+  | { type: 'tool-group'; toolCalls: ToolCall[] }
+  | { type: 'thinking'; content: string }
+
+const renderSegments = computed((): RenderSegment[] => {
+  const segments = timelineSegments.value
+  if (segments.length === 0) return []
+
+  const result: RenderSegment[] = []
+  let toolBuffer: ToolCall[] = []
+
+  const flushToolBuffer = () => {
+    if (toolBuffer.length > 0) {
+      result.push({ type: 'tool-group', toolCalls: [...toolBuffer] })
+      toolBuffer = []
+    }
+  }
+
+  for (const seg of segments) {
+    if (seg.type === 'thinking') {
+      flushToolBuffer()
+      result.push({ type: 'thinking', content: seg.content || '' })
+    } else if (seg.type === 'text') {
+      flushToolBuffer()
+      result.push({ type: 'text', content: seg.content || '' })
+    } else {
+      const tc = getToolCall(seg.callId)
+      if (tc) {
+        toolBuffer.push(tc)
+      }
+    }
+  }
+
+  flushToolBuffer()
+  return result
+})
+
+const lastThinkingIdx = computed(() => {
+  for (let i = renderSegments.value.length - 1; i >= 0; i--) {
+    if (renderSegments.value[i].type === 'thinking') return i
+  }
+  return -1
+})
+
+/** 重置重试时会短暂把 thinking 标为 true；只有思考段仍在时间线末尾才显示「思考中」 */
+const lastRenderIsThinking = computed(() =>
+  renderSegments.value[renderSegments.value.length - 1]?.type === 'thinking'
+)
+
+/** Approx. chars per visual line in the user bubble (max-width ~75%). */
+const USER_CHARS_PER_LINE = 48
+const USER_COLLAPSE_LINES = 10
+/** Skip collapse for tiny multi-line content (e.g. short numbered lists). */
+const USER_COLLAPSE_MIN_CHARS = 160
+
+function estimateUserVisualLines(content: string): number {
+  if (!content) return 0
+  return content.split('\n').reduce((sum, line) => {
+    return sum + Math.max(1, Math.ceil(line.length / USER_CHARS_PER_LINE))
+  }, 0)
+}
+
+const isUserLong = computed(() => {
+  if (role.value !== 'user') return false
+  // 开头的回复引用折成一行摘要，不拿去撑开折叠。
+  const content = userParsedSegments.value.map(seg => {
+    if (seg.type === 'text') return seg.content
+    if (seg.type === 'file') return seg.filePath
+    return seg.name
+  }).join('')
+  return content.length >= USER_COLLAPSE_MIN_CHARS
+    && estimateUserVisualLines(content) > USER_COLLAPSE_LINES
+})
+
+/**
+ * 用户消息的展示口径：剥离图片 URL 注入行后的正文。
+ * 落库文本 part 带注入行（给 Agent 下载文件本体用），本地乐观消息只有正文，
+ * 不统一口径会让历史重拉后气泡「多出一行」。气泡 / 编辑 / 复制都读这个值。
+ */
+const userText = computed(() => userVisibleText(props.message.content || ''))
+
+/** footer / 复制等与角色无关的出口：用户走剥离口径，assistant 原样。 */
+const displayText = computed(() => role.value === 'user' ? userText.value : (props.message.content || ''))
+
+const userMessageParts = computed(() => splitUserMessageForDisplay(userText.value))
+const userReplyQuotes = computed(() => role.value === 'user' ? userMessageParts.value.quotes : [])
+const userParsedSegments = computed(() => {
+  if (role.value !== 'user') return []
+  return userMessageParts.value.segments
+})
+
+// Fetch commands when user messages with command tags are rendered
+const hasCommandSegments = computed(() =>
+  role.value === 'user' && userParsedSegments.value.some(s => s.type === 'command')
+)
+watch(hasCommandSegments, (val) => { if (val) ensureCommandContent() }, { immediate: true })
+
+function getCommandContent(name: string): string | undefined {
+  return lookupCommandContent(name)
+}
+
+function getToolCall(callId: string): ToolCall | undefined {
+  return visibleToolCalls.value.find(c => c.id === callId)
+}
+
+function hideQuoteFloat() {
+  quoteFloat.value = null
+}
+
+function elementFromNode(node: Node | null): Element | null {
+  if (!node) return null
+  return node instanceof Element ? node : node.parentElement
+}
+
+function captureQuoteSelection() {
+  if (!quoteReplyToChat || isAndroidCapacitor() || role.value !== 'assistant' || isAssistantRunning.value) {
+    hideQuoteFloat()
+    return
+  }
+  const selection = window.getSelection()
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+    hideQuoteFloat()
+    return
+  }
+  const anchorBody = elementFromNode(selection.anchorNode)?.closest('.markdown-body')
+  const focusBody = elementFromNode(selection.focusNode)?.closest('.markdown-body')
+  if (!anchorBody || anchorBody !== focusBody || !rootEl.value?.contains(anchorBody)) {
+    hideQuoteFloat()
+    return
+  }
+  const text = plainTextFromRange(selection.getRangeAt(0))
+  if (!text) {
+    hideQuoteFloat()
+    return
+  }
+  const rect = selection.getRangeAt(0).getBoundingClientRect()
+  quoteFloat.value = { top: Math.max(8, rect.top - 32), left: Math.max(8, rect.left), text }
+}
+
+function applyFloatQuote() {
+  if (!quoteReplyToChat || !quoteFloat.value) return
+  quoteReplyToChat(quoteFloat.value.text)
+  hideQuoteFloat()
+  window.getSelection()?.removeAllRanges()
+}
+
+/**
+ * 收起选区浮钮（总线的 dismiss 回调：按下 / 滚动 / 缩放 / Esc 都会走到）。
+ * 点在浮钮自身不能收——浮钮的 click 还没触发，收了就点不出引用。
+ */
+function dismissQuoteFloat(event?: Event) {
+  const target = event?.target
+  if (target instanceof Element && target.closest('.selection-quote-float')) return
+  hideQuoteFloat()
+}
+let copyTimer: ReturnType<typeof setTimeout> | null = null
+
+// ─── 点踩反馈 ───
+
+const showDislike = computed(() =>
+  props.dislikeEnabled
+  && role.value === 'assistant'
+  && isDislikeEligible(props.message.id)
+)
+
+const messageDisliked = computed(() => isMessageDisliked(props.sessionId, props.message.id))
+const dislikeSubmitting = computed(() => isDislikeSubmitting(props.message.id))
+
+/** Fork 入口只对助手回复有意义：把主会话历史复制到新的边路任务 */
+const showFork = computed(() => props.forkEnabled && role.value === 'assistant')
+
+/** 分享会话入口：同样是助手回复（会话级能力，与消息本身无关） */
+const showShare = computed(() => props.shareEnabled && role.value === 'assistant')
+
+const dislikePopoverVisible = ref(false)
+const selectedReason = ref<FeedbackReason | null>(null)
+
+function toggleDislikePopover() {
+  if (dislikeSubmitting.value) return
+  dislikePopoverVisible.value = !dislikePopoverVisible.value
+}
+
+// popover 受控模式下，点击按钮/弹层以外区域关闭
+function onDocumentClick(event: MouseEvent) {
+  if (!dislikePopoverVisible.value) return
+  const target = event.target as HTMLElement | null
+  if (target?.closest('.dislike-btn') || target?.closest('.dislike-popover-body') || target?.closest('.el-popover')) return
+  dislikePopoverVisible.value = false
+}
+
+let unsubscribeQuoteSelection: (() => void) | null = null
+
+onMounted(() => {
+  document.addEventListener('click', onDocumentClick)
+  if (!quoteReplyToChat) return
+  // 回复选区的窗口监听走共享总线：整条消息列表只挂一组，按选中所在气泡分发。
+  // 每条气泡各挂 5 个 listener 的话，长会话里每次 pointerup / scroll
+  // 都会在所有已挂载气泡里跑一遍选区判定。
+  unsubscribeQuoteSelection = subscribeReplyQuoteSelection({
+    root: () => rootEl.value,
+    refresh: captureQuoteSelection,
+    dismiss: dismissQuoteFloat,
+  })
+})
+onUnmounted(() => {
+  document.removeEventListener('click', onDocumentClick)
+  unsubscribeQuoteSelection?.()
+  unsubscribeQuoteSelection = null
+})
+
+watch(() => props.message.id, () => {
+  dislikePopoverVisible.value = false
+  selectedReason.value = null
+})
+
+async function chooseReason(reason: FeedbackReason) {
+  selectedReason.value = reason
+  const ok = await submitDislike(props.sessionId, props.message.id, reason)
+  if (ok) dislikePopoverVisible.value = false
+}
+
+async function handleCancelDislike() {
+  const ok = await removeDislike(props.sessionId, props.message.id)
+  if (ok) {
+    dislikePopoverVisible.value = false
+    selectedReason.value = null
+  }
+}
+
+async function copyMessage() {
+  // 引用标记同样是渲染层约定（来源区不在剪贴板语境里），复制时一并剥掉
+  const text = stripCitationMarkers(stripInternalMarkers(displayText.value)).trim()
+  if (!text) return
+  const ok = await copyText(text)
+  if (!ok) return
+  copied.value = true
+  if (copyTimer) clearTimeout(copyTimer)
+  copyTimer = setTimeout(() => { copied.value = false }, 1500)
+}
+</script>
+
+<style scoped>
+.message-locate-flash {
+  animation: message-locate-flash 2s ease;
+}
+@keyframes message-locate-flash {
+  0%, 40% { background: rgba(255, 193, 7, 0.45); }
+  100% { background: transparent; }
+}
+.message-bubble {
+  display: flex;
+  gap: 12px;
+}
+
+.message-bubble.user {
+  flex-direction: row-reverse;
+}
+
+.message-content {
+  min-width: 100%;
+  max-width: 100%;
+}
+
+.message-bubble.user .message-content {
+  text-align: left;
+  min-width: 20%;
+  max-width: 75%;
+}
+
+.message-time-top {
+  margin-bottom: 4px;
+}
+
+.message-time {
+  font-size: var(--aw-text-fine);
+  color: var(--aw-ink-muted-48);
+  letter-spacing: -0.12px;
+}
+
+.bg-subagent-card {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  padding: 5px 10px;
+  border: 1px solid var(--aw-hairline);
+  border-radius: var(--aw-radius-sm);
+  background: var(--aw-surface-pearl, var(--aw-canvas-parchment));
+  color: var(--aw-ink);
+  cursor: pointer;
+  font-size: var(--aw-text-fine);
+  line-height: 1.5;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.bg-subagent-card:hover {
+  border-color: var(--aw-primary);
+}
+
+.bg-subagent-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--aw-success);
+  flex-shrink: 0;
+}
+
+.bg-subagent-card.bg-FAILED .bg-subagent-dot {
+  background: var(--aw-danger);
+}
+
+.bg-subagent-card.bg-CANCELLED .bg-subagent-dot {
+  background: var(--aw-ink-muted-48);
+}
+
+.bg-subagent-detail {
+  margin-bottom: 6px;
+  color: var(--aw-body);
+  font-size: var(--aw-text-caption);
+  line-height: 2;
+  letter-spacing: -0.374px;
+  word-break: break-word;
+}
+
+.bg-subagent-detail-excerpt {
+  color: var(--aw-ink-muted-80);
+}
+
+.bg-subagent-detail-toggle {
+  display: inline-block;
+  margin-top: 2px;
+  padding: 2px 0;
+  border: none;
+  background: none;
+  color: var(--aw-primary);
+  font-size: var(--aw-text-fine);
+  cursor: pointer;
+  line-height: 1.5;
+}
+
+.bg-subagent-detail-toggle:hover {
+  opacity: 0.7;
+}
+
+:root[data-theme="dark"] .bg-subagent-detail-toggle {
+  color: var(--aw-primary-on-dark);
+}
+
+.message-text {
+  border-radius: var(--aw-radius-lg);
+  line-height: 2;
+  letter-spacing: -0.374px;
+  word-break: break-word;
+  font-size: var(--aw-text-caption);
+}
+
+.user-text {
+  color: var(--aw-ink);
+  background: var(--aw-primary-hover);
+  border-top-right-radius: var(--aw-radius-xs);
+  white-space: pre-line;
+  padding: 8px 14px;
+}
+
+:root[data-theme="dark"] .user-text {
+  background: rgba(41, 151, 255, 0.12);
+}
+
+.user-text.collapsed .user-text-content {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 10;
+  line-clamp: 10;
+  overflow: hidden;
+}
+
+.user-reply-quotes {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+
+.user-reply-quote {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--aw-ink-muted-64);
+  font-size: var(--aw-text-fine);
+}
+
+.selection-quote-float {
+  position: fixed;
+  z-index: 4000;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--aw-hairline, #ddd);
+  border-radius: 6px;
+  background: var(--aw-canvas, #fff);
+  color: var(--aw-ink, #222);
+  font-size: 12px;
+  line-height: 22px;
+  cursor: pointer;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+}
+
+.user-collapse-toggle {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 2px 0;
+  border: none;
+  background: none;
+  color: var(--aw-primary);
+  font-size: var(--aw-text-fine);
+  cursor: pointer;
+  line-height: 1.5;
+}
+
+.user-collapse-toggle:hover {
+  opacity: 0.7;
+}
+
+:root[data-theme="dark"] .user-collapse-toggle {
+  color: var(--aw-primary-on-dark);
+}
+
+.assistant-text {
+  color: var(--aw-body);
+  font-size: var(--aw-text-caption);
+  line-height: 2;
+  letter-spacing: -0.374px;
+  word-break: break-word;
+}
+
+.assistant-text:last-child {
+  margin-bottom: 0;
+}
+
+/* Markdown body styles */
+.markdown-body :deep(p) {
+  margin: 0;
+  font-size: var(--aw-text-caption);
+  line-height: 2;
+  letter-spacing: -0.374px;
+}
+
+.markdown-body :deep(pre) {
+  margin: 2px 0;
+  border-radius: var(--aw-radius-sm);
+  overflow: hidden;
+}
+
+.markdown-body :deep(.code-block) {
+  margin: 2px 0;
+  border-radius: var(--aw-radius-sm);
+  overflow: hidden;
+}
+
+.markdown-body :deep(.code-block-header) {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 12px;
+  background: var(--aw-surface-code-header);
+  font-size: var(--aw-text-fine);
+}
+
+.markdown-body :deep(.code-lang) {
+  color: var(--aw-ink-muted-48);
+  font-family: var(--aw-font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0;
+}
+
+.markdown-body :deep(.code-copy-btn) {
+  height: var(--aw-btn-height);
+  background: none;
+  border: 1px solid var(--aw-hairline);
+  color: var(--aw-ink-muted-48);
+  padding: var(--aw-btn-padding);
+  border-radius: var(--aw-radius-xs);
+  cursor: pointer;
+  font-size: var(--aw-text-fine);
+  transition: all 0.15s;
+}
+
+.markdown-body :deep(.code-copy-btn:hover) {
+  color: var(--aw-ink);
+  border-color: var(--aw-ink-muted-48);
+}
+
+.markdown-body :deep(code) {
+  font-family: var(--aw-font-mono);
+  font-size: var(--aw-text-caption);
+}
+
+.markdown-body :deep(.monaco-code) {
+  display: block;
+  padding: 12px;
+  background: var(--aw-surface-code);
+  color: var(--aw-text-code);
+  overflow-x: auto;
+  font-family: var(--aw-font-mono);
+  font-size: var(--aw-text-caption);
+  line-height: 20px;
+}
+
+.markdown-body :deep(ul),
+.markdown-body :deep(ol) {
+  margin: 2px 0;
+  padding-left: 20px;
+}
+
+.markdown-body :deep(li) {
+  font-size: var(--aw-text-caption);
+  line-height: 2;
+  letter-spacing: -0.374px;
+}
+
+.markdown-body :deep(blockquote) {
+  margin: 2px 0;
+  padding: 4px 12px;
+  border-left: 3px solid var(--aw-primary);
+  color: var(--aw-ink-muted-80);
+  background: var(--aw-canvas-parchment);
+  border-radius: 0 var(--aw-radius-xs) var(--aw-radius-xs) 0;
+}
+
+.markdown-body :deep(table) {
+  border-collapse: collapse;
+  margin: 2px 0;
+  width: 100%;
+}
+
+.markdown-body :deep(th),
+.markdown-body :deep(td) {
+  border: 1px solid var(--aw-hairline);
+  padding: 6px 10px;
+  text-align: left;
+  font-size: var(--aw-text-caption);
+}
+
+.markdown-body :deep(th) {
+  background: var(--aw-canvas-parchment);
+  font-weight: 600;
+}
+
+.markdown-body :deep(hr) {
+  border: none;
+  border-top: 1px solid var(--aw-divider-soft);
+  margin: 2px 0;
+}
+
+.markdown-body :deep(h1),
+.markdown-body :deep(h2),
+.markdown-body :deep(h3),
+.markdown-body :deep(h4) {
+  font-family: var(--aw-font-display);
+  font-weight: 600;
+  color: var(--aw-ink);
+  margin: 4px 0 2px;
+  letter-spacing: 0;
+}
+
+.markdown-body :deep(h1) { font-size: var(--aw-text-lead); }
+.markdown-body :deep(h2) { font-size: var(--aw-text-tagline); }
+.markdown-body :deep(h3) { font-size: var(--aw-text-body); }
+.markdown-body :deep(h4) { font-size: var(--aw-text-caption); }
+
+.tool-calls {
+  margin-top: 0;
+}
+
+.file-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+/* ─── 回复引用溯源（技术方案 2026-10-12）─── */
+
+.message-citations {
+  margin-top: 6px;
+  border: 1px solid var(--aw-hairline);
+  border-radius: var(--aw-radius-sm);
+  background: var(--aw-canvas-parchment);
+  overflow: hidden;
+}
+
+.cite-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 10px;
+  border: none;
+  background: none;
+  color: var(--aw-ink-muted-80);
+  font-size: var(--aw-text-fine);
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.cite-toggle:hover {
+  color: var(--aw-ink);
+}
+
+.cite-toggle-label {
+  font-weight: 500;
+}
+
+.cite-toggle-icon {
+  color: var(--aw-primary);
+}
+
+.cite-list {
+  margin: 0;
+  padding: 2px 10px 8px 10px;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.cite-item {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: var(--aw-radius-xs);
+  font-size: var(--aw-text-fine);
+  line-height: 1.6;
+  color: var(--aw-ink-muted-80);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.cite-item:hover {
+  background: color-mix(in srgb, var(--aw-primary) 8%, transparent);
+  color: var(--aw-ink);
+}
+
+.cite-index {
+  font-family: var(--aw-font-mono);
+  color: var(--aw-primary);
+  flex-shrink: 0;
+}
+
+.cite-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cite-domain {
+  flex-shrink: 0;
+  color: var(--aw-ink-muted-48);
+  font-size: var(--aw-text-fine);
+}
+
+.cite-item-flash {
+  animation: cite-item-flash 1.6s ease;
+}
+
+@keyframes cite-item-flash {
+  0%, 40% { background: rgba(255, 193, 7, 0.35); }
+  100% { background: transparent; }
+}
+
+.markdown-body :deep(.cite-ref) {
+  display: inline-block;
+  min-width: 14px;
+  margin: 0 1px;
+  padding: 0 3px;
+  border-radius: var(--aw-radius-xs);
+  background: color-mix(in srgb, var(--aw-primary) 12%, transparent);
+  color: var(--aw-primary);
+  font-size: 10px;
+  line-height: 1.5;
+  text-align: center;
+  cursor: pointer;
+  vertical-align: super;
+  font-family: var(--aw-font-mono);
+  transition: background 0.15s;
+}
+
+.markdown-body :deep(.cite-ref:hover) {
+  background: color-mix(in srgb, var(--aw-primary) 25%, transparent);
+}
+
+.message-bubble.user .file-attachments {
+  justify-content: flex-end;
+}
+
+.file-tag {
+  font-size: var(--aw-text-fine);
+  border-radius: var(--aw-radius-pill);
+}
+
+.message-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.message-bubble.user .message-images {
+  justify-content: flex-end;
+}
+
+.message-image {
+  max-width: 60px;
+  max-height: 60px;
+  object-fit: cover;
+  border-radius: var(--aw-radius-sm);
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.message-image:hover {
+  opacity: 0.85;
+}
+
+.message-footer {
+  display: flex;
+  align-items: center;
+  margin-top: 4px;
+}
+
+.message-bubble.user .message-footer {
+  justify-content: flex-end;
+}
+
+/* 操作栏图标钮统一 24px 见方圆钮（同 fork-btn / share-btn-icon）；带文字的状态
+   （已复制）单独放宽成胶囊，避免为偶发文字把常驻宽度撑大。 */
+.copy-btn {
+  width: var(--aw-btn-height);
+  height: var(--aw-btn-height);
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  border: none;
+  background: transparent;
+  color: var(--aw-ink-muted-48);
+  font-size: var(--aw-text-fine);
+  cursor: pointer;
+  border-radius: var(--aw-radius-xs);
+  transition: color 0.15s, background 0.15s;
+  letter-spacing: -0.12px;
+}
+
+.copy-btn:hover {
+  color: var(--aw-ink);
+  background: color-mix(in srgb, var(--aw-ink) 5%, transparent);
+}
+
+.copy-btn.copied {
+  width: auto;
+  padding: var(--aw-btn-padding);
+  color: var(--aw-success);
+}
+
+.dislike-btn {
+  width: var(--aw-btn-height);
+  height: var(--aw-btn-height);
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  border: none;
+  background: transparent;
+  color: var(--aw-ink-muted-48);
+  font-size: var(--aw-text-fine);
+  line-height: 1;
+  cursor: pointer;
+  border-radius: var(--aw-radius-xs);
+  transition: color 0.15s, background 0.15s;
+  letter-spacing: -0.12px;
+}
+
+.dislike-btn:hover:not(:disabled) {
+  color: var(--aw-ink);
+  background: color-mix(in srgb, var(--aw-ink) 5%, transparent);
+}
+
+/* 文字态（已点踩）放宽成胶囊，与 .copy-btn.copied 一致 */
+.dislike-btn.disliked {
+  width: auto;
+  padding: var(--aw-btn-padding);
+  color: var(--aw-danger, #e05252);
+}
+
+.dislike-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.dislike-icon {
+  display: block;
+  margin-top: 1px; /* SVG 无字体基线整体偏高，下移对齐复制图标（el-icon 12px）视觉中线 */
+}
+
+.dislike-text {
+  line-height: 1;
+}
+
+.fork-btn {
+  width: var(--aw-btn-height);
+  height: var(--aw-btn-height);
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--aw-ink-muted-48);
+  cursor: pointer;
+  border-radius: var(--aw-radius-xs);
+  transition: color 0.15s, background 0.15s;
+}
+
+.fork-btn:hover {
+  color: var(--aw-primary);
+  background: color-mix(in srgb, var(--aw-ink) 5%, transparent);
+}
+
+.fork-icon {
+  display: block;
+  margin-top: 1px; /* 与点踩图标同样下移，对齐 el-icon 12px 的视觉中线 */
+}
+
+.dislike-popover-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.dislike-popover-title {
+  font-size: var(--aw-text-fine);
+  color: var(--aw-ink);
+  font-weight: 500;
+}
+
+.dislike-reason-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.dislike-reason-item {
+  padding: 6px 10px;
+  border: 1px solid var(--aw-hairline);
+  border-radius: var(--aw-radius-xs);
+  background: transparent;
+  color: var(--aw-ink-muted-80);
+  font-size: var(--aw-text-fine);
+  text-align: left;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.dislike-reason-item:hover {
+  border-color: var(--aw-primary);
+  color: var(--aw-ink);
+}
+
+.dislike-reason-item.active {
+  border-color: var(--aw-primary);
+  background: color-mix(in srgb, var(--aw-primary) 8%, transparent);
+  color: var(--aw-primary);
+}
+
+.dislike-cancel-btn {
+  height: var(--aw-btn-height);
+  padding: var(--aw-btn-padding);
+  border: 1px solid var(--aw-hairline);
+  border-radius: var(--aw-radius-xs);
+  background: transparent;
+  color: var(--aw-ink-muted-48);
+  font-size: var(--aw-text-fine);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.dislike-cancel-btn:hover:not(:disabled) {
+  color: var(--aw-ink);
+  border-color: var(--aw-ink-muted-48);
+}
+
+.dislike-cancel-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.stream-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 0;
+}
+
+.stream-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--aw-ink-muted-48);
+  animation: stream-pulse 1.4s ease-in-out infinite;
+}
+
+.stream-dot:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.stream-dot:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes stream-pulse {
+  0%, 80%, 100% { opacity: 0.3; transform: scale(0.8); }
+  40% { opacity: 1; transform: scale(1); }
+}
+
+.llm-retry-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--aw-warning, #e6a23c);
+  border-radius: var(--aw-radius-sm, 8px);
+  background: color-mix(in srgb, var(--aw-warning, #e6a23c) 10%, transparent);
+  color: var(--aw-warning, #e6a23c);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.llm-retry-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid color-mix(in srgb, var(--aw-warning, #e6a23c) 30%, transparent);
+  border-top-color: var(--aw-warning, #e6a23c);
+  border-radius: 50%;
+  animation: llm-retry-spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes llm-retry-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Edit mode styles */
+.message-edit {
+  width: 100%;
+}
+
+.edit-textarea {
+  width: 100%;
+  min-height: 60px;
+  padding: 8px 12px;
+  border: 1px solid var(--aw-primary);
+  border-radius: var(--aw-radius-sm);
+  background: var(--aw-surface);
+  color: var(--aw-ink);
+  font-size: var(--aw-text-caption);
+  line-height: 1.6;
+  resize: vertical;
+  outline: none;
+  transition: border-color 0.15s;
+  box-sizing: border-box;
+}
+
+.edit-textarea:focus {
+  border-color: var(--aw-primary-focus);
+}
+
+.edit-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.edit-confirm-btn,
+.edit-cancel-btn {
+  height: var(--aw-btn-height);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: var(--aw-btn-padding);
+  border: none;
+  border-radius: var(--aw-radius-xs);
+  font-size: var(--aw-text-fine);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.edit-confirm-btn {
+  background: var(--aw-primary);
+  color: white;
+}
+
+.edit-confirm-btn:hover:not(:disabled) {
+  background: var(--aw-primary-focus);
+}
+
+.edit-confirm-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.edit-cancel-btn {
+  background: transparent;
+  color: var(--aw-ink-muted-48);
+  border: 1px solid var(--aw-hairline);
+}
+
+.edit-cancel-btn:hover {
+  color: var(--aw-ink);
+  border-color: var(--aw-ink-muted-48);
+}
+
+.edit-btn {
+  width: var(--aw-btn-height);
+  height: var(--aw-btn-height);
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border: none;
+  background: transparent;
+  color: var(--aw-ink-muted-48);
+  font-size: var(--aw-text-fine);
+  cursor: pointer;
+  border-radius: var(--aw-radius-xs);
+  transition: color 0.15s, background 0.15s;
+}
+
+.edit-btn:hover {
+  color: var(--aw-primary);
+  background: color-mix(in srgb, var(--aw-ink) 5%, transparent);
+}
+
+.add-command-btn {
+  width: var(--aw-btn-height);
+  height: var(--aw-btn-height);
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border: none;
+  background: transparent;
+  color: var(--aw-ink-muted-48);
+  font-size: var(--aw-text-fine);
+  cursor: pointer;
+  border-radius: var(--aw-radius-xs);
+  transition: color 0.15s, background 0.15s;
+}
+
+.add-command-btn:hover {
+  color: var(--aw-primary);
+  background: color-mix(in srgb, var(--aw-ink) 5%, transparent);
+}
+
+/* 分享会话：与 fork-btn 及整条操作栏同形同度量（24px 见方圆钮，悬停主色）。图标用 Link
+   链条，不用 element-plus 的 Share——后者同样是「三点 + 连线」，和 fork 拓扑撞车难以分辨。 */
+.share-btn-icon {
+  width: var(--aw-btn-height);
+  height: var(--aw-btn-height);
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--aw-ink-muted-48);
+  cursor: pointer;
+  border-radius: var(--aw-radius-xs);
+  transition: color 0.15s, background 0.15s;
+}
+
+.share-btn-icon:hover {
+  color: var(--aw-primary);
+  background: color-mix(in srgb, var(--aw-ink) 5%, transparent);
+}
+</style>

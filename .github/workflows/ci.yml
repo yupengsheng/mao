@@ -1,0 +1,172 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend TS Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: backend-ts/package-lock.json
+
+      - name: Install dependencies
+        working-directory: backend-ts
+        run: npm ci
+
+      - name: Build backend-ts
+        working-directory: backend-ts
+        run: npm run build
+
+      - name: Test backend-ts
+        working-directory: backend-ts
+        run: npm test
+
+  admin:
+    name: Admin Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: admin/package-lock.json
+
+      - name: Install dependencies
+        working-directory: admin
+        run: npm ci
+
+      - name: Build admin
+        working-directory: admin
+        run: npm run build
+
+  desktop:
+    name: Desktop Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3 python3-setuptools make g++
+
+      - name: Install dependencies
+        working-directory: desktop
+        # CI 只跑 vitest / vue-tsc / vite，不启动 Electron。跳过 lifecycle
+        # 以免 electron 二进制下载和 node-pty 的 electron-rebuild 拖垮或弄挂 npm ci。
+        run: npm ci --ignore-scripts --legacy-peer-deps
+
+      - name: Run unit tests
+        working-directory: desktop
+        run: npm run test:unit
+
+      - name: Build desktop
+        working-directory: desktop
+        run: npm run build
+
+  embed-sdk:
+    name: Embed SDK Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: sdk/embed/package-lock.json
+
+      - name: Install dependencies
+        working-directory: sdk/embed
+        run: npm ci
+
+      - name: Build embed SDK
+        working-directory: sdk/embed
+        run: npm run build
+
+      - name: Test embed SDK
+        working-directory: sdk/embed
+        run: npm test
+
+      - name: Check bundle size
+        working-directory: sdk/embed
+        run: npm run size
+
+  agent-cli:
+    name: Agent CLI Test (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["20", "22"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: agent-cli/package-lock.json
+
+      - name: Install dependencies
+        working-directory: agent-cli
+        run: npm ci
+
+      - name: Build agent-cli
+        working-directory: agent-cli
+        run: npm run build
+
+      - name: Typecheck agent-cli tests
+        working-directory: agent-cli
+        run: npm run typecheck
+
+      - name: Test agent-cli
+        working-directory: agent-cli
+        run: npm test
+
+      - name: Vendor localShell stays in sync
+        run: cmp desktop/electron/localShell.cjs agent-cli/vendor/localShell.cjs
+
+      - name: Pack agent-cli
+        working-directory: agent-cli
+        run: npm pack --dry-run

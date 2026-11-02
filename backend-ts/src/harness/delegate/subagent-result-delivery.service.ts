@@ -1,0 +1,351 @@
+import { nowSql } from '../../common/datetime.js';
+import { MISSING_TOOL_RESULT_PLACEHOLDER } from '../core/message-history-normalizer.js';
+import type { Db } from '../../db/db.js';
+import type { FileChange, Message, Session, SubagentExecution } from '../../session/types.js';
+import { harnessLog } from '../log.js';
+import { fileChangeCopyKey, fileChangesAfterMessage } from './file-change-copy.js';
+import { SubagentExecutionMapper } from './subagent-execution.mapper.js';
+import { SubagentRecoveryResultFactory } from './subagent-recovery-result-factory.js';
+
+const TERMINAL_PHASES = new Set(['COMPLETED', 'FAILED', 'CANCELLED']);
+
+export interface BackgroundFileChangeRepo {
+  listBySession(sessionId: number): Promise<FileChange[]>;
+  insert(change: FileChange): Promise<number>;
+}
+
+/** SUBAGENT_DONE 站内通知能力（可选注入；接口化避免 harness 反向依赖 inbox 域实现）。 */
+export interface SubagentDeliveryInboxRecorder {
+  recordSubagentDone(input: {
+    parentSessionId: number;
+    childSessionId: number;
+    executionId: number;
+    status: string;
+    result: string | null;
+    agentType: string | null;
+    taskDescription: string | null;
+  }): Promise<void>;
+}
+
+export class SubagentResultDeliveryService {
+  constructor(
+    private readonly db: Db,
+    private readonly fileChangeRepo?: BackgroundFileChangeRepo,
+    private readonly inboxRecorder?: SubagentDeliveryInboxRecorder | null,
+  ) {}
+
+  async inferLegacyFields(execution: SubagentExecution): Promise<SubagentExecution> {
+    if (execution.id == null || execution.childSessionId == null) return execution;
+    if (execution.invocationType && execution.parentToolCallId) return execution;
+    return this.db.transaction(async (tx) => {
+      const mapper = new SubagentExecutionMapper(tx);
+      const locked = await mapper.findByIdForUpdate(execution.id!);
+      if (!locked) throw new Error(`Subagent execution ${execution.id} not found`);
+      const first = await mapper.findFirstByChildSessionId(locked.childSessionId!);
+      const invocationType = locked.invocationType ?? (first?.id === locked.id ? 'DELEGATE' : 'FOLLOWUP');
+      const parentToolCallId = locked.parentToolCallId ?? `recovered_subagent_execution_${locked.id}`;
+      await mapper.updateById(locked.id!, { invocationType, parentToolCallId });
+      return { ...locked, invocationType, parentToolCallId };
+    });
+  }
+
+  async deliver(executionId: number): Promise<'DELIVERED' | 'SUPPRESSED' | 'SKIPPED'> {
+    return this.db.transaction(async (tx) => {
+      const mapper = new SubagentExecutionMapper(tx);
+      let execution = await mapper.findByIdForUpdate(executionId);
+      if (!execution) throw new Error(`Subagent execution ${executionId} not found`);
+      if (execution.deliveryStatus === 'DELIVERED' || execution.deliveryStatus === 'SUPPRESSED') return 'SKIPPED';
+      if (execution.parentSessionId == null || execution.childSessionId == null) {
+        await mapper.updateById(executionId, { deliveryStatus: 'SUPPRESSED' });
+        return 'SUPPRESSED';
+      }
+      const parentSessionId = execution.parentSessionId;
+      const childSessionId = execution.childSessionId;
+      const parent = await tx.queryOne<Session>(
+        'SELECT * FROM session WHERE id = ? AND deleted = 0 FOR UPDATE', [parentSessionId],
+      );
+      if (!parent || TERMINAL_PHASES.has(parent.phase ?? '')) {
+        await tx.execute(
+          `UPDATE subagent_execution SET delivery_status = 'SUPPRESSED'
+           WHERE parent_session_id = ? AND delivery_status = 'PENDING'`,
+          [parentSessionId],
+        );
+        return 'SUPPRESSED';
+      }
+      execution = await this.inferLocked(tx, mapper, execution);
+      if (execution.invocationType === 'BACKGROUND' || execution.invocationType === 'FOLLOWUP') {
+        return this.deliverBackground(tx, mapper, execution, parentSessionId);
+      }
+      const toolCallId = execution.parentToolCallId!;
+      const existing = await this.findMessagePair(tx, parentSessionId, toolCallId);
+      let assistantId = existing.assistant?.id ?? null;
+      let toolId = existing.tool?.id ?? null;
+      if (!existing.complete) {
+        if (existing.assistant?.id != null) {
+          // 原助手消息上可能还有正文和同轮其它工具调用，只换掉缺失或占位的这一条 TOOL。
+          assistantId = existing.assistant.id;
+          if (existing.tool?.id != null) {
+            await tx.execute('UPDATE message SET deleted = 1 WHERE id = ?', [existing.tool.id]);
+          }
+        } else {
+          await this.removeIncompletePair(tx, parentSessionId, toolCallId);
+          assistantId = await tx.insert('message', {
+            sessionId: parentSessionId,
+            role: 'ASSISTANT',
+            content: '',
+            thinkingContent: null,
+            toolCallId: null,
+            toolCalls: JSON.stringify([{
+              id: toolCallId,
+              type: 'function',
+              function: {
+                name: 'delegate',
+                arguments: JSON.stringify(SubagentRecoveryResultFactory.invocationArguments(execution)),
+              },
+            }]),
+            tokenCount: 0,
+            modelId: null,
+            metadata: null,
+            sourceSessionId: null,
+            deleted: 0,
+          });
+        }
+        toolId = await tx.insert('message', {
+          sessionId: parentSessionId,
+          role: 'TOOL',
+          content: JSON.stringify(SubagentRecoveryResultFactory.build(execution)),
+          thinkingContent: null,
+          toolCallId,
+          toolCalls: null,
+          tokenCount: 0,
+          modelId: null,
+          metadata: null,
+          sourceSessionId: childSessionId,
+          deleted: 0,
+        });
+      }
+      const now = nowSql();
+      await mapper.updateById(executionId, {
+        deliveryStatus: 'DELIVERED',
+        parentResultDeliveredAt: now,
+        parentAssistantMessageId: assistantId,
+        parentToolMessageId: toolId,
+      });
+      await tx.execute('UPDATE session SET updated_at = ? WHERE id = ?', [now, parentSessionId]);
+      harnessLog('info', `subagent_result_delivered executionId=${executionId} parent=${execution.parentSessionId} toolCallId=${toolCallId}`);
+      return 'DELIVERED';
+    });
+  }
+
+  private async deliverBackground(
+    tx: Db,
+    mapper: SubagentExecutionMapper,
+    execution: SubagentExecution,
+    parentSessionId: number,
+  ): Promise<'DELIVERED' | 'SUPPRESSED'> {
+    const summary = truncate(execution.result ?? '', 2000);
+    const content = `后台子代理（${execution.agentType ?? ''}）${backgroundStatusLabel(execution.status ?? '')}：${summary}`;
+    const metadata = JSON.stringify({
+      backgroundSubagentCompletion: {
+        childSessionId: execution.childSessionId,
+        executionId: execution.id,
+        status: execution.status,
+        agentType: execution.agentType ?? null,
+      },
+    });
+    // 正常完成路径先插通知、再单独把 delivery_status 写成 DELIVERED。
+    // 两步之间崩溃时状态仍是 PENDING，恢复不能再插一条相同通知。
+    const existingId = await this.findBackgroundNotice(tx, parentSessionId, execution);
+    const assistantId = existingId ?? await tx.insert('message', {
+      sessionId: parentSessionId,
+      role: 'ASSISTANT',
+      content,
+      thinkingContent: null,
+      toolCallId: null,
+      toolCalls: null,
+      tokenCount: 0,
+      modelId: null,
+      metadata,
+      sourceSessionId: execution.childSessionId,
+      deleted: 0,
+    });
+    // 通知去重与文件变更聚合是两件独立的事：崩溃可能发生在「通知已提交」与
+    // 「copyFileChanges 提交」之间，恢复复用已有通知时仍必须执行聚合，否则该后台
+    // 子代理本轮的文件变更永久丢失（父会话变更面板静默缺失）。幂等由 copyFileChanges
+    // 内按 fileChangeCopyKey 构建的 seen 集合保证，重复调用不会复制出重复行。
+    if (this.fileChangeRepo && execution.childSessionId != null) {
+      await this.copyFileChanges(
+        execution.childSessionId, assistantId, parentSessionId, execution.executionStartMessageId ?? null,
+      );
+    }
+    const now = nowSql();
+    await mapper.updateById(execution.id!, {
+      deliveryStatus: 'DELIVERED',
+      parentResultDeliveredAt: now,
+      parentAssistantMessageId: assistantId,
+    });
+    await tx.execute('UPDATE session SET updated_at = ? WHERE id = ?', [now, parentSessionId]);
+    harnessLog('info', `background_subagent_result_delivered executionId=${execution.id} parent=${parentSessionId}`);
+    this.notifyInboxSubagentDone(execution, parentSessionId);
+    return 'DELIVERED';
+  }
+
+  /**
+   * SUBAGENT_DONE 站内通知：覆盖 COMPLETED / FAILED / CANCELLED 三种终态。
+   * fire-and-forget + 全吞异常：投递事务已经提交，收件箱失败不得回滚或上抛。
+   */
+  private notifyInboxSubagentDone(execution: SubagentExecution, parentSessionId: number): void {
+    const recorder = this.inboxRecorder;
+    if (recorder == null) return;
+    const childSessionId = execution.childSessionId;
+    const executionId = execution.id;
+    if (childSessionId == null || executionId == null) return;
+    const status = execution.status ?? '';
+    if (status !== 'COMPLETED' && status !== 'FAILED' && status !== 'CANCELLED') return;
+    void Promise.resolve()
+      .then(() => recorder.recordSubagentDone({
+        parentSessionId,
+        childSessionId,
+        executionId,
+        status,
+        result: execution.result ?? null,
+        agentType: execution.agentType ?? null,
+        taskDescription: execution.taskDescription ?? null,
+      }))
+      .catch((e) => {
+        harnessLog('warn', `Inbox subagent notification failed for execution ${executionId}: ${(e as Error).message}`);
+      });
+  }
+
+  private async copyFileChanges(
+    childSessionId: number,
+    noticeMessageId: number,
+    parentSessionId: number,
+    afterMessageId: number | null,
+  ): Promise<void> {
+    const repo = this.fileChangeRepo;
+    if (!repo) return;
+    try {
+      const changes = fileChangesAfterMessage(await repo.listBySession(childSessionId), afterMessageId);
+      const seen = new Set((await repo.listBySession(parentSessionId)).map(fileChangeCopyKey));
+      for (const change of changes) {
+        const key = fileChangeCopyKey(change);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        await repo.insert({
+          ...change,
+          id: undefined,
+          messageId: noticeMessageId,
+          sessionId: parentSessionId,
+        });
+      }
+    } catch (e) {
+      harnessLog('warn', `Failed to aggregate file changes for recovered background subagent ${childSessionId}: ${(e as Error).message}`);
+    }
+  }
+
+  async suppressForParent(parentSessionId: number): Promise<void> {
+    await this.db.transaction(async (tx) => {
+      await tx.queryOne('SELECT id FROM session WHERE id = ? FOR UPDATE', [parentSessionId]);
+      await tx.execute(
+        `UPDATE subagent_execution
+         SET delivery_status = 'SUPPRESSED',
+             completed_at = CASE WHEN status IN ('RUNNING', 'RECOVERING') THEN ? ELSE completed_at END,
+             status = CASE WHEN status IN ('RUNNING', 'RECOVERING') THEN 'CANCELLED' ELSE status END
+         WHERE parent_session_id = ? AND delivery_status = 'PENDING'`,
+        [nowSql(), parentSessionId],
+      );
+    });
+  }
+
+  private async inferLocked(
+    tx: Db, mapper: SubagentExecutionMapper, execution: SubagentExecution,
+  ): Promise<SubagentExecution> {
+    if (execution.invocationType && execution.parentToolCallId) return execution;
+    const first = await mapper.findFirstByChildSessionId(execution.childSessionId!);
+    const invocationType = execution.invocationType ?? (first?.id === execution.id ? 'DELEGATE' : 'FOLLOWUP');
+    const parentToolCallId = execution.parentToolCallId ?? `recovered_subagent_execution_${execution.id}`;
+    await mapper.updateById(execution.id!, { invocationType, parentToolCallId });
+    return { ...execution, invocationType, parentToolCallId };
+  }
+
+  private async findBackgroundNotice(
+    tx: Db, parentSessionId: number, execution: SubagentExecution,
+  ): Promise<number | null> {
+    if (execution.id == null || execution.childSessionId == null) return null;
+    const rows = await tx.query<{ id?: number; metadata?: string | null }>(
+      `SELECT id, metadata FROM message
+       WHERE session_id = ? AND role = 'ASSISTANT' AND deleted = 0 AND source_session_id = ?`,
+      [parentSessionId, execution.childSessionId],
+    );
+    for (const row of rows) {
+      if (row.id == null || row.metadata == null || row.metadata === '') continue;
+      try {
+        const meta = JSON.parse(row.metadata) as { backgroundSubagentCompletion?: { executionId?: number } };
+        if (meta.backgroundSubagentCompletion?.executionId === execution.id) return row.id;
+      } catch {
+        // 损坏的 metadata 不当作已投递通知
+      }
+    }
+    return null;
+  }
+
+  private async findMessagePair(
+    tx: Db, parentSessionId: number, toolCallId: string,
+  ): Promise<{ assistant: Message | null; tool: Message | null; complete: boolean }> {
+    const rows = await tx.query<Message>(
+      `SELECT * FROM message WHERE session_id = ? AND deleted = 0
+       AND (tool_call_id = ? OR (role = 'ASSISTANT' AND tool_calls IS NOT NULL)) ORDER BY id`,
+      [parentSessionId, toolCallId],
+    );
+    let assistant: Message | null = null;
+    const tool = rows.find((row) => row.role === 'TOOL' && row.toolCallId === toolCallId) ?? null;
+    for (const row of rows) {
+      if (row.role !== 'ASSISTANT' || !row.toolCalls) continue;
+      try {
+        const calls = JSON.parse(row.toolCalls) as Array<{ id?: string }>;
+        if (calls.some((call) => call.id === toolCallId)) assistant = row;
+      } catch {
+        // Damaged assistant rows are removed below before reconstruction.
+      }
+    }
+    // 占位不是真实输出。替换时只动这一条 TOOL，不拆整条助手消息。
+    const placeholder = tool != null && tool.content === MISSING_TOOL_RESULT_PLACEHOLDER;
+    return { assistant, tool, complete: assistant != null && tool != null && !placeholder };
+  }
+
+  private async removeIncompletePair(tx: Db, parentSessionId: number, toolCallId: string): Promise<void> {
+    const rows = await tx.query<Message>(
+      `SELECT * FROM message WHERE session_id = ? AND deleted = 0
+       AND (tool_call_id = ? OR role = 'ASSISTANT')`,
+      [parentSessionId, toolCallId],
+    );
+    const ids: number[] = [];
+    for (const row of rows) {
+      if (row.role === 'TOOL' && row.toolCallId === toolCallId && row.id != null) ids.push(row.id);
+      if (row.role === 'ASSISTANT' && row.toolCalls && row.id != null) {
+        try {
+          const calls = JSON.parse(row.toolCalls) as Array<{ id?: string }>;
+          if (calls.some((call) => call.id === toolCallId)) ids.push(row.id);
+        } catch {
+          if (row.toolCalls.includes(toolCallId)) ids.push(row.id);
+        }
+      }
+    }
+    if (ids.length > 0) {
+      await tx.execute(`UPDATE message SET deleted = 1 WHERE id IN (${ids.map(() => '?').join(',')})`, ids);
+    }
+  }
+}
+
+function truncate(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  return text.slice(0, maxLen) + '...';
+}
+
+function backgroundStatusLabel(status: string): string {
+  if (status === 'COMPLETED') return '已完成';
+  if (status === 'FAILED') return '执行失败';
+  if (status === 'CANCELLED') return '已取消';
+  return status;
+}

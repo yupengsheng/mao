@@ -1,0 +1,156 @@
+import { describe, expect, it } from 'vitest';
+import type { ChatRequest } from './chat-request.js';
+import { serializeChatRequest } from './json.js';
+
+describe('serializeChatRequest', () => {
+  it.each([false, true])('omits internal tool summaries without mutating history (stream=%s)', (stream) => {
+    const toolCalls = [
+      {
+        id: 'call_date',
+        type: 'function',
+        function: { name: 'shell', arguments: '{"command":"date"}' },
+        summary: '执行 date (2 行输出)',
+      },
+      {
+        id: 'call_read',
+        type: 'function',
+        function: { name: 'read_file', arguments: '{"path":"README.md"}' },
+        summary: '',
+      },
+    ];
+    const request: ChatRequest = {
+      messages: [
+        { role: 'system', content: '网页助手' },
+        { role: 'user', content: '现在几点' },
+        { role: 'assistant', content: '', toolCalls },
+        { role: 'tool', content: '2026-09-08 09:29:00 CST', toolCallId: 'call_date' },
+        { role: 'tool', content: '文档正文', toolCallId: 'call_read' },
+      ],
+    };
+    const original = structuredClone(request);
+
+    const body = serializeChatRequest(request, 'glm-5.3', stream);
+
+    expect(body).toEqual({
+      model: 'glm-5.3',
+      stream,
+      messages: [
+        { role: 'system', content: '网页助手' },
+        { role: 'user', content: '现在几点' },
+        {
+          role: 'assistant', content: '',
+          tool_calls: toolCalls.map((tc) => ({ id: tc.id, type: tc.type, function: tc.function })),
+        },
+        { role: 'tool', content: '2026-09-08 09:29:00 CST', tool_call_id: 'call_date' },
+        { role: 'tool', content: '文档正文', tool_call_id: 'call_read' },
+      ],
+    });
+    expect(request).toEqual(original);
+  });
+
+  it.each([false, true])('defaults missing tool_call type to function for legacy Responses history (stream=%s)', (stream) => {
+    const request: ChatRequest = {
+      messages: [
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{ id: 'call_legacy', function: { name: 'lookup', arguments: '{}' } }],
+        },
+        { role: 'tool', content: '结果', toolCallId: 'call_legacy' },
+      ],
+    };
+
+    const body = serializeChatRequest(request, 'glm-5.3', stream);
+    const assistant = (body.messages as Record<string, unknown>[])[0];
+    expect(assistant.tool_calls).toEqual([
+      { id: 'call_legacy', type: 'function', function: { name: 'lookup', arguments: '{}' } },
+    ]);
+  });
+
+  it.each([
+    ['deepseek-chat', true],
+    ['DeepSeek-Reasoner', true],
+    ['ds-v4-flash', true],
+    ['glm-5.3', false],
+    ['gpt-test', false],
+  ])('echoes reasoning_content only for DeepSeek-family models (model=%s)', (modelId, expected) => {
+    const request: ChatRequest = {
+      messages: [
+        { role: 'assistant', content: '', reasoningContent: '思考过程', toolCalls: [] },
+        { role: 'tool', content: '结果', toolCallId: 'call_1' },
+      ],
+    };
+    const body = serializeChatRequest(request, modelId, false);
+    const assistant = (body.messages as Record<string, unknown>[])[0];
+    if (expected) {
+      expect(assistant.reasoning_content).toBe('思考过程');
+    } else {
+      expect(assistant).not.toHaveProperty('reasoning_content');
+    }
+  });
+
+  it('DeepSeek assistant tool_calls without thinking still carries empty reasoning_content key', () => {
+    const request: ChatRequest = {
+      messages: [
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{ id: 'call_1', type: 'function', function: { name: 'read_file', arguments: '{}' } }],
+        },
+        { role: 'tool', content: '结果', toolCallId: 'call_1' },
+      ],
+      tools: [{ type: 'function', function: { name: 'read_file', parameters: { type: 'object' } } }],
+    };
+    const body = serializeChatRequest(request, 'deepseek-v4-flash', true);
+    const assistant = (body.messages as Record<string, unknown>[])[0];
+    expect(assistant.reasoning_content).toBe('');
+  });
+
+  it('non-DeepSeek models never emit empty reasoning_content key on assistant', () => {
+    const request: ChatRequest = {
+      messages: [
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{ id: 'call_1', type: 'function', function: { name: 'read_file', arguments: '{}' } }],
+        },
+      ],
+    };
+    const body = serializeChatRequest(request, 'glm-5.3', true);
+    const assistant = (body.messages as Record<string, unknown>[])[0];
+    expect(assistant).not.toHaveProperty('reasoning_content');
+  });
+
+  it('omits the internal senderYmd field from the serialized body', () => {
+    const request: ChatRequest = {
+      messages: [
+        { role: 'system', content: 'sys' },
+        { role: 'user', content: '隔天再问', senderYmd: '2026-10-13' },
+      ],
+    };
+    const body = serializeChatRequest(request, 'glm-5.3', false);
+    const user = (body.messages as Record<string, unknown>[])[1];
+    expect(user).not.toHaveProperty('senderYmd');
+    expect(JSON.stringify(body)).not.toContain('senderYmd');
+    // 原对象不被序列化过程改写
+    expect(request.messages![1].senderYmd).toBe('2026-10-13');
+  });
+
+  it('passes promptCacheKey through as prompt_cache_key', () => {
+    const request: ChatRequest = {
+      messages: [{ role: 'user', content: 'hi' }],
+      promptCacheKey: 'mao-session-42',
+    };
+    expect(serializeChatRequest(request, 'gpt-test', true)).toMatchObject({ prompt_cache_key: 'mao-session-42' });
+  });
+
+  it('omits prompt_cache_key for blank keys and when explicitly suppressed', () => {
+    const request: ChatRequest = {
+      messages: [{ role: 'user', content: 'hi' }],
+      promptCacheKey: '',
+    };
+    expect(serializeChatRequest(request, 'gpt-test', true)).not.toHaveProperty('prompt_cache_key');
+    expect(serializeChatRequest({ messages: [], promptCacheKey: 'mao-session-1' }, 'gpt-test', true, false))
+      .not.toHaveProperty('prompt_cache_key');
+  });
+});

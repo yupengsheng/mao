@@ -1,0 +1,535 @@
+// Node 环境的 Vue 插件只给 SFC 生成 ssrRender。这里用 compiler-dom 补一份客户端
+// render，再用无 DOM 渲染器点按钮、读文本。
+// 覆盖：摘要懒加载的迟到响应不得跨会话回填；记忆条数相同的会话切换仍要重拉 snippet；
+// 上下文入口从检查器页签改为任务信息区的徽标 + 详情抽屉（抽屉随之懒加载、切会话自动收起）；
+// 运行轨迹入口改为点任务状态徽标（不再有独立「轨迹」按钮；主会话 / 边路 / 子代理视图均可点，
+// 各自打开对应会话的轨迹）；头部会话 ID 行（0.0.346）展示 + 点击复制 + 无会话不渲染。
+import { readFileSync } from 'node:fs'
+import { describe, expect, it, vi, beforeEach } from 'vitest'
+import * as Vue from 'vue'
+import { computed, h, nextTick, reactive, ref, defineComponent, createRenderer } from 'vue'
+import { parse, compileScript } from '@vue/compiler-sfc'
+import { compile } from '@vue/compiler-dom'
+
+vi.mock('vue', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>()
+  return {
+    ...actual,
+    useSSRContext: () => ({ modules: new Set(), scopeId: null, styles: '' }),
+  }
+})
+
+interface Deferred { promise: Promise<unknown>; resolve: (v: unknown) => void }
+function deferred(): Deferred {
+  let resolve!: (v: unknown) => void
+  const promise = new Promise((res) => { resolve = res })
+  return { promise, resolve }
+}
+const summaryDeferreds = new Map<string, Deferred>()
+const summaryCallSids: string[] = []
+const memoryDeferreds: Deferred[] = []
+const memoryCallCount = { value: 0 }
+
+vi.mock('../../api', () => ({
+  getSessionCompaction: async (sid: number | string) => {
+    summaryCallSids.push(String(sid))
+    const d = deferred()
+    summaryDeferreds.set(String(sid), d)
+    return d.promise
+  },
+  listMemories: async () => {
+    memoryCallCount.value++
+    const d = deferred()
+    memoryDeferreds.push(d)
+    return d.promise
+  },
+  setSessionMemoryInjectionDisabled: async () => undefined,
+}))
+
+vi.mock('../../stores/session', () => {
+  const sessions = reactive<Array<Record<string, unknown>>>([])
+  return {
+    useSessionStore: () => ({
+      sessions,
+      updateSession: vi.fn((id: string, patch: Record<string, unknown>) => {
+        const found = sessions.find(s => String(s.id) === id)
+        if (found) Object.assign(found, patch)
+      }),
+      isSessionCompacting: vi.fn(() => false),
+    }),
+  }
+})
+
+vi.mock('../../composables/useStreamWS', () => ({
+  useStreamWS: () => ({ compactNow: vi.fn(async () => true) }),
+}))
+vi.mock('../../utils/clipboard', () => ({ copyText: vi.fn(async () => true) }))
+vi.mock('../../composables/useGitStatus', () => ({
+  useGitStatus: () => ({
+    loading: ref(false), error: ref(null), status: ref(null), files: ref([]),
+    refresh: vi.fn(), refreshRemote: vi.fn(),
+  }),
+}))
+vi.mock('../../composables/useGitRepos', () => ({
+  useGitRepos: () => ({
+    repos: ref([]), multiRepoMode: ref(false), changedRepos: ref([]), unavailableRepos: ref([]),
+    selectedRepoPath: ref(null), selectedRepo: ref(null), loading: ref(false), error: ref(null),
+    refresh: vi.fn(), selectRepo: vi.fn(),
+  }),
+}))
+vi.mock('../../composables/useModelContext', () => ({
+  useModelContext: () => ({ maxTokens: ref(200000) }),
+}))
+vi.mock('vue-router', () => ({ useRouter: () => ({ push: vi.fn() }) }))
+
+vi.mock('element-plus', () => ({
+  ElMessage: { error: vi.fn(), info: vi.fn(), success: vi.fn(), warning: vi.fn() },
+  ElTooltip: defineComponent({ render() { return h('div', this.$slots.default?.() ?? []) } }),
+}))
+
+// 环境变量抽屉替身：真实抽屉把内容挂到 body teleport 且内部要打接口，这里退化成
+// 「打开即渲染一段可见标记」的普通组件，用来验证入口点击真的打开了抽屉、且带对了参数。
+// 必须 mock 模块：模板编译产物是 $setup["EnvVarsDrawer"]，走 setup 绑定而非 components 解析。
+vi.mock('../chat/EnvVarsDrawer.vue', async () => {
+  const { defineComponent: def, h: hn } = await import('vue')
+  return {
+    default: def({
+      name: 'EnvVarsDrawerStub',
+      props: {
+        modelValue: { type: Boolean, default: false },
+        sessionId: { type: [Number, String], default: null },
+        workspace: { type: String, default: '' },
+      },
+      render() {
+        if (!this.modelValue) return null
+        return hn('div', { class: 'env-vars-drawer-stub' }, `ENV-DRAWER-OPEN:${this.sessionId}:${this.workspace}`)
+      },
+    }),
+  }
+})
+
+vi.mock('./TodoChecklist.vue', () => ({ default: { render: () => null } }))
+vi.mock('./SideTaskList.vue', () => ({ default: { render: () => null } }))
+vi.mock('./SubagentList.vue', () => ({ default: { render: () => null } }))
+vi.mock('./GitChangeList.vue', () => ({ default: { render: () => null } }))
+vi.mock('../file-browser/FileTree.vue', () => ({ default: { render: () => null } }))
+
+import TaskInspector from './TaskInspector.vue'
+import { ElMessage } from 'element-plus'
+import { copyText } from '../../utils/clipboard'
+import type { ContextWindowInfo } from '../../types/chat'
+
+const descriptor = parse(readFileSync(new URL('./TaskInspector.vue', import.meta.url), 'utf8')).descriptor
+const script = compileScript(descriptor, { id: 'review-inspector' })
+const compiled = compile(descriptor.template!.content, {
+  mode: 'function',
+  prefixIdentifiers: true,
+  bindingMetadata: script.bindings,
+})
+const clientRender = new Function('Vue', compiled.code)(Vue) as (ctx: unknown, cache: unknown) => unknown
+// el-drawer 的替身：真实组件会把内容挂到 body 的 teleport 层，这里退化成普通组件，
+// 行为对齐「没点开上下文徽标前抽屉内容根本不在 DOM 里」。
+// 必须挂在 ClientInspector 自己的 components 上：模板编译产物是 _component_el_drawer，
+// 在子组件的渲染作用域里解析，挂 Host 上无效；解析不到组件时 Vue 会退化成原生元素，
+// 把抽屉内容直接铺到检查器面板里（v-model 也一起失效）。
+const ElDrawerStub = defineComponent({
+  name: 'ElDrawerStub',
+  props: { modelValue: { type: Boolean, default: false } },
+  emits: ['update:modelValue'],
+  render() { return this.modelValue ? h('div', this.$slots.default?.() ?? []) : null },
+})
+const ClientInspector = {
+  ...(TaskInspector as object),
+  components: { 'el-drawer': ElDrawerStub, ElDrawer: ElDrawerStub },
+  render: clientRender,
+}
+
+interface StubEl { tag: string; children: StubNode[]; parent: StubEl | null; props: Record<string, unknown>; style: { display?: string } }
+type StubNode = StubEl | { text: string; parent: StubEl | null }
+
+const handlers = new WeakMap<StubEl, Array<(e?: unknown) => unknown>>()
+
+function nodeOps() {
+  const createElement = (tag: string): StubEl => ({ tag, children: [], parent: null, props: {}, style: {} })
+  const createText = (text: string): StubNode => ({ text, parent: null })
+  return {
+    createElement,
+    createText,
+    createComment: (t: string) => createText(t),
+    setText: (n: StubNode, t: string) => { if ('text' in n) n.text = String(t) },
+    setElementText: (el: StubEl, t: string) => { el.children = [{ text: String(t), parent: el }] },
+    insert: (child: StubNode, parent: StubEl, anchor?: StubNode | null) => {
+      child.parent = parent
+      const idx = anchor ? parent.children.indexOf(anchor) : -1
+      if (idx >= 0) parent.children.splice(idx, 0, child)
+      else parent.children.push(child)
+    },
+    remove: (child: StubNode) => {
+      const p = child.parent
+      if (p) {
+        const i = p.children.indexOf(child)
+        if (i >= 0) p.children.splice(i, 1)
+      }
+      child.parent = null
+    },
+    parentNode: (n: StubNode) => n.parent ?? null,
+    nextSibling: (n: StubNode) => {
+      const p = n.parent
+      if (!p) return null
+      return p.children[p.children.indexOf(n) + 1] ?? null
+    },
+    querySelector: () => null,
+    setScopeId: () => {},
+    cloneNode: (el: StubEl) => el,
+    insertStaticContent: (_content: string, _before: StubNode | null, _parent: StubEl): [StubEl, StubEl] => [
+      createElement('static-start'),
+      createElement('static-end'),
+    ],
+    patchProp: (el: StubEl, key: string, _prev: unknown, next: unknown) => {
+      el.props[key] = next
+      if (/^onClick/.test(key) && typeof next === 'function') {
+        const arr = handlers.get(el) ?? []
+        arr.push(next as (e?: unknown) => unknown)
+        handlers.set(el, arr)
+      }
+    },
+  }
+}
+
+function subtreeText(el: StubEl): string {
+  const acc: string[] = []
+  const walk = (n: StubNode) => {
+    if ('text' in n) { acc.push(n.text); return }
+    for (const c of n.children) walk(c)
+  }
+  for (const c of el.children) walk(c)
+  return acc.join('')
+}
+
+function mountInspector(
+  initialMemoryIds: number[],
+  opts: {
+    viewType?: 'chat' | 'side_task' | 'subagent'
+    phase?: string
+    executionMode?: string
+    /** 覆盖默认水位；传 null 表示该视图没有自身上下文数据 */
+    contextWindow?: ContextWindowInfo | null
+  } = {},
+) {
+  const sid = ref('11')
+  const memoryIds = ref<number[]>(initialMemoryIds)
+  const contextWindow = computed<ContextWindowInfo | null>(() => {
+    if (opts.contextWindow !== undefined) return opts.contextWindow
+    return {
+      estimated: 100, actual: 50,
+      manifest: {
+        sections: [{ key: 'messages', label: '会话消息', tokens: 1234, count: 2 }],
+        memoryIds: memoryIds.value,
+        estimatedWindowTokens: 200000,
+      },
+    }
+  })
+  const traceOpens = { value: 0, sid: '' as string }
+  const Host = defineComponent({
+    render: () => h(ClientInspector as never, {
+      title: 'T', phase: opts.phase ?? 'COMPLETED', panelCollapsed: false, fileProvider: null,
+      sessionId: sid.value, contextWindow: contextWindow.value,
+      executionMode: opts.executionMode ?? 'CLOUD', workspace: '/ws', gitProvider: null,
+      viewType: opts.viewType,
+      onOpenTrace: (emittedSid: string) => { traceOpens.value++; traceOpens.sid = emittedSid },
+    } as never),
+  })
+  const ops = nodeOps()
+  const { createApp } = createRenderer(ops)
+  const root = ops.createElement('root')
+  const app = createApp(Host)
+  const errors: unknown[] = []
+  app.config.warnHandler = () => {}
+  app.config.errorHandler = (err) => { errors.push(err) }
+  app.mount(root as never)
+  if (errors.length) throw errors[0]
+
+  const findAll = (pred: (el: StubEl) => boolean): StubEl[] => {
+    const out: StubEl[] = []
+    const walk = (el: StubEl) => {
+      if (pred(el)) out.push(el)
+      for (const c of el.children) if (!('text' in c)) walk(c)
+    }
+    for (const c of root.children) if (!('text' in c)) walk(c)
+    return out
+  }
+  const clickWhere = (pred: (el: StubEl) => boolean, label: string) => {
+    const hit = findAll(el => el.tag === 'button' && pred(el))[0]
+    if (!hit) {
+      const buttons = findAll(el => el.tag === 'button').map(el => subtreeText(el)).join(' | ')
+      throw new Error(`button not found: ${label}; buttons=${buttons || '(none)'}`)
+    }
+    const arr = handlers.get(hit)
+    if (!arr || !arr.length) throw new Error(`no click handler on: ${label}`)
+    return arr[arr.length - 1]!()
+  }
+  return {
+    sid, memoryIds, traceOpens,
+    clickContextBadge: () => clickWhere(el => subtreeText(el).includes('上下文'), 'context badge'),
+    clickEnvVars: () => clickWhere(el => subtreeText(el).trim() === '环境变量', 'env vars entry'),
+    clickStatusBadge: (label = '已完成') => clickWhere(el => subtreeText(el).includes(label), 'status badge'),
+    clickSummaryToggle: () => clickWhere(el => String(el.props.class ?? '').includes('ctx-summary-toggle'), 'summary toggle'),
+    clickSessionId: () => clickWhere(el => subtreeText(el).includes('会话 #'), 'session id row'),
+    buttonTexts: () => findAll(el => el.tag === 'button').map(el => subtreeText(el)),
+    pageText: () => subtreeText(root),
+  }
+}
+
+async function flush(rounds = 8) {
+  for (let i = 0; i < rounds; i++) { await Promise.resolve(); await nextTick() }
+}
+
+// 两个 describe 共用同一套 mock 记帐，重置放在文件级 beforeEach，避免用例间串数
+beforeEach(() => {
+  summaryCallSids.length = 0
+  summaryDeferreds.clear()
+  memoryDeferreds.length = 0
+  memoryCallCount.value = 0
+})
+
+describe('TaskInspector 上下文详情抽屉：会话切换清理/竞态（round3 复现）', () => {
+  it('BUG-A：切会话后旧摘要迟到响应必须被丢弃，新会话重新加载且不得显示旧会话摘要', async () => {
+    const m = mountInspector([])
+    m.clickContextBadge()
+    await flush()
+
+    m.clickSummaryToggle()
+    await flush()
+    expect(summaryCallSids).toEqual(['11'])
+
+    m.sid.value = '22'
+    await flush()
+
+    summaryDeferreds.get('11')!.resolve({
+      summaryText: 'SUMMARY-OF-SESSION-11', compactCount: 3, compactModel: 'm', updatedAt: 'x',
+    })
+    await flush()
+
+    // 抽屉在切会话时已自动收起，需重新点开徽标才会为新会话再读一次摘要
+    m.clickContextBadge()
+    await flush()
+    m.clickSummaryToggle()
+    await flush()
+
+    expect({
+      requests: [...summaryCallSids],
+      showsOldSummary: m.pageText().includes('SUMMARY-OF-SESSION-11'),
+    }).toEqual({
+      requests: ['11', '22'],
+      showsOldSummary: false,
+    })
+  })
+
+})
+
+describe('TaskInspector 上下文入口：徽标开抽屉，无顶层页签（0.0.244）', () => {
+  it('未点击时不渲染抽屉内容；点击后才展示容量，且没有记忆注入开关', async () => {
+    const m = mountInspector([1, 2])
+    await flush()
+    expect(m.pageText()).not.toContain('上下文容量')
+
+    m.clickContextBadge()
+    await flush()
+    expect(memoryCallCount.value).toBe(0)
+    expect(m.pageText()).toContain('上下文容量')
+    expect(m.pageText()).toContain('手动整理上下文')
+    expect(m.pageText()).not.toContain('本会话注入记忆')
+    expect(m.pageText()).not.toContain('本次未注入长期记忆')
+    // 容量保持模型水位 max(estimated=100, actual=50)，不改成构成原始估算 1234。
+    expect(m.pageText()).toContain('100/200.00k（0%）')
+    expect(m.pageText()).not.toContain('1.2k')
+  })
+
+  it('切换会话后抽屉自动关闭，必须重新点击徽标才会再展示', async () => {
+    const m = mountInspector([])
+    m.clickContextBadge()
+    await flush()
+    expect(m.pageText()).toContain('上下文容量')
+
+    m.sid.value = '22'
+    await flush()
+
+    expect(m.pageText()).not.toContain('上下文容量')
+    m.clickContextBadge()
+    await flush()
+    expect(m.pageText()).toContain('上下文容量')
+  })
+})
+
+describe('TaskInspector 子代理上下文徽标：只读占比（0.0.323）', () => {
+  it('子代理视图显示自身占比，徽标不是按钮、不能打开抽屉', async () => {
+    const m = mountInspector([], {
+      viewType: 'subagent',
+      contextWindow: {
+        estimated: 20000,
+        actual: 18000,
+        manifest: { sections: [], memoryIds: [], estimatedWindowTokens: 200000 },
+      },
+    })
+    await flush()
+
+    expect(m.pageText()).toContain('上下文 10%')
+    // 只读徽标用 span 渲染：按钮列表里没有上下文，也就没有抽屉入口
+    expect(m.buttonTexts().some(t => t.includes('上下文'))).toBe(false)
+    expect(m.pageText()).not.toContain('上下文容量')
+  })
+
+  it('子代理没有自身上下文时不显示徽标，避免拿主会话水位冒充', async () => {
+    const m = mountInspector([], { viewType: 'subagent', contextWindow: null })
+    await flush()
+    expect(m.pageText()).not.toContain('上下文')
+  })
+
+  it('边路任务仍可通过徽标打开上下文详情抽屉', async () => {
+    const m = mountInspector([], { viewType: 'side_task' })
+    await flush()
+    expect(m.buttonTexts().some(t => t.includes('上下文'))).toBe(true)
+
+    m.clickContextBadge()
+    await flush()
+    expect(m.pageText()).toContain('上下文容量')
+  })
+})
+
+describe('TaskInspector 运行轨迹入口：点任务状态徽标（0.0.252）', () => {
+  it('主会话视图：状态徽标即入口，点击 emit open-trace，且不再有独立「轨迹」按钮', async () => {
+    const m = mountInspector([], { viewType: 'chat' })
+    await flush()
+
+    expect(m.buttonTexts().some(t => t.includes('已完成'))).toBe(true)
+    expect(m.buttonTexts().map(t => t.trim())).not.toContain('轨迹')
+
+    m.clickStatusBadge()
+    await flush()
+    expect(m.traceOpens.value).toBe(1)
+    expect(m.traceOpens.sid).toBe('11')
+  })
+
+  it('边路任务 / 子代理视图：徽标同样可点，emit 各自的会话 id', async () => {
+    for (const viewType of ['side_task', 'subagent'] as const) {
+      const m = mountInspector([], { viewType })
+      await flush()
+      expect(m.buttonTexts().some(t => t.includes('已完成'))).toBe(true)
+
+      m.clickStatusBadge()
+      await flush()
+      expect(m.traceOpens.value).toBe(1)
+      expect(m.traceOpens.sid).toBe('11')
+    }
+  })
+
+  it('没有会话 id（占位边路 Tab）时不露入口', async () => {
+    const m = mountInspector([], { viewType: 'side_task' })
+    m.sid.value = ''
+    await flush()
+
+    expect(m.pageText()).toContain('已完成')
+    expect(m.buttonTexts().some(t => t.includes('已完成'))).toBe(false)
+  })
+
+  it('取消 / 恢复等状态也有徽标可点，取消后仍进得去轨迹', async () => {
+    for (const [phase, label] of [['CANCELLED', '已取消'], ['RESUMING', '恢复中'], ['CANCELLING', '取消中']] as const) {
+      const m = mountInspector([], { viewType: 'chat', phase })
+      await flush()
+      expect(m.buttonTexts().some(t => t.includes(label))).toBe(true)
+      m.clickStatusBadge(label)
+      await flush()
+      expect(m.traceOpens.value).toBe(1)
+    }
+  })
+
+  it('IDLE（尚无 run）不渲染徽标，也就没有入口', async () => {
+    const m = mountInspector([], { viewType: 'chat', phase: 'IDLE' })
+    await flush()
+    // .phase-badge.idle 被 CSS 隐藏，label 为空字符串：没有可点的状态文本
+    expect(m.pageText()).not.toMatch(/执行中|恢复中|待审批|取消中|已完成|失败|已取消/)
+  })
+})
+
+describe('TaskInspector 环境变量入口：工作区区块的行式按钮（0.0.308）', () => {
+  it('CLOUD 会话：工作区区块渲染入口，点击打开抽屉并带上会话 id 与工作区', async () => {
+    const m = mountInspector([])
+    await flush()
+    expect(m.buttonTexts().some(t => t.trim() === '环境变量')).toBe(true)
+    // 抽屉内容不在 DOM 里，直到点开
+    expect(m.pageText()).not.toContain('ENV-DRAWER-OPEN')
+
+    m.clickEnvVars()
+    await flush()
+    expect(m.pageText()).toContain('ENV-DRAWER-OPEN:11:/ws')
+  })
+
+  it('LOCAL 会话不渲染入口：本机环境不注入，没有可配置的三层变量', async () => {
+    const m = mountInspector([], { executionMode: 'LOCAL' })
+    await flush()
+    expect(m.buttonTexts().some(t => t.trim() === '环境变量')).toBe(false)
+  })
+
+  it('没有会话 id（新建任务占位态）不渲染入口：effective-env 按会话归属鉴权', async () => {
+    const m = mountInspector([])
+    m.sid.value = ''
+    await flush()
+    expect(m.buttonTexts().some(t => t.trim() === '环境变量')).toBe(false)
+  })
+
+  it('切换会话后抽屉自动关闭：避免把变量改到另一个会话的工作区上', async () => {
+    const m = mountInspector([])
+    m.clickEnvVars()
+    await flush()
+    expect(m.pageText()).toContain('ENV-DRAWER-OPEN:11:/ws')
+
+    m.sid.value = '22'
+    await flush()
+    expect(m.pageText()).not.toContain('ENV-DRAWER-OPEN')
+
+    m.clickEnvVars()
+    await flush()
+    expect(m.pageText()).toContain('ENV-DRAWER-OPEN:22:/ws')
+  })
+})
+
+describe('TaskInspector 会话 ID 行：展示与复制（0.0.346）', () => {
+  beforeEach(() => {
+    vi.mocked(copyText).mockClear()
+    vi.mocked(ElMessage.success).mockClear()
+    vi.mocked(ElMessage.error).mockClear()
+  })
+
+  it('头部显示「会话 #<id>」，点击整行复制该 ID 并提示成功', async () => {
+    const m = mountInspector([])
+    await flush()
+    expect(m.pageText()).toContain('会话 #11')
+
+    m.clickSessionId()
+    await flush()
+    expect(copyText).toHaveBeenCalledWith('11')
+    expect(ElMessage.success).toHaveBeenCalledWith('会话 ID 已复制')
+  })
+
+  it('边路 / 子代理视图同样渲染：跟随展示对象的 sessionId prop', async () => {
+    const m = mountInspector([], { viewType: 'subagent' })
+    await flush()
+    expect(m.pageText()).toContain('会话 #11')
+  })
+
+  it('复制失败降级提示错误，不弹成功', async () => {
+    vi.mocked(copyText).mockResolvedValueOnce(false)
+    const m = mountInspector([])
+    m.clickSessionId()
+    await flush()
+    expect(ElMessage.error).toHaveBeenCalledWith('复制失败，请手动记录会话 ID')
+    expect(ElMessage.success).not.toHaveBeenCalled()
+  })
+
+  it('新建态无会话 id 时不渲染该行，避免用户抄走无效 ID', async () => {
+    const m = mountInspector([])
+    m.sid.value = ''
+    await flush()
+    expect(m.pageText()).not.toContain('会话 #')
+  })
+})

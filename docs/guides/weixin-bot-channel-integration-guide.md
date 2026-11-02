@@ -1,0 +1,759 @@
+# 微信 Bot 通道集成指南
+
+本文档用于指导其他项目集成“微信 Bot 通道”能力。目标项目无需依赖本项目源码，但需要按本文约定实现账号绑定、消息监听、入站处理、消息发送和状态存储。
+
+## 1. 能力概览
+
+微信 Bot 通道提供三类核心能力：
+
+1. 扫码绑定：业务用户通过二维码登录微信 Bot，系统保存该账号的 `botToken`、`baseUrl`、微信侧用户 ID 等凭据。
+2. 消息监听：服务端按绑定账号启动 `getupdates` 长轮询，持续拉取微信消息。
+3. 消息发送：服务端使用入站消息中的 `context_token` 调用 `sendmessage`，向微信用户发送文本或媒体消息。
+
+整体链路：
+
+```mermaid
+sequenceDiagram
+    participant User as 业务用户
+    participant App as 业务系统
+    participant Ilink as ilink 网关
+    participant Agent as AI/业务处理器
+
+    User->>App: 请求绑定微信 Bot
+    App->>Ilink: GET /ilink/bot/get_bot_qrcode
+    Ilink-->>App: 返回二维码
+    User->>Ilink: 微信扫码并确认
+    App->>Ilink: GET /ilink/bot/get_qrcode_status
+    Ilink-->>App: 返回 botToken/baseUrl/ilinkUserId
+    App->>App: 保存绑定账号
+    App->>Ilink: POST /ilink/bot/getupdates 长轮询
+    Ilink-->>App: 返回入站消息和 get_updates_buf
+    App->>App: 保存 context_token
+    App->>Agent: 转交消息
+    Agent-->>App: 返回回答
+    App->>Ilink: POST /ilink/bot/sendmessage
+    Ilink-->>User: 微信消息
+```
+
+## 2. 外部依赖
+
+需要访问 ilink 网关，默认地址：
+
+```text
+https://ilinkai.weixin.qq.com
+```
+
+涉及的 ilink API：
+
+| 场景 | 方法 | 路径 |
+| --- | --- | --- |
+| 获取登录二维码 | `GET` | `/ilink/bot/get_bot_qrcode?bot_type=3` |
+| 查询扫码状态 | `GET` | `/ilink/bot/get_qrcode_status?qrcode={qrcode}` |
+| 拉取消息 | `POST` | `/ilink/bot/getupdates` |
+| 发送消息 | `POST` | `/ilink/bot/sendmessage` |
+| 获取用户配置/typing ticket | `POST` | `/ilink/bot/getconfig` |
+| 发送 typing 状态 | `POST` | `/ilink/bot/sendtyping` |
+| 获取媒体上传地址 | `POST` | `/ilink/bot/getuploadurl` |
+
+其中 `getupdates`、`sendmessage`、`getconfig`、`sendtyping`、`getuploadurl` 都需要带 bot token。
+
+HTTP Header 建议：
+
+```http
+Content-Type: application/json
+AuthorizationType: ilink_bot_token
+Authorization: Bearer {botToken}
+X-WECHAT-UIN: {base64(random_uint32_decimal_string)}
+```
+
+## 3. 配置项
+
+建议目标项目提供以下配置：
+
+```yaml
+weixin:
+  bot:
+    enabled: true
+    ilink-base-url: https://ilinkai.weixin.qq.com
+    cdn-base-url: https://novac2c.cdn.weixin.qq.com/c2c
+    monitor:
+      enabled: true
+      reconcile-interval-ms: 5000
+      long-poll-timeout-ms: 35000
+      max-consecutive-failures: 3
+    lease:
+      enabled: true
+      ttl-ms: 15000
+```
+
+关键说明：
+
+- `ilink-base-url`：二维码、扫码状态、消息收发 API 的根地址。
+- `cdn-base-url`：媒体下载/上传使用的 CDN 根地址。
+- `monitor.enabled`：是否自动监听已绑定账号。
+- `monitor.reconcile-interval-ms`：账号对账周期。轮询循环连续失败达到 `max-consecutive-failures` 后会退出，必须由周期对账重新拉起，否则账号在一次网络抖动后永久掉线（只能等进程重启或重新扫码）。
+- `monitor.max-consecutive-failures`：单账号轮询连续失败上限，超过后退出该账号的监听，交由下一轮对账恢复。
+- `lease.ttl-ms`：多实例部署时的监听租约时长，避免同一账号被多个实例重复拉取。
+
+## 4. 数据模型
+
+目标项目至少需要两张表：账号表和上下文 token 表。
+
+### 4.1 账号表
+
+建议表名：`weixin_channel_account`
+
+```sql
+CREATE TABLE weixin_channel_account (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  app_code VARCHAR(128) NOT NULL COMMENT '业务应用编码',
+  account_id VARCHAR(128) NOT NULL COMMENT '业务侧绑定账号ID，建议使用业务userId规范化后结果',
+  payload_json TEXT NOT NULL COMMENT '账号凭据JSON',
+  get_updates_buf TEXT NULL COMMENT 'getupdates游标',
+  enabled TINYINT NOT NULL DEFAULT 1 COMMENT '是否启用',
+  deleted TINYINT NOT NULL DEFAULT 0 COMMENT '是否删除',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  KEY idx_account_id (account_id),
+  KEY idx_enabled (enabled)
+);
+```
+
+`payload_json` 推荐结构：
+
+```json
+{
+  "token": "ilink bot token",
+  "baseUrl": "https://...",
+  "userId": "ilink_user_id",
+  "savedAt": "2026-07-15T10:00:00Z"
+}
+```
+
+字段含义：
+
+- `token`：扫码确认后返回的 `botToken`，用于后续 ilink API 鉴权。
+- `baseUrl`：扫码确认后返回的 API base URL；优先使用返回值，而不是固定配置。
+- `userId`：扫码确认后返回的微信侧 `ilink_user_id`，发送消息时作为默认收件人。
+- `savedAt`：保存时间，便于排查凭据刷新问题。
+
+### 4.2 Context Token 表
+
+建议表名：`weixin_channel_context_token`
+
+```sql
+CREATE TABLE weixin_channel_context_token (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  account_id VARCHAR(128) NOT NULL COMMENT '绑定账号ID',
+  wx_user_id VARCHAR(128) NOT NULL COMMENT '微信侧用户ID',
+  token TEXT NOT NULL COMMENT 'context_token',
+  deleted TINYINT NOT NULL DEFAULT 0,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  KEY idx_account_id (account_id),
+  KEY idx_wx_user_id (wx_user_id),
+  UNIQUE KEY uk_account_wx_user (account_id, wx_user_id)
+);
+```
+
+`context_token` 非常关键：主动发消息通常需要最近一次入站消息携带的 `context_token`。如果没有收到过该用户消息，系统可能无法主动下行。
+
+## 5. 绑定流程
+
+### 5.1 对外接口
+
+目标项目可提供接口：
+
+```http
+GET /weixin/oauth/qrcode?userId={userId}&appCode={appCode}
+POST /weixin/oauth/qrcode?userId={userId}&appCode={appCode}
+```
+
+返回：
+
+```json
+{
+  "success": true,
+  "data": {
+    "sessionKey": "normalized-user-id",
+    "qrDataUrl": "data:image/png;base64,...",
+    "message": "使用微信扫描以下二维码，以完成连接。"
+  }
+}
+```
+
+### 5.2 实现步骤
+
+1. 校验 `userId` 和 `appCode`。
+2. 将 `userId` 规范化为 `accountId`，建议只保留字母、数字、下划线、短横线等安全字符。
+3. 请求二维码：
+
+```http
+GET {ilinkBaseUrl}/ilink/bot/get_bot_qrcode?bot_type=3
+```
+
+返回中需要保存：
+
+```json
+{
+  "qrcode": "qrcode-id",
+  "qrcode_img_content": "data:image/png;base64,..."
+}
+```
+
+4. 启动异步等待任务，轮询扫码状态：
+
+```http
+GET {ilinkBaseUrl}/ilink/bot/get_qrcode_status?qrcode={qrcode}
+```
+
+状态处理建议：
+
+| status | 含义 | 处理 |
+| --- | --- | --- |
+| `wait` | 待扫码 | 继续轮询 |
+| `scaned` | 已扫码未确认 | 继续轮询 |
+| `expired` | 二维码过期 | 重新生成二维码或提示用户重试 |
+| `confirmed` | 已确认 | 保存账号凭据 |
+
+确认后响应通常包含：
+
+```json
+{
+  "status": "confirmed",
+  "bot_token": "...",
+  "ilink_bot_id": "...",
+  "baseurl": "https://...",
+  "ilink_user_id": "..."
+}
+```
+
+5. 保存或更新 `weixin_channel_account`。
+6. 清空该账号的 `get_updates_buf`。
+7. 清除账号的本地 pause 状态。
+8. 立即触发一次监听协调，启动该账号的消息监听。
+
+## 6. 消息监听
+
+监听不是 webhook，而是服务端长轮询。
+
+### 6.1 监听协调器
+
+建议实现一个 `MonitorScheduler`：
+
+1. 周期扫描 `enabled = 1` 且 `deleted = 0` 的账号。
+2. 对每个账号尝试获取监听租约。
+3. 获取成功则确保本实例有 monitor 线程。
+4. 获取失败则停止本实例对应 monitor。
+5. 账号被禁用或删除时释放租约并停止 monitor。
+
+单机部署可以用内存租约；多实例部署建议使用 Redis、数据库或分布式锁。
+
+### 6.2 长轮询请求
+
+请求：
+
+```http
+POST {baseUrl}/ilink/bot/getupdates
+AuthorizationType: ilink_bot_token
+Authorization: Bearer {botToken}
+Content-Type: application/json
+```
+
+Body：
+
+```json
+{
+  "get_updates_buf": "previous buf or empty string",
+  "base_info": {
+    "channel_version": "your-service-version"
+  }
+}
+```
+
+响应示例：
+
+```json
+{
+  "ret": 0,
+  "errcode": 0,
+  "get_updates_buf": "next-buf",
+  "longpolling_timeout_ms": 35000,
+  "msgs": [
+    {
+      "from_user_id": "wx-user-id",
+      "to_user_id": "bot-id",
+      "create_time_ms": 1760000000000,
+      "message_type": 1,
+      "message_state": 1,
+      "context_token": "context-token",
+      "item_list": []
+    }
+  ]
+}
+```
+
+处理规则：
+
+- `ret = 0` 且 `errcode = 0`：正常处理。
+- 响应里有新的 `get_updates_buf`：立即更新账号表游标。
+- `msgs` 为空：继续下一轮长轮询。
+- 连续失败：短暂重试，超过阈值后退出该账号的监听，由下一轮周期对账重新拉起（不要只退不拉，否则账号永久掉线）。
+- 如果错误码表示 session 过期，例如 `-14`：暂停该账号、禁用账号、停止监听，等待重新扫码绑定。
+
+## 7. 入站消息处理
+
+入站消息建议统一转换为内部上下文对象：
+
+```json
+{
+  "accountId": "business-user-id",
+  "appCode": "agent_abm",
+  "fromUserId": "wx-user-id",
+  "body": "用户消息文本",
+  "contextToken": "context-token",
+  "mediaPath": "/tmp/weixin/media/xxx.png",
+  "mediaType": "image/png",
+  "rawMessage": {}
+}
+```
+
+建议处理顺序：
+
+1. 提取文本内容。
+2. 处理内置 slash 命令，例如 `/echo`。
+3. 识别图片、视频、文件、语音等媒体。
+4. 下载并解密媒体文件，保存到本地临时目录。
+5. 标准化消息体，支持引用消息格式。
+6. 鉴权，判断是否允许该 `fromUserId` 给该 bot 发消息。
+7. 保存 `context_token` 到 `weixin_channel_context_token`。
+8. 可选：调用 `getconfig` 获取 typing ticket，并周期发送 typing 状态。
+9. 调用业务处理器，例如 AI Agent、客服系统、工作流引擎。
+10. 将业务处理结果通过发送服务下行。
+
+### 7.1 文本提取建议
+
+优先从 `item_list` 中找 `type = TEXT` 的 item：
+
+```json
+{
+  "type": 1,
+  "text_item": {
+    "text": "hello"
+  }
+}
+```
+
+如果是语音消息且有识别文本，可使用语音 item 的 `text`。
+
+### 7.2 引用消息
+
+如果文本 item 带引用消息，可以将引用内容拼进正文：
+
+```text
+[引用: 原消息标题 | 原消息内容]
+用户输入内容
+```
+
+### 7.3 媒体处理
+
+媒体类型建议支持：
+
+| 类型 | 内部 mediaType |
+| --- | --- |
+| 图片 | `image/*` |
+| 视频 | `video/mp4` 或实际 MIME |
+| PDF | `application/pdf` |
+| 普通文件 | 文件实际 MIME |
+| 语音 | 语音实际 MIME 或转码后 MIME |
+
+业务处理器可以只接收已下载的本地路径，不直接处理 ilink/CDN 加密参数。
+
+### 7.4 入站文件接收（file_item）
+
+**当前实现**：`InboundProcessor` 识别 `item_list` 中 `type = FILE`（`type=4`，`file_item`）的条目，经 CDN 下载（`encrypt_query_param`）+ AES-128-ECB 解密后，保存到微信会话工作区 `weixin-files/YYYY-MM-DD/` 目录，并将绝对路径以 `@{路径}@` 文件引用形式注入 Agent 消息（复用桌面端文件引用格式，`PromptEngine` 剥离标记后 Agent 得到纯路径文本）。文件下载/解密/保存失败或超过大小上限（`weixin.bot.max-inbound-file-mb`，默认 100MB）时，向用户回复明确错误提示，不再静默忽略；多文件部分失败时会在消息中告知 Agent 哪些文件接收失败。
+
+| 入站项 | item type | 处理 |
+| --- | --- | --- |
+| 文本 | 1 | 提取为消息正文 |
+| 图片 | 2 | 下载解密 → data URI 供多模态 |
+| 语音（含识别文本） | 3 | 取识别文本为正文 |
+| 文件（file_item） | 4 | 下载解密 → 保存工作区 → `@{路径}@` 注入 |
+
+入站上下文示例（含文件）：
+
+```json
+{
+  "accountId": "business-user-id",
+  "appCode": "agent_abm",
+  "fromUserId": "wx-user-id",
+  "body": "用户消息文本",
+  "contextToken": "context-token",
+  "mediaPath": "/tmp/weixin/media/xxx.png",
+  "mediaType": "image/png",
+  "files": [
+    { "fileName": "报价单.pdf", "bytes": "...", "mimeType": "application/pdf" }
+  ],
+  "rawMessage": {}
+}
+```
+
+文件消息保存规则：
+- 保存目录：`{会话工作区}/weixin-files/{yyyy-MM-dd}/`，按日期归档。
+- 文件名清洗：取 basename、剔除非法字符与文件引用保留字符（`{}@`）、截断长度（≤120），防路径穿越、避免破坏 `@{路径}@` 引用解析。
+- 同名文件：自动追加时间戳后缀（`xxx_20260806153012.pdf`），原子写入（CREATE_NEW），并发消息不互相覆盖。
+- 下载参数与 AES key 按同一媒体节点回退解析（`media` → `thumb_media` → `file_item` 级），保证回退时同源。
+- 失败处理：下载/解密/保存失败时向用户回复明确错误提示；失败消息同样执行"新消息接管"（取消在途执行）；仅当消息无任何可处理内容（无成功文件、无文字、无图片）时才直接回复错误，带文字/图片时继续处理有效内容并附失败说明。
+- 不登记 `file` 表、不做管理后台文件列表；Agent 通过 `read_file` / `shell` 工具按路径自主读取内容（PDF/Office 解析由 Agent 自行通过 shell 工具或脚本完成）。
+
+## 8. 业务处理器接口
+
+建议定义一个项目无关的接口：
+
+```java
+public interface WeixinInboundHandler {
+    boolean authorizeDirectMessage(String accountId, String fromUserId, String text);
+
+    CompletionStage<WeixinReply> onMessage(WeixinInboundMessageContext context);
+}
+```
+
+`WeixinReply` 可设计为：
+
+```java
+public class WeixinReply {
+    private String text;
+    private String mediaUrlOrLocalPath;
+}
+```
+
+如果目标项目接入 AI Agent，可以在 `onMessage` 中：
+
+1. 根据 `accountId/appCode/fromUserId` 生成会话 ID。
+2. 初始化或加载会话。
+3. 将文本和附件转换为 Agent 的请求对象。
+4. 执行业务逻辑。
+5. 将最终回答发送回微信。
+
+推荐会话 ID 格式：
+
+```text
+weixin_{appCode}_{accountId}
+```
+
+## 9. 消息发送
+
+### 9.1 主动发送接口
+
+目标项目可提供：
+
+```http
+POST /weixin/messaging/send-text
+Content-Type: application/json
+
+{
+  "userId": "business-user-id",
+  "text": "要发送的内容"
+}
+```
+
+内部流程：
+
+1. 根据 `userId` 查询绑定账号。
+2. 从账号 `payload_json` 获取 `baseUrl`、`botToken`、默认 `ilink_user_id`。
+3. 查询最近保存的 `context_token`。
+4. 组装 `WeixinMessage`。
+5. 调用 `sendmessage`。
+
+注意：如果没有可用 `context_token`，应返回明确错误，例如“用户尚未向 Bot 发送过消息，无法主动下行”。
+
+### 9.2 sendmessage 请求
+
+请求：
+
+```http
+POST {baseUrl}/ilink/bot/sendmessage
+AuthorizationType: ilink_bot_token
+Authorization: Bearer {botToken}
+Content-Type: application/json
+```
+
+文本消息 Body：
+
+```json
+{
+  "msg": {
+    "from_user_id": "",
+    "to_user_id": "wx-user-id",
+    "client_id": "openclaw-weixin-unique-id",
+    "message_type": 2,
+    "message_state": 1,
+    "context_token": "context-token",
+    "item_list": [
+      {
+        "type": 1,
+        "text_item": {
+          "text": "hello"
+        }
+      }
+    ]
+  },
+  "base_info": {
+    "channel_version": "your-service-version"
+  }
+}
+```
+
+建议约定：
+
+- `client_id` 每条消息唯一。
+- `from_user_id` 可为空。
+- `to_user_id` 使用微信侧用户 ID。
+- `message_type` 使用 Bot 消息类型。
+- `message_state` 使用完成态。
+- `context_token` 必填。
+
+### 9.3 媒体发送
+
+媒体发送建议分两步：
+
+1. 上传媒体到 ilink/CDN，得到加密下载参数、AES key、文件大小等信息。
+2. 调用 `sendmessage` 发送图片、视频或文件 item。
+
+如果文本和媒体一起发送，建议拆成多条消息：
+
+1. 先发文本 item。
+2. 再发媒体 item。
+
+这样更容易兼容微信侧展示和失败重试。
+
+### 9.4 出站图片发送（image_item）
+
+协议：`getuploadurl`（media_type=1）→ AES-128-ECB + PKCS7 加密 → POST CDN `/upload` → `sendmessage` 携带 `image_item`（type=2）。
+
+`getuploadurl` 请求（图片）：
+
+```json
+{
+  "filekey": "7cc7ad1d6aaf4c32b23dc4f8c40ec0cf",
+  "media_type": 1,
+  "to_user_id": "o9cq800kum_4g8Py8Qw5G0a@im.wechat",
+  "rawsize": 248731,
+  "rawfilemd5": "9c4d5c0b21f7f5c77c2b12f05f1b8df8",
+  "filesize": 248736,
+  "no_need_thumb": true,
+  "aeskey": "00112233445566778899aabbccddeeff",
+  "base_info": { "channel_version": "mao-server-1.0" }
+}
+```
+
+说明：
+
+- `media_type`：1=IMAGE、2=VIDEO、3=FILE、4=VOICE。
+- `filesize` = PKCS7 填充后的密文大小：`ceil((rawsize + 1) / 16) * 16`。
+- 响应取 `upload_full_url`（回退 `upload_param` + CDN base 拼接）。
+
+CDN 上传成功后响应头 `x-encrypted-param` 即 `CDNMedia.encrypt_query_param`。
+
+`sendmessage` 图片消息：
+
+```json
+{
+  "type": 2,
+  "image_item": {
+    "media": {
+      "encrypt_query_param": "AAFFc8c2PXQ5mKPw7rbcH7S1EA=",
+      "aes_key": "MDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiY2NkZGVlZmY=",
+      "encrypt_type": 1
+    },
+    "mid_size": 248736
+  }
+}
+```
+
+要点：
+
+- `aes_key` 使用协议格式 B：`base64(hex string)`，即把 16 字节 key 的 hex 文本字节再 base64。
+- `mid_size` 填主图密文长度。
+- 官方发送实现仅带 `media` + `mid_size`，不带 `thumb_media`（`no_need_thumb=true`）。
+
+### 9.5 出站文件发送（file_item）
+
+`getuploadurl`（media_type=3）→ AES-128-ECB 加密 → CDN 上传 → `sendmessage` 携带 `file_item`（type=4）。
+
+`sendmessage` 文件消息：
+
+```json
+{
+  "type": 4,
+  "file_item": {
+    "media": {
+      "encrypt_query_param": "AALk1J1Rljnmdk6PMx1PZ0h4mA=",
+      "aes_key": "MDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiY2NkZGVlZmY=",
+      "encrypt_type": 1
+    },
+    "file_name": "报价单-2026Q1.pdf",
+    "md5": "9d2a7b9c3e2f1d41c7d5b3a1a7e1c6f0",
+    "len": "542188"
+  }
+}
+```
+
+要点：
+
+- `md5` 为明文文件 MD5；`len` 为明文大小（字符串形式）。
+- 不需要缩略图。
+
+### 9.6 媒体发送限制
+
+- 图片建议 ≤ 20MB，超出后微信侧可能拒收。
+- 文件建议 ≤ 100MB，上传耗时较长，客户端 readTimeout 需放宽（建议 ≥ 180s）。
+- 文本与媒体务必使用不同的 `client_id`，每一条 `sendmessage` 独立发送。
+
+## 10. Typing 状态
+
+可选能力，用于在 AI 生成期间展示“正在输入”。
+
+流程：
+
+1. 收到入站消息后调用：
+
+```http
+POST {baseUrl}/ilink/bot/getconfig
+```
+
+Body：
+
+```json
+{
+  "ilink_user_id": "wx-user-id",
+  "context_token": "context-token",
+  "base_info": {
+    "channel_version": "your-service-version"
+  }
+}
+```
+
+2. 如果返回 `typing_ticket`，生成期间每 5 秒调用 `sendtyping`。
+3. 业务处理结束后发送取消状态。
+
+建议给 typing ticket 做缓存，避免每条消息都强依赖 `getconfig` 成功。
+
+## 11. 异常与恢复
+
+### 11.1 Session 过期
+
+当 `getupdates` 或发送接口返回 session 过期错误，例如 `-14`：
+
+1. 本地暂停账号一段时间，避免持续失败刷日志。
+2. 将账号 `enabled` 置为 `0`。
+3. 停止 monitor。
+4. 提示用户重新扫码绑定。
+
+### 11.2 长轮询失败
+
+建议策略：
+
+- 第 1 到第 2 次失败：等待 2 秒重试。
+- 连续 3 次失败：等待 30 秒退避。
+- 成功后清零失败计数。
+
+### 11.3 消息发送失败
+
+常见原因：
+
+- 缺少 `context_token`。
+- bot token 失效。
+- 请求体序列化格式不符合 ilink 要求。
+- 短时间连续发送过多消息。
+- 媒体上传失败或 CDN 下载失败。
+
+应记录：
+
+- `accountId`
+- `toUserId`
+- `clientId`
+- ilink 原始响应体（脱敏后）
+
+下行失败时不要静默返回：用户侧收不到任何提示会以为 Agent 卡死。应按以下顺序降级，任一级可达即停：
+
+1. 微信内发一条短降级说明（如「回复发送失败了，但回答已经生成，请在电脑端打开 Mao 查看完整内容」）指路到桌面/网页端——原始回复已入库，那里始终可见。
+2. 微信侧完全不可达时（如 24 小时窗口过期，连降级提示也发不出去），若用户已配置钉钉/飞书通知 Webhook，把回复原文推送过去，用户至少有一个渠道能看到完整内容。Webhook 自身失败只记日志，不得影响主流程与返回值。
+
+应记录：`ilink` 原始响应体、发送文本长度或媒体路径、降级推送结果。
+
+### 11.4 长文本分片
+
+ilink 协议未下发文本长度上限。实测（2026-10-10 对线上网关二分探测）结论是：**上限按 UTF-8 字节数计算，含中文时约 6000 字节为通过上限**——纯中文 2000 字符（6000 字节）成功、2001 字符（6003 字节）即被拒；纯 ASCII 可放到 16000 字节以上。因此不要按字符数切分，否则中文消息会被高估成多条（2000 汉字被当成 2000 个单位切成 3 条），白白消耗微信侧配额。超过上限时应拆成多条气泡，而不是直接发一条超大消息：
+
+- 切分按字节预算：取文本在 6000 字节内的最长字符前缀作为窗口，分隔符位置同样按字节换算后才判断是否落在窗口前半段（≥50%）。
+- 切分优先级：段落（`\n\n`）→ 行（`\n`）→ 空格 → 硬切；硬切时逐字符累积字节，保证不切出半个多字节字符（否则会出现 `\uFFFD` 乱码）。
+- 每片用新的 `client_id`，复用同一个 `context_token`。
+- 用户侧表现为连续多条消息，内容顺序拼接后必须与原文一致。
+- 任一分片失败即停止后续发送，并向用户发降级提示。
+
+### 11.5 区分「消息体过大」与「24 小时窗口过期」
+
+两者都返回 `ret=-2`，仅凭错误码无法区分，必须结合 `errmsg` 与业务上下文：
+
+| 现象 | 判据 |
+| --- | --- |
+| 消息体过大 | `errmsg="prepare failed"`；入站时间很近（秒级到分钟级），`context_token` 刚刷新 |
+| 24 小时窗口过期 | 无 `errmsg` 或 `errmsg` 与消息体无关；距该用户最近一次入站已超过 24 小时，`context_token` 早已失效 |
+
+> 注意：微信的「连续发送条数」配额以**用户入站消息**为周期刷新，不是会话累计——用户每发一条消息就重置。因此「Agent 发了 3 条就被拒」通常不是配额问题，应优先查消息体大小和 24 小时窗口。
+
+线上实证（2026-10-05 / 10-06 / 10-09 三次定时任务失败）：距上次入站 61～104 小时，`context_token` 已过期，属于 24 小时窗口过期；而 2026-10-09 20:15 用户主动提问后的失败距入站仅 1.7 分钟，是消息体 16976 字节超限。定时任务等「用户长时间未说话后触发」的场景必然落在窗口外，发送前应先查该账号最近入站时间，超窗则不打 ilink，改为写站内通知。
+
+应记录：`ilink` 原始响应体、发送文本长度或媒体路径。
+
+## 12. 安全建议
+
+1. `botToken` 必须加密存储或至少限制数据库访问权限。
+2. 不要在日志中完整打印 `botToken`、`context_token`。
+3. 对绑定接口做登录态校验，避免任意人绑定或覆盖账号。
+4. 对主动发送接口做权限校验和频控。
+5. 对媒体下载路径做目录限制，避免任意文件读取。
+6. 对入站用户做 allowlist 或业务授权校验。
+
+## 13. 推荐模块划分
+
+目标项目可按以下模块落地：
+
+| 模块 | 职责 |
+| --- | --- |
+| `QrLoginService` | 获取二维码、轮询扫码状态 |
+| `WeixinAccountRepository` | 账号凭据和游标存储 |
+| `ContextTokenRepository` | 保存和查询 `context_token` |
+| `MonitorScheduler` | 周期扫描账号并协调监听租约 |
+| `MonitorManager` | 管理本 JVM 内 monitor 线程 |
+| `WeixinMonitor` | 单账号 `getupdates` 长轮询 |
+| `InboundProcessor` | 入站消息标准化、媒体处理、typing、转交业务 |
+| `WeixinInboundHandler` | 业务扩展点 |
+| `WeixinSendService` | 文本和媒体下行 |
+| `SessionGuard` | session 过期暂停与恢复 |
+
+## 14. 最小落地步骤
+
+1. 建表：`weixin_channel_account`、`weixin_channel_context_token`。
+2. 实现二维码接口，并保存扫码成功后的账号凭据。
+3. 实现账号监听调度和单账号长轮询。
+4. 处理 `getupdates` 响应，保存新游标和 `context_token`。
+5. 定义 `WeixinInboundHandler`，把入站消息交给业务系统。
+6. 实现 `sendText`，使用最近的 `context_token` 调用 `sendmessage`。
+7. 加入 session 过期、失败退避、账号禁用和重新绑定逻辑。
+8. 多实例部署时接入 Redis/DB 租约，保证一个账号只有一个实例监听。
+
+## 15. 集成检查清单
+
+- [ ] 扫码绑定成功后是否保存了 `appCode/accountId/token/baseUrl/ilinkUserId`
+- [ ] `appCode` 是否必填并落库，避免后续会话找不到业务应用
+- [ ] `get_updates_buf` 是否每次更新后持久化
+- [ ] `context_token` 是否按 `accountId + wxUserId` 保存
+- [ ] 主动发送时是否能拿到最近的 `context_token`
+- [ ] 长轮询是否有失败退避
+- [ ] session 过期是否会停用账号并提示重新绑定
+- [ ] 多实例是否有监听租约
+- [ ] 日志是否避免打印敏感 token
+- [ ] 媒体下载和上传是否限制路径和大小
+

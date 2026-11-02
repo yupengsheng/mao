@@ -1,0 +1,610 @@
+<template>
+  <div class="llm-call-view">
+    <el-card>
+      <template #header>
+        <div class="card-header">
+          <span>调用流水</span>
+          <div class="header-actions">
+            <el-button :loading="exporting" @click="handleExportCsv">导出 CSV</el-button>
+            <el-button @click="fetchRecords">
+              <el-icon><Refresh /></el-icon>
+            </el-button>
+          </div>
+        </div>
+      </template>
+
+      <el-form :inline="true" class="search-form">
+        <FilterPanel>
+          <template #always>
+            <el-form-item label="场景">
+              <el-select v-model="filters.scene" clearable placeholder="全部" style="width: 150px" @change="handleSearch">
+                <el-option v-for="opt in LLM_CALL_SCENE_OPTIONS" :key="opt.value" :label="opt.label" :value="opt.value" />
+              </el-select>
+            </el-form-item>
+            <el-form-item label="结果">
+              <el-select v-model="resultFilter" clearable placeholder="全部" style="width: 120px" @change="handleSearch">
+                <el-option label="成功" value="success" />
+                <el-option label="失败" value="failed" />
+                <el-option label="取消" value="cancelled" />
+              </el-select>
+            </el-form-item>
+            <el-form-item>
+              <el-button type="primary" @click="handleSearch">查询</el-button>
+              <el-button @click="handleReset">重置</el-button>
+            </el-form-item>
+          </template>
+          <el-form-item label="用户">
+            <el-select
+              v-model="filters.userId"
+              clearable
+              filterable
+              placeholder="全部"
+              style="width: 160px"
+              @change="handleSearch"
+            >
+              <el-option
+                v-for="u in userOptions"
+                :key="u.id"
+                :label="u.displayName || u.username || `用户 #${u.id}`"
+                :value="u.id"
+              />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="Agent">
+            <el-select
+              v-model="filters.agentId"
+              clearable
+              filterable
+              placeholder="全部 Agent"
+              style="width: 160px"
+              @change="handleSearch"
+            >
+              <el-option v-for="a in agentOptions" :key="a.id" :label="a.name" :value="a.id" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="会话 ID">
+            <el-input
+              v-model="filters.sessionId"
+              clearable
+              placeholder="会话 ID"
+              inputmode="numeric"
+              style="width: 120px"
+              @keyup.enter="handleSearch"
+              @clear="handleSearch"
+            />
+          </el-form-item>
+          <el-form-item label="模型">
+            <el-select
+              v-model="filters.modelId"
+              clearable
+              filterable
+              remote
+              :remote-method="searchModels"
+              :loading="modelSearching"
+              placeholder="全部"
+              style="width: 180px"
+              @change="handleSearch"
+            >
+              <el-option
+                v-for="m in modelOptions"
+                :key="m.id"
+                :label="m.provider ? `${m.name} (${m.provider})` : m.name"
+                :value="m.id"
+              />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="开始日期">
+            <el-date-picker v-model="filters.startDate" type="date" value-format="YYYY-MM-DD" placeholder="开始" style="width: 150px" @change="handleSearch" />
+          </el-form-item>
+          <el-form-item label="结束日期">
+            <el-date-picker v-model="filters.endDate" type="date" value-format="YYYY-MM-DD" placeholder="结束" style="width: 150px" @change="handleSearch" />
+          </el-form-item>
+        </FilterPanel>
+      </el-form>
+
+      <el-table v-if="!isMobile" :data="records" v-loading="loading" stripe>
+        <template #empty>
+          <el-empty description="暂无数据" :image-size="60" />
+        </template>
+        <el-table-column prop="createdAt" label="时间" width="170" :formatter="formatDateTimeColumn" />
+        <el-table-column label="用户" width="120" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.displayName || row.username || row.userId || '-' }}</template>
+        </el-table-column>
+        <el-table-column label="场景" width="120">
+          <template #default="{ row }">
+            <el-tag size="small">{{ llmCallSceneLabel(row.scene) }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="模型" min-width="180" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.modelName || row.providerModelId || '-' }}</template>
+        </el-table-column>
+        <el-table-column label="入 Token" width="100" align="right">
+          <template #default="{ row }">{{ formatNumber(row.promptTokens || 0) }}</template>
+        </el-table-column>
+        <el-table-column label="出 Token" width="100" align="right">
+          <template #default="{ row }">{{ formatNumber(row.completionTokens || 0) }}</template>
+        </el-table-column>
+        <el-table-column label="成本" width="100" align="right" class-name="hide-on-mobile">
+          <template #default="{ row }">{{ formatCostCell(row.costMicros) }}</template>
+        </el-table-column>
+        <el-table-column label="缓存" width="140" align="right" class-name="hide-on-mobile cache-col">
+          <template #default="{ row }">
+            <span class="cache-cell">{{ formatCacheHit(row) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="缓存写" width="100" align="right" class-name="hide-on-mobile">
+          <template #default="{ row }">{{ formatCacheWriteCell(row.cacheCreationTokens) }}</template>
+        </el-table-column>
+        <el-table-column label="流式" width="70" align="center">
+          <template #default="{ row }">{{ row.stream === 1 ? '是' : '否' }}</template>
+        </el-table-column>
+        <el-table-column label="首字" width="90" align="right">
+          <template #default="{ row }">{{ formatMs(row.firstTokenMs) }}</template>
+        </el-table-column>
+        <el-table-column label="总耗时" width="90" align="right">
+          <template #default="{ row }">{{ formatMs(row.durationMs) }}</template>
+        </el-table-column>
+        <el-table-column label="吞吐" width="100" align="right">
+          <template #default="{ row }">{{ formatThroughput(row) }}</template>
+        </el-table-column>
+        <el-table-column label="结果" width="80">
+          <template #default="{ row }">
+            <el-tag size="small" :type="resultCell(row).type">{{ resultCell(row).label }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="150" fixed="right">
+          <template #default="{ row }">
+            <el-button type="primary" link size="small" @click="showDetail(row)">详情</el-button>
+            <el-button v-if="row.sessionId" type="primary" link size="small" @click="goSession(row.sessionId)">
+              查看会话
+            </el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+
+      <div v-else class="mobile-card-list">
+        <el-card v-for="row in records" :key="row.id" class="call-card" shadow="hover">
+          <div class="call-card-head">
+            <el-tag size="small">{{ llmCallSceneLabel(row.scene) }}</el-tag>
+            <el-tag size="small" :type="resultCell(row).type">{{ resultCell(row).label }}</el-tag>
+          </div>
+          <div class="call-card-row"><span class="call-card-label">时间</span><span>{{ formatDateTime(row.createdAt) }}</span></div>
+          <div class="call-card-row"><span class="call-card-label">用户</span><span>{{ row.displayName || row.username || row.userId || '-' }}</span></div>
+          <div class="call-card-row"><span class="call-card-label">模型</span><span>{{ row.modelName || '-' }}</span></div>
+          <div class="call-card-row"><span class="call-card-label">Token</span><span>{{ formatNumber(row.promptTokens || 0) }} / {{ formatNumber(row.completionTokens || 0) }}</span></div>
+          <div class="call-card-row"><span class="call-card-label">成本</span><span>{{ formatCostCell(row.costMicros) }}</span></div>
+          <div class="call-card-row"><span class="call-card-label">缓存</span><span>{{ formatCacheHit(row) }}</span></div>
+          <div class="call-card-row"><span class="call-card-label">缓存写</span><span>{{ formatCacheWriteCell(row.cacheCreationTokens) }}</span></div>
+          <div class="call-card-row"><span class="call-card-label">耗时</span><span>首字 {{ formatMs(row.firstTokenMs) }} / 总 {{ formatMs(row.durationMs) }}</span></div>
+          <div class="call-card-row"><span class="call-card-label">吞吐</span><span>{{ formatThroughput(row) }}</span></div>
+          <div class="call-card-row"><span class="call-card-label">重试</span><span>{{ row.retryCount ?? 0 }}</span></div>
+          <div v-if="row.errorMessage" class="call-card-row"><span class="call-card-label">错误</span><span class="call-card-error">{{ row.errorMessage }}</span></div>
+          <div class="call-card-actions">
+            <el-button type="primary" link size="small" @click="showDetail(row)">详情</el-button>
+            <el-button v-if="row.sessionId" type="primary" link size="small" @click="goSession(row.sessionId)">
+              查看会话
+            </el-button>
+          </div>
+        </el-card>
+        <el-empty v-if="!loading && records.length === 0" description="暂无数据" />
+      </div>
+
+      <ResponsivePagination
+        class="pagination"
+        v-model:current-page="currentPage"
+        v-model:page-size="pageSize"
+        :total="total"
+        :page-sizes="[20, 50, 100]"
+        @current-change="fetchRecords"
+        @size-change="handleSizeChange"
+      />
+    </el-card>
+
+    <ResponsiveDialog v-if="detailVisible" v-model="detailVisible" title="调用详情" width="720px">
+      <el-descriptions v-if="currentRecord" :column="2" border>
+        <el-descriptions-item label="时间">{{ formatDateTime(currentRecord.createdAt) }}</el-descriptions-item>
+        <el-descriptions-item label="结果">{{ resultCell(currentRecord).label }}</el-descriptions-item>
+        <el-descriptions-item label="用户">{{ currentRecord.displayName || currentRecord.username || currentRecord.userId || '-' }}</el-descriptions-item>
+        <el-descriptions-item label="场景">{{ llmCallSceneLabel(currentRecord.scene) }}</el-descriptions-item>
+        <el-descriptions-item label="会话 ID">{{ currentRecord.sessionId || '-' }}</el-descriptions-item>
+        <el-descriptions-item label="Agent">{{ currentRecord.agentName || currentRecord.agentId || '-' }}</el-descriptions-item>
+        <el-descriptions-item label="模型">{{ currentRecord.modelName || '-' }}</el-descriptions-item>
+        <el-descriptions-item label="供应商">{{ currentRecord.provider || '-' }}</el-descriptions-item>
+        <el-descriptions-item label="上游模型 ID" :span="2">{{ currentRecord.providerModelId || '-' }}</el-descriptions-item>
+        <el-descriptions-item label="协议">{{ llmCallProtocolLabel(currentRecord.protocol) }}</el-descriptions-item>
+        <el-descriptions-item label="推理强度">{{ currentRecord.effort || '-' }}</el-descriptions-item>
+        <el-descriptions-item label="流式">{{ currentRecord.stream === 1 ? '是' : '否' }}</el-descriptions-item>
+        <el-descriptions-item label="重试">{{ currentRecord.retryCount ?? 0 }}</el-descriptions-item>
+        <el-descriptions-item label="入 Token">{{ formatNumber(currentRecord.promptTokens || 0) }}</el-descriptions-item>
+        <el-descriptions-item label="出 Token">{{ formatNumber(currentRecord.completionTokens || 0) }}</el-descriptions-item>
+        <el-descriptions-item label="成本">{{ formatCostCell(currentRecord.costMicros) }}</el-descriptions-item>
+        <el-descriptions-item label="缓存 Token">{{ formatCacheHit(currentRecord) }}</el-descriptions-item>
+        <el-descriptions-item label="缓存写 Token">{{ formatCacheWriteCell(currentRecord.cacheCreationTokens) }}</el-descriptions-item>
+        <el-descriptions-item label="合计 Token">{{ formatNumber(currentRecord.totalTokens || 0) }}</el-descriptions-item>
+        <el-descriptions-item label="首字耗时">{{ formatMs(currentRecord.firstTokenMs) }}</el-descriptions-item>
+        <el-descriptions-item label="总耗时">{{ formatMs(currentRecord.durationMs) }}</el-descriptions-item>
+        <el-descriptions-item label="吞吐量">{{ formatThroughput(currentRecord) }}</el-descriptions-item>
+        <el-descriptions-item label="错误" :span="2">{{ currentRecord.errorMessage || '-' }}</el-descriptions-item>
+      </el-descriptions>
+    </ResponsiveDialog>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { reactive, ref, computed, onMounted, onActivated } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { Refresh } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
+import { api } from '../../api'
+import { downloadBlob } from '../../utils/download'
+import { formatDateTime, formatDateTimeColumn } from '../../utils/datetime'
+import { useBreakpoint } from '../../composables/useBreakpoint'
+import ResponsivePagination from '../../components/ResponsivePagination.vue'
+import ResponsiveDialog from '../../components/ResponsiveDialog.vue'
+import FilterPanel from '../../components/FilterPanel.vue'
+import { LLM_CALL_SCENE_OPTIONS, llmCallSceneLabel, llmCallProtocolLabel, formatMs, formatCost } from '../../utils/llmCallLabels'
+import { formatThroughput, throughput } from '../../utils/throughput'
+
+const route = useRoute()
+const router = useRouter()
+const { isMobile } = useBreakpoint()
+const loading = ref(false)
+const exporting = ref(false)
+const records = ref<any[]>([])
+const total = ref(0)
+const currentPage = ref(1)
+const pageSize = ref(20)
+const detailVisible = ref(false)
+const currentRecord = ref<any | null>(null)
+const userOptions = ref<Array<{ id: number; username?: string | null; displayName?: string | null }>>([])
+const agentOptions = ref<Array<{ id: number; name: string }>>([])
+const modelOptions = ref<Array<{ id: number; name: string; provider?: string | null }>>([])
+const modelSearching = ref(false)
+const EXPORT_PAGE_SIZE = 500
+const EXPORT_MAX_ROWS = 10000
+const filters = reactive({
+  scene: '',
+  success: undefined as boolean | undefined,
+  cancelled: undefined as boolean | undefined,
+  userId: undefined as number | undefined,
+  agentId: undefined as number | string | undefined,
+  sessionId: '',
+  modelId: undefined as number | undefined,
+  startDate: '',
+  endDate: '',
+})
+
+/**
+ * 结果四态下拉（全部 / 成功 / 失败 / 取消）↔ (success, cancelled) 两个后端筛选参数的映射。
+ * 「失败」是纯失败：取消单列一档，不再混在失败里（用户点停止产生的 Cancelled by user）。
+ */
+const resultFilter = computed<'success' | 'failed' | 'cancelled' | undefined>({
+  get: () => {
+    if (filters.cancelled) return 'cancelled'
+    if (filters.success === true) return 'success'
+    if (filters.success === false) return 'failed'
+    return undefined
+  },
+  set: (v) => {
+    filters.success = v === 'success' ? true : v === 'failed' ? false : undefined
+    filters.cancelled = v === 'cancelled' ? true : undefined
+  },
+})
+
+/** 结果单元格三态：取消（用户主动停止）不是失败，灰色单列。 */
+function resultCell(row: { success?: number | null; cancelled?: number | null }): { label: string; type: 'success' | 'info' | 'danger' } {
+  if (row.cancelled === 1) return { label: '取消', type: 'info' }
+  return row.success === 1 ? { label: '成功', type: 'success' } : { label: '失败', type: 'danger' }
+}
+
+function applyQueryFilters() {
+  const q = route.query
+  filters.scene = typeof q.scene === 'string' ? q.scene : ''
+  if (q.cancelled === 'true' || q.cancelled === '1') {
+    filters.cancelled = true
+    filters.success = undefined
+  } else {
+    filters.cancelled = undefined
+    if (q.success === 'false' || q.success === '0') filters.success = false
+    else if (q.success === 'true' || q.success === '1') filters.success = true
+    else filters.success = undefined
+  }
+  const userId = Number(q.userId)
+  filters.userId = q.userId != null && q.userId !== '' && Number.isFinite(userId) ? userId : undefined
+  const agentId = Number(q.agentId)
+  filters.agentId = q.agentId != null && q.agentId !== '' && Number.isFinite(agentId) ? agentId : undefined
+  filters.sessionId = typeof q.sessionId === 'string' ? q.sessionId : ''
+  const modelId = Number(q.modelId)
+  filters.modelId = q.modelId != null && q.modelId !== '' && Number.isFinite(modelId) ? modelId : undefined
+  filters.startDate = typeof q.startDate === 'string' ? q.startDate : ''
+  filters.endDate = typeof q.endDate === 'string' ? q.endDate : ''
+}
+
+function formatNumber(value: number) {
+  return new Intl.NumberFormat('zh-CN').format(value)
+}
+
+/** 成本单元格：cost_micros 微单位 → 成本单位（与模型价格填写口径一致）；NULL（未配价）显示 -。 */
+function formatCostCell(costMicros?: number | null): string {
+  if (costMicros == null) return '-'
+  return formatCost(costMicros / 1000000)
+}
+
+function formatCacheHit(row: { cachedTokens?: number | null; promptTokens?: number | null }) {
+  const cached = row.cachedTokens || 0
+  const prompt = row.promptTokens || 0
+  if (cached <= 0) return '0'
+  const num = formatNumber(cached)
+  if (prompt <= 0) return num
+  return `${num} (${Math.round((cached / prompt) * 100)}%)`
+}
+
+/** 缓存写 token 单元格：0（OpenAI 系协议 / 未产生缓存写）显示 -，避免满屏 0 噪声。 */
+function formatCacheWriteCell(cacheCreationTokens?: number | null): string {
+  const value = cacheCreationTokens || 0
+  if (value <= 0) return '-'
+  return formatNumber(value)
+}
+
+function parseFilterId(raw: unknown): number | null {
+  const text = String(raw ?? '').trim()
+  if (!/^\d+$/.test(text)) return null
+  const id = Number(text)
+  return Number.isSafeInteger(id) ? id : null
+}
+
+/** 非法 ID 返回提示文案；空值表示不按该条件筛选。 */
+function filterIdError(): string | null {
+  const sessionRaw = filters.sessionId.trim()
+  if (sessionRaw && parseFilterId(sessionRaw) == null) return '会话 ID 需为数字'
+  if (filters.agentId != null && filters.agentId !== '' && parseFilterId(filters.agentId) == null) {
+    return 'Agent ID 需为数字'
+  }
+  return null
+}
+
+function rejectInvalidFilters(): boolean {
+  const message = filterIdError()
+  if (!message) return false
+  ElMessage.warning(message)
+  return true
+}
+
+function buildFilterParams(page: number, size: number): Record<string, unknown> {
+  const params: Record<string, unknown> = { page, size }
+  if (filters.scene) params.scene = filters.scene
+  if (filters.success !== undefined) params.success = filters.success
+  if (filters.cancelled !== undefined) params.cancelled = filters.cancelled
+  if (filters.userId != null) params.userId = filters.userId
+  if (filters.agentId != null && filters.agentId !== '') {
+    const agentId = parseFilterId(filters.agentId)
+    if (agentId != null) params.agentId = agentId
+  }
+  if (filters.sessionId.trim()) {
+    const sessionId = parseFilterId(filters.sessionId)
+    if (sessionId != null) params.sessionId = sessionId
+  }
+  if (filters.modelId != null) params.modelId = filters.modelId
+  if (filters.startDate) params.startDate = filters.startDate
+  if (filters.endDate) params.endDate = filters.endDate
+  return params
+}
+
+let fetchSeq = 0
+async function fetchRecords() {
+  if (rejectInvalidFilters()) return
+  await loadRecords()
+}
+
+function handleSearch() {
+  if (rejectInvalidFilters()) return
+  currentPage.value = 1
+  void loadRecords()
+}
+
+async function loadRecords() {
+  const seq = ++fetchSeq
+  loading.value = true
+  try {
+    const { data } = await api.get('/admin/llm-calls', {
+      params: buildFilterParams(currentPage.value, pageSize.value)
+    })
+    if (seq !== fetchSeq) return
+    records.value = data?.records || []
+    total.value = data?.total || 0
+  } catch { /* handled */ } finally {
+    if (seq === fetchSeq) loading.value = false
+  }
+}
+
+function handleReset() {
+  filters.scene = ''
+  filters.success = undefined
+  filters.cancelled = undefined
+  filters.userId = undefined
+  filters.agentId = undefined
+  filters.sessionId = ''
+  filters.modelId = undefined
+  filters.startDate = ''
+  filters.endDate = ''
+  handleSearch()
+}
+
+function handleSizeChange() {
+  currentPage.value = 1
+  fetchRecords()
+}
+
+function goSession(sessionId: number | string) {
+  router.push(`/sessions/${sessionId}`)
+}
+
+function csvCell(value: unknown): string {
+  const text = value == null ? '' : String(value)
+  return `"${text.replace(/"/g, '""')}"`
+}
+
+function handleExportCsv() {
+  if (rejectInvalidFilters()) return
+  if (total.value > EXPORT_MAX_ROWS) {
+    ElMessage.warning(`当前筛选共 ${total.value} 条，超出导出上限 ${EXPORT_MAX_ROWS} 条，请缩小筛选范围后重试`)
+    return
+  }
+  doExportCsv()
+}
+
+async function doExportCsv() {
+  exporting.value = true
+  try {
+    const rows: any[] = []
+    let pageNum = 1
+    while (rows.length < total.value && rows.length < EXPORT_MAX_ROWS) {
+      const { data } = await api.get('/admin/llm-calls', {
+        params: buildFilterParams(pageNum, EXPORT_PAGE_SIZE)
+      })
+      const records: any[] = data?.records || []
+      if (records.length === 0) break
+      rows.push(...records)
+      pageNum += 1
+    }
+    const header = ['时间', '用户', '模型', '输入 Token', '输出 Token', '成本', '耗时(ms)', '吞吐(tok/s)', '缓存 Token', '缓存写 Token', '状态', '错误信息', '会话 ID', 'Agent ID']
+    const lines = [header.map(csvCell).join(',')]
+    for (const row of rows) {
+      // 吞吐与表格列同源同公式：不可解码行（非流式）留空
+      const tps = throughput(row)
+      lines.push([
+        row.createdAt,
+        row.displayName || row.username || row.userId || '',
+        row.modelName || row.providerModelId || '',
+        row.promptTokens || 0,
+        row.completionTokens || 0,
+        row.costMicros == null ? '' : (row.costMicros / 1000000).toFixed(6),
+        row.durationMs ?? '',
+        tps == null ? '' : tps.toFixed(1),
+        row.cachedTokens || 0,
+        row.cacheCreationTokens || 0,
+        row.cancelled === 1 ? '取消' : (row.success === 1 ? '成功' : '失败'),
+        row.errorMessage || '',
+        row.sessionId ?? '',
+        row.agentId ?? ''
+      ].map(csvCell).join(','))
+    }
+    const blob = new Blob([`\uFEFF${lines.join('\r\n')}`], { type: 'text/csv;charset=utf-8;' })
+    downloadBlob(blob, `llm-calls-${new Date().toISOString().slice(0, 10)}.csv`)
+    ElMessage.success(`已导出 ${rows.length} 条调用记录`)
+  } catch { /* 拦截器已提示失败 */ } finally {
+    exporting.value = false
+  }
+}
+
+async function searchModels(keyword: string) {
+  modelSearching.value = true
+  try {
+    const { data } = await api.get('/models', { params: { page: 1, size: 50, keyword: keyword || undefined } })
+    modelOptions.value = data?.records || []
+  } catch { /* 拦截器已提示失败 */ } finally {
+    modelSearching.value = false
+  }
+}
+
+function showDetail(row: any) {
+  currentRecord.value = row
+  detailVisible.value = true
+}
+
+async function fetchFilterOptions() {
+  try {
+    const [usersRes, agentsRes, modelsRes] = await Promise.all([
+      api.get('/admin/sessions/options/users'),
+      api.get('/admin/sessions/options/agents'),
+      api.get('/models', { params: { page: 1, size: 50 } }),
+    ])
+    userOptions.value = usersRes.data || []
+    agentOptions.value = agentsRes.data || []
+    modelOptions.value = modelsRes.data?.records || []
+  } catch { /* 拦截器已提示失败 */ }
+}
+
+onMounted(() => {
+  applyQueryFilters()
+  fetchRecords()
+  fetchFilterOptions()
+})
+
+// 本页 keepAlive: true，切走再回来不会重跑 onMounted。调用流水是持续增长的实时流水表，
+// 沿用缓存视图会让人误判「最近没有调用」，因此激活时按当前 URL 筛选重新拉取。
+// 首次挂载时 activated 紧随 mounted 触发，必须跳过，否则首屏请求两次。
+let firstActivation = true
+onActivated(() => {
+  if (firstActivation) {
+    firstActivation = false
+    return
+  }
+  applyQueryFilters()
+  fetchRecords()
+})
+</script>
+
+<style scoped>
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.search-form {
+  margin-bottom: 16px;
+}
+
+.pagination {
+  margin-top: 16px;
+  justify-content: flex-end;
+}
+
+.cache-col .cache-cell {
+  white-space: nowrap;
+}
+
+.mobile-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.call-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.call-card-row {
+  display: flex;
+  gap: 8px;
+  padding: 4px 0;
+  line-height: 1.5;
+}
+
+.call-card-label {
+  width: 48px;
+  flex-shrink: 0;
+  color: var(--mao-muted);
+}
+
+.call-card-error {
+  color: var(--el-color-danger);
+  word-break: break-all;
+}
+
+.call-card-actions {
+  margin-top: 10px;
+  border-top: 1px solid var(--mao-border);
+  padding-top: 10px;
+}
+</style>

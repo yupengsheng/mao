@@ -1,0 +1,329 @@
+import type { MessageSearchGroup, MessageSearchHit, MessageSearchResult } from '@mao/contracts';
+export type { MessageSearchGroup, MessageSearchHit, MessageSearchResult };
+
+export interface Session {
+  id?: number;
+  userId: number;
+  agentId?: number | null;
+  title?: string | null;
+  status?: string | null;
+  executionMode?: string | null;
+  workspace?: string | null;
+  permissionLevel?: string | null;
+  memoryInjectionDisabled?: number | null;
+  modelId?: number | null;
+  isGit?: boolean | number | null;
+  platform?: string | null;
+  shellPath?: string | null;
+  osVersion?: string | null;
+  phase?: string | null;
+  summary?: string | null;
+  startedAt?: string | null;
+  elapsedMs?: number | null;
+  stepsJson?: string | null;
+  projectKey?: string | null;
+  lastActivityAt?: string | null;
+  contextTokens?: number | null;
+  /** 最近一次请求的上下文构成快照 JSON，与 context_window 推送同源。 */
+  contextManifestJson?: string | null;
+  lastPromptTokens?: number | null;
+  contextAnchorMsgId?: number | null;
+  unread?: number | null;
+  parentSessionId?: number | null;
+  sessionType?: string | null;
+  source?: string | null;
+  runtimeStatusJson?: string | null;
+  deleted?: number;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export interface Message {
+  id?: number;
+  sessionId: number;
+  role: string;
+  content?: string | null;
+  thinkingContent?: string | null;
+  toolCallId?: string | null;
+  toolCalls?: string | null;
+  tokenCount?: number | null;
+  modelId?: number | null;
+  metadata?: string | null;
+  sourceSessionId?: number | null;
+  deleted?: number;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export interface FileChange {
+  id?: number;
+  messageId: number;
+  sessionId: number;
+  filePath?: string | null;
+  changeType?: string | null;
+  linesAdded?: number | null;
+  linesDeleted?: number | null;
+  diffMode?: string | null;
+  beforeContent?: string | null;
+  afterContent?: string | null;
+  patchContent?: string | null;
+  patchTruncated?: boolean | number | null;
+  diffUnavailableReason?: string | null;
+  createdAt?: string | null;
+}
+
+/**
+ * message_queue.source_type 取值：SCHEDULED=定时任务 busy 入队、WEBHOOK=入站
+ * Webhook 触发器、API=开放 API Token、SIGNAL=信号哨兵变化触发（signal 域）；
+ * NULL=普通手工入队。
+ */
+export type MessageQueueSource = 'SCHEDULED' | 'WEBHOOK' | 'API' | 'SIGNAL';
+
+export interface MessageQueue {
+  id?: number;
+  sessionId: number;
+  userId?: number | null;
+  content?: string | null;
+  images?: string | null;
+  sortOrder?: number | null;
+  status?: string | null;
+  /** busy 入队的定时任务来源；队列消费完成后回写任务 lastExecutionStatus */
+  scheduledTaskId?: number | null;
+  /** 入队来源（收件箱徽标透传；NULL=普通手工入队） */
+  sourceType?: MessageQueueSource | null;
+  /** WEBHOOK 来源时的触发器绑定（类比 scheduledTaskId，消费终态后回写失败计数） */
+  openTriggerId?: number | null;
+  /** API/WEBHOOK 入队时的调用流水绑定，消费终态后回写 open_api_call_log */
+  openCallLogId?: number | null;
+  deleted?: number;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export interface SessionCompaction {
+  id?: number;
+  sessionId: number;
+  summaryText?: string | null;
+  lastCompactedMsgId?: number | null;
+  compactCount?: number | null;
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  compactModel?: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export interface SessionCompactionEvent {
+  id?: number;
+  sessionId: number;
+  triggerMode?: string | null;
+  prevBoundaryMsgId?: number | null;
+  boundaryMsgId?: number | null;
+  compactedMessageCount?: number | null;
+  promptTokens?: number | null;
+  cachedTokens?: number | null;
+  completionTokens?: number | null;
+  summaryTokens?: number | null;
+  savedTokens?: number | null;
+  durationMs?: number | null;
+  compactModel?: string | null;
+  createdAt?: string | null;
+}
+
+export interface SessionActivity {
+  id?: number;
+  sessionId: number;
+  type?: string | null;
+  target?: string | null;
+  summary?: string | null;
+  detailJson?: string | null;
+  status?: string | null;
+  durationMs?: number | null;
+  createdAt?: string | null;
+}
+
+export interface SessionTodo {
+  id?: number;
+  sessionId: number;
+  content?: string | null;
+  description?: string | null;
+  activeForm?: string | null;
+  status?: string | null;
+  sortOrder?: number | null;
+  owner?: string | null;
+  claimedAt?: string | null;
+  blockedBy?: string | null;
+  deleted?: number;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export interface SubagentExecution {
+  id?: number;
+  parentSessionId?: number | null;
+  childSessionId?: number | null;
+  agentType?: string | null;
+  invocationType?: 'DELEGATE' | 'FOLLOWUP' | 'BACKGROUND' | null;
+  parentToolCallId?: string | null;
+  deliveryStatus?: 'PENDING' | 'DELIVERED' | 'SUPPRESSED' | 'LEGACY' | null;
+  parentResultDeliveredAt?: string | null;
+  parentAssistantMessageId?: number | null;
+  parentToolMessageId?: number | null;
+  executionStartMessageId?: number | null;
+  finalMessageId?: number | null;
+  taskDescription?: string | null;
+  result?: string | null;
+  status?: string | null;
+  totalRounds?: number | null;
+  totalPromptTokens?: number | null;
+  totalCompletionTokens?: number | null;
+  totalToolCalls?: number | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+/** 运行中子代理的轻量查询行：仅卡片展示所需字段，不读取结果正文。 */
+export interface RunningSubagentExecutionRow {
+  id: number;
+  childSessionId: number | null;
+  agentType: string | null;
+  taskDescription: string | null;
+  status: string;
+  totalRounds: number | null;
+  /** 子代理会话标题（session.title），可能为空或仍是自动生成前缀。 */
+  childTitle: string | null;
+}
+
+export interface AgentRef {
+  id: number;
+  name: string;
+  skillNames?: string | null;
+  /** Agent 默认模型 ID：会话未显式选模型时的优先回退 */
+  defaultModelId?: number | null;
+  /** 0-停用；缺省或 1 为启用 */
+  enabled?: number | null;
+  /** 0-仅管理端可见（客户端新建会话列表与切换不可选）；缺省或 1 为开放 */
+  clientVisible?: number | null;
+  /** 团队经验库开关（V169）：0-不挂载不注入；缺省或 1 为启用 */
+  experienceLibraryEnabled?: number | null;
+}
+
+export interface LlmModelRef {
+  id: number;
+  name: string;
+  provider?: string | null;
+  apiProtocol?: string | null;
+  baseUrl?: string | null;
+  apiKey?: string | null;
+  modelId?: string | null;
+  clientImpersonation?: string | null;
+  contextWindowTokens?: number | null;
+  supportsVision?: number | null;
+  isDefault?: number | null;
+  status?: number | null;
+}
+
+export interface UserRef {
+  id: number;
+  username: string;
+  displayName?: string | null;
+}
+
+export interface UserCommandRef {
+  name: string;
+  content: string;
+}
+
+export interface AgentLookup {
+  findById(id: number): Promise<AgentRef | null>;
+  findByIds(ids: number[]): Promise<AgentRef[]>;
+  requireDefaultAgent(): Promise<AgentRef>;
+  listOptions(): Promise<Array<{ id: number; name: string }>>;
+}
+
+export interface LlmModelLookup {
+  findById(id: number): Promise<LlmModelRef | null>;
+  findByIds(ids: number[]): Promise<LlmModelRef[]>;
+  findDefault(): Promise<LlmModelRef | null>;
+}
+
+export interface UserLookup {
+  findByIds(ids: number[]): Promise<UserRef[]>;
+  listOptions(): Promise<UserRef[]>;
+}
+
+export interface UserCommandLookup {
+  listAvailableForUser(userId: number): Promise<UserCommandRef[]>;
+}
+
+export interface GitCredentialLookup {
+  getTokenMapByUser(userId: number): Promise<Record<string, string>>;
+}
+
+export interface ApprovalRegistry {
+  countForSessionIds(ids: number[]): Map<number, number>;
+}
+
+/** 内存里等待用户作答的 ask_user_questions（尚未随整轮消息落库）。 */
+export interface PendingAskQuestion {
+  requestId: string;
+  questions: Array<Record<string, unknown>>;
+  metadata: Record<string, unknown> | null;
+}
+
+export interface AskUserQuestionsRegistry {
+  countPendingBySessionIds(ids: number[]): Map<number, number>;
+  getPendingForSession(sessionId: number | null): PendingAskQuestion[];
+}
+
+export interface SessionTreeSignalPublisher {
+  publish(sessionId: number): void;
+  /** 从任一节点沿父链上溯到根主会话并发布聚合信号（链断不发） */
+  publishAtRoot(fromSessionId: number): void;
+}
+
+export interface SessionGroupBucket {
+  key: string;
+  label: string;
+  total: number;
+  hasMore: boolean;
+  sessions: Session[];
+}
+
+export interface SessionGroupPage {
+  items: Session[];
+  total: number;
+  offset: number;
+  limit: number;
+  hasMore: boolean;
+}
+
+export interface MessagePage {
+  messages: Message[];
+  hasMore: boolean;
+  nextBeforeMessageId: number | null;
+  /** 仅 aroundMessageId 定位窗口返回：命中轮之后是否还有更新的消息 */
+  hasNewer?: boolean;
+}
+
+export interface ContextAnchor {
+  lastPromptTokens: number;
+  contextAnchorMsgId: number;
+}
+
+export function emptyApprovalRegistry(): ApprovalRegistry {
+  return { countForSessionIds: () => new Map() };
+}
+
+export function emptyQuestionRegistry(): AskUserQuestionsRegistry {
+  return {
+    countPendingBySessionIds: () => new Map(),
+    getPendingForSession: () => [],
+  };
+}
+
+export function noopTreePublisher(): SessionTreeSignalPublisher {
+  return { publish: () => undefined, publishAtRoot: () => undefined };
+}

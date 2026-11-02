@@ -1,0 +1,1190 @@
+import axios, { type InternalAxiosRequestConfig } from 'axios'
+import { ElMessage } from 'element-plus'
+import type { InboxItem, InboxKind, InboxListResult, InboxPreference, InboxSource, NotificationChannel, Result, TaskNotificationPreference } from '@mao/contracts'
+import { redirectToLogin } from '../utils/login-redirect'
+import { useAuthStore } from '../stores/auth'
+import { getRefreshToken, getToken, setTokens } from '../utils/auth-storage'
+import type { MessageSearchResult } from '../types/chat'
+import type { WorkspaceOverviewResult, WorkspaceReference } from '../types/workspace-overview'
+
+/** 强制下线：动态引入 router（避免模块加载期创建路由，破坏 Node 环境单测）。 */
+async function forceRelogin(): Promise<void> {
+  await useAuthStore().clearLocalSession()
+  const { default: router } = await import('../router')
+  redirectToLogin(router)
+}
+
+export const api = axios.create({
+  baseURL: import.meta.env.VITE_API_BASE_URL || 'http://localhost:9080/api/v1',
+  timeout: 30000,
+  headers: {
+    'Content-Type': 'application/json'
+  }
+})
+
+/** 登录页自身的请求（/auth/*），失败只展示表单错误，不得触发强制下线跳转。 */
+function isAuthPath(url?: string): boolean {
+  return !!url && /\/auth\/(login|refresh|feishu)/.test(url)
+}
+
+let isRefreshing = false
+let pendingRequests: Array<{ resolve: (token: string) => void; reject: (err: unknown) => void }> = []
+
+export async function doRefreshToken(): Promise<string> {
+  const refreshToken = getRefreshToken()
+  if (!refreshToken) throw new Error('No refresh token')
+
+  const baseURL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:9080/api/v1'
+  const resp = await axios.post<Result<{ accessToken: string; refreshToken: string }>>(
+    `${baseURL}/auth/refresh`,
+    { refreshToken }
+  )
+  const { data } = resp.data
+  if (!data) throw new Error('Refresh failed: empty data')
+
+  await setTokens(data.accessToken, data.refreshToken)
+  return data.accessToken
+}
+
+// Request interceptor - add token
+api.interceptors.request.use(
+  (config) => {
+    const token = getToken()
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`
+    }
+    return config
+  },
+  (error) => {
+    return Promise.reject(error)
+  }
+)
+
+// Response interceptor - handle errors with token refresh
+api.interceptors.response.use(
+  (response) => {
+    const { data } = response
+    if (data.code !== 0) {
+      const skipCodes = (response.config as InternalAxiosRequestConfig & { skipBusinessCodes?: number[] }).skipBusinessCodes
+      const err = new Error(data.message || '请求失败') as Error & { toastShown?: boolean; code?: number }
+      err.code = data.code
+      if (!skipCodes?.includes(data.code)) {
+        ElMessage.error(data.message || '请求失败')
+        err.toastShown = true
+      }
+      return Promise.reject(err)
+    }
+    return data
+  },
+  async (error) => {
+    const originalRequest = error.config as InternalAxiosRequestConfig & { _retry?: boolean; skipErrorToast?: boolean }
+
+    if (error.response?.status === 401 && !originalRequest._retry) {
+      originalRequest._retry = true
+
+      if (isAuthPath(originalRequest.url)) {
+        // 登录/刷新接口自身的 401 交给调用方处理
+        return Promise.reject(error)
+      }
+
+      if (isRefreshing) {
+        // Another request is already refreshing — queue this one
+        return new Promise((resolve, reject) => {
+          pendingRequests.push({
+            resolve: (newToken: string) => {
+              originalRequest.headers.Authorization = `Bearer ${newToken}`
+              resolve(api(originalRequest))
+            },
+            reject
+          })
+        })
+      }
+
+      isRefreshing = true
+      try {
+        const newToken = await doRefreshToken()
+        // isRefreshing 必须在 flush 排队请求之前复位：若等重试请求完成才复位，
+        // 窗口期内到达的 401 会继续入队，但队列已被 flush，这些请求将永久挂起
+        isRefreshing = false
+        // Retry all queued requests with the new token
+        pendingRequests.forEach(cb => cb.resolve(newToken))
+        pendingRequests = []
+        // Retry the original request
+        originalRequest.headers.Authorization = `Bearer ${newToken}`
+        return api(originalRequest)
+      } catch (refreshError) {
+        isRefreshing = false
+        // refresh 失败必须 reject 排队请求，否则调用方 await 永久挂起
+        pendingRequests.forEach(cb => cb.reject(refreshError))
+        pendingRequests = []
+        // refresh 失败：清本地会话并回登录页（redirectToLogin 自带防抖与「已在登录页」判断）
+        void forceRelogin()
+        return Promise.reject(error)
+      }
+    }
+
+    if (error.response) {
+      const { status, data } = error.response
+      if (status === 403) {
+        // 403 是已登录无权限，不是未登录：只提示，不踢回登录页
+        ElMessage.error(data?.message || '无权限执行该操作')
+        if (error && typeof error === 'object') {
+          (error as Error & { toastShown?: boolean }).toastShown = true
+        }
+      } else if (status !== 401) {
+        ElMessage.error(data?.message || '请求失败')
+        if (error && typeof error === 'object') {
+          (error as Error & { toastShown?: boolean }).toastShown = true
+        }
+      }
+    } else if (!originalRequest.skipErrorToast) {
+      ElMessage.error('网络错误')
+    }
+    return Promise.reject(error)
+  }
+)
+
+export interface GitCredential {
+  id: number
+  domain: string
+  accessToken: string
+  description?: string
+  createdAt?: string
+  updatedAt?: string
+}
+
+export async function getGitCredentials(): Promise<GitCredential[]> {
+  const { data } = await api.get('/user/git-credentials')
+  return data
+}
+
+export async function createGitCredential(payload: {
+  domain: string
+  accessToken: string
+  description?: string
+}): Promise<GitCredential> {
+  const { data } = await api.post('/user/git-credentials', payload)
+  return data
+}
+
+export async function updateGitCredential(
+  id: number,
+  payload: { accessToken?: string; description?: string }
+): Promise<GitCredential> {
+  const { data } = await api.put(`/user/git-credentials/${id}`, payload)
+  return data
+}
+
+export async function deleteGitCredential(id: number): Promise<void> {
+  await api.delete(`/user/git-credentials/${id}`)
+}
+
+export type { NotificationChannel, TaskNotificationPreference }
+
+export async function getTaskNotificationPreference(): Promise<TaskNotificationPreference> {
+  const { data } = await api.get('/user-preferences/task-notification')
+  return data
+}
+
+export async function saveTaskNotificationPreference(payload: {
+  enabled: boolean
+  channel: NotificationChannel | null
+  webhookUrl?: string
+}): Promise<TaskNotificationPreference> {
+  const { data } = await api.put('/user-preferences/task-notification', payload)
+  return data
+}
+
+export async function testTaskNotification(payload: {
+  channel: NotificationChannel
+  webhookUrl?: string
+}): Promise<void> {
+  await api.post('/user-preferences/task-notification/test', payload)
+}
+
+export interface WeixinPreference {
+  voiceReply: boolean
+}
+
+export async function getWeixinPreference(): Promise<WeixinPreference> {
+  const { data } = await api.get('/user-preferences/weixin')
+  return data
+}
+
+export async function saveWeixinPreference(payload: {
+  voiceReply: boolean
+}): Promise<WeixinPreference> {
+  const { data } = await api.put('/user-preferences/weixin', payload)
+  return data
+}
+
+export interface McpServerPreferenceItem {
+  id: number
+  /** 服务器来源：GLOBAL=全局服务器，USER=用户私有服务器 */
+  scope: string
+  name: string
+  description: string | null
+  serverType: string
+  /** 服务器状态：ENABLED | DISABLED */
+  status: string
+  /** 用户级启用状态：true=启用（含未单独配置跟随全局），false=用户已停用或管理员已停用 */
+  userEnabled: boolean
+}
+
+/** 获取当前用户可用的 MCP 服务器及其用户级启用状态（客户端设置页）。 */
+export async function getMcpServerPreferences(): Promise<McpServerPreferenceItem[]> {
+  const { data } = await api.get('/mcp-servers/preferences')
+  return data
+}
+
+/** 保存单个 MCP 服务器的用户级启用/停用偏好。 */
+export async function saveMcpServerPreference(serverId: number, enabled: boolean): Promise<void> {
+  await api.put('/mcp-servers/preferences', { items: [{ serverId, enabled }] })
+}
+
+export interface McpServerConfig {
+  id: number
+  userId: number
+  name: string
+  description: string | null
+  serverType: string
+  command: string | null
+  argsJson: string | null
+  url: string | null
+  status: string
+}
+
+export interface SaveMcpServerPayload {
+  name: string
+  description?: string
+  serverType: string
+  command?: string
+  args?: string[]
+  url?: string
+  env?: Record<string, string>
+}
+
+export interface McpToolItem {
+  serverId: number
+  serverName: string
+  toolName: string
+  description: string
+  /** MCP tools/list 注解（只读标记；未标注的 server 不返回）。 */
+  annotations?: { readOnlyHint?: boolean } | null
+}
+
+/** MCP 工具加载模式：WORKING_SET=工作集（只列名单，schema 按需查） | FULL=全量注入。 */
+export type McpLoadMode = 'WORKING_SET' | 'FULL'
+
+/** 读取本人当前生效的 MCP 加载模式（用户偏好 → 全局默认）。 */
+export async function getMcpLoadMode(): Promise<McpLoadMode> {
+  const { data } = await api.get('/mcp-servers/load-mode')
+  return data?.loadMode === 'FULL' ? 'FULL' : 'WORKING_SET'
+}
+
+/** 保存本人 MCP 加载模式（用户级单值，与 per-server 启用偏好解耦）。 */
+export async function saveMcpLoadMode(loadMode: McpLoadMode): Promise<void> {
+  await api.put('/mcp-servers/load-mode', { loadMode })
+}
+
+/** 获取当前用户的私有 MCP 服务器列表。 */
+export async function getMyMcpServers(): Promise<McpServerConfig[]> {
+  const { data } = await api.get('/mcp-servers/me')
+  return data
+}
+
+/** 创建用户私有 MCP 服务器。 */
+export async function createMyMcpServer(payload: SaveMcpServerPayload): Promise<McpServerConfig> {
+  const { data } = await api.post('/mcp-servers/me', payload)
+  return data
+}
+
+/** 编辑用户私有 MCP 服务器。 */
+export async function updateMyMcpServer(id: number, payload: SaveMcpServerPayload): Promise<McpServerConfig> {
+  const { data } = await api.put(`/mcp-servers/me/${id}`, payload)
+  return data
+}
+
+/** 删除用户私有 MCP 服务器。 */
+export async function deleteMyMcpServer(id: number): Promise<void> {
+  await api.delete(`/mcp-servers/me/${id}`)
+}
+
+/** 测试用户私有 MCP 服务器连接，返回服务器暴露的工具清单。 */
+export async function testMyMcpServer(id: number): Promise<McpToolItem[]> {
+  const { data } = await api.post(`/mcp-servers/me/${id}/test`)
+  return data
+}
+
+// ─── 会话消息搜索 ───
+
+export interface SessionSearchParams {
+  agentId?: number | null
+  dateFrom?: string | null
+  dateTo?: string | null
+  sessionType?: 'NORMAL' | 'SIDE_TASK' | null
+  page?: number
+  size?: number
+  signal?: AbortSignal
+}
+
+/** 按用户与助手消息搜索会话，结果按会话分组。 */
+export async function searchSessions(keyword: string, options?: SessionSearchParams): Promise<MessageSearchResult> {
+  const params: Record<string, unknown> = { keyword }
+  if (options?.agentId != null) params.agentId = options.agentId
+  if (options?.dateFrom) params.dateFrom = options.dateFrom
+  if (options?.dateTo) params.dateTo = options.dateTo
+  if (options?.sessionType) params.sessionType = options.sessionType
+  if (options?.page != null) params.page = options.page
+  if (options?.size != null) params.size = options.size
+  const { data } = await api.get('/sessions/search', {
+    params,
+    signal: options?.signal,
+    skipErrorToast: true
+  } as any)
+  return data ?? { items: [], total: 0, page: 1, size: 20, path: 'LIKE' }
+}
+
+// ─── 站内收件箱 ───
+
+export type { InboxItem, InboxKind, InboxListResult, InboxPreference, InboxSource }
+
+/** 收件箱列表（分页 page + size，unreadOnly 只看未读）。 */
+export async function fetchInboxList(params?: {
+  page?: number
+  size?: number
+  unreadOnly?: boolean
+}): Promise<InboxListResult> {
+  const { data } = await api.get('/inbox', { params })
+  return data
+}
+
+/** 徽标数据源：服务端 COUNT 为唯一权威，前端禁止本地累加。 */
+export async function fetchInboxUnreadCount(): Promise<{ unreadCount: number }> {
+  const { data } = await api.get('/inbox/unread-count')
+  return data
+}
+
+export async function markInboxItemRead(id: number): Promise<void> {
+  await api.post(`/inbox/${id}/read`)
+}
+
+export async function markInboxAllRead(): Promise<void> {
+  await api.post('/inbox/read-all')
+}
+
+export async function removeInboxItem(id: number): Promise<void> {
+  await api.delete(`/inbox/${id}`)
+}
+
+export async function getInboxPreference(): Promise<InboxPreference> {
+  const { data } = await api.get('/inbox/preferences')
+  return data
+}
+
+export async function saveInboxPreference(payload: InboxPreference): Promise<InboxPreference> {
+  const { data } = await api.put('/inbox/preferences', payload)
+  return data
+}
+
+// ─── 每日运营摘要 ───
+
+/** 「上一份摘要」三态：待生成 / 已发送 / 无事件未发送。 */
+export type YesterdayDigestStatus = 'PENDING' | 'SENT' | 'QUIET'
+
+export interface DigestPreferenceView {
+  enabled: boolean
+  /** HH:MM（Asia/Shanghai 口径）。 */
+  pushTime: string
+  outboundEnabled: boolean
+  lastDigestDate: string | null
+  yesterdayStatus: YesterdayDigestStatus
+  /** 状态对应的被汇总日期（昨天）。 */
+  yesterdayCoveredDate: string
+}
+
+export interface DigestSendNowResult {
+  sent: boolean
+  /** DISABLED=总开关关闭；QUIET=安静日无数据。 */
+  reason?: 'DISABLED' | 'QUIET'
+  /** 收件箱浓缩一行（sent=true 时返回）。 */
+  line?: string
+  coveredDate: string
+}
+
+export async function getDigestPreferences(): Promise<DigestPreferenceView> {
+  const { data } = await api.get('/digest/preferences')
+  return data
+}
+
+/** 增量保存：只传要改的字段，未传字段服务端保持原值。 */
+export async function saveDigestPreferences(payload: {
+  enabled?: boolean
+  pushTime?: string
+  outboundEnabled?: boolean
+}): Promise<Omit<DigestPreferenceView, 'yesterdayStatus' | 'yesterdayCoveredDate'>> {
+  const { data } = await api.patch('/digest/preferences', payload)
+  return data
+}
+
+/** 试发昨日摘要（不推进 last_digest_date，可重复调用）。 */
+export async function sendDigestNow(): Promise<DigestSendNowResult> {
+  const { data } = await api.post('/digest/send-now')
+  return data
+}
+
+// ─── 消息点踩反馈 ───
+
+export type { FeedbackReason } from '@mao/contracts'
+import type { FeedbackReason } from '@mao/contracts'
+
+/** 提交（或覆盖）某条 assistant 消息的点踩。 */
+export async function dislikeMessage(messageId: number, reason: FeedbackReason): Promise<void> {
+  await api.put(`/feedback/messages/${messageId}/dislike`, { reason })
+}
+/** 取消某条消息的点踩。 */
+export async function cancelDislikeMessage(messageId: number): Promise<void> {
+  await api.delete(`/feedback/messages/${messageId}/dislike`)
+}
+
+/** 拉取当前用户在指定会话内已点踩的消息 ID 列表（用于会话历史回显）。 */
+export async function fetchDislikedMessageIds(sessionId: number): Promise<number[]> {
+  const { data } = await api.get('/feedback/messages/disliked-ids', { params: { sessionId } })
+  return data?.ids ?? []
+}
+
+// ─── 长期记忆（跨会话记忆） ───
+
+export type { MemoryScope, MemoryStatus, MemorySource } from '@mao/contracts'
+import type { MemoryScope, MemoryStatus, MemorySource } from '@mao/contracts'
+
+export interface MemoryItem {
+  id: number
+  scope: MemoryScope
+  projectKey: string | null
+  content: string
+  source: MemorySource
+  status: MemoryStatus
+  originSessionId: number | null
+  createdAt?: string | null
+  updatedAt?: string | null
+}
+
+export interface MemoryPage {
+  records: MemoryItem[]
+  total: number
+  current: number
+  size: number
+}
+
+export interface MemoryListParams {
+  page?: number
+  pageSize?: number
+  scope?: MemoryScope | null
+  projectKey?: string | null
+  status?: MemoryStatus | null
+}
+
+export async function listMemories(params: MemoryListParams = {}): Promise<MemoryPage> {
+  const { data } = await api.get('/memory', { params })
+  return data
+}
+
+export async function createMemory(payload: { scope: MemoryScope; content: string; projectKey?: string | null }): Promise<MemoryItem> {
+  const { data } = await api.post('/memory', payload)
+  return data
+}
+
+export async function updateMemory(
+  id: number,
+  payload: { content?: string; status?: MemoryStatus }
+): Promise<MemoryItem> {
+  const { data } = await api.patch(`/memory/${id}`, payload)
+  return data
+}
+
+export async function deleteMemory(id: number): Promise<void> {
+  await api.delete(`/memory/${id}`)
+}
+
+/** 会话最近一次压缩摘要的现值（技术方案 5.5）。 */
+export interface SessionCompactionSummary {
+  summaryText: string | null
+  lastCompactedMsgId: number | null
+  compactCount: number | null
+  compactModel: string | null
+  updatedAt: string | null
+}
+
+/** 读取会话压缩摘要现值；无压缩记录时后端 data 缺省，返回 null。 */
+export async function getSessionCompaction(sessionId: number | string): Promise<SessionCompactionSummary | null> {
+  const { data } = await api.get(`/sessions/${sessionId}/compaction`)
+  return (data ?? null) as SessionCompactionSummary | null
+}
+
+export async function getMemorySettings(): Promise<{ autoCaptureEnabled: boolean }> {
+  const { data } = await api.get('/memory/settings')
+  return data
+}
+
+export async function saveMemorySettings(autoCaptureEnabled: boolean): Promise<void> {
+  await api.patch('/memory/settings', { autoCaptureEnabled })
+}
+
+export async function listMemoryProjects(): Promise<string[]> {
+  const { data } = await api.get('/memory/projects')
+  return data?.projects ?? []
+}
+
+// ─── 工作区总览与生命周期（技术方案 2026-10-29） ───
+
+export async function fetchWorkspaceOverview(): Promise<WorkspaceOverviewResult> {
+  const { data } = await api.get('/files/workspace-overview')
+  return data ?? { entries: [], error: null }
+}
+
+export async function refreshWorkspaceOverview(path?: string | null): Promise<void> {
+  await api.post('/files/workspace-overview/refresh', { path: path ?? null })
+}
+
+/** 删除确认弹层取活跃引用清单；路径非法时后端回 400 信封（拦截器 toast），此处返回空清单 */
+export async function fetchWorkspaceReferences(path: string): Promise<WorkspaceReference[]> {
+  try {
+    const { data } = await api.get('/files/workspace-overview/references', { params: { path } })
+    return data ?? []
+  } catch {
+    return []
+  }
+}
+
+export async function deleteWorkspaceByPath(path: string): Promise<void> {
+  await api.delete('/files/workspace-overview', { data: { path } })
+}
+
+// ─── 审批放行规则（LOCAL 工具审批 allowlist） ───
+
+export type { ApprovalRuleType, ApprovalRuleScope } from '@mao/contracts'
+import type { ApprovalRuleType, ApprovalRuleScope } from '@mao/contracts'
+
+export interface ApprovalRule {
+  id: number
+  scope: ApprovalRuleScope
+  sessionId: number | null
+  ruleType: ApprovalRuleType
+  ruleValue: string
+  hitCount: number
+  lastHitAt: string | null
+  enabled: boolean
+  createdAt?: string | null
+  updatedAt?: string | null
+}
+
+export interface ApprovalRulePage {
+  records: ApprovalRule[]
+  total: number
+}
+
+export async function listApprovalRules(params: {
+  page?: number
+  pageSize?: number
+  /** 类型筛选（服务端过滤，保证 tab 翻页口径一致）；空 = 全部 */
+  ruleType?: ApprovalRuleType | null
+} = {}): Promise<ApprovalRulePage> {
+  const { data } = await api.get('/approval-rules', { params })
+  return data
+}
+
+/** 创建用户级规则；服务端归一化（SHELL_PREFIX 取前两 token）并在响应中返回归一化后的值 */
+export async function createApprovalRule(payload: { ruleType: ApprovalRuleType; ruleValue: string }): Promise<ApprovalRule> {
+  const { data } = await api.post('/approval-rules', payload)
+  return data
+}
+
+export async function updateApprovalRule(
+  id: number,
+  payload: { enabled?: boolean; ruleValue?: string }
+): Promise<ApprovalRule> {
+  const { data } = await api.patch(`/approval-rules/${id}`, payload)
+  return data
+}
+
+export async function deleteApprovalRule(id: number): Promise<void> {
+  await api.delete(`/approval-rules/${id}`)
+}
+
+// ─── 开放接口（API Token / Webhook 触发器 / 出站订阅） ───
+
+export interface ApiTokenView {
+  id: number
+  name: string
+  tokenPrefix: string
+  /** 留有加密明文，可随时重新复制；旧版（V147 前）签发的 Token 为 false */
+  canCopy: boolean
+  scopes: string[]
+  expiresAt: string | null
+  revokedAt: string | null
+  lastUsedAt: string | null
+  autoDisabledAt: string | null
+  autoDisableReason: string | null
+  logFullBody: boolean
+  createdAt: string | null
+}
+
+export interface IssuedApiToken extends ApiTokenView {
+  plainToken: string
+}
+
+export interface WebhookTriggerView {
+  id: number
+  name: string
+  agentId: number
+  sessionId: number | null
+  enabled: boolean
+  url: string | null
+  pathToken?: string
+  consecutiveFailures: number
+  lastFiredAt: string | null
+  createdAt: string | null
+}
+
+export interface CreatedWebhookTrigger {
+  id: number
+  pathToken: string
+  plainSecret: string
+  url: string
+}
+
+export interface OutboundSubscriptionView {
+  id: number
+  event: string
+  targetUrl: string
+  enabled: boolean
+  createdAt: string | null
+}
+
+export interface CreatedOutboundSubscription {
+  id: number
+  event: string
+  targetUrl: string
+  plainSecret: string
+}
+
+export interface OutboundDeliveryView {
+  id: number
+  event: string
+  status: string
+  attemptCount: number
+  lastHttpStatus: number | null
+  lastError: string | null
+  createdAt: string | null
+  sentAt: string | null
+}
+
+export async function listApiTokens(): Promise<ApiTokenView[]> {
+  const { data } = await api.get('/open/tokens')
+  return data ?? []
+}
+
+export async function issueApiToken(payload: { name: string; scopes: string[] }): Promise<IssuedApiToken> {
+  const { data } = await api.post('/open/tokens', payload)
+  return data
+}
+
+/** 再次获取明文 Token（服务端解密 token_cipher）；旧版签发的 Token 会报错 */
+export async function revealApiToken(id: number): Promise<string> {
+  const { data } = await api.get(`/open/tokens/${id}/plain`)
+  return data.plainToken
+}
+
+export async function revokeApiToken(id: number): Promise<void> {
+  await api.delete(`/open/tokens/${id}`)
+}
+
+export async function setTokenLogFullBody(id: number, enabled: boolean): Promise<void> {
+  await api.put(`/open/tokens/${id}/log-full-body`, { enabled })
+}
+
+export async function reEnableToken(id: number): Promise<void> {
+  await api.post(`/open/tokens/${id}/re-enable`)
+}
+
+export interface OpenApiCallView {
+  id: number
+  tokenId: number | null
+  triggerId: number | null
+  agentId: number | null
+  userId: number | null
+  sessionId: number | null
+  source: string
+  sourceIp: string | null
+  httpStatus: number | null
+  outcome: string
+  errorCode: string | null
+  errorSummary: string | null
+  durationMs: number | null
+  executionMs: number | null
+  queueWaitMs: number | null
+  createdAt: string | null
+  requestSummaryJson?: string | null
+  requestFullJson?: string | null
+}
+
+export interface OpenApiCallPage {
+  records: OpenApiCallView[]
+  total: number
+}
+
+export async function listOpenApiCalls(params: {
+  tokenId?: number
+  triggerId?: number
+  page?: number
+  size?: number
+}): Promise<OpenApiCallPage> {
+  const { data } = await api.get('/open/calls', { params })
+  return data ?? { records: [], total: 0 }
+}
+
+export async function getOpenApiCall(id: number): Promise<OpenApiCallView> {
+  const { data } = await api.get(`/open/calls/${id}`)
+  return data
+}
+
+export async function listWebhookTriggers(): Promise<WebhookTriggerView[]> {
+  const { data } = await api.get('/open/triggers')
+  return data ?? []
+}
+
+export async function createWebhookTrigger(payload: { name: string; agentId: number; sessionId?: number | null }): Promise<CreatedWebhookTrigger> {
+  const { data } = await api.post('/open/triggers', payload)
+  return data
+}
+
+export async function updateWebhookTrigger(id: number, payload: { name?: string; agentId?: number; sessionId?: number | null; enabled?: boolean }): Promise<void> {
+  await api.put(`/open/triggers/${id}`, payload)
+}
+
+export async function deleteWebhookTrigger(id: number): Promise<void> {
+  await api.delete(`/open/triggers/${id}`)
+}
+
+export async function rotateWebhookTriggerSecret(id: number): Promise<{ plainSecret: string }> {
+  const { data } = await api.post(`/open/triggers/${id}/rotate-secret`)
+  return data
+}
+
+export async function listOutboundSubscriptions(): Promise<OutboundSubscriptionView[]> {
+  const { data } = await api.get('/open/subscriptions')
+  return data ?? []
+}
+
+export async function createOutboundSubscription(payload: { event: string; targetUrl: string }): Promise<CreatedOutboundSubscription> {
+  const { data } = await api.post('/open/subscriptions', payload)
+  return data
+}
+
+export async function setOutboundSubscriptionEnabled(id: number, enabled: boolean): Promise<void> {
+  await api.put(`/open/subscriptions/${id}`, { enabled })
+}
+
+export async function deleteOutboundSubscription(id: number): Promise<void> {
+  await api.delete(`/open/subscriptions/${id}`)
+}
+
+export async function listOutboundDeliveries(subscriptionId: number): Promise<OutboundDeliveryView[]> {
+  const { data } = await api.get(`/open/subscriptions/${subscriptionId}/deliveries`)
+  return data ?? []
+}
+
+export interface SessionShareInfo {
+  token: string
+  messageWatermark: number
+  viewCount: number
+  createdAt?: string | null
+  expiresAt?: string | null
+  lastViewedAt?: string | null
+}
+
+export async function getSessionShare(sessionId: string): Promise<SessionShareInfo | null> {
+  const { data } = await api.get(`/sessions/${sessionId}/share`)
+  return data ?? null
+}
+
+export async function createSessionShare(
+  sessionId: string,
+  payload: { publicLink?: boolean; expiresInDays?: number } = {},
+): Promise<SessionShareInfo> {
+  const { data } = await api.post(`/sessions/${sessionId}/share`, payload)
+  return data
+}
+
+export async function refreshSessionShare(sessionId: string): Promise<SessionShareInfo> {
+  const { data } = await api.put(`/sessions/${sessionId}/share`)
+  return data
+}
+
+export async function revokeSessionShare(sessionId: string): Promise<void> {
+  await api.delete(`/sessions/${sessionId}/share`)
+}
+
+// ─── 我的用量（顶栏抽屉：总览 / 趋势 / 明细） ───
+
+export interface UsageTotals {
+  callCount: number
+  successCount: number
+  failCount: number
+  /** 取消数（用户点停止）：不计入 failCount，也不进成功率分母 */
+  cancelledCount: number
+  promptTokens: number
+  completionTokens: number
+  cachedTokens: number
+  totalTokens: number
+  /** 成本合计（成本单位 = 模型价格填写口径）；未配价的调用不计入，展示时按「—」处理 */
+  cost: number
+  /** 可解码行的输出 token 合计（平均速度的分子；后端 /summary 补零，非空） */
+  decodeTokens: number
+  /** 可解码行的解码耗时合计（ms，= Σ(durationMs − firstTokenMs)；平均速度的分母 */
+  decodeMs: number
+}
+
+export interface UsageModelRow {
+  modelId: number | null
+  modelName: string | null
+  callCount: number
+  failCount: number
+  cancelledCount: number
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+  cost: number
+}
+
+export interface UsageSceneRow {
+  scene: string
+  callCount: number
+  failCount: number
+  cancelledCount: number
+  totalTokens: number
+}
+
+export interface UsageAgentRow {
+  /** agentId 为 null = 无归属调用（压缩/标题等系统场景）；agentName 查不到时也为 null */
+  agentId: number | null
+  agentName: string | null
+  callCount: number
+  failCount: number
+  cancelledCount: number
+  totalTokens: number
+  cost: number
+}
+
+/** 统计周期：日历周期在前，滚动窗口在后，自定义区间收尾（今日/昨日时趋势图自动按小时分桶）。 */
+export type UsageRange =
+  | 'today'
+  | 'yesterday'
+  | 'week'
+  | 'lastWeek'
+  | 'month'
+  | 'lastMonth'
+  | 'last7'
+  | 'last30'
+  | 'custom'
+
+/** 自定义周期（range=custom）的起止日期，闭区间日历日 YYYY-MM-DD，两端都由用户选定。 */
+export interface UsageDateRange {
+  startDate: string
+  endDate: string
+}
+
+export interface MyUsageSummary {
+  range: UsageRange
+  totals: UsageTotals
+  byModel: UsageModelRow[]
+  byScene: UsageSceneRow[]
+  byAgent: UsageAgentRow[]
+}
+
+export interface UsageTrendBucket {
+  /** day 粒度为 YYYY-MM-DD，hour 粒度为 YYYY-MM-DD HH:00 */
+  bucket: string
+  callCount: number
+  failCount: number
+  /** 取消数（用户点停止）：不计入失败，tooltip 单列一档 */
+  cancelledCount: number
+  /** 入 Token / 其中命中缓存的 Token，供缓存命中率趋势按桶计算 */
+  promptTokens: number
+  cachedTokens: number
+  totalTokens: number
+  cost: number
+  /** 桶内可解码行的输出 token 合计（输出速度趋势的分子；无流式调用的桶为 0） */
+  decodeTokens: number
+  /** 桶内可解码行的解码耗时合计（ms，输出速度趋势的分母；无流式调用的桶为 0） */
+  decodeMs: number
+}
+
+export interface MyUsageTrends {
+  range: UsageRange
+  granularity: 'day' | 'hour'
+  buckets: UsageTrendBucket[]
+}
+
+export interface MyLlmCallRecord {
+  id: number
+  createdAt: string | null
+  scene: string | null
+  modelName: string | null
+  providerModelId: string | null
+  promptTokens: number | null
+  completionTokens: number | null
+  cachedTokens: number | null
+  totalTokens: number | null
+  firstTokenMs: number | null
+  durationMs: number | null
+  success: number | null
+  /** 是否取消（0/1，读时按 error_message 推导）：取消不是失败，表格单列一档 */
+  cancelled: number | null
+  sessionId: number | null
+}
+
+/** 我的用量总览：指定周期（缺省由后端回落 last30）总账 + 按模型 + 按场景。 */
+export async function fetchMyUsageSummary(
+  range: UsageRange,
+  dateRange?: UsageDateRange,
+): Promise<MyUsageSummary> {
+  const { data } = await api.get('/llm-calls/me/summary', { params: { range, ...dateRange } })
+  return data
+}
+
+/** 我的用量趋势：指定周期按天/小时分桶（后端补零，序列连续无缺口）。 */
+export async function fetchMyUsageTrends(
+  range: UsageRange,
+  granularity: 'day' | 'hour' = 'day',
+  dateRange?: UsageDateRange,
+): Promise<MyUsageTrends> {
+  const { data } = await api.get('/llm-calls/me/trends', { params: { range, granularity, ...dateRange } })
+  return data
+}
+
+/** 我的调用明细（分页；场景 / 模型 / 成败筛选，后端 /v1/llm-calls/me 均已支持）。 */
+export async function fetchMyLlmCalls(params: {
+  page?: number
+  size?: number
+  scene?: string
+  modelId?: number
+  success?: boolean
+  /** 取消筛选（第三态）：true = 只要取消，false = 排除取消 */
+  cancelled?: boolean
+}): Promise<{ records: MyLlmCallRecord[]; total: number; page: number; size: number }> {
+  const { data } = await api.get('/llm-calls/me', { params })
+  return data
+}
+
+// ── 用量预算（/v1/me/budgets）─────────────────────────────────────────────
+
+export type { BudgetScope, BudgetLimitType, BudgetAction, BudgetStatus, MyBudgetItemVO, MyBudgetsVO } from '@mao/contracts'
+import type { MyBudgetsVO } from '@mao/contracts'
+
+/** 对我生效的用量预算（GLOBAL + 本人 USER scope；月度周期，服务器本地时区；单位两侧同口径）。 */
+export async function fetchMyBudgets(): Promise<MyBudgetsVO> {
+  const { data } = await api.get('/me/budgets')
+  return data
+}
+
+// ── 信号哨兵（/v1/signal-watchers）─────────────────────────────────────────
+
+export type { SignalCompareMode, SignalTriggerMode, SignalWatcherStatus } from '@mao/contracts'
+import type { SignalCompareMode, SignalTriggerMode, SignalWatcherStatus } from '@mao/contracts'
+
+export interface SignalWatcherView {
+  id: number
+  name: string
+  agentId: number
+  url: string
+  method: string
+  /** 请求头；敏感值已打码为 ••••（服务端 mask）。 */
+  headers: Record<string, string>
+  hasBody: boolean
+  bodyLength: number
+  intervalMinutes: number
+  compareMode: SignalCompareMode
+  jsonPath: string | null
+  promptTemplate: string
+  status: SignalWatcherStatus
+  /** 触发方式：NEW_SESSION=每次新建会话，REUSE_SESSION=复用自己的会话。 */
+  triggerMode: SignalTriggerMode
+  /** REUSE_SESSION 模式当前复用的会话 id（只读；指针由系统维护，不接受提交）。 */
+  reuseSessionId: number | null
+  lastValueHash: string | null
+  lastCheckedAt: string | null
+  lastChangedAt: string | null
+  consecutiveFailures: number
+  createdAt: string | null
+}
+
+export interface SignalWatcherCheckView {
+  id: number
+  checkedAt: string | null
+  httpStatus: number | null
+  valueHash: string | null
+  changed: number
+  triggeredSessionId: number | null
+  error: string | null
+  durationMs: number | null
+  warning: string | null
+}
+
+export interface SignalWatcherCheckPage {
+  rows: SignalWatcherCheckView[]
+  total: number
+}
+
+export interface SignalWatcherTestResult {
+  httpStatus: number | null
+  durationMs: number
+  valueHash: string | null
+  parseOk: boolean
+  sample: string
+  error: string | null
+}
+
+export interface SignalWatcherInput {
+  name: string
+  agentId: number
+  url: string
+  method: string
+  /**
+   * 请求头整体下发；省略该键 = 服务端保留原值（`undefined`），
+   * 显式 `null` / `{}` = 清空。前端按「未填任何请求头就不下发」的语义省略。
+   */
+  headers?: Record<string, string> | null
+  /** 同 headers：省略 = 保留原值，`null` = 清空（POST 下不可为空）。 */
+  body?: string | null
+  intervalMinutes: number
+  compareMode: SignalCompareMode
+  jsonPath?: string | null
+  promptTemplate: string
+  /** 触发方式；缺省 = NEW_SESSION（保持现状语义）。 */
+  triggerMode?: SignalTriggerMode
+  /**
+   * 复制源哨兵 id（仅新建生效）：敏感请求头与请求体由后端从源行解密继承，
+   * 前端不下发明文。reuseSessionId 刻意不在入参里——指针系统维护。
+   */
+  copyFrom?: number
+}
+
+export async function listSignalWatchers(): Promise<SignalWatcherView[]> {
+  const { data } = await api.get('/signal-watchers')
+  return data ?? []
+}
+
+export async function createSignalWatcher(payload: SignalWatcherInput): Promise<SignalWatcherView> {
+  const { data } = await api.post('/signal-watchers', payload)
+  return data
+}
+
+export async function updateSignalWatcher(id: number, payload: Partial<SignalWatcherInput>): Promise<SignalWatcherView> {
+  const { data } = await api.put(`/signal-watchers/${id}`, payload)
+  return data
+}
+
+export async function deleteSignalWatcher(id: number): Promise<void> {
+  await api.delete(`/signal-watchers/${id}`)
+}
+
+/** 启停：status 仅支持 ACTIVE/PAUSED（DISABLED 为系统终态，需重新启用）。 */
+export async function setSignalWatcherStatus(id: number, status: 'ACTIVE' | 'PAUSED'): Promise<SignalWatcherView> {
+  const { data } = await api.post(`/signal-watchers/${id}/status`, { status })
+  return data
+}
+
+export async function listSignalWatcherChecks(
+  id: number,
+  params: { page?: number; size?: number } = {},
+): Promise<SignalWatcherCheckPage> {
+  const { data } = await api.get(`/signal-watchers/${id}/checks`, { params })
+  return data ?? { rows: [], total: 0 }
+}
+
+/** 立即执行一次探针：不触发、不写库，用于保存前验证 URL/判定模式可用。 */
+export async function testSignalWatcher(id: number): Promise<SignalWatcherTestResult> {
+  const { data } = await api.post(`/signal-watchers/${id}/test`)
+  return data
+}
+
+// ---------------------------------------------------------------- 三级环境变量
+
+export interface EnvVariableView {
+  id: number
+  envKey: string
+  note?: string | null
+  createdAt?: string | null
+  updatedAt?: string | null
+}
+
+export interface EnvVariablePayload {
+  envKey?: string
+  envValue: string
+  note?: string | null
+}
+
+export interface WorkspaceEnvVariablePayload extends EnvVariablePayload {
+  workspacePath: string
+}
+
+export interface EffectiveEnvItem {
+  envKey: string
+  source: 'SYSTEM' | 'USER' | 'WORKSPACE' | 'BUILTIN' | 'INHERITED'
+  note: string | null
+}
+
+export interface EffectiveEnvView {
+  enabled: boolean
+  items: EffectiveEnvItem[]
+  totals: { system: number; user: number; workspace: number; builtin: number; inherited: number }
+}
+
+export async function listEnvVariables(): Promise<EnvVariableView[]> {
+  const { data } = await api.get('/user/env-variables')
+  return data ?? []
+}
+
+export async function createEnvVariable(payload: EnvVariablePayload): Promise<EnvVariableView> {
+  const { data } = await api.post('/user/env-variables', payload)
+  return data
+}
+
+export async function updateEnvVariable(id: number, payload: EnvVariablePayload): Promise<EnvVariableView> {
+  const { data } = await api.put(`/user/env-variables/${id}`, payload)
+  return data
+}
+
+export async function deleteEnvVariable(id: number): Promise<void> {
+  await api.delete(`/user/env-variables/${id}`)
+}
+
+export async function listWorkspaceEnvVariables(workspace?: string | null): Promise<EnvVariableView[]> {
+  const { data } = await api.get('/user/workspace-env-variables', {
+    params: workspace ? { workspace } : {}
+  })
+  return data ?? []
+}
+
+export async function createWorkspaceEnvVariable(payload: WorkspaceEnvVariablePayload): Promise<EnvVariableView> {
+  const { data } = await api.post('/user/workspace-env-variables', payload)
+  return data
+}
+
+export async function updateWorkspaceEnvVariable(id: number, payload: EnvVariablePayload): Promise<EnvVariableView> {
+  const { data } = await api.put(`/user/workspace-env-variables/${id}`, payload)
+  return data
+}
+
+export async function deleteWorkspaceEnvVariable(id: number): Promise<void> {
+  await api.delete(`/user/workspace-env-variables/${id}`)
+}
+
+/** 会话最终生效变量（配置态视图：三层 + 内置 + 继承，值一律不回显）。 */
+export async function getEffectiveEnv(sessionId: number): Promise<EffectiveEnvView> {
+  const { data } = await api.get(`/sessions/${sessionId}/effective-env`)
+  return data
+}
+

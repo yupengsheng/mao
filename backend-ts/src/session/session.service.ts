@@ -1,0 +1,1792 @@
+import { mkdirSync, existsSync, rmSync, readdirSync, statSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { BusinessException } from '../common/business-exception.js';
+import { ErrorCode } from '../common/error-code.js';
+import { javaLocalDateTimeString, nowSql, nowSqlMs } from '../common/datetime.js';
+import { loadConfig } from '../config/app-config.js';
+import {
+  SEARCH_KEYWORD_MAX_LENGTH,
+  SEARCH_OFFSET_CAP,
+  buildSnippet,
+  escapeLike,
+  indexOfIgnoreCase,
+  isFulltextDegradeError,
+  isSearchFulltextEnabled,
+  messageRoleClause,
+  normalizeMessageScope,
+  normalizeSearchListParams,
+  prepareMessageSearch,
+  type MessageSearchScope,
+  type PreparedSearch,
+  type SearchListParams,
+} from './message-search.js';
+import type { MessageSearchHitRow, MessageSearchSqlFilter } from './session.repository.js';
+
+export { buildSnippet, indexOfIgnoreCase };
+import { collectEntityIds, parseEntityId } from '../common/request.js';
+import { isMultimodalContentParts } from '../common/multimodal-content.js';
+import type { EnvironmentInfoProvider } from '../harness/core/environment-info.js';
+import { MessageHistoryNormalizer, MISSING_TOOL_RESULT_PLACEHOLDER } from '../harness/core/message-history-normalizer.js';
+import { isRealUserMessage } from '../harness/core/compaction-service.js';
+import type { ChatMessage } from '../harness/llm/chat-request.js';
+import { CloudWorkspaceResolver } from '../harness/safety/cloud-workspace-resolver.js';
+import type { PathSandbox } from '../harness/safety/path-sandbox.js';
+import type { ExperienceMountService } from '../harness/experience/experience-mount.service.js';
+import { fromString as permissionFromString } from './permission-level.js';
+import { isFeishuChannelSession } from '../harness/tool/feishu-channel-tool.js';
+import { isDingtalkChannelSession } from '../harness/tool/dingtalk-channel-tool.js';
+import type { GitOperationService } from './git-operation.service.js';
+import type { SessionCompactionService } from './session-compaction.service.js';
+import type { SessionCompactionEventService } from './session-compaction-event.service.js';
+import { FileChangeRepository, isSessionSource, MessageRepository, SessionRepository, type SessionListFilter, type SessionSource } from './session.repository.js';
+import { SessionTodoRepository } from './activity.repository.js';
+import type {
+  AgentLookup,
+  AgentRef,
+  ContextAnchor,
+  FileChange,
+  Message,
+  MessagePage,
+  MessageSearchGroup,
+  MessageSearchHit,
+  MessageSearchResult,
+  Session,
+  SessionGroupBucket,
+  SessionGroupPage,
+  SessionTodo,
+  UserCommandLookup,
+} from './types.js';
+import { SessionGroupKey, ACTIVE_PHASE_SQL_LIST } from './util/session-group-key.js';
+import { GitUrlParser } from './util/git-url-parser.js';
+import { toStoredContentJson } from './session-vo.js';
+import { buildUserContentParts } from './util/image-url-annotation.js';
+import { stripCitationMarkers } from './util/citation-markers.js';
+import { WEIXIN_PROJECT_KEY } from '../domain/types.js';
+
+const SEARCH_RESULT_LIMIT = 20;
+/** dump_user_messages 的扫描批次：非真实用户消息被过滤时按此粒度继续向前翻。 */
+const RECENT_USER_MESSAGE_SCAN_BATCH = 50;
+/** 写入会话工作区的 runtime 临时目录/文件前缀，会话删除时一并清理。 */
+const RUNTIME_WORKSPACE_PREFIX = 'mao-runtime-';
+
+export class SessionService {
+  static readonly SEARCH_RESULT_LIMIT = SEARCH_RESULT_LIMIT;
+
+  constructor(
+    private readonly sessionRepo: SessionRepository,
+    private readonly messageRepo: MessageRepository,
+    private readonly fileChangeRepo: FileChangeRepository,
+    private readonly agentLookup: AgentLookup,
+    private readonly pathSandbox: PathSandbox,
+    private readonly environmentInfoProvider: EnvironmentInfoProvider,
+    _userCommandService: UserCommandLookup,
+    private readonly gitOperationService: GitOperationService,
+    private readonly sessionCompactionService: SessionCompactionService,
+    private readonly sessionCompactionEventService: SessionCompactionEventService,
+    private readonly todoRepo?: SessionTodoRepository,
+    /** 会话删除时清理 runtime 目录（含上传的 incoming 文件）的回调，可选。 */
+    private readonly cleanupRuntimeDir?: (userId: number, sessionId: number) => void,
+    /** 会话删除时关闭其全部云端终端的回调，可选。 */
+    private readonly closeSessionTerminals?: (sessionId: number) => void,
+    /** 会话删除后清理绑定资源（如定时任务）。失败只记日志，不回滚已删除的会话。 */
+    private readonly onSessionDeleted?: (sessionId: number) => Promise<void> | void,
+    /** 会话删除时物理删其会话级审批放行规则（V135 级联）。 */
+    private readonly deleteSessionApprovalRules?: (sessionId: number) => Promise<void>,
+    /** 团队经验库挂载（技术方案 2026-10-24 §3.3）：CLOUD 会话创建时同步 团队经验 符号链接。可选注入。 */
+    private readonly experienceMount?: ExperienceMountService | null,
+  ) {}
+
+  /** 同一会话的 context token / manifest 写入按调用顺序串行，避免并发 UPDATE 把旧快照写回去。 */
+  private readonly contextTokenWrites = new Map<number, Promise<void>>();
+
+  async createSession(
+    userId: number,
+    agentId: number | null | undefined,
+    title: string | null | undefined,
+    executionMode?: string | null,
+    workspace?: string | null,
+    permissionLevel?: string | null,
+    isGit?: boolean | null,
+    platform?: string | null,
+    shellPath?: string | null,
+    osVersion?: string | null,
+    modelId?: number | null,
+    cloudProjectKey?: string | null,
+    workspaceMode?: string | null,
+    gitCloneUrl?: string | null,
+    gitBranch?: string | null,
+    source?: SessionSource | null,
+  ): Promise<Session> {
+    let resolvedAgentId = parseEntityId(agentId);
+    if (resolvedAgentId == null) {
+      resolvedAgentId = (await this.agentLookup.requireDefaultAgent()).id;
+    }
+    const agent = await this.agentLookup.findById(resolvedAgentId);
+    if (agent == null) {
+      throw new BusinessException(ErrorCode.AGENT_NOT_FOUND);
+    }
+    if (agent.enabled === 0) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '该 Agent 已停用');
+    }
+
+    const session: Session = {
+      userId,
+      agentId: resolvedAgentId,
+      title: title != null ? title : '未命名会话',
+      status: 'ACTIVE',
+      executionMode: executionMode != null ? executionMode : 'CLOUD',
+      permissionLevel: permissionLevel != null ? permissionLevel : 'READ_ONLY',
+      isGit: isGit ?? null,
+      platform: platform ?? null,
+      shellPath: shellPath ?? null,
+      osVersion: osVersion ?? null,
+      modelId: parseEntityId(modelId),
+      phase: 'IDLE',
+      elapsedMs: 0,
+      sessionType: 'NORMAL',
+      source: source ?? 'web',
+    };
+
+    if (session.executionMode === 'CLOUD') {
+      if (workspace != null && workspace.length > 0) {
+        session.workspace = workspace;
+        // 显式 cloudProjectKey（如飞书通道 feishu-{botId}-private-{uid}）优先于路径尾段推导，
+        // 否则 feishu-chat 工作区会因 projectKey 不匹配被误判为群聊分组。
+        session.projectKey = cloudProjectKey != null && cloudProjectKey.trim().length > 0
+          ? cloudProjectKey.trim()
+          : SessionService.deriveProjectKey(workspace);
+      } else {
+        session.workspace = null;
+        session.projectKey = null;
+      }
+    } else {
+      session.workspace = workspace ?? null;
+      session.projectKey = SessionService.deriveProjectKey(workspace ?? null);
+    }
+
+    await this.sessionRepo.insert(session);
+
+    if (session.executionMode === 'CLOUD') {
+      if (session.workspace == null || session.workspace.length === 0) {
+        try {
+          await this.initializeCloudWorkspace(session, userId, workspaceMode ?? null, cloudProjectKey ?? null, gitCloneUrl ?? null, gitBranch ?? null);
+          const env = await this.environmentInfoProvider.detect(session.workspace);
+          session.isGit = env.isGit;
+          session.platform = env.platform;
+          session.shellPath = env.shell;
+          session.osVersion = env.osVersion;
+          await this.sessionRepo.updateById(session);
+        } catch (e) {
+          await this.rollbackCreatedSession(session);
+          throw e;
+        }
+      } else {
+        const env = await this.environmentInfoProvider.detect(session.workspace);
+        session.isGit = env.isGit;
+        session.platform = env.platform;
+        session.shellPath = env.shell;
+        session.osVersion = env.osVersion;
+        await this.sessionRepo.updateById(session);
+      }
+      await this.mountExperienceLibrary(session);
+    }
+
+    return session;
+  }
+
+  /**
+   * 团队经验库挂载（技术方案 2026-10-24 §3.3）：按 Agent 开关同步工作区符号链接。
+   * 整体降级：挂载失败只记日志——链接缺失损失的是经验检索能力，不应阻断建会话。
+   */
+  private async mountExperienceLibrary(session: Session): Promise<void> {
+    if (this.experienceMount == null || session.agentId == null) return;
+    if (session.workspace == null || session.workspace.length === 0) return;
+    try {
+      const agent = await this.agentLookup.findById(session.agentId);
+      if (agent == null) return;
+      this.experienceMount.syncForSession(
+        session.workspace,
+        session.agentId,
+        (agent.experienceLibraryEnabled ?? 1) === 1,
+      );
+    } catch (e) {
+      console.error(`Failed to mount experience library for session ${session.id}:`, e);
+    }
+  }
+
+  private async initializeCloudWorkspace(
+    session: Session,
+    userId: number,
+    workspaceMode: string | null,
+    cloudProjectKey: string | null,
+    gitCloneUrl: string | null,
+    gitBranch: string | null,
+  ): Promise<void> {
+    const mode = workspaceMode != null ? workspaceMode : 'new';
+
+    if (mode === 'git' && gitCloneUrl != null && gitCloneUrl.trim().length > 0) {
+      GitUrlParser.validate(gitCloneUrl);
+      const slug = GitUrlParser.extractSlug(gitCloneUrl);
+      const projectPath = CloudWorkspaceResolver.resolveProjectWorkspace(this.pathSandbox, userId, slug);
+      // 项目工作区按 (userId, slug) 共享，不是本次会话独占：clone 失败只允许清理本次新建的目录，
+      // 已有内容的目录必须原样保留（clone 进非空目录必然失败，删掉会毁掉上一条会话的整个仓库）。
+      const projectExisted = existsSync(projectPath);
+      this.ensureWorkspaceDirectory(projectPath);
+      const result = await this.gitOperationService.clone(gitCloneUrl, gitBranch, projectPath, userId, session.id ?? null);
+      if (!result.success) {
+        if (!projectExisted) this.deleteWorkspaceDirectory(projectPath);
+        throw new BusinessException(ErrorCode.GIT_CLONE_FAILED, result.error ?? ErrorCode.GIT_CLONE_FAILED.message);
+      }
+      session.workspace = projectPath;
+      session.projectKey = slug;
+      await this.sessionRepo.updateById(session);
+    } else if (mode === 'existing' && cloudProjectKey != null && cloudProjectKey.trim().length > 0) {
+      const slug = CloudWorkspaceResolver.normalizeAndValidate(cloudProjectKey);
+      const projectPath = CloudWorkspaceResolver.resolveProjectWorkspace(this.pathSandbox, userId, slug);
+      if (!existsSync(projectPath)) {
+        throw new BusinessException(ErrorCode.PARAM_INVALID, `工作区 "${slug}" 不存在`);
+      }
+      session.workspace = projectPath;
+      session.projectKey = slug;
+      await this.sessionRepo.updateById(session);
+    } else if (cloudProjectKey != null && cloudProjectKey.trim().length > 0) {
+      const slug = CloudWorkspaceResolver.normalizeAndValidate(cloudProjectKey);
+      const projectPath = CloudWorkspaceResolver.resolveProjectWorkspace(this.pathSandbox, userId, slug);
+      this.ensureWorkspaceDirectory(projectPath);
+      session.workspace = projectPath;
+      session.projectKey = slug;
+      await this.sessionRepo.updateById(session);
+    } else {
+      const autoPath = resolve(this.pathSandbox.getWorkspaceRoot(), String(userId), String(session.id));
+      this.ensureWorkspaceDirectory(autoPath);
+      session.workspace = autoPath;
+      session.projectKey = SessionService.deriveProjectKey(autoPath);
+      await this.sessionRepo.updateById(session);
+    }
+  }
+
+  private async rollbackCreatedSession(session: Session): Promise<void> {
+    if (session.id == null) {
+      return;
+    }
+    const workspace = session.workspace;
+    await this.sessionRepo.logicalDelete(session.id);
+    if (workspace != null && workspace.trim().length > 0) {
+      this.deleteWorkspaceDirectory(workspace);
+    }
+  }
+
+  async listSessions(userId: number, keyword?: string | null, status?: string | null): Promise<Session[]> {
+    const { whereSql, params } = this.baseSessionListQuery(userId, keyword, status);
+    return this.sessionRepo.list(whereSql, params, 'ORDER BY updated_at DESC, id DESC');
+  }
+
+  async listSessionGroups(userId: number, keyword: string | null | undefined, status: string | null | undefined, previewLimit: number): Promise<SessionGroupBucket[]> {
+    const limit = Math.max(0, previewLimit);
+    const all = await this.listSessions(userId, keyword, status);
+    const byKey = new Map<string, Session[]>();
+    const keyOrder: string[] = [];
+    for (const s of all) {
+      const key = SessionGroupKey.of(s);
+      if (!byKey.has(key)) {
+        byKey.set(key, []);
+        keyOrder.push(key);
+      }
+      byKey.get(key)!.push(s);
+    }
+    const keys = [...keyOrder];
+    keys.sort(SessionGroupKey.compareKeys);
+    const groups: SessionGroupBucket[] = [];
+    const agentMap = await this.batchLoadAgents(all);
+    for (const key of keys) {
+      const members = byKey.get(key)!;
+      members.sort(SessionGroupKey.compareSessions);
+      const total = members.length;
+      const preview = limit >= total ? members : members.slice(0, limit);
+      const first = members[0];
+      const agentName = first.agentId != null ? agentMap.get(first.agentId)?.name : undefined;
+      const groupName = first.title != null && first.title !== '飞书Bot会话' ? first.title : undefined;
+      groups.push({ key, label: SessionGroupKey.formatLabel(key, agentName, groupName), total, hasMore: total > limit, sessions: [...preview] });
+    }
+    return groups;
+  }
+
+  async listSessionsByGroup(
+    userId: number,
+    groupKey: string,
+    keyword: string | null | undefined,
+    status: string | null | undefined,
+    offset: number,
+    limit: number,
+  ): Promise<SessionGroupPage> {
+    if (groupKey == null || groupKey.trim().length === 0) {
+      throw new BusinessException(ErrorCode.PARAM_MISSING, 'groupKey is required');
+    }
+    const safeOffset = Math.max(0, offset);
+    const safeLimit = Math.min(Math.max(1, limit), 100);
+    const base = this.baseSessionListQuery(userId, keyword, status);
+    let filter;
+    try {
+      filter = SessionGroupKey.applyFilter(groupKey);
+    } catch (e) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, (e as Error).message);
+    }
+    const whereSql = [...base.whereSql.split(' AND '), ...filter.clauses].join(' AND ');
+    const params = [...base.params, ...filter.params];
+    const total = await this.sessionRepo.count(whereSql, params);
+    const orderSql = status === 'ARCHIVED'
+      ? 'ORDER BY updated_at DESC, id DESC'
+      // 活跃相位与 ACTIVE_PHASES（isActivePhase / 侧边栏组预览 / dashboard）同一口径，含 CANCELLING；
+      // 漏列会把取消中的会话当空闲排到后面，与组预览排序互相打架。
+      : `ORDER BY CASE WHEN phase IN (${ACTIVE_PHASE_SQL_LIST}) THEN 0 ELSE 1 END, updated_at DESC, id DESC`;
+    const items = await this.sessionRepo.list(
+      whereSql,
+      params,
+      `${orderSql} LIMIT ${safeLimit} OFFSET ${safeOffset}`,
+    );
+    const hasMore = safeOffset + items.length < total;
+    return { items, total, offset: safeOffset, limit: safeLimit, hasMore };
+  }
+
+  /**
+   * Embed SDK 历史列表：当前用户、指定 agent、指定来源的主会话，updated_at 倒序分页。
+   * limit 上限 50、默认 20（与 groupKey 分页的 100 上限独立，浮窗场景不需要更大页）。
+   */
+  async listSessionsByFilter(
+    userId: number,
+    agentId: number | null | undefined,
+    source: SessionSource,
+    offset: number,
+    limit: number,
+  ): Promise<SessionGroupPage> {
+    // 非整数（1.5 / 1e21 等）截断，避免拼进 LIMIT/OFFSET 生成非法 SQL
+    const safeOffset = Math.trunc(Math.max(0, offset));
+    const safeLimit = Math.min(Math.max(1, Math.trunc(limit)), 50);
+    const filter: SessionListFilter = {
+      userId,
+      agentId: parseEntityId(agentId) ?? null,
+      source,
+    };
+    return this.sessionRepo.pageSessionsByFilter(filter, safeOffset, safeLimit);
+  }
+
+  /** 存量 SDK 常驻会话惰性标记：仅允许 web → embed 单向迁移，幂等 */
+  async markSessionSource(sessionId: number, userId: number, source: SessionSource): Promise<Session> {
+    const session = await this.getSession(sessionId);
+    if (session.userId !== userId) {
+      throw new BusinessException(ErrorCode.FORBIDDEN, '无权操作该会话');
+    }
+    if (source !== 'embed') {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, "source 仅允许设置为 'embed'");
+    }
+    if (session.source === 'embed') {
+      return session;
+    }
+    await this.sessionRepo.updateFields(sessionId, { source });
+    return this.getSession(sessionId);
+  }
+
+  private baseSessionListQuery(
+    userId: number,
+    keyword?: string | null,
+    status?: string | null,
+  ): { whereSql: string; params: unknown[] } {
+    const clauses = ['user_id = ?', `session_type NOT IN ('SUBAGENT', 'SIDE_TASK')`];
+    const params: unknown[] = [userId];
+    if (keyword != null && keyword.length > 0) {
+      clauses.push('title LIKE ?');
+      params.push(`%${keyword}%`);
+    }
+    if (status != null && status.length > 0) {
+      clauses.push('status = ?');
+      params.push(status);
+    } else {
+      clauses.push('status = ?');
+      params.push('ACTIVE');
+    }
+    return { whereSql: clauses.join(' AND '), params };
+  }
+
+  listSideTaskSessions(parentSessionId: number, userId: number): Promise<Session[]> {
+    return this.sessionRepo.list(
+      `parent_session_id = ? AND user_id = ? AND session_type = 'SIDE_TASK' AND status <> 'ARCHIVED'`,
+      [parentSessionId, userId],
+      'ORDER BY created_at DESC',
+    );
+  }
+
+  /** 递归列出根主会话树下的全部后代边路任务（updated_at 降序平铺），归档子树隐藏、孤儿不可达。 */
+  async listDescendantSideTaskSessions(rootId: number, userId: number): Promise<Session[]> {
+    return this.sessionRepo.listDescendantSideTasks(rootId, userId);
+  }
+
+  /** 批量递归：多个根主会话各自的全部后代边路任务（enrichSessions 首刷聚合用，按根分组）。 */
+  listDescendantSideTaskSessionsByRoots(rootIds: number[]): Promise<Map<number, Session[]>> {
+    return this.sessionRepo.listDescendantSideTasksByRoots(rootIds);
+  }
+
+  listSubagentSessions(parentSessionId: number, userId?: number): Promise<Session[]> {
+    if (userId != null) {
+      return this.sessionRepo.list(
+        `parent_session_id = ? AND user_id = ? AND session_type = 'SUBAGENT' AND status <> 'ARCHIVED'`,
+        [parentSessionId, userId],
+        'ORDER BY created_at DESC',
+      );
+    }
+    return this.sessionRepo.list(
+      `parent_session_id = ? AND session_type = 'SUBAGENT' AND status <> 'ARCHIVED'`,
+      [parentSessionId],
+      '',
+    );
+  }
+
+  async listSubagentSessionsWithSideTasks(parentSessionId: number, userId: number): Promise<Session[]> {
+    const direct = await this.listSubagentSessions(parentSessionId, userId);
+    const sideTasks = await this.listSideTaskSessions(parentSessionId, userId);
+    if (sideTasks.length === 0) {
+      return direct;
+    }
+    const sideTaskIds = sideTasks.map((s) => s.id!).filter((id) => id != null);
+    if (sideTaskIds.length === 0) {
+      return direct;
+    }
+    const placeholders = sideTaskIds.map(() => '?').join(',');
+    const sideChildren = await this.sessionRepo.list(
+      `parent_session_id IN (${placeholders}) AND user_id = ? AND session_type = 'SUBAGENT' AND status <> 'ARCHIVED'`,
+      [...sideTaskIds, userId],
+      '',
+    );
+    if (sideChildren.length === 0) {
+      return direct;
+    }
+    const merged = [...direct, ...sideChildren];
+    merged.sort((a, b) => {
+      const au = a.createdAt ?? '';
+      const bu = b.createdAt ?? '';
+      return bu.localeCompare(au);
+    });
+    return merged;
+  }
+
+  async listSessionsForAdmin(
+    page: number,
+    size: number,
+    userId?: number | null,
+    agentId?: number | null,
+    executionMode?: string | null,
+    phase?: string | null,
+    keyword?: string | null,
+    status?: string | null,
+    messageScope?: string | null,
+    source?: string | null,
+  ): Promise<{ records: Session[]; total: number; current: number; size: number; matchSnippets: Record<number, string> }> {
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    if (userId != null) {
+      clauses.push('user_id = ?');
+      params.push(userId);
+    }
+    // admin 侧来源筛选按「创建时来源」等值过滤；闭集外的非法值宽松忽略、不过滤（§4.1-6 定案），
+    // 避免 `?source=Feishu` 这类手拼值命中 0 行被误读为「该来源没有会话」
+    if (source != null && isSessionSource(source)) {
+      clauses.push('source = ?');
+      params.push(source);
+    }
+    if (agentId != null) {
+      clauses.push('agent_id = ?');
+      params.push(agentId);
+    }
+    if (executionMode != null && executionMode.length > 0) {
+      clauses.push('execution_mode = ?');
+      params.push(executionMode);
+    }
+    if (phase != null && phase.length > 0) {
+      if (phase.includes(',')) {
+        const phases = phase.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+        clauses.push(`phase IN (${phases.map(() => '?').join(',')})`);
+        params.push(...phases);
+      } else {
+        clauses.push('phase = ?');
+        params.push(phase);
+      }
+    }
+    const trimmedKeyword = keyword != null ? keyword.trim() : '';
+    // 搜索范围决定消息正文是否含工具输出/系统消息：ALL 保留旧口径，默认只看对话双方。
+    const scope = normalizeMessageScope(messageScope);
+    // 关键词命中消息正文优先走 ngram 全文索引：LIKE '%kw%' 对 23 万条 message 全表扫，
+    // 实测 1~2s/次；FT 命中消息再 LEFT JOIN 回 session，可降到几十毫秒。
+    // 单字符关键词 ngram(token_size=2) 索引不到，会漏召，仍走 LIKE 子查询。
+    const messageMatch = this.buildAdminMessageMatch(trimmedKeyword, scope);
+    if (messageMatch != null) {
+      const [matchSql, ...matchParams] = messageMatch;
+      clauses.push(`(title LIKE ? ESCAPE '\\\\' OR summary LIKE ? ESCAPE '\\\\' OR id IN (${matchSql}))`);
+      params.push(`%${escapeLike(trimmedKeyword)}%`, `%${escapeLike(trimmedKeyword)}%`, ...matchParams);
+    } else if (trimmedKeyword.length > 0) {
+      // 无全文索引可用的关键词（单字符 / 显式关闭 FT）：退回消息正文子串扫描。
+      clauses.push(
+        `(title LIKE ? ESCAPE '\\\\' OR summary LIKE ? ESCAPE '\\\\' OR id IN (
+          SELECT m.session_id FROM message m
+          WHERE m.deleted = 0${messageRoleClause(scope)} AND m.content LIKE CONCAT('%', ?, '%') ESCAPE '\\\\'
+        ))`,
+      );
+      params.push(`%${escapeLike(trimmedKeyword)}%`, `%${escapeLike(trimmedKeyword)}%`, `%${escapeLike(trimmedKeyword)}%`);
+    }
+    clauses.push('status = ?');
+    params.push(status != null && status.length > 0 ? status : 'ACTIVE');
+    const whereSql = clauses.length > 0 ? clauses.join(' AND ') : '1=1';
+    // 按最后活动倒序（最近有动作的浮到最前；未产生过活动的 NULL 由 MySQL 归底）；
+    // last_activity_at 秒级精度：并列行补唯一 tiebreaker，保证深翻页不重复/丢行
+    const result = await this.sessionRepo.selectPage(page, size, whereSql, params, 'ORDER BY last_activity_at DESC, id DESC');
+    const matchSnippets = await this.loadAdminMatchSnippets(result.records, trimmedKeyword, scope);
+    return { ...result, current: page, size, matchSnippets };
+  }
+
+  /**
+   * 管理端关键词的消息正文匹配子查询。返回 [sql, ...params]，无法走全文索引时返回 null（调用方降级 LIKE）。
+   * 全文索引建在 message.content 上（V146 ngram），命中消息的 session 经 DISTINCT 去重后用于 `id IN (...)`。
+   */
+  private buildAdminMessageMatch(keyword: string, scope: MessageSearchScope): [string, ...unknown[]] | null {
+    if (keyword.length === 0) return null;
+    const prepared = prepareMessageSearch(keyword, this.searchFulltextEnabled());
+    if (prepared.path !== 'FULLTEXT') return null;
+    const match = prepared.match.replace(/\*/g, '');
+    if (match.length === 0) return null;
+    return [
+      `SELECT m.session_id FROM message m
+       WHERE m.deleted = 0${messageRoleClause(scope)} AND MATCH(m.content) AGAINST (? IN BOOLEAN MODE)`,
+      match,
+    ];
+  }
+
+  private async loadAdminMatchSnippets(records: Session[], keyword: string, scope: MessageSearchScope): Promise<Record<number, string>> {
+    if (keyword.length === 0 || records.length === 0) {
+      return {};
+    }
+    const sessionIds = records.map((s) => s.id).filter((id): id is number => id != null);
+    if (sessionIds.length === 0) {
+      return {};
+    }
+    const hits = await this.messageRepo.selectFirstMatchingMessages(sessionIds, escapeLike(keyword), scope);
+    const matchSnippets: Record<number, string> = {};
+    for (const hit of hits) {
+      const snippet = this.searchSnippet(hit.content ?? null, keyword);
+      if (snippet != null) matchSnippets[hit.sessionId] = snippet;
+    }
+    return matchSnippets;
+  }
+
+  async getSession(id: number): Promise<Session> {
+    const session = await this.sessionRepo.findById(id);
+    if (session == null) {
+      throw new BusinessException(ErrorCode.SESSION_NOT_FOUND);
+    }
+    return session;
+  }
+
+  async deleteSession(id: number): Promise<void> {
+    const session = await this.sessionRepo.findById(id);
+    if (session != null && (
+      session.phase === 'RUNNING' || session.phase === 'WAITING_APPROVAL'
+      || session.phase === 'RESUMING' || session.phase === 'CANCELLING'
+    )) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '会话运行中，无法删除');
+    }
+    await this.sessionRepo.lockActiveSessionById(id);
+    if (this.deleteSessionApprovalRules) {
+      // 会话级审批规则物理删（V135）：WAITING_APPROVAL 拒删守卫保证无挂起审批，
+      // 规则删除失败不阻断会话删除（残留行不参与匹配——会话已删、sessionId 不复用）
+      try {
+        await this.deleteSessionApprovalRules(id);
+      } catch (e) {
+        console.error(`Failed to delete approval rules for session ${id}`, e);
+      }
+    }
+    await this.sessionCompactionService.deleteBySessionId(id);
+    await this.sessionCompactionEventService.deleteBySessionId(id);
+    await this.messageRepo.logicalDeleteBySession(id);
+    await this.sessionRepo.logicalDelete(id);
+    if (this.onSessionDeleted) {
+      try {
+        await this.onSessionDeleted(id);
+      } catch (e) {
+        console.error(`Failed to clean resources bound to session ${id}`, e);
+      }
+    }
+    // 文件清理失败不影响会话删除本身（记录日志即可）
+    if (session != null) {
+      try {
+        this.cleanupRuntimeDir?.(session.userId, id);
+      } catch (e) {
+        console.error(`Failed to clean runtime incoming dir for session ${id}`, e);
+      }
+      try {
+        this.closeSessionTerminals?.(id);
+      } catch (e) {
+        console.error(`Failed to close cloud terminals for session ${id}`, e);
+      }
+      if (session.workspace != null && session.workspace.trim() !== '') {
+        this.deleteRuntimeWorkspaceFiles(session.workspace);
+      }
+    }
+  }
+
+  /**
+   * 删除会话工作区内残留的 runtime 临时文件（写入工作区时以 `mao-runtime-` 前缀存放）。
+   * 仅删除该前缀命中的目录/文件，不影响用户项目文件。
+   */
+  private deleteRuntimeWorkspaceFiles(workspace: string): void {
+    try {
+      const root = this.pathSandbox.getEffectiveWorkspaceRoot(workspace);
+      if (!existsSync(root) || !statSync(root).isDirectory()) return;
+      for (const entry of readdirSync(root, { withFileTypes: true })) {
+        if (entry.name.startsWith(RUNTIME_WORKSPACE_PREFIX)) {
+          rmSync(resolve(root, entry.name), { recursive: true, force: true });
+        }
+      }
+    } catch (e) {
+      console.error(`Failed to clean runtime workspace files in ${workspace}`, e);
+    }
+  }
+
+  async promoteSideTaskToMainSession(sideSessionId: number, userId: number): Promise<Session> {
+    return this.sessionRepo.transaction(async (tx) => {
+      const txSessionRepo = new SessionRepository(tx);
+      const txMessageRepo = new MessageRepository(tx);
+      const txFileChangeRepo = new FileChangeRepository(tx);
+      const txTodoRepo = new SessionTodoRepository(tx);
+
+      const source = await txSessionRepo.findByIdForUpdate(sideSessionId);
+      if (source == null) {
+        throw new BusinessException(ErrorCode.SESSION_NOT_FOUND);
+      }
+      if (source.userId !== userId) {
+        throw new BusinessException(ErrorCode.FORBIDDEN, '无权操作该会话');
+      }
+      if (source.sessionType !== 'SIDE_TASK') {
+        throw new BusinessException(ErrorCode.PARAM_INVALID, '只有边路任务可以升级为主会话');
+      }
+      if (source.phase === 'RUNNING' || source.phase === 'WAITING_APPROVAL' || source.phase === 'RESUMING' || source.phase === 'CANCELLING') {
+        throw new BusinessException(ErrorCode.PARAM_INVALID, '边路任务运行中，无法升级为主会话');
+      }
+      // 仅拒绝存在子代理子会话的提升：SIDE_TASK 子树不受阻——子树的 parent_session_id
+      // 本就指向被提升会话，提升后子树在树上自然跟随新主会话，无需重挂。
+      const subagentChildren = await txSessionRepo.list(
+        `parent_session_id = ? AND session_type = 'SUBAGENT' AND status <> 'ARCHIVED'`,
+        [sideSessionId],
+        'LIMIT 1',
+      );
+      if (subagentChildren.length > 0) {
+        throw new BusinessException(ErrorCode.PARAM_INVALID, '边路任务存在子代理会话，无法升级为主会话');
+      }
+
+      const target: Session = {
+        userId,
+        agentId: source.agentId,
+        title: source.title ?? '未命名会话',
+        status: 'ACTIVE',
+        executionMode: source.executionMode,
+        workspace: source.workspace,
+        permissionLevel: source.permissionLevel,
+        modelId: source.modelId,
+        isGit: source.isGit,
+        platform: source.platform,
+        shellPath: source.shellPath,
+        osVersion: source.osVersion,
+        phase: 'IDLE',
+        summary: source.summary,
+        elapsedMs: 0,
+        projectKey: source.projectKey ?? SessionService.deriveProjectKey(source.workspace),
+        contextTokens: null,
+        lastPromptTokens: null,
+        unread: 0,
+        parentSessionId: null,
+        sessionType: 'NORMAL',
+      };
+      await txSessionRepo.insert(target);
+      const targetId = target.id!;
+
+      const messages = await txMessageRepo.listBySession(sideSessionId);
+      const messageIdMap = new Map<number, number>();
+      for (const m of messages) {
+        const copy: Message = {
+          sessionId: targetId,
+          role: m.role,
+          content: m.content,
+          thinkingContent: m.thinkingContent,
+          toolCallId: m.toolCallId,
+          toolCalls: m.toolCalls,
+          tokenCount: m.tokenCount,
+          modelId: m.modelId,
+          metadata: m.metadata,
+          sourceSessionId: m.sourceSessionId ?? sideSessionId,
+        };
+        await txMessageRepo.insert(copy);
+        if (m.id != null && copy.id != null) messageIdMap.set(m.id, copy.id);
+      }
+
+      const fileChanges = await txFileChangeRepo.listBySession(sideSessionId);
+      for (const change of fileChanges) {
+        if (change.messageId == null) continue;
+        const mappedMessageId = messageIdMap.get(change.messageId);
+        if (mappedMessageId == null) continue;
+        await txFileChangeRepo.insert({
+          messageId: mappedMessageId,
+          sessionId: targetId,
+          filePath: change.filePath,
+          changeType: change.changeType,
+          linesAdded: change.linesAdded,
+          linesDeleted: change.linesDeleted,
+          diffMode: change.diffMode,
+          beforeContent: change.beforeContent,
+          afterContent: change.afterContent,
+          patchContent: change.patchContent,
+          patchTruncated: change.patchTruncated,
+          diffUnavailableReason: change.diffUnavailableReason,
+        });
+      }
+
+      if (this.todoRepo != null) {
+        const todos = await txTodoRepo.listBySession(sideSessionId);
+        for (const todo of todos) {
+          await txTodoRepo.insert({
+            sessionId: targetId,
+            content: todo.content,
+            description: todo.description,
+            activeForm: todo.activeForm,
+            status: todo.status,
+            sortOrder: todo.sortOrder,
+            owner: todo.owner,
+            claimedAt: todo.claimedAt,
+            blockedBy: todo.blockedBy,
+          } as SessionTodo);
+        }
+      }
+
+      await tx.execute('DELETE FROM session_compaction WHERE session_id = ?', [sideSessionId]);
+      await tx.execute('DELETE FROM session_compaction_event WHERE session_id = ?', [sideSessionId]);
+      // 工作区规则快照同属会话级资源：本路径不走 onSessionDeleted，需在同一事务内回收，
+      // 否则边路会话每提升一次就泄漏一行（技术方案 §4.6 评审补充）。
+      await tx.execute('DELETE FROM session_workspace_rules WHERE session_id = ?', [sideSessionId]);
+      await txMessageRepo.logicalDeleteBySession(sideSessionId);
+      // 提升是「插入新主会话 + 逻辑删除旧边路会话」：直接子会话的 parent 仍指向旧 id，
+      // 不重挂则整棵边路子树在新旧两棵树上都不可达（BFS / 树信号 / 搜索全部失联）。
+      // 子代理子会话已被前置校验拒绝，这里命中的只会是边路子树。
+      await txSessionRepo.reparentChildrenTo(sideSessionId, targetId);
+      await txSessionRepo.logicalDelete(sideSessionId);
+      return target;
+    });
+  }
+
+  async searchMessages(
+    userId: number,
+    keyword: string | null | undefined,
+    raw: {
+      agentId?: number | null;
+      dateFrom?: string | null;
+      dateTo?: string | null;
+      sessionType?: string | null;
+      page?: number | null;
+      size?: number | null;
+    } = {},
+  ): Promise<MessageSearchResult> {
+    if (keyword == null || keyword.trim().length === 0) {
+      throw new BusinessException(ErrorCode.PARAM_MISSING, '缺少搜索关键词');
+    }
+    const trimmed = keyword.trim();
+    if (trimmed.length > SEARCH_KEYWORD_MAX_LENGTH) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, `搜索关键词不能超过 ${SEARCH_KEYWORD_MAX_LENGTH} 个字符`);
+    }
+    const list = normalizeSearchListParams(raw);
+    if ((list.page - 1) * list.size > SEARCH_OFFSET_CAP) {
+      const prepared = this.prepareSearch(trimmed);
+      return { items: [], total: 0, page: list.page, size: list.size, path: prepared.path };
+    }
+    const enabled = this.searchFulltextEnabled();
+    let prepared = prepareMessageSearch(trimmed, enabled);
+    if (prepared.path === 'FULLTEXT') {
+      try {
+        return await this.executeMessageSearch(userId, trimmed, prepared, list);
+      } catch (err) {
+        if (!isFulltextDegradeError(err)) throw err;
+        console.warn(`Fulltext search degraded to LIKE: ${(err as Error).message}`);
+        prepared = prepareMessageSearch(trimmed, false);
+      }
+    }
+    return this.executeMessageSearch(userId, trimmed, prepared, list);
+  }
+
+  private searchFulltextEnabled(): boolean {
+    if (process.env.SEARCH_FULLTEXT_ENABLED != null && process.env.SEARCH_FULLTEXT_ENABLED !== '') {
+      return isSearchFulltextEnabled();
+    }
+    return loadConfig().app.search?.fulltextEnabled !== false;
+  }
+
+  private prepareSearch(keyword: string): PreparedSearch {
+    return prepareMessageSearch(keyword, this.searchFulltextEnabled());
+  }
+
+  private async executeMessageSearch(
+    userId: number,
+    keyword: string,
+    prepared: PreparedSearch,
+    list: SearchListParams,
+  ): Promise<MessageSearchResult> {
+    const filter: MessageSearchSqlFilter = {
+      mode: prepared.path,
+      userId,
+      match: prepared.match,
+      agentId: list.agentId,
+      createdFrom: list.createdFrom,
+      createdToExclusive: list.createdToExclusive,
+      sessionType: list.sessionType,
+      limit: list.size,
+      offset: (list.page - 1) * list.size,
+    };
+    const [aggs, total] = await Promise.all([
+      this.sessionRepo.selectMatchingSessions(filter),
+      this.sessionRepo.countMatchingSessions(filter),
+    ]);
+    const empty: MessageSearchResult = { items: [], total, page: list.page, size: list.size, path: prepared.path };
+    if (aggs.length === 0) return empty;
+    const ids = aggs.map((row) => row.sessionId);
+    const loaded = await this.sessionRepo.selectByIds(ids);
+    const byId = new Map(loaded.filter((s) => s.id != null).map((s) => [s.id!, s]));
+    const ordered: Session[] = [];
+    for (const id of ids) {
+      const session = byId.get(id);
+      if (session != null) ordered.push(session);
+    }
+    const rawHits = await this.messageRepo.selectHitMessages(
+      ids,
+      prepared.path,
+      prepared.match,
+      list.createdFrom,
+      list.createdToExclusive,
+    );
+    const hitsBySession = new Map<number, MessageSearchHitRow[]>();
+    for (const hit of rawHits) {
+      const listHits = hitsBySession.get(hit.sessionId) ?? [];
+      listHits.push(hit);
+      hitsBySession.set(hit.sessionId, listHits);
+    }
+    const rootIdBySession = await this.resolveSearchRoots(ordered);
+    const agentMap = await this.batchLoadAgents(ordered);
+    const aggById = new Map(aggs.map((row) => [row.sessionId, row]));
+    const items: MessageSearchGroup[] = [];
+    for (const session of ordered) {
+      if (session.sessionType === 'SIDE_TASK' && !rootIdBySession.has(session.id!)) continue;
+      const raw = hitsBySession.get(session.id!) ?? [];
+      const hits: MessageSearchHit[] = [];
+      for (const hit of raw) {
+        const snippet = this.searchSnippet(hit.content ?? null, keyword, prepared.snippetTerms);
+        if (snippet == null) continue;
+        hits.push({
+          messageId: hit.messageId,
+          role: hit.role,
+          snippet,
+          createdAt: javaLocalDateTimeString(hit.createdAt),
+        });
+      }
+      if (hits.length === 0) continue;
+      const sqlCount = aggById.get(session.id!)?.hitCount ?? hits.length;
+      const hitCount = hits.length < raw.length ? hits.length : Math.max(sqlCount, hits.length);
+      const agent = session.agentId != null ? agentMap.get(session.agentId) : undefined;
+      items.push({
+        sessionId: session.id!,
+        title: session.title,
+        sessionType: session.sessionType,
+        parentSessionId: session.parentSessionId,
+        rootSessionId: session.sessionType === 'SIDE_TASK' ? rootIdBySession.get(session.id!) ?? null : session.id ?? null,
+        updatedAt: javaLocalDateTimeString(session.updatedAt),
+        phase: session.phase != null ? session.phase : 'IDLE',
+        status: session.status ?? 'ACTIVE',
+        agentId: session.agentId ?? null,
+        agentName: agent?.name ?? null,
+        hitCount,
+        hits,
+      });
+    }
+    return { items, total, page: list.page, size: list.size, path: prepared.path };
+  }
+
+  /**
+   * 批量解析搜索候选中边路会话所属的根主会话 id。
+   * 先把全部父会话一次性查出建映射，再逐链上溯；
+   * 链上任何节点缺失（已删除）即视为孤儿，不为其产出根 id。
+   */
+  private async resolveSearchRoots(candidates: Session[]): Promise<Map<number, number>> {
+    const result = new Map<number, number>();
+    const sideCandidates = candidates.filter((s) => s.sessionType === 'SIDE_TASK' && s.parentSessionId != null);
+    if (sideCandidates.length === 0) return result;
+    const needed = new Set<number>();
+    for (const s of sideCandidates) needed.add(s.parentSessionId!);
+    const parentById = new Map<number, Session>();
+    for (let round = 0; round < 10 && needed.size > 0; round++) {
+      const ids = [...needed];
+      const placeholders = ids.map(() => '?').join(',');
+      const rows = await this.sessionRepo.list(`id IN (${placeholders})`, ids, '');
+      const nextNeeded = new Set<number>();
+      for (const row of rows) {
+        if (row.id == null) continue;
+        parentById.set(row.id, row);
+        if (row.parentSessionId != null && !parentById.has(row.parentSessionId)) {
+          nextNeeded.add(row.parentSessionId);
+        }
+      }
+      needed.clear();
+      for (const id of nextNeeded) needed.add(id);
+    }
+    for (const s of sideCandidates) {
+      let current = parentById.get(s.parentSessionId!);
+      let guard = 0;
+      while (current != null && current.parentSessionId != null && guard < 10) {
+        current = parentById.get(current.parentSessionId);
+        guard++;
+      }
+      if (current != null && current.parentSessionId == null && current.sessionType !== 'SIDE_TASK' && current.id != null) {
+        result.set(s.id!, current.id);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * 搜索片段用的正文：可见文本再剥掉引用标记。`[^n^]` 是桌面渲染层约定，来源区不在
+   * 纯文本片段（桌面搜索浮层 / admin 会话列表）的语境里，原样露出像没渲染干净的模板变量。
+   */
+  private snippetSourceText(content: string | null): string | null {
+    const text = this.extractVisibleText(content);
+    return text == null ? null : stripCitationMarkers(text);
+  }
+
+  /**
+   * 搜索片段：优先用剥掉引用标记的正文建；建不出来时（典型是关键词本身含 `[^n^]`
+   * 字面量，剥标文本里找不到词）回退用未剥标的可见文本建。否则整条命中会被丢弃，
+   * 而 total 仍按 SQL 计数，桌面会出现「找到 N 个相关会话」却列不出东西。
+   */
+  private searchSnippet(content: string | null, keyword: string | null, extraTerms?: string[]): string | null {
+    const snippet = buildSnippet(this.snippetSourceText(content), keyword, extraTerms);
+    if (snippet != null) return snippet;
+    return buildSnippet(this.extractVisibleText(content), keyword, extraTerms);
+  }
+
+  extractVisibleText(content: string | null): string | null {
+    if (content == null) return null;
+    const raw = content.trim();
+    if (!raw.startsWith('[')) {
+      return content;
+    }
+    try {
+      const parts = JSON.parse(raw) as unknown[];
+      if (parts.length === 0) {
+        return content;
+      }
+      let sb = '';
+      let multimodal = false;
+      let allParts = true;
+      for (const part of parts) {
+        if (part && typeof part === 'object' && !Array.isArray(part)) {
+          const map = part as Record<string, unknown>;
+          const type = map.type;
+          if (type === 'text') {
+            if (map.text != null) sb += String(map.text);
+            multimodal = true;
+          } else if (type === 'image_url') {
+            multimodal = true;
+          } else {
+            allParts = false;
+          }
+        } else {
+          allParts = false;
+        }
+      }
+      return multimodal && allParts ? sb : content;
+    } catch (e) {
+      console.warn(`Failed to parse multimodal message content, fallback to raw: ${(e as Error).message}`);
+      return content;
+    }
+  }
+
+  private async batchLoadAgents(sessions: Session[]): Promise<Map<number, AgentRef>> {
+    const ids = collectEntityIds(sessions.map((s) => s.agentId));
+    if (ids.length === 0) {
+      return new Map();
+    }
+    const agents = await this.agentLookup.findByIds(ids);
+    return new Map(agents.map((a) => [parseEntityId(a.id) ?? a.id, a]));
+  }
+
+  async archiveSession(id: number): Promise<void> {
+    await this.getSession(id);
+    await this.sessionRepo.updateFields(id, { status: 'ARCHIVED' });
+  }
+
+  async unarchiveSession(id: number): Promise<void> {
+    await this.getSession(id);
+    await this.sessionRepo.updateFields(id, { status: 'ACTIVE' });
+  }
+
+  async restoreRunningAfterApproval(sessionId: number): Promise<boolean> {
+    const rows = await this.sessionRepo.updateWhere(
+      { phase: 'RUNNING', lastActivityAt: nowSql() },
+      `id = ? AND phase = 'WAITING_APPROVAL' AND phase NOT IN ('FAILED', 'CANCELLED', 'COMPLETED')`,
+      [sessionId],
+    );
+    return rows > 0;
+  }
+
+  async enterWaitingApproval(sessionId: number): Promise<boolean> {
+    const rows = await this.sessionRepo.updateWhere(
+      { phase: 'WAITING_APPROVAL', lastActivityAt: nowSql() },
+      `id = ? AND phase NOT IN ('FAILED', 'CANCELLED', 'COMPLETED')`,
+      [sessionId],
+    );
+    return rows > 0;
+  }
+
+  async save(session: Session): Promise<void> {
+    await this.sessionRepo.insert(session);
+  }
+
+  async updateField(sessionId: number, field: string, value: unknown): Promise<void> {
+    switch (field) {
+      case 'status':
+        await this.sessionRepo.updateFields(sessionId, { status: value });
+        break;
+      case 'phase': {
+        const phase = String(value);
+        const fields: Record<string, unknown> = { phase };
+        if (phase === 'RUNNING' || phase === 'RESUMING') {
+          fields.lastActivityAt = nowSql();
+        }
+        await this.sessionRepo.updateFields(sessionId, fields);
+        break;
+      }
+      default:
+        throw new Error(`Unsupported field: ${field}`);
+    }
+  }
+
+  async saveMessage(
+    sessionId: number,
+    role: string,
+    content: unknown,
+    thinkingContent: string | null,
+    toolCallId: string | null,
+    toolCalls: string | null,
+    tokenCount: number | null,
+    modelId: number | null,
+    metadata?: string | null,
+  ): Promise<Message> {
+    const message: Message = {
+      sessionId,
+      role,
+      thinkingContent,
+      toolCallId,
+      toolCalls,
+      tokenCount: tokenCount != null ? tokenCount : 0,
+      modelId,
+      metadata: metadata ?? null,
+    };
+    if (typeof content === 'string') {
+      message.content = content;
+    } else if (content != null) {
+      try {
+        message.content = toStoredContentJson(content);
+      } catch {
+        console.warn('Failed to serialize content to JSON, storing as string');
+        message.content = String(content);
+      }
+    }
+    await this.messageRepo.insert(message);
+
+    const session = await this.sessionRepo.findById(sessionId);
+    if (session != null) {
+      await this.sessionRepo.updateFields(sessionId, { updatedAt: nowSql() });
+    }
+    return message;
+  }
+
+  async getMessages(sessionId: number): Promise<Message[]> {
+    const messages = await this.messageRepo.listBySession(sessionId);
+    return (MessageHistoryNormalizer.normalizeEntities(messages, parseToolCallsJson) ?? messages) as Message[];
+  }
+
+  /**
+   * 原始消息列表（不做 MessageHistoryNormalizer 归一化）。回复引用溯源的 registry
+   * 构建需要按 tool_call_id 精确匹配 TOOL 消息与 ASSISTANT 的 tool_calls，归一化
+   * 会改写 / 合并消息行，破坏匹配口径（技术方案 2026-10-12 §5.2）。
+   */
+  getRawMessages(sessionId: number): Promise<Message[]> {
+    return this.messageRepo.listBySession(sessionId);
+  }
+
+  /** 只更新消息的 metadata 列（引用溯源 citations 挂载；全字段 updateById 会误清 content）。 */
+  updateMessageMetadata(messageId: number, metadata: string | null): Promise<void> {
+    return this.messageRepo.updateMetadata(messageId, metadata);
+  }
+
+  /** 最后一条 role=ASSISTANT 且正文非空的消息（引用溯源 citations 的挂载行；记忆抽取同源口径）。 */
+  findLastAssistantMessage(sessionId: number): Promise<Message | null> {
+    return this.messageRepo.selectLastAssistantMessage(sessionId);
+  }
+
+  getMessagesAfterId(sessionId: number, afterMessageId: number | null): Promise<Message[]> {
+    const boundary = afterMessageId != null ? afterMessageId : 0;
+    return this.messageRepo.selectMessagesAfterId(sessionId, boundary);
+  }
+
+  /** 取消息并校验归属：不存在、已删除或属于其他会话时返回 null。分叉切点校验用。 */
+  findOwnedMessage(sessionId: number, messageId: number): Promise<Message | null> {
+    return this.messageRepo.selectValidBoundaryMessage(sessionId, messageId);
+  }
+
+  /**
+   * Fork 预览：边路任务创建前预演「发出首条消息后这条边路会话会看到的原始历史」。
+   *
+   * 走与 `/sessions/:id/messages` 完全相同的轮次分页口径（默认最近 N 轮、hasMore 翻页），
+   * 只把上界从「最新一条」换成切点：切点是被点击那一轮的助手最终回复，轮次分页的起点查询
+   * 必须含该轮的用户消息（`id <= 切点`），否则来源轮次整轮消失，预览与真实结果不符。
+   * 无切点 = 全量分叉，与带 forkFromMessageId 的真实创建一一对应。
+   */
+  async getForkPreview(
+    sessionId: number,
+    cutMessageId: number | null,
+    roundLimit: number,
+    beforeMessageId: number | null = null,
+  ): Promise<MessagePage> {
+    const limit = Math.max(1, Math.min(roundLimit, 50));
+    const userStarts = cutMessageId == null
+      ? await this.messageRepo.selectUserStarts(sessionId, beforeMessageId, limit + 1)
+      : await this.messageRepo.selectUserStartsThrough(sessionId, cutMessageId, beforeMessageId, limit + 1);
+    if (userStarts.length === 0) {
+      return { messages: [], hasMore: false, nextBeforeMessageId: null };
+    }
+    const hasMore = userStarts.length > limit;
+    const pageStarts = hasMore ? userStarts.slice(0, limit) : userStarts;
+    const startId = pageStarts[pageStarts.length - 1].id!;
+    // 翻页游标是上一页最旧一条的 id，上界必须排他，否则这条会再返回一次。
+    // 切点仍含边界：它是被点击那一轮的助手最终回复，预览要带上它。游标不小于切点时以上界为切点。
+    const pagingExclusive = beforeMessageId != null && (cutMessageId == null || beforeMessageId <= cutMessageId);
+    const raw = pagingExclusive
+      ? await this.messageRepo.selectRange(sessionId, startId, beforeMessageId)
+      : cutMessageId != null
+        ? await this.messageRepo.selectRangeThrough(sessionId, startId, cutMessageId)
+        : await this.messageRepo.selectRange(sessionId, startId, null);
+    const supplemented = await this.includeMissingToolResults(sessionId, raw, {
+      maxMessageId: cutMessageId,
+      excludeSourceSessionId: null,
+    });
+    const messages = (MessageHistoryNormalizer.normalizeEntities(supplemented, parseToolCallsJson) ?? supplemented) as Message[];
+    const nextBeforeMessageId = messages.length === 0 ? null : messages[0].id ?? null;
+    return { messages, hasMore, nextBeforeMessageId };
+  }
+
+  async getMessagesByRounds(
+    sessionId: number,
+    roundLimit: number,
+    beforeMessageId: number | null,
+    options?: {
+      maxMessageId?: number | null;
+      excludeSourceSessionId?: number | null;
+      aroundMessageId?: number | null;
+      /** 管理端紧凑载荷：不拉附件图片 base64（见 MessageRepository.COMPACT_MESSAGE_COLUMNS）。 */
+      compactMedia?: boolean;
+    },
+  ): Promise<MessagePage> {
+    if (options?.aroundMessageId != null) {
+      return this.loadMessagesAround(sessionId, roundLimit, options.aroundMessageId, options);
+    }
+    const limit = Math.max(1, Math.min(roundLimit, 50));
+    const maxMessageId = options?.maxMessageId ?? null;
+    const excludeSourceSessionId = options?.excludeSourceSessionId ?? null;
+    const compactMedia = options?.compactMedia === true;
+    let beforeMessage: Message | null = null;
+    if (beforeMessageId != null) {
+      beforeMessage = await this.messageRepo.findById(beforeMessageId);
+      if (beforeMessage == null || beforeMessage.sessionId !== sessionId) {
+        throw new BusinessException(ErrorCode.PARAM_INVALID);
+      }
+    }
+    const beforeId = beforeMessage?.id ?? null;
+    const userStarts = excludeSourceSessionId == null
+      ? (maxMessageId == null
+        ? await this.messageRepo.selectUserStarts(sessionId, beforeId, limit + 1)
+        : await this.messageRepo.selectUserStarts(sessionId, beforeId, limit + 1, maxMessageId))
+      : await this.messageRepo.selectUserStarts(sessionId, beforeId, limit + 1, maxMessageId, excludeSourceSessionId);
+    if (userStarts.length === 0) {
+      return { messages: [], hasMore: false, nextBeforeMessageId: null };
+    }
+    const hasMore = userStarts.length > limit;
+    const pageStarts = hasMore ? userStarts.slice(0, limit) : userStarts;
+    const startId = pageStarts[pageStarts.length - 1].id!;
+    const raw = excludeSourceSessionId == null
+      ? (maxMessageId == null
+        ? await this.messageRepo.selectRange(sessionId, startId, beforeId, undefined, undefined, compactMedia)
+        : await this.messageRepo.selectRange(sessionId, startId, beforeId, maxMessageId, undefined, compactMedia))
+      : await this.messageRepo.selectRange(sessionId, startId, beforeId, maxMessageId, excludeSourceSessionId, compactMedia);
+    const supplemented = await this.includeMissingToolResults(sessionId, raw, {
+      maxMessageId,
+      excludeSourceSessionId,
+      compactMedia,
+    });
+    const messages = (MessageHistoryNormalizer.normalizeEntities(supplemented, parseToolCallsJson) ?? supplemented) as Message[];
+    const nextBeforeMessageId = messages.length === 0 ? null : messages[0].id ?? null;
+    return { messages, hasMore, nextBeforeMessageId };
+  }
+
+  /**
+   * 本页助手声明了工具、但 TOOL 行不在本页 id 区间（补写占位的 id 大于后续 USER）时补回来。
+   * 归一化会把它贴到助手后面；另一页里没有对应助手的 TOOL 仍会被丢掉，避免两页各出现一次。
+   */
+  private async includeMissingToolResults(
+    sessionId: number,
+    raw: Message[],
+    options: { maxMessageId?: number | null; excludeSourceSessionId?: number | null; compactMedia?: boolean },
+  ): Promise<Message[]> {
+    const present = new Set<string>();
+    for (const message of raw) {
+      if (message.role === 'TOOL' && message.toolCallId) present.add(message.toolCallId);
+    }
+    const missing: string[] = [];
+    for (const message of raw) {
+      if (message.role !== 'ASSISTANT' || message.toolCalls == null || message.toolCalls.length === 0) continue;
+      for (const id of extractToolCallIds(message.toolCalls)) {
+        if (!present.has(id) && !missing.includes(id)) missing.push(id);
+      }
+    }
+    if (missing.length === 0) return raw;
+    // compactMedia 必须穿透到补抓查询：TOOL 行常带截图附件，走全列会把 base64 带回响应
+    const extra = await this.messageRepo.selectToolMessagesByCallIds(
+      sessionId, missing, options.maxMessageId ?? null, options.excludeSourceSessionId ?? null, options.compactMedia === true,
+    );
+    if (extra.length === 0) return raw;
+    const seen = new Set(raw.map((message) => message.id));
+    const merged = raw.slice();
+    for (const row of extra) {
+      if (row.id != null && seen.has(row.id)) continue;
+      merged.push(row);
+    }
+    return merged;
+  }
+
+  private async loadMessagesAround(
+    sessionId: number,
+    roundLimit: number,
+    aroundMessageId: number,
+    options?: { maxMessageId?: number | null; excludeSourceSessionId?: number | null; compactMedia?: boolean },
+  ): Promise<MessagePage> {
+    const hit = await this.messageRepo.findById(aroundMessageId);
+    if (hit == null || hit.sessionId !== sessionId) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID);
+    }
+    const roundStart = await this.messageRepo.selectRoundStartForMessage(sessionId, aroundMessageId);
+    if (roundStart == null) {
+      const nextUserId = await this.messageRepo.selectNextUserMessageId(sessionId, aroundMessageId);
+      const maxMessageId = options?.maxMessageId ?? null;
+      const excludeSourceSessionId = options?.excludeSourceSessionId ?? null;
+      const raw = excludeSourceSessionId == null
+        ? (maxMessageId == null
+          ? await this.messageRepo.selectRange(sessionId, aroundMessageId, nextUserId, undefined, undefined, options?.compactMedia === true)
+          : await this.messageRepo.selectRange(sessionId, aroundMessageId, nextUserId, maxMessageId, undefined, options?.compactMedia === true))
+        : await this.messageRepo.selectRange(sessionId, aroundMessageId, nextUserId, maxMessageId, excludeSourceSessionId, options?.compactMedia === true);
+      const supplemented = await this.includeMissingToolResults(sessionId, raw, {
+        maxMessageId,
+        excludeSourceSessionId,
+        compactMedia: options?.compactMedia,
+      });
+      const messages = (MessageHistoryNormalizer.normalizeEntities(supplemented, parseToolCallsJson) ?? supplemented) as Message[];
+      const earlier = await this.messageRepo.hasMessageBefore(sessionId, aroundMessageId);
+      return {
+        messages,
+        hasMore: earlier,
+        nextBeforeMessageId: messages.length === 0 ? aroundMessageId : messages[0].id ?? aroundMessageId,
+        hasNewer: nextUserId != null,
+      };
+    }
+    const nextUserId = await this.messageRepo.selectNextUserMessageId(sessionId, roundStart);
+    const page = await this.getMessagesByRounds(sessionId, roundLimit, nextUserId, {
+      maxMessageId: options?.maxMessageId,
+      excludeSourceSessionId: options?.excludeSourceSessionId,
+      compactMedia: options?.compactMedia,
+    });
+    return { ...page, hasNewer: nextUserId != null };
+  }
+
+  async getFileChangesBySession(sessionId: number): Promise<Map<number, FileChange[]>> {
+    return groupFileChanges(await this.fileChangeRepo.listBySession(sessionId));
+  }
+
+  async getFileChangesByMessageIds(sessionId: number, messageIds: number[] | null): Promise<Map<number, FileChange[]>> {
+    if (messageIds == null || messageIds.length === 0) {
+      return new Map();
+    }
+    return groupFileChanges(await this.fileChangeRepo.listByMessageIds(sessionId, messageIds));
+  }
+
+  async listFileChangeSummaries(sessionId: number, excludeSourceSessionId?: number | null): Promise<FileChange[]> {
+    return this.fileChangeRepo.listSummaryBySession(sessionId, excludeSourceSessionId);
+  }
+
+  async getFileChangeSummariesByMessageIds(sessionId: number, messageIds: number[] | null): Promise<Map<number, FileChange[]>> {
+    if (messageIds == null || messageIds.length === 0) {
+      return new Map();
+    }
+    return groupFileChanges(await this.fileChangeRepo.listSummaryByMessageIds(sessionId, messageIds));
+  }
+
+  /**
+   * 管理端按需读取工具附件字节：图片 base64 存在 message.metadata.attachments[index].data_uri，
+   * 列表接口（compact）不再内联返回，前端展开工具卡片时才取这一张图。
+   */
+  async getMessageAttachment(
+    sessionId: number,
+    messageId: number,
+    index: number,
+  ): Promise<{ mime: string; bytes: Buffer }> {
+    const message = await this.messageRepo.findById(messageId);
+    if (message == null || message.sessionId !== sessionId) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID);
+    }
+    const attachment = parseAttachmentDataUri(message.metadata, index);
+    if (attachment == null) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID);
+    }
+    return attachment;
+  }
+
+  async cleanupIncompleteTail(sessionId: number): Promise<number> {
+    return this.cleanupIncompleteTailList(sessionId, await this.getMessages(sessionId));
+  }
+
+  async cleanupIncompleteTailAfterId(sessionId: number, afterMessageId: number): Promise<number> {
+    const messages = (MessageHistoryNormalizer.normalizeEntities(await this.getMessagesAfterId(sessionId, afterMessageId), parseToolCallsJson) ?? []) as Message[];
+    return this.cleanupIncompleteTailList(sessionId, messages);
+  }
+
+  private async cleanupIncompleteTailList(sessionId: number, messages: Message[]): Promise<number> {
+    if (messages.length === 0) return 0;
+    let filled = 0;
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      if (msg.role !== 'ASSISTANT' || msg.toolCalls == null || msg.toolCalls.length === 0) continue;
+      const expectedIds = extractToolCallIds(msg.toolCalls);
+      if (expectedIds.size === 0) continue;
+      const foundIds = new Set<string>();
+      for (let j = i + 1; j < messages.length; j++) {
+        const subsequent = messages[j];
+        if (subsequent.role === 'TOOL' && subsequent.toolCallId != null) {
+          foundIds.add(subsequent.toolCallId);
+        } else if (subsequent.role === 'ASSISTANT') {
+          break;
+        }
+      }
+      for (const id of expectedIds) {
+        if (foundIds.has(id)) continue;
+        await this.saveMessage(sessionId, 'TOOL', MISSING_TOOL_RESULT_PLACEHOLDER, null, id, null, 0, null);
+        filled++;
+      }
+    }
+    if (filled > 0) {
+      console.info(`Session ${sessionId}: filled ${filled} missing tool output(s)`);
+    }
+    return filled;
+  }
+
+  /** 按会话范围回滚单条消息：入站消息被更新消息取代时清理，避免历史中留下无回复的孤立 USER。 */
+  async deleteMessageById(sessionId: number, messageId: number): Promise<void> {
+    await this.messageRepo.logicalDeleteByIdInSession(sessionId, messageId);
+  }
+
+  async editMessageAndTruncate(sessionId: number, messageId: number, newContent: string | null, images: string[] | null): Promise<Message> {
+    const message = await this.messageRepo.findById(messageId);
+    if (message == null || message.role !== 'USER') {
+      throw new Error('只能编辑用户消息');
+    }
+    if (message.sessionId !== sessionId) {
+      throw new BusinessException(ErrorCode.FORBIDDEN, '无权操作该消息');
+    }
+    const lastUser = await this.getLastUserMessage(sessionId);
+    if (!lastUser || lastUser.id !== messageId) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '只能编辑最后一条用户消息');
+    }
+    await this.sessionRepo.lockActiveSessionById(sessionId);
+    const compaction = await this.sessionCompactionService.loadValidated(message.sessionId);
+    if (compaction != null && messageId <= this.sessionCompactionService.boundaryOf(compaction)) {
+      throw new BusinessException(ErrorCode.MESSAGE_ALREADY_COMPACTED);
+    }
+    message.content = buildEditContent(newContent, images);
+    // 毫秒精度：updated_at 是「编辑前」段的切点，与 created_at 同为 DATETIME(3)。
+    // 秒级下编辑与随后的重发常落在同一秒，切点会把重发的调用误划进「编辑前」。
+    message.updatedAt = nowSqlMs();
+    await this.messageRepo.updateById(message);
+    await this.messageRepo.logicalDeleteAfter(message.sessionId, messageId);
+    console.info(`Edited message ${messageId} in session ${message.sessionId}, truncated subsequent messages`);
+    return message;
+  }
+
+  /**
+   * 停机/排空收尾：仅当会话仍在运行态才标记为被中断（原子 CAS）。
+   *
+   * 不能"先 getSession 读 phase 再 updatePhase"——执行线程可能在两者之间写入 COMPLETED，
+   * 无条件写会把终态覆盖回 RESUMING，而已完成的会话随后会被孤儿巡检重新执行一遍。
+   * 返回是否真的标记成功。
+   */
+  async markInterruptedIfActive(sessionId: number): Promise<boolean> {
+    const affected = await this.sessionRepo.markPhaseIfIn(sessionId, 'RESUMING', ['RUNNING', 'RESUMING']);
+    return affected > 0;
+  }
+
+  async updatePhase(sessionId: number, phase: string): Promise<void> {
+    const session = await this.getSession(sessionId);
+    const oldPhase = session.phase;
+    const fields: Record<string, unknown> = { phase, lastActivityAt: nowSql() };
+    if (phase === 'RUNNING') {
+      if (session.startedAt == null) {
+        fields.startedAt = nowSql();
+      }
+    } else if (phase === 'IDLE' || phase === 'COMPLETED' || phase === 'FAILED' || phase === 'CANCELLED') {
+      if (session.startedAt != null) {
+        const elapsed = Date.parse(session.startedAt.replace(' ', 'T')) ? Date.now() - Date.parse(toIso(session.startedAt)) : 0;
+        fields.elapsedMs = (session.elapsedMs != null ? session.elapsedMs : 0) + Math.max(0, elapsed);
+        fields.startedAt = null;
+      }
+      // 微信/飞书/钉钉通道会话与信号哨兵会话由机器触发，终态不计未读，
+      // 避免聚焦模式被无人工关注的会话置顶（与 WS 事件口径保持一致）
+      if (!isTerminalPhase(oldPhase) && isTerminalPhase(phase)
+        && session.projectKey !== WEIXIN_PROJECT_KEY
+        && !isFeishuChannelSession(session.projectKey, session.workspace)
+        && !isDingtalkChannelSession(session.projectKey, session.workspace)
+        && session.source !== 'signal') {
+        fields.unread = 1;
+      }
+    }
+    await this.sessionRepo.updateFields(sessionId, fields);
+  }
+
+  async markLastMessageFinished(sessionId: number): Promise<void> {
+    const last = await this.messageRepo.selectLast(sessionId);
+    // USER 消息的 updated_at 只表示「用户编辑过」（V029 列注释）：取消命中工具阶段、
+    // 空响应耗尽、首轮失败时助手消息未落库，最后一条正是 USER，终态刷新不能写它，
+    // 否则运行轨迹读模型会把这类 run 误判成编辑重发，伪造「编辑前」段。
+    if (last != null && last.role !== 'USER') {
+      // 毫秒精度：与 message.created_at 同为 DATETIME(3)。秒级下「执行结束刷
+      // updated_at」会与 created_at 同秒，让 RunTraceService 误判成编辑重发。
+      last.updatedAt = nowSqlMs();
+      await this.messageRepo.updateById(last);
+    }
+  }
+
+  async markAsRead(sessionId: number): Promise<void> {
+    const session = await this.getSession(sessionId);
+    if (session.unread === 1) {
+      await this.sessionRepo.updateFields(sessionId, { unread: 0 });
+    }
+  }
+
+  async updateSummary(sessionId: number, summary: string): Promise<void> {
+    await this.getSession(sessionId);
+    await this.sessionRepo.updateFields(sessionId, { summary });
+  }
+
+  async updateProjectKey(sessionId: number, projectKey: string): Promise<void> {
+    await this.getSession(sessionId);
+    await this.sessionRepo.updateFields(sessionId, { projectKey });
+  }
+
+  async updateTitle(sessionId: number, title: string): Promise<void> {
+    await this.getSession(sessionId);
+    await this.sessionRepo.updateFields(sessionId, { title });
+  }
+
+  async updatePermissionLevel(sessionId: number, permissionLevel: string): Promise<void> {
+    permissionFromString(permissionLevel);
+    await this.getSession(sessionId);
+    await this.sessionRepo.updateFields(sessionId, { permissionLevel });
+  }
+
+  async updateMemoryInjectionDisabled(sessionId: number, disabled: boolean): Promise<void> {
+    await this.getSession(sessionId);
+    await this.sessionRepo.updateFields(sessionId, { memoryInjectionDisabled: disabled ? 1 : 0 });
+  }
+
+  async updateModelId(sessionId: number, modelId: number): Promise<void> {
+    await this.getSession(sessionId);
+    await this.sessionRepo.updateFields(sessionId, { modelId });
+  }
+
+  /** 会话绑定 Agent 的目标校验（切换 / 重开共用）：存在 + 启用 + 客户端可选，口径与新建会话一致。 */
+  async assertAgentSwitchable(agentId: number): Promise<void> {
+    const agent = await this.agentLookup.findById(agentId);
+    if (agent == null) {
+      throw new BusinessException(ErrorCode.AGENT_NOT_FOUND);
+    }
+    if (agent.enabled === 0) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '该 Agent 已停用');
+    }
+    if (agent.clientVisible === 0) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '该 Agent 不对客户端开放');
+    }
+  }
+
+  async updateSessionAgent(sessionId: number, agentId: number): Promise<void> {
+    await this.getSession(sessionId);
+    await this.assertAgentSwitchable(agentId);
+    await this.sessionRepo.updateFields(sessionId, { agentId });
+  }
+
+  async updateContextTokens(sessionId: number, contextTokens: number, manifestJson?: string | null): Promise<void> {
+    const prev = this.contextTokenWrites.get(sessionId) ?? Promise.resolve();
+    const run = prev.catch(() => undefined).then(async () => {
+      const fields: Record<string, unknown> = { contextTokens };
+      // 未传第三参时不碰快照列：锚点更新只改水位，压缩编排在 listener 落快照之前先写数字。
+      if (manifestJson !== undefined) fields.contextManifestJson = manifestJson;
+      await this.sessionRepo.updateFields(sessionId, fields);
+    });
+    const tracked = run.then(() => undefined, () => undefined);
+    this.contextTokenWrites.set(sessionId, tracked);
+    try {
+      await run;
+    } finally {
+      if (this.contextTokenWrites.get(sessionId) === tracked) {
+        this.contextTokenWrites.delete(sessionId);
+      }
+    }
+  }
+
+  async updateRuntimeStatus(sessionId: number, runtimeStatus: unknown | null): Promise<void> {
+    await this.sessionRepo.updateFields(sessionId, {
+      runtimeStatusJson: runtimeStatus == null ? null : JSON.stringify(runtimeStatus),
+    });
+  }
+
+  async updateContextAnchor(sessionId: number, lastPromptTokens: number, contextAnchorMsgId: number): Promise<void> {
+    await this.sessionRepo.updateFields(sessionId, {
+      lastPromptTokens,
+      contextAnchorMsgId,
+      contextTokens: lastPromptTokens,
+    });
+  }
+
+  async clearContextAnchor(sessionId: number): Promise<void> {
+    await this.sessionRepo.updateFields(sessionId, { lastPromptTokens: 0, contextAnchorMsgId: 0 });
+  }
+
+  getMaxMessageId(sessionId: number): Promise<number> {
+    return this.messageRepo.selectMaxMessageId(sessionId);
+  }
+
+  /** 按 id 单调序取最后一条用户消息，不受 created_at 时钟偏移影响。 */
+  getLastUserMessage(sessionId: number): Promise<Message | null> {
+    return this.messageRepo.selectLastUserMessage(sessionId);
+  }
+
+  /**
+   * 最近 N 条「真实用户消息」（id 倒序取、正序返回）：dump_user_messages 工具的数据源。
+   *
+   * 「真实」口径与压缩 / 无进展判定共用 isRealUserMessage（排除压缩摘要 handoff 与
+   * `<system-notice>` 系统注入）。非真实行（极小概率）被过滤时继续按游标向前扫描，
+   * 保证「最近 N 条」口径不缩水；扫到会话首条用户消息为止。
+   */
+  async getRecentUserMessages(sessionId: number, limit: number): Promise<Message[]> {
+    const wanted = Math.max(1, Math.trunc(limit));
+    const picked: Message[] = [];
+    let beforeId: number | null = null;
+    while (picked.length < wanted) {
+      const batch = await this.messageRepo.selectRecentUserMessages(
+        sessionId, RECENT_USER_MESSAGE_SCAN_BATCH, beforeId,
+      );
+      if (batch.length === 0) break;
+      for (const row of batch) {
+        if (isRealUserMessage(toRealUserMessageProbe(row))) picked.push(row);
+        if (picked.length >= wanted) break;
+      }
+      const lastId = batch[batch.length - 1]?.id ?? null;
+      if (lastId == null || batch.length < RECENT_USER_MESSAGE_SCAN_BATCH) break;
+      beforeId = lastId;
+    }
+    return picked.reverse();
+  }
+
+  /** 会话首条现存用户消息（id 最小）：系统提示日期锚点，跨天不重算（技术方案 2026-10-12 §5.1）。 */
+  getFirstUserStamp(sessionId: number): Promise<Pick<Message, 'id' | 'createdAt'> | null> {
+    return this.messageRepo.selectFirstUserStamp(sessionId);
+  }
+
+  /** beforeId 之前最近的一条现存用户消息：跨天提示的「上一条用户消息」参照。 */
+  getPreviousUserStamp(sessionId: number, beforeId: number): Promise<Pick<Message, 'id' | 'createdAt'> | null> {
+    return this.messageRepo.selectPreviousUserStamp(sessionId, beforeId);
+  }
+
+  async loadContextAnchor(sessionId: number): Promise<ContextAnchor> {
+    const session = await this.getSession(sessionId);
+    return {
+      lastPromptTokens: session.lastPromptTokens ?? 0,
+      contextAnchorMsgId: session.contextAnchorMsgId ?? 0,
+    };
+  }
+
+  async listSessionsForDashboard(userId: number): Promise<Record<string, Session[]>> {
+    // 运行中口径与 ACTIVE_PHASES（isActivePhase / 删除提升守卫）一致，含 CANCELLING（取消流程进行中）；
+    // recent 用同一集合取反，保证两个分桶互补、不重不漏。
+    const running = await this.sessionRepo.list(
+      `user_id = ? AND status = 'ACTIVE' AND phase IN (${ACTIVE_PHASE_SQL_LIST})`,
+      [userId],
+      'ORDER BY last_activity_at DESC',
+    );
+    const recent = await this.sessionRepo.list(
+      `user_id = ? AND status = 'ACTIVE' AND phase NOT IN (${ACTIVE_PHASE_SQL_LIST})`,
+      [userId],
+      'ORDER BY updated_at DESC LIMIT 20',
+    );
+    return { running, recent };
+  }
+
+  async touchLastActivity(sessionId: number): Promise<void> {
+    const session = await this.sessionRepo.findById(sessionId);
+    if (session == null) return;
+    const phase = session.phase;
+    if (phase !== 'RUNNING' && phase !== 'RESUMING') return;
+    await this.sessionRepo.updateFields(sessionId, { lastActivityAt: nowSql() });
+  }
+
+  private ensureWorkspaceDirectory(path: string): void {
+    try {
+      mkdirSync(path, { recursive: true });
+    } catch (e) {
+      console.error(`Failed to create workspace directory: ${path}`, e);
+      throw new BusinessException(ErrorCode.INTERNAL_ERROR, '工作区目录创建失败');
+    }
+  }
+
+  private deleteWorkspaceDirectory(path: string): void {
+    try {
+      if (existsSync(path)) {
+        rmSync(path, { recursive: true, force: true });
+      }
+    } catch (e) {
+      console.error(`Failed to delete workspace directory: ${path}`, e);
+    }
+  }
+
+  static deriveProjectKey(workspace: string | null | undefined): string | null {
+    if (workspace == null || workspace.trim().length === 0) return null;
+    const normalized = workspace.replace(/\\/g, '/');
+    const parts = normalized.split('/');
+    for (let i = parts.length - 1; i >= 0; i--) {
+      if (parts[i].length > 0) return parts[i];
+    }
+    return null;
+  }
+}
+
+function groupFileChanges(changes: FileChange[]): Map<number, FileChange[]> {
+  const grouped = new Map<number, FileChange[]>();
+  for (const fc of changes) {
+    const list = grouped.get(fc.messageId) ?? [];
+    list.push(fc);
+    grouped.set(fc.messageId, list);
+  }
+  return grouped;
+}
+
+function extractToolCallIds(toolCallsJson: string): Set<string> {
+  const ids = new Set<string>();
+  try {
+    const array = JSON.parse(toolCallsJson) as unknown;
+    if (Array.isArray(array)) {
+      for (const tc of array) {
+        if (tc && typeof tc === 'object' && 'id' in tc && (tc as { id?: unknown }).id != null) {
+          ids.add(String((tc as { id: unknown }).id));
+        }
+      }
+    }
+  } catch (e) {
+    console.warn(`Failed to parse tool_calls JSON for tail cleanup: ${(e as Error).message}`);
+  }
+  return ids;
+}
+
+function buildEditContent(text: string | null, images: string[] | null): string | null {
+  if (images == null || images.length === 0) {
+    return text;
+  }
+  try {
+    // 委托统一实现（技术方案 2026-10-22 §5.3）：幂等由共享模块保证——
+    // 编辑回传的正文含旧注入行时先剥离再追加，不重复堆积。
+    return JSON.stringify(buildUserContentParts(text ?? '', images));
+  } catch {
+    return text;
+  }
+}
+
+/** 终态口径与仓内其余定义一致（task-terminal.service.ts / streaming-ws-handler.ts）：IDLE 既非活跃也非终态。 */
+function isTerminalPhase(phase: string | null | undefined): boolean {
+  return phase === 'COMPLETED' || phase === 'FAILED' || phase === 'CANCELLED';
+}
+
+function toIso(sql: string): string {
+  return sql.includes('T') ? sql : sql.replace(' ', 'T');
+}
+
+function parseToolCallsJson(json: string): Array<{ id?: string }> {
+  try {
+    const parsed = JSON.parse(json) as unknown;
+    return Array.isArray(parsed) ? parsed as Array<{ id?: string }> : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * DB 消息行 → isRealUserMessage 判定所需的最小 ChatMessage：role 小写化，
+ * 多模态 JSON 数组还原为 content parts（与 session-history-loader 同款结构判定，
+ * 避免把用户发的裸 JSON 数组误当多模态内容）。
+ */
+function toRealUserMessageProbe(message: Message): ChatMessage {
+  return {
+    role: String(message.role ?? '').toLowerCase(),
+    content: parseStoredContentForProbe(message.content),
+  };
+}
+
+function parseStoredContentForProbe(content: string | null | undefined): unknown {
+  if (content == null) return '';
+  if (!content.trim().startsWith('[')) return content;
+  try {
+    const parsed = JSON.parse(content.trim()) as unknown;
+    if (isMultimodalContentParts(parsed)) return parsed;
+  } catch {
+    // 非 JSON 文本：按原文处理
+  }
+  return content;
+}
+
+/**
+ * 解析工具附件里的内联图片：`metadata.attachments[index].data_uri` 形如
+ * `data:image/png;base64,xxxx`。index 越界、非图片或 metadata 不是 JSON 时返回 null。
+ */
+function parseAttachmentDataUri(
+  metadata: string | null | undefined,
+  index: number,
+): { mime: string; bytes: Buffer } | null {
+  if (metadata == null || metadata.length === 0) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(metadata);
+  } catch {
+    return null;
+  }
+  if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const attachments = (parsed as { attachments?: unknown }).attachments;
+  if (!Array.isArray(attachments)) return null;
+  const attachment = attachments[index];
+  if (attachment == null || typeof attachment !== 'object' || Array.isArray(attachment)) return null;
+  const item = attachment as { mime?: unknown; data_uri?: unknown };
+  if (typeof item.data_uri !== 'string') return null;
+  const match = /^data:([^;,]+);base64,([\s\S]+)$/.exec(item.data_uri);
+  if (match == null) return null;
+  const mime = typeof item.mime === 'string' && item.mime.trim() !== '' ? item.mime.trim() : match[1];
+  return { mime, bytes: Buffer.from(match[2], 'base64') };
+}

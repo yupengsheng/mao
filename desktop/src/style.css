@@ -1,0 +1,826 @@
+/* ============================================
+   Mao — Apple Design Token System
+   ============================================ */
+
+:root {
+  /* Colors — Brand & Accent */
+  --aw-primary: #0066cc;
+  --aw-primary-focus: #0071e3;
+  --aw-primary-on-dark: #2997ff;
+  --aw-primary-lighter: rgba(0, 102, 204, 0.10);
+  --aw-primary-soft: rgba(0, 102, 204, 0.05);
+  --aw-primary-hover: rgba(0, 102, 204, 0.08);
+  --aw-primary-ring: rgba(0, 102, 204, 0.12);
+  --aw-primary-line: rgba(0, 102, 204, 0.20);
+  --aw-on-primary: #ffffff;
+
+  /* Colors — Surface */
+  --aw-canvas: #ffffff;
+  --aw-canvas-parchment: #f5f5f7;
+  --aw-surface: #ffffff;
+  --aw-surface-hover: #f5f5f7;
+  --aw-surface-glass: rgba(255, 255, 255, 0.72);
+  --aw-surface-pearl: #fafafc;
+  --aw-surface-tile-1: #272729;
+  --aw-surface-tile-2: #2a2a2c;
+  --aw-surface-tile-3: #252527;
+  --aw-surface-black:#1a1a1a;
+  --aw-surface-chip: #d2d2d7;
+  --aw-surface-code: #f5f5f7;
+  --aw-surface-code-header: #eaeaef;
+  --aw-text-code: #1d1d1f;
+  --aw-nav-bg: #ffffff;
+  --aw-nav-text: #1d1d1f;
+  --aw-nav-text-muted: #86868b;
+
+  /* Colors — Text */
+  --aw-ink: #1d1d1f;
+  --aw-body: #1d1d1f;
+  --aw-body-on-dark: #ffffff;
+  --aw-body-muted: #cccccc;
+  --aw-ink-muted: #86868b;
+  --aw-ink-muted-80: #333333;
+  --aw-ink-muted-64: #5c5c5c;
+  --aw-ink-muted-60: #666666;
+  --aw-ink-muted-48: #7a7a7a;
+  --aw-ink-muted-40: #999999;
+  --aw-muted: #86868b;
+
+  /* Colors — Borders & Dividers */
+  --aw-divider-soft: #f0f0f0;
+  --aw-divider: #f0f0f0;
+  --aw-hairline: #e0e0e0;
+  --aw-border: #e0e0e0;
+
+  /* Colors — Accent aliases */
+  --aw-accent: #0066cc;
+  --aw-accent-rgb: 0, 102, 204;
+  --aw-accent-bg: rgba(0, 102, 204, 0.08);
+
+  /* Colors — Status */
+  --aw-success: #34c759;
+  --aw-warning: #ff9f0a;
+  --aw-danger: #ff3b30;
+
+  /* Colors — Tag chips (editor/file reference) */
+  --aw-tag-skill: #0066cc;
+  --aw-tag-command: #7c3aed;
+  --aw-tag-file: #0d9488;
+  --aw-tag-fg: #ffffff;
+  --aw-tag-file-ink: #ffffff;
+
+  /* Colors — List status dots */
+  --aw-status-waiting: #b37400;
+  --aw-status-success: var(--aw-success);
+  --aw-status-danger: var(--aw-danger);
+
+  /* Colors — Diff / change badges */
+  --aw-diff-add: #1a7f37;
+  --aw-diff-add-bg: rgba(26, 127, 55, 0.12);
+  --aw-diff-del: #cf222e;
+  --aw-diff-del-bg: rgba(207, 34, 46, 0.12);
+  --aw-diff-mod: #9a6700;
+  --aw-diff-mod-bg: rgba(154, 103, 0, 0.12);
+  --aw-diff-info: #0550ae;
+  --aw-diff-info-bg: rgba(5, 80, 174, 0.12);
+  --aw-status-waiting-bg: rgba(179, 116, 0, 0.08);
+
+  /* Shadows — Single product shadow only */
+  --aw-shadow-product: 3px 5px 30px 0 rgba(0, 0, 0, 0.22);
+  --aw-shadow-popover: 0 -4px 16px rgba(0, 0, 0, 0.1);
+
+  /* Border Radius */
+  --aw-radius-xs: 5px;
+  --aw-radius-sm: 8px;
+  --aw-radius-md: 11px;
+  --aw-radius-lg: 18px;
+  --aw-radius-pill: 9999px;
+
+  /* Typography — Font Families */
+  --aw-font-display: 'SF Pro Display', system-ui, -apple-system, 'Microsoft YaHei', 'PingFang SC', 'Hiragino Sans GB', sans-serif;
+  --aw-font-text: 'SF Pro Text', system-ui, -apple-system, 'Microsoft YaHei', 'PingFang SC', 'Hiragino Sans GB', sans-serif;
+  --aw-font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, 'SF Mono', Menlo, Monaco, monospace;
+
+  /* Typography — Sizes */
+  --aw-text-hero: 56px;
+  --aw-text-display-lg: 40px;
+  --aw-text-display-md: 34px;
+  --aw-text-lead: 28px;
+  --aw-text-lead-airy: 24px;
+  --aw-text-tagline: 21px;
+  --aw-text-body: 17px;
+  --aw-text-caption: 14px;
+  --aw-text-fine: 12px;
+  --aw-text-micro: 10px;
+
+  /* Spacing */
+  --aw-space-xxs: 4px;
+  --aw-space-xs: 8px;
+  --aw-space-sm: 12px;
+  --aw-space-md: 17px;
+  --aw-space-lg: 24px;
+  --aw-space-xl: 32px;
+  --aw-space-xxl: 48px;
+  --aw-space-section: 80px;
+
+  /* Layout */
+  --aw-nav-height: 44px;
+  --aw-subnav-height: 52px;
+  --aw-session-panel-width: 280px;
+  --aw-inspector-width: 260px;
+
+  /* Terminal */
+  --aw-terminal-bg: #f5f5f7;
+  --aw-terminal-header-bg: #f5f5f7;
+  --aw-terminal-header-height: 36px;
+
+  /* 按钮统一度量（small）：EP 的 .el-button 与项目自定义按钮（.create-btn / .dialog-btn 等）共用 */
+  --aw-btn-height: 24px;
+  --aw-btn-padding: 5px 11px;
+}
+
+/* ============================================
+   Mobile — Compact layout
+   ============================================ */
+
+@media (max-width: 768px) {
+  :root {
+    --aw-session-panel-width: 140px;
+    --aw-inspector-width: 140px;
+  }
+}
+
+/*
+ * 「我的用量」抽屉头部（el-drawer 内部结构，故放全局样式）。
+ * class="usage-drawer" 是经 fallthrough attrs 传到 .el-drawer 上的，scoped 的
+ * data-v-* 属性不会跟着 attrs 走，组件内写 .usage-drawer :deep(.el-drawer__header)
+ * 会因带 [data-v-x] 而匹配不到，规则静默失效（实测 matches=false）。
+ *
+ * 两处覆盖：
+ * ① EP 的 .el-drawer__header 有 `& > :first-child { flex: 1 }`，插槽内容会占满头部全宽，
+ *    把默认关闭按钮挤出屏幕（393px 视口实测按钮 left=407）。给插槽内容留出右侧空间。
+ * ② 默认 margin-bottom: 32px 在抽屉高度紧张时是一大块空白，收紧到 12px。
+ */
+@media (max-width: 768px) {
+  .usage-drawer .el-drawer__header {
+    position: relative;
+    margin-bottom: 12px;
+    padding-right: 40px;
+    align-items: flex-start;
+  }
+
+  /* 关闭按钮脱离文档流固定在右上角，不再与插槽内容争宽度 */
+  .usage-drawer .el-drawer__close-btn {
+    position: absolute;
+    top: 20px;
+    right: 12px;
+    z-index: 1;
+  }
+}
+
+/* 桌面端同样要防关闭按钮被挤出：插槽内容留出右侧 36px 给按钮 */
+.usage-drawer .el-drawer__header > :first-child {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-right: 36px;
+}
+
+/*
+ * Electron 窗口拖拽区是几何区域，与绘制层级无关：可拖拽范围 = 所有
+ * -webkit-app-region: drag 元素盒子并集 − 所有 no-drag 元素盒子并集。
+ * .top-nav 整条是 drag（仅 .nav-left/.nav-right 自身盒子是 no-drag），
+ * teleport 到 body 的 EP 浮层即使画在拖拽带上方也不会被自动抠出——落在
+ * 拖拽带里的 mousedown/mousemove 被系统吞掉（无 hover、无点击），
+ * Web/安卓不受影响（该属性在非 Electron 下无效）。
+ *
+ * 曾致「我的用量」抽屉头部点不动：刷新按钮与统计周期前 7 项都落在拖拽带
+ * 里，只有伸进 .nav-right 盒子（约 x≥1194）的「近 30 天/自定义」幸存。
+ * 0.0.270 的 append-to-body 只解决了抽屉被顶栏裁剪，没解决几何重叠。
+ *
+ * 把浮层整体标为 no-drag 即从拖拽带里抠掉：.el-overlay 覆盖
+ * 抽屉/对话框的遮罩与内容，.el-popper 覆盖下拉、日期面板、气泡等。
+ * 无浮层时规则不命中任何元素，拖拽区与此前完全一致；有浮层时整块
+ * 遮罩不可拖拽（模态打开期间本就不该拖窗口），属预期行为。
+ */
+.el-overlay,
+.el-popper {
+  -webkit-app-region: no-drag;
+}
+
+@media (max-width: 768px) {
+  .usage-drawer .el-drawer__header > :first-child {
+    margin-right: 0;
+  }
+}
+
+/* Capacitor 安卓：立即隐藏 HTML splash，避免与原生 SplashScreen 叠出残留图标。 */
+html.android-capacitor #splash {
+  display: none !important;
+}
+
+/*
+ * Capacitor 安卓顶部导航：必须显示（0.0.7 曾 display:none 导致操作栏消失）。
+ * 去掉 macOS 红绿灯预留的 78px 左缩进，改为紧凑单行。
+ * 系统状态栏 / 手势条由原生 WebView WindowInsets padding 避让（勿再给 body 加同值 padding，会双倍）。
+ */
+html.android-capacitor .top-nav {
+  display: flex !important;
+  box-sizing: border-box;
+  height: var(--aw-nav-height) !important;
+  min-height: var(--aw-nav-height) !important;
+  padding: 0 8px !important;
+  -webkit-app-region: no-drag;
+}
+
+html.android-capacitor .nav-left {
+  gap: 4px;
+  padding-left: 0 !important;
+}
+
+html.android-capacitor .nav-right {
+  gap: 2px;
+  min-width: 0;
+}
+
+html.android-capacitor .theme-toggle {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  position: relative;
+}
+
+html.android-capacitor .theme-toggle::before {
+  content: '';
+  position: absolute;
+  inset: 50% auto auto 50%;
+  width: 44px;
+  height: 44px;
+  transform: translate(-50%, -50%);
+}
+
+html.android-capacitor .nav-user {
+  flex-shrink: 0;
+  padding: 2px;
+}
+
+html.android-capacitor .nav-username,
+html.android-capacitor .nav-user > .el-icon {
+  display: none;
+}
+
+/* 安卓管理弹窗宽度适配（弹窗由设置页技能/指令管理、Bot 绑定等共用）。 */
+html.android-capacitor .management-dialog {
+  width: calc(100vw - 24px) !important;
+  max-width: calc(100vw - 24px);
+  margin: 12px auto !important;
+}
+
+html.android-capacitor .management-dialog .el-dialog__body {
+  max-height: calc(100dvh - 140px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* 安卓终端：面板随软键盘避让（margin-bottom 由 JS 设置），内容区收窄留白并放大触控目标。 */
+html.android-capacitor .terminal-panel {
+  transition: margin-bottom 0.12s ease-out;
+}
+
+html.android-capacitor .terminal-container {
+  padding: 4px 8px;
+}
+
+html.android-capacitor .terminal-keybar-btn {
+  min-width: 44px;
+  height: 36px;
+}
+
+/* ============================================
+   Dark Mode — Apple Near-Black Surfaces
+   ============================================ */
+
+[data-theme="dark"] {
+  --aw-canvas: #1a1a1a;
+  --aw-canvas-parchment: #252525;
+  --aw-surface: #252525;
+  --aw-surface-hover: #252530;
+  --aw-surface-glass: rgba(30, 30, 40, 0.72);
+  --aw-surface-pearl: #1e1e28;
+  --aw-surface-black:#1a1a1a;
+  --aw-surface-code: #1e1e28;
+  --aw-surface-code-header: #2a2a2e;
+  --aw-text-code: #d4d4d4;
+
+  --aw-ink: #f5f5f7;
+  --aw-body: #f5f5f7;
+  --aw-body-on-dark: #f5f5f7;
+  --aw-body-muted: #a1a1a6;
+  --aw-ink-muted: #a1a1a6;
+  --aw-ink-muted-80: #cccccc;
+  --aw-ink-muted-64: #9a9a9f;
+  --aw-ink-muted-60: #8e8e93;
+  --aw-ink-muted-48: #86868b;
+  --aw-ink-muted-40: #636366;
+  --aw-muted: #a1a1a6;
+
+  --aw-divider-soft: #2a2a2e;
+  --aw-divider: #2a2a2e;
+  --aw-hairline: #38383a;
+  --aw-border: #38383a;
+
+  --aw-primary-on-dark: #2997ff;
+  --aw-primary-lighter: rgba(41, 151, 255, 0.18);
+  --aw-primary-soft: rgba(41, 151, 255, 0.08);
+  --aw-primary-hover: rgba(41, 151, 255, 0.14);
+  --aw-primary-ring: rgba(41, 151, 255, 0.22);
+  --aw-primary-line: rgba(41, 151, 255, 0.32);
+  --aw-accent: #2997ff;
+  --aw-accent-rgb: 41, 151, 255;
+  --aw-accent-bg: rgba(41, 151, 255, 0.12);
+
+  --aw-nav-bg:#1a1a1a;
+  --aw-nav-text: #f5f5f7;
+  --aw-nav-text-muted: #a1a1a6;
+
+  /* Colors — Tag chips (editor/file reference) */
+  --aw-tag-skill: #5b9bd5;
+  --aw-tag-command: #a78bfa;
+  --aw-tag-file: #2dd4bf;
+  --aw-tag-fg: #ffffff;
+  --aw-tag-file-ink: #134e4a;
+
+  /* Colors — List status dots */
+  --aw-status-waiting: #e6b84c;
+  --aw-status-success: var(--aw-success);
+  --aw-status-danger: var(--aw-danger);
+
+  /* Colors — Diff / change badges */
+  --aw-diff-add: #3fb950;
+  --aw-diff-add-bg: rgba(63, 185, 80, 0.12);
+  --aw-diff-del: #f85149;
+  --aw-diff-del-bg: rgba(248, 81, 73, 0.12);
+  --aw-diff-mod: #d29922;
+  --aw-diff-mod-bg: rgba(210, 153, 34, 0.12);
+  --aw-diff-info: #58a6ff;
+  --aw-diff-info-bg: rgba(88, 166, 255, 0.12);
+  --aw-status-waiting-bg: rgba(230, 184, 76, 0.12);
+
+  /* Terminal */
+  --aw-terminal-bg: #252525;
+  --aw-terminal-header-bg: #252525;
+}
+
+/* ============================================
+   Global Resets
+   ============================================ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--aw-font-text);
+  font-size: var(--aw-text-body);
+  line-height: 1.47;
+  letter-spacing: -0.374px;
+  color: var(--aw-body);
+  background: var(--aw-canvas);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#app {
+  height: 100vh;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--aw-font-display);
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--aw-ink);
+}
+
+/*
+ * 自定义按钮统一垂直居中。裸 <button> 不声明 display 时，Chromium 只在行盒放得下
+ * 内容区时才居中：本项目按钮高 24px、上下 padding 各 5px（--aw-btn-height /
+ * --aw-btn-padding），内容区只剩 14px，而文案继承 body 的 line-height 1.47，
+ * 12px 字的行盒约 17.6px 放不下——行盒遂从内容区顶部起排并向下溢出，文字整体
+ * 偏低约 2.5px（曾影响解绑/绑定/取消/保存等一大批按钮）。EP 的 .el-button 自带
+ * inline-flex 居中，不受此规则影响；自定义按钮此前靠各 class 手写
+ * display:inline-flex 补齐（.create-btn 等），漏写的就歪，在此统一收口。
+ * 不设 gap：EP 按钮靠 [class*=el-icon]+span 的 margin-left 撑图标间距，叠加会变宽。
+ *
+ * justify-content: center 不能省：flex 容器里文字是匿名 flex 项，按 justify-content
+ * 排布，浏览器 UA 给 button 的 text-align:center 在 flex 布局下失效，而默认值
+ * flex-start 会让被拉宽的按钮（grid/flex 拉伸、width:100% 等）文案贴左边缘。
+ * 声明居中即恢复原生 button 的默认表现；EP 按钮自带同名声明（类选择器优先），
+ * 不受影响。按设计要左对齐的宽按钮（如目录选择行）需在自己 class 里显式写回
+ * justify-content: flex-start。
+ */
+button {
+  font-family: var(--aw-font-text);
+  transition: transform 0.1s;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+button:active {
+  transform: scale(0.95);
+}
+
+a {
+  color: var(--aw-primary);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+/* ============================================
+   Element Plus Theme Overrides
+   ============================================ */
+
+:root {
+  --el-color-primary: var(--aw-primary);
+  --el-color-primary-light-3: #3385d9;
+  --el-color-primary-light-5: rgba(0, 102, 204, 0.15);
+  --el-color-primary-light-7: rgba(0, 102, 204, 0.1);
+  --el-color-primary-light-8: rgba(0, 102, 204, 0.08);
+  --el-color-primary-light-9: rgba(0, 102, 204, 0.05);
+  --el-color-primary-dark-2: var(--aw-primary-focus);
+  --el-color-success: var(--aw-success);
+  --el-color-warning: var(--aw-warning);
+  --el-color-danger: var(--aw-danger);
+  --el-color-info: var(--aw-ink-muted-48);
+  --el-bg-color: var(--aw-canvas);
+  --el-bg-color-page: var(--aw-canvas-parchment);
+  --el-bg-color-overlay: var(--aw-canvas);
+  --el-text-color-primary: var(--aw-ink);
+  --el-text-color-regular: var(--aw-body);
+  --el-text-color-secondary: var(--aw-ink-muted-80);
+  --el-text-color-placeholder: var(--aw-ink-muted-48);
+  --el-text-color-disabled: var(--aw-ink-muted-48);
+  --el-border-color: var(--aw-hairline);
+  --el-border-color-light: var(--aw-divider-soft);
+  --el-border-color-lighter: var(--aw-divider-soft);
+  --el-border-radius-base: var(--aw-radius-sm);
+  --el-border-radius-small: var(--aw-radius-xs);
+  --el-border-radius-round: var(--aw-radius-pill);
+  /*
+   * EP 控件字号基准。EP 有 49 条规则直接取 --el-font-size-base（按钮、输入框、下拉项、
+   * el-form 及表单标签、checkbox/radio、MessageBox 正文等），历史上误设为 17px（对齐
+   * --aw-text-body），导致这些控件比 App 控件区 13px 的文案大一圈，只能靠各处局部覆盖补救。
+   * 本项目 EP 只用于表单/弹窗/控件，统一按 13px；small/extra-small 取 App 的 12px。
+   * EP 的 size="small" 按钮是写死的 12px，不随此变量变。
+   */
+  --el-font-size-base: 13px;
+  --el-font-size-small: 12px;
+  --el-font-size-extra-small: 12px;
+  --el-fill-color: var(--aw-canvas-parchment);
+  --el-fill-color-light: var(--aw-canvas-parchment);
+  --el-fill-color-lighter: var(--aw-canvas-parchment);
+  --el-fill-color-blank: var(--aw-canvas);
+  --el-box-shadow: none;
+  --el-box-shadow-light: none;
+}
+
+/*
+ * Element Plus 下拉列表（el-select）选项文字。字号已由 --el-font-size-base（13px）统一，
+ * 这里只定字体、字重和选中项颜色：选中项沿用「模型选择」列表的表达——常规字重 + 深色文字 +
+ * 淡蓝底（保留 EP 的 ✓）。用 .el-select-dropdown 前缀抬高优先级（盖过 EP 默认），同时低于
+ * 各组件自带的 popper 定制（如仓库选择器的等宽 12px、输入区紧凑下拉），组件样式仍可覆盖。
+ */
+.el-select-dropdown .el-select-dropdown__item,
+.el-select-dropdown .el-select-dropdown__item.is-selected {
+  font-family: var(--aw-font-text);
+  font-weight: 400;
+  color: var(--aw-body);
+}
+
+.el-select-dropdown .el-select-dropdown__item.is-selected {
+  background: var(--aw-primary-lighter);
+}
+
+/*
+ * Element Plus 输入框 / 多行输入 / 日期区间的字体。字号已由 --el-font-size-base（13px）统一，
+ * 这里只指定字体，让输入文字与 App 正文一致。
+ */
+.el-input,
+.el-textarea,
+.el-range-input,
+.el-input__inner,
+.el-textarea__inner {
+  font-family: var(--aw-font-text);
+}
+
+/*
+ * Element Plus 按钮统一为 small（24px 高、5px 11px 内边距、12px 字）。
+ * App 控件密度以 small 为准，但模板里 23 个按钮没写 size、取默认 32px，和写了 size="small"
+ * 的按钮大小不一；逐个补 size 治标不治本——ElMessageBox、日期面板、popconfirm 等 EP 内部
+ * 渲染的按钮不在模板里，仍是默认尺寸。这里按 EP small 的度量统一定义 .el-button，
+ * size="large" 的度量一并被覆盖。is-link 按钮 EP 自带更高优先级（auto 高度）不受影响；
+ * 登录页 CTA 是自设 height:auto 的样式，优先级也更高。输入框前/后缀里的按钮要跟输入框
+ * 齐高，单独还原。
+ */
+.el-button {
+  height: var(--aw-btn-height);
+  padding: var(--aw-btn-padding);
+  font-size: var(--aw-text-fine);
+  border-radius: calc(var(--el-border-radius-base) - 1px);
+}
+
+/* 输入框前/后缀内的按钮跟随输入框高度，不参与统一 small */
+.el-input-group__prepend .el-button,
+.el-input-group__append .el-button {
+  height: var(--el-component-size, 32px);
+  padding: 8px 15px;
+}
+
+/* Element Plus Dark Mode */
+[data-theme="dark"] {
+  --el-bg-color: #141416;
+  --el-bg-color-page: #1a1a1a;
+  --el-bg-color-overlay: #1d1d20;
+  --el-fill-color: #2a2a2e;
+  --el-fill-color-light: #1e1e22;
+  --el-fill-color-lighter: #161618;
+  --el-fill-color-blank: #1a1a1a;
+  --el-border-color: #38383a;
+  --el-border-color-light: #2a2a2e;
+  --el-border-color-lighter: #1e1e22;
+}
+
+/* ============================================
+   Utility Classes
+   ============================================ */
+
+code {
+  font-family: var(--aw-font-mono);
+  font-size: 0.9em;
+  padding: 2px 6px;
+  background: var(--aw-surface-code);
+  border-radius: var(--aw-radius-xs);
+  color: var(--aw-ink);
+}
+
+pre {
+  margin: 0;
+}
+
+pre code {
+  padding: 0;
+  background: none;
+}
+
+/* Message bubble spacing */
+.message-bubble {
+  margin-bottom: 2px;
+}
+
+.message-bubble.user {
+  margin-bottom: 20px;
+}
+
+/* ============================================
+   Markdown 富渲染（技术方案 2026-10-25-message-rendering）：
+   Mermaid 图 / 公式 / 表格工具条。markdown-body 分散在聊天、文件预览、
+   轨迹、技能、分享页等多个组件，因此样式放全局而非任一组件内。
+   ============================================ */
+
+/* Mermaid：占位（初始为代码块）渲染成功后替换为图 + 「查看源码」折叠 */
+.markdown-body .mermaid-block {
+  margin: 8px 0;
+}
+
+/* 气泡里的图缩到容器宽后宽架构图字号只剩 4~5px，点图进全屏查看器读 */
+.markdown-body .mermaid-block .mermaid-figure {
+  position: relative;
+  overflow-x: auto;
+  text-align: center;
+  cursor: zoom-in;
+}
+
+.markdown-body .mermaid-block .mermaid-figure svg {
+  max-width: 100%;
+  height: auto;
+  background: transparent;
+}
+
+.markdown-body .mermaid-block .mermaid-figure:hover {
+  border-color: var(--aw-divider);
+}
+
+/* 常驻放大入口：桌面 hover 才显，触屏无 hover 故常显（否则移动端完全没有入口） */
+.mermaid-expand-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 1;
+  padding: 3px 9px;
+  border: 1px solid var(--aw-divider);
+  border-radius: var(--aw-radius-pill);
+  background: var(--aw-surface-glass);
+  color: var(--aw-ink-muted-64);
+  font-size: 11px;
+  line-height: 1.5;
+  cursor: zoom-in;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.markdown-body .mermaid-block .mermaid-figure:hover .mermaid-expand-btn,
+.mermaid-expand-btn:focus-visible {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .mermaid-expand-btn {
+    opacity: 0.9;
+  }
+}
+
+/* Mermaid 全屏查看器：mermaid-viewer.ts 建的 DOM，不经过 Vue 挂载 */
+.mermaid-viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 3000;
+  display: none;
+}
+
+.mermaid-viewer.is-open {
+  display: block;
+}
+
+.mermaid-viewer-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.72);
+}
+
+.mermaid-viewer-panel {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+  gap: 12px;
+}
+
+.mermaid-viewer-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.mermaid-viewer-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: #fff;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  opacity: 0.8;
+}
+
+.mermaid-viewer-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+}
+
+.mermaid-viewer-btn {
+  padding: 5px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  border-radius: var(--aw-radius-pill);
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1.6;
+  cursor: pointer;
+}
+
+.mermaid-viewer-btn:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.mermaid-viewer-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.mermaid-viewer-btn:disabled:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.mermaid-viewer-btn.is-active {
+  border-color: transparent;
+  background: #fff;
+  color: #1d1d1f;
+}
+
+/* 缩放档位按钮：－ / ＋ 用全角符号，窄屏比「缩小 / 放大」省一半宽度 */
+.mermaid-viewer-zoom {
+  padding: 5px 10px;
+}
+
+/* 当前百分比：同时是「回到 100%」的按钮 */
+.mermaid-viewer-scale {
+  min-width: 52px;
+  padding: 5px 8px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.mermaid-viewer-stage {
+  flex: 1;
+  overflow: auto;
+  border-radius: var(--aw-radius-md);
+  background: var(--aw-surface);
+}
+
+.mermaid-viewer-canvas {
+  padding: 16px;
+  text-align: center;
+}
+
+.mermaid-viewer-canvas svg {
+  display: inline-block;
+  max-width: none;
+  height: auto;
+  background: transparent;
+}
+
+.markdown-body .mermaid-block details.mermaid-source {
+  margin-top: 4px;
+}
+
+.markdown-body .mermaid-block details.mermaid-source summary {
+  display: inline-block;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1.6;
+  opacity: 0.65;
+  user-select: none;
+}
+
+.markdown-body .mermaid-block details.mermaid-source summary:hover {
+  opacity: 1;
+}
+
+/* KaTeX：超宽公式横向滚动，不撑破气泡 */
+.markdown-body .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 2px 0;
+}
+
+/* 表格复制工具条：hover / 键盘聚焦时出现 */
+.markdown-body .md-table-wrap {
+  position: relative;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+
+.markdown-body .md-table-toolbar {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  z-index: 1;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.markdown-body .md-table-wrap:hover .md-table-toolbar,
+.markdown-body .md-table-wrap:focus-within .md-table-toolbar {
+  opacity: 1;
+}
+
+.markdown-body .md-table-toolbar .table-copy-btn {
+  font-size: 12px;
+  line-height: 1;
+  padding: 3px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--el-border-color);
+  background: var(--el-bg-color);
+  color: var(--el-text-color-regular);
+  cursor: pointer;
+}
+
+.markdown-body .md-table-toolbar .table-copy-btn:hover {
+  color: var(--el-color-primary);
+  border-color: var(--el-color-primary-light-5);
+}
+

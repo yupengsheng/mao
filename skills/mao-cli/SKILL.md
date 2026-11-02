@@ -1,0 +1,146 @@
+---
+name: mao-cli
+description: Mao 产品知识库与代理入口：项目说明、安装部署配置、管理后台/桌面/Electron/安卓/mao-agent 全端手册与排障，以及统一 REST CLI（原 mao-user-cli + mao-admin-cli）。不覆盖消息发送与 WebSocket Agent 运行。
+---
+
+# mao-cli
+
+Mao 的**产品文档唯一正文**（可独立分发）+ **REST 操作 CLI**。Agent 应先读本页路由，再打开对应 `reference/*.md`；需要调 API 时用本目录内置 CLI。
+
+## 知识库路由
+
+| 用户问题 | 阅读 |
+|----------|------|
+| 这是什么 / Git / 架构 / 核心功能 / 与 Codex 对比 | [reference/project.md](reference/project.md) |
+| 本地开发：克隆、MySQL、启动三端 | [reference/install.md](reference/install.md) |
+| 生产自托管：服务器、Nginx、HTTPS、升级、运维 | [reference/deploy.md](reference/deploy.md) |
+| 双域名合并为单域名 / 改 Nginx | 仓库 [docs/guides/single-domain-nginx-migration.md](../../docs/guides/single-domain-nginx-migration.md) |
+| 工作区规则（AGENTS.md）会话级冻结：改了不生效 / 前缀缓存塌陷 / 强制刷新 | 仓库 [docs/guides/workspace-rules-snapshot.md](../../docs/guides/workspace-rules-snapshot.md) |
+| 环境变量、数据目录、默认账号、认证方式 | [reference/config.md](reference/config.md) |
+| 管理后台怎么用 / Agent 头像与分组编辑 / 提示词版本与回滚 | [reference/admin.md](reference/admin.md) |
+| 桌面 Web 端（任务、工作区、终端、通知、渠道绑定、我的用量抽屉等） | [reference/desktop.md](reference/desktop.md) |
+| 长期记忆（跨会话记忆的查看与维护） | [reference/memory.md](reference/memory.md) |
+| 任务收件箱（站内通知中心：未读数、七类事件、偏好开关） | [reference/inbox.md](reference/inbox.md) |
+| 模型价格与用量成本核算（每百万 token 价格、llm_call 成本、分析看钱） | [reference/model.md](reference/model.md)、[reference/analytics.md](reference/analytics.md) |
+| 用量预算（全局 / 用户 / Agent 月度预算，超额提醒或拦截） | [reference/budget.md](reference/budget.md) |
+| 开放接口（API Token / 入站 Webhook 触发器 / 出站事件订阅） | [reference/open-api.md](reference/open-api.md) |
+| 信号哨兵 | [reference/signal-watcher.md](reference/signal-watcher.md) |
+| 信号哨兵（定时探测外部接口，变化触发 Agent） | [reference/signal-watcher.md](reference/signal-watcher.md) |
+| 自定义 HTTP 工具（管理员配置并关联到 Agent） | [reference/http-tool.md](reference/http-tool.md) |
+| 飞书机器人通道（绑定 / 群聊@机器人 / 多机器人配置） | [reference/feishu-bot.md](reference/feishu-bot.md) |
+| 钉钉机器人通道（绑定 / 群聊@机器人 / 多机器人配置） | [reference/dingtalk-bot.md](reference/dingtalk-bot.md) |
+| 任务通知邮件渠道（SMTP 配置 / 用户选邮件推送） | [reference/settings.md](reference/settings.md#邮件通知配置notifyemail0.0.318-起) |
+| Electron LOCAL、工具审批、LOCAL 附件、托盘/通知/快捷键、打包与自动更新 | [reference/electron.md](reference/electron.md) |
+| 安卓壳、远程前端、APK OTA | [reference/android.md](reference/android.md) |
+| 终端对话客户端 mao-agent | [reference/mao-agent.md](reference/mao-agent.md) |
+| Web 页面嵌入对话浮窗（Embed SDK 接入，含管理后台内置浮窗助手） | [reference/embed-sdk.md](reference/embed-sdk.md)（设计细节见仓库 [docs/plan/2026-09-04-embed-sdk-technical-design.md](../../docs/plan/2026-09-04-embed-sdk-technical-design.md)；管理后台接入见 [docs/plan/2026-10-16-admin-embed-chat-technical-design.md](../../docs/plan/2026-10-16-admin-embed-chat-technical-design.md)） |
+| 部署/登录/LOCAL/Git/通知等 FAQ | [reference/troubleshooting.md](reference/troubleshooting.md) |
+| 首次部署、管理员上线、日常任务 + CLI | [business_process.md](business_process.md) |
+
+**发版记录**：完整 `CHANGELOG` 在 Mao 源码仓库根目录；独立分发包以发行说明为准。
+
+## REST CLI 何时使用
+
+- 登录并缓存 JWT；查询/配置用户、角色、Agent、模型（含价格）、Skill、会话元数据、文件诊断、定时任务、微信、MCP、审计等
+- 管理开放接口：API Token、入站 Webhook 触发器、出站事件订阅的 CRUD（见 [reference/open-api.md](reference/open-api.md)）
+- 管理信号哨兵：定时探测外部接口、变化触发 Agent 的 CRUD / 启停 / 轮询记录 / 试运行，以及管理端只读清单 `admin-list`（需 `signal:read`，见 [reference/signal-watcher.md](reference/signal-watcher.md)）
+- 管理自定义 HTTP 工具：清单 / 新建 / 编辑 / 启停 / 删除 / 试运行与调用统计（需 `http_tool:read` / `http_tool:write`，见 [reference/http-tool.md](reference/http-tool.md)）
+- 管理用量预算：全局 / 用户 / Agent 月度预算，金额或 token 口径，超额提醒或拦截（见 [reference/budget.md](reference/budget.md)）
+- 脚本或 Agent 流程中以 JSON 消费上述 API
+
+## REST CLI 何时不要使用
+
+- **不要**发送对话、写入消息队列、连接 WebSocket 跑 Agent → 用 `mao-agent`（见 [reference/mao-agent.md](reference/mao-agent.md)）
+- 未登录且未提供 `--token` / `MAO_TOKEN` 时不要调需鉴权接口
+- 用户端与管理端同一 JWT；管理接口成败取决于账号权限
+
+## 尚未覆盖的 REST 能力（明确不做 / 待补）
+
+- 对话消息发送、消息队列写操作、WebSocket 流式会话
+- `/v1/statistics/*` 用量统计（管理后台 UI 可用）
+- 开放 API / Webhook 直接触发运行（`open` 已覆盖 mao_ Token 触发，预算判定同样作用于这两类来源，见 [budget.md](reference/budget.md)）
+- Agent 头像上传与设置（管理后台 UI / REST 可用，见 [reference/agent.md](reference/agent.md)）
+- Agent 系统提示词版本列表与回滚（管理后台 UI / REST 可用，见 [reference/agent.md](reference/agent.md)）
+- 会话 `search` / `messages` 全文检索（管理端 UI 可用）
+- 工作区 Git 写操作（commit/push 等，CLI 仅只读诊断）
+- 飞书机器人管理端 CRUD（`/v1/admin/feishu-bots`，见 [reference/feishu-bot.md](reference/feishu-bot.md) 直接调 REST）
+- 钉钉机器人管理端 CRUD（`/v1/admin/dingtalk-bots`，见 [reference/dingtalk-bot.md](reference/dingtalk-bot.md) 直接调 REST）
+
+## 安装与就绪（Agent 执行，勿让用户安装）
+
+本 CLI 与本 Skill 同目录内置。`mao` / `mao-cli` 不可用时 **Agent 自行安装**：
+
+```bash
+npm install . -g   # 在本 Skill 目录执行
+```
+
+推荐：先调用 CLI → `command not found` 则安装 → 立即重试。权限失败时用 `node bin/mao-cli.js ...`。
+
+要求 Node.js ≥ 18。命令名：`mao` / `mao-cli`。兼容别名：`mao-user`、`mao-user-cli`、`mao-admin`、`mao-admin-cli`。
+
+## 鉴权与 baseUrl
+
+| 项 | 说明 |
+|----|------|
+| 默认 baseUrl | 未配置时回落到开源示例域名（最低优先级，私有化不可用）；请设 `MAO_BASE_URL` / `--base-url` 指向自己的实例，见 [config.md](reference/config.md#站点域名) |
+| 环境变量 | `MAO_BASE_URL`（优先）；兼容 `MAO_USER_BASE_URL`、`MAO_ADMIN_BASE_URL` |
+| 全局选项 | `--base-url`、`--token`、`--json`、`--raw`、`--timeout-ms`、`-h/--help` |
+| Token | `--token` > `MAO_TOKEN` > `~/.mao/auth.json` |
+| 缓存文件 | `~/.mao/auth.json`（只存 JWT，不存密码） |
+
+```bash
+mao auth login --username <用户名> --password <密码>
+```
+
+云端/微信 shell 中后端会注入 `MAO_TOKEN`，无需 `auth login`。见 [reference/auth.md](reference/auth.md)。
+
+`model create/update` 的 `--base-url` 表示**模型服务商 API**，服务端地址请用 `MAO_BASE_URL`。
+
+## 统一响应约定
+
+后端 `{ code, message, data, timestamp }`，`code === 0` 成功。`--json` / `--raw`；失败 stderr + exit 1；401 有场景化指引。
+
+## 命令选择总规则
+
+1. 401 → 云端/微信先查 `MAO_TOKEN`；本地终端再 `auth login` / `auth refresh`
+2. 按模块读 `reference/*.md` 查参数
+3. 用户会话 → `session`；全站检索 → `admin-session`
+4. 个人技能 → `skill`；全局技能 → `skill-docs`；把技能发给指定用户（个人技能，不进全局库）→ `skill-docs assign`
+5. 先 `agent list` + `model list-active`，再 `session create`
+6. `mao-admin session` / `skill` 自动映射到 `admin-session` / `skill-docs`
+7. 跨模块流程 → [business_process.md](business_process.md)
+8. 问"这个月谁花了多少钱 / 要不要给某用户或 Agent 装费用闸门" → 先 `model get` 看价格有没有配，再 `analytics` 看成本、`budget` 设上限（见 [budget.md](reference/budget.md)、[analytics.md](reference/analytics.md)）
+
+## REST 模块文档索引
+
+| 需求 | 阅读 |
+|------|------|
+| 登录 / 飞书 / 当前用户 | [reference/auth.md](reference/auth.md) |
+| 用户 CRUD | [reference/user.md](reference/user.md) |
+| 角色、权限点 | [reference/role.md](reference/role.md) |
+| Agent 与经验 | [reference/agent.md](reference/agent.md) |
+| 模型查询与管理端配置 | [reference/model.md](reference/model.md) |
+| MCP 全局/用户级配置与偏好 | [reference/mcp.md](reference/mcp.md) |
+| 当前用户会话元数据 | [reference/session.md](reference/session.md) |
+| 管理端会话检索 | [reference/admin-session.md](reference/admin-session.md) |
+| 会话待办 | [reference/todo.md](reference/todo.md) |
+| 定时任务 | [reference/scheduled-task.md](reference/scheduled-task.md) |
+| 个人 Skill | [reference/skill.md](reference/skill.md) |
+| 全局 Skill 文档 | [reference/skill-docs.md](reference/skill-docs.md) |
+| 个人指令 / 系统指令 / 管理端个人指令 | [reference/command.md](reference/command.md) |
+| 附件与工作区 | [reference/file.md](reference/file.md) |
+| OSS / 上传配置 | [reference/oss.md](reference/oss.md) |
+| 任务面板/通知偏好 | [reference/pref.md](reference/pref.md) |
+| 跨会话长期记忆 | [reference/memory.md](reference/memory.md) |
+| 任务收件箱（站内通知） | [reference/inbox.md](reference/inbox.md) |
+| Git 凭证 | [reference/git.md](reference/git.md) |
+| 内置工具查询 | [reference/tool.md](reference/tool.md) |
+| 微信 Bot | [reference/weixin.md](reference/weixin.md) |
+| 运行监控 | [reference/runtime.md](reference/runtime.md) |
+| 分析汇总 / 分维度（含运行轨迹三个榜） | [reference/analytics.md](reference/analytics.md) |
+| LLM 调用流水 | [reference/llm-call.md](reference/llm-call.md) |
+| 信号哨兵 | [reference/signal-watcher.md](reference/signal-watcher.md) |
+| 消息点踩反馈 | [reference/feedback.md](reference/feedback.md) |
+| 审计日志 | [reference/audit.md](reference/audit.md) |
+| 系统设置 | [reference/settings.md](reference/settings.md) |
+| 用量预算（全局 / 用户 / Agent 月度预算，超额提醒或拦截） | [reference/budget.md](reference/budget.md) |

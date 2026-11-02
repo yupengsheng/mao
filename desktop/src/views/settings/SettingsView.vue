@@ -1,0 +1,206 @@
+<template>
+  <div class="settings-layout">
+    <aside class="settings-sidebar">
+      <button class="settings-back" @click="goBack">
+        <el-icon :size="14"><ArrowLeft /></el-icon>
+        返回工作台
+      </button>
+      <h2 class="settings-title">设置</h2>
+      <nav class="settings-nav">
+        <router-link to="/settings/profile" class="settings-nav-item" active-class="active">
+          个人信息
+        </router-link>
+        <router-link
+          v-if="showServerNav"
+          to="/settings/server"
+          class="settings-nav-item"
+          active-class="active"
+        >
+          服务器
+        </router-link>
+        <router-link
+          v-if="showDesktopNav"
+          to="/settings/desktop"
+          class="settings-nav-item"
+          active-class="active"
+        >
+          桌面
+        </router-link>
+        <router-link to="/settings/git-credentials" class="settings-nav-item" active-class="active">
+          Git 凭证
+        </router-link>
+        <router-link to="/settings/env-variables" class="settings-nav-item" active-class="active">
+          环境变量
+        </router-link>
+        <router-link to="/settings/notifications" class="settings-nav-item" active-class="active">
+          消息通知
+        </router-link>
+        <router-link to="/settings/memory" class="settings-nav-item" active-class="active">
+          长期记忆
+        </router-link>
+        <router-link to="/settings/approval-rules" class="settings-nav-item" active-class="active">
+          审批规则
+        </router-link>
+        <router-link to="/settings/channel-bindings" class="settings-nav-item" active-class="active">
+          渠道绑定
+        </router-link>
+        <router-link to="/settings/mcp-servers" class="settings-nav-item" active-class="active">
+          MCP 服务器
+        </router-link>
+        <router-link to="/settings/skills" class="settings-nav-item" active-class="active">
+          Skills 技能
+        </router-link>
+        <router-link to="/settings/commands" class="settings-nav-item" active-class="active">
+          我的指令
+        </router-link>
+        <router-link to="/settings/scheduled-tasks" class="settings-nav-item" active-class="active">
+          定时任务
+        </router-link>
+        <router-link to="/settings/open-api" class="settings-nav-item" active-class="active">
+          开放接口
+        </router-link>
+        <router-link to="/settings/signal-watchers" class="settings-nav-item" active-class="active">
+          信号哨兵
+        </router-link>
+      </nav>
+    </aside>
+    <section class="settings-content">
+      <router-view />
+    </section>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ArrowLeft } from '@element-plus/icons-vue'
+import { computed } from 'vue'
+import { useRouter } from 'vue-router'
+import { useSessionStore } from '../../stores/session'
+import { goBackToWorkbench } from '../../utils/workbench-nav'
+import { isElectronClient } from '../../utils/platform'
+
+const sessionStore = useSessionStore()
+const router = useRouter()
+const showServerNav = computed(() => isElectronClient())
+const showDesktopNav = computed(() => isElectronClient())
+
+function goBack() {
+  const active = sessionStore.activeSession
+  goBackToWorkbench(router, active?.id ?? sessionStore.sessions[0]?.id)
+}
+</script>
+
+<style scoped>
+.settings-layout {
+  display: flex;
+  height: 100%;
+  overflow: hidden;
+}
+
+.settings-sidebar {
+  width: 200px;
+  flex-shrink: 0;
+  padding: 24px 16px;
+  border-right: 1px solid var(--aw-divider-soft);
+  background: var(--aw-surface);
+}
+
+.settings-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 0 16px 4px;
+  padding: 4px 8px;
+  border: none;
+  border-radius: var(--aw-radius-xs);
+  background: transparent;
+  color: var(--aw-ink-muted);
+  font-size: 12px;
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+}
+
+.settings-back:hover {
+  color: var(--aw-ink);
+  background: var(--aw-surface-hover);
+}
+
+.settings-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--aw-ink);
+  margin: 0 0 16px 8px;
+}
+
+.settings-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-nav-item {
+  display: block;
+  padding: 8px 12px;
+  border-radius: var(--aw-radius-xs);
+  font-size: 13px;
+  color: var(--aw-ink-muted);
+  text-decoration: none;
+  transition: color 0.15s, background 0.15s;
+}
+
+.settings-nav-item:hover {
+  color: var(--aw-ink);
+  background: var(--aw-surface-hover);
+  text-decoration: none;
+}
+
+.settings-nav-item.active {
+  color: var(--aw-primary);
+  background: var(--aw-accent-bg);
+  font-weight: 500;
+}
+
+.settings-content {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  padding: 24px 32px;
+}
+
+@media (max-width: 640px) {
+  .settings-layout {
+    flex-direction: column;
+    height: 100%;
+    overflow: auto;
+  }
+
+  .settings-sidebar {
+    width: 100%;
+    padding: 14px 16px 10px;
+    border-right: 0;
+    border-bottom: 1px solid var(--aw-divider-soft);
+  }
+
+  .settings-back {
+    margin: 0 0 10px;
+  }
+
+  .settings-title {
+    margin: 0 0 10px;
+  }
+
+  .settings-nav {
+    flex-direction: row;
+    overflow-x: auto;
+  }
+
+  .settings-nav-item {
+    flex: 0 0 auto;
+  }
+
+  .settings-content {
+    flex: none;
+    overflow: visible;
+    padding: 20px 16px 28px;
+  }
+}
+</style>

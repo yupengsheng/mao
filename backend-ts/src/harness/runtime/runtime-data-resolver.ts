@@ -1,0 +1,97 @@
+import path from 'node:path';
+
+const LOCAL_RUNTIME_PREFIX = '~/.mao/runtime';
+const LOCAL_UNSYNCED_SKILLS_PREFIX = '~/.agents/skills';
+
+export class RuntimeDataResolver {
+  readonly runtimeRoot: string;
+  readonly userHomeRoot: string;
+
+  constructor(runtimeDir: string, userHomeDir: string) {
+    this.runtimeRoot = path.resolve(runtimeDir);
+    this.userHomeRoot = path.resolve(userHomeDir);
+  }
+
+  static forTest(runtimeDir: string, userHomeDir: string): RuntimeDataResolver {
+    return new RuntimeDataResolver(runtimeDir, userHomeDir);
+  }
+
+  resolveSessionRuntimeDir(userId: number, sessionId: number): string {
+    return path.join(this.runtimeRoot, String(userId), String(sessionId));
+  }
+
+  /** 用户级 runtime 根（容器挂载与 envelope 使用的 {runtimeRoot}/{userId}）。 */
+  resolveUserRuntimeDir(userId: number): string {
+    return path.join(this.runtimeRoot, String(userId));
+  }
+
+  resolveSkillsDir(userId: number, sessionId: number): string {
+    return path.join(this.resolveSessionRuntimeDir(userId, sessionId), 'skills');
+  }
+
+  resolveShellOutputDir(userId: number, sessionId: number): string {
+    return path.join(this.resolveSessionRuntimeDir(userId, sessionId), 'shellOutput');
+  }
+
+  resolveCompactionDir(userId: number, sessionId: number): string {
+    return path.join(this.resolveSessionRuntimeDir(userId, sessionId), 'compaction');
+  }
+
+  /** 网页全文落盘目录：open_web_page 截断时存放完整内容，供 Agent 按需回读。 */
+  resolveWebPageCacheDir(userId: number, sessionId: number): string {
+    return path.join(this.resolveSessionRuntimeDir(userId, sessionId), 'webPages');
+  }
+
+  /**
+   * 用户消息原文落盘目录：dump_user_messages 把最近 N 条用户消息写成文件，
+   * 供 Agent 用 read_file / grep_search / shell 精确处理，避免复述长数据。
+   */
+  resolveUserMessagesDir(userId: number, sessionId: number): string {
+    return path.join(this.resolveSessionRuntimeDir(userId, sessionId), 'userMessages');
+  }
+
+  resolveIncomingDir(userId: number, sessionId: number): string {
+    return path.join(this.resolveSessionRuntimeDir(userId, sessionId), 'incoming');
+  }
+
+  resolveGitAskpassScript(userId: number, sessionId: number): string {
+    return path.join(this.resolveSessionRuntimeDir(userId, sessionId), 'git-askpass.sh');
+  }
+
+  resolveUserHomeDir(userId: number | null | undefined): string | null {
+    if (userId == null) return null;
+    return path.join(this.userHomeRoot, String(userId));
+  }
+
+  formatLocalSkillsPath(sessionId: number, skillName: string): string {
+    return `${LOCAL_RUNTIME_PREFIX}/${sessionId}/skills/${skillName}/SKILL.md`;
+  }
+
+  formatLocalSkillsDir(sessionId: number, skillName: string): string {
+    return `${LOCAL_RUNTIME_PREFIX}/${sessionId}/skills/${skillName}`;
+  }
+
+  formatCloudSkillsPath(userId: number, sessionId: number, skillName: string): string {
+    return path.join(this.resolveSkillsDir(userId, sessionId), skillName, 'SKILL.md');
+  }
+
+  formatCloudSkillsDir(userId: number, sessionId: number, skillName: string): string {
+    return path.join(this.resolveSkillsDir(userId, sessionId), skillName);
+  }
+
+  getRuntimeRoot(): string {
+    return this.runtimeRoot;
+  }
+
+  getUserHomeRoot(): string {
+    return this.userHomeRoot;
+  }
+
+  formatLocalUnsyncedSkillsPath(folderName: string): string {
+    return `${LOCAL_UNSYNCED_SKILLS_PREFIX}/${folderName}/SKILL.md`;
+  }
+
+  formatLocalUnsyncedSkillsDir(folderName: string): string {
+    return `${LOCAL_UNSYNCED_SKILLS_PREFIX}/${folderName}`;
+  }
+}

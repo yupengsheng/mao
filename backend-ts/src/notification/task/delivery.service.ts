@@ -1,0 +1,241 @@
+import { randomUUID } from 'node:crypto';
+import { formatDateTime } from '../../common/json.js';
+import { hasText } from '../../common/case.js';
+import type { MessageQueueItem, Session } from '../../domain/types.js';
+import { WEIXIN_PROJECT_KEY } from '../../domain/types.js';
+import { DeliveryStatus, type TaskNotificationDelivery } from './types.js';
+import type { TaskNotificationPreferenceService } from './preference.service.js';
+
+export interface DeliveryStore {
+  insert(row: TaskNotificationDelivery): Promise<number>;
+  updateById(row: Partial<TaskNotificationDelivery> & { id: number }): Promise<void>;
+  updateIfStatus?(
+    id: number,
+    expectedStatus: string,
+    row: Partial<TaskNotificationDelivery>,
+  ): Promise<boolean>;
+  /** 按幂等键取行。审批帧抑制拿不到内存里的 delivery 对象时用。 */
+  findByEventKey?(eventKey: string): Promise<TaskNotificationDelivery | null>;
+}
+
+/** 桌面端仍连接、人未处理时，过这么久再外推。固定值，不进偏好表、不进系统设置。 */
+export const PENDING_ESCALATION_DELAY_MS = 3 * 60 * 1000;
+
+export interface QueueLister {
+  listPending(sessionId: number): Promise<MessageQueueItem[]>;
+}
+
+export interface TaskNotificationMetrics {
+  created(channel: string, phase: string): void;
+  suppressedByWebSocket(channel: string): void;
+  sent(channel: string, result: string): void;
+  retried(channel: string): void;
+  pending(count: number): void;
+}
+
+export class InMemoryTaskNotificationMetrics implements TaskNotificationMetrics {
+  created(): void {}
+  suppressedByWebSocket(): void {}
+  sent(): void {}
+  retried(): void {}
+  pending(): void {}
+}
+
+export class TaskNotificationDeliveryService {
+  constructor(
+    private readonly store: DeliveryStore,
+    private readonly preferenceService: TaskNotificationPreferenceService,
+    private readonly queueService: QueueLister,
+    private readonly metrics: TaskNotificationMetrics = new InMemoryTaskNotificationMetrics(),
+  ) {}
+
+  async prepare(session: Session | null, phase: string, executionId: string | null, failureReason: string | null): Promise<TaskNotificationDelivery | null> {
+    if (session == null || (phase !== 'COMPLETED' && phase !== 'FAILED')) {
+      return null;
+    }
+    if (session.sessionType === 'SUBAGENT') {
+      return null;
+    }
+    if (session.projectKey === WEIXIN_PROJECT_KEY) {
+      console.debug(`Skipping task notification for weixin session: sessionId=${session.id}`);
+      return null;
+    }
+    if ((await this.queueService.listPending(session.id!)).length > 0) {
+      return null;
+    }
+    const preference = await this.preferenceService.findEnabled(session.userId!);
+    if (preference == null) {
+      return null;
+    }
+    const resolvedExecutionId = !hasText(executionId) ? randomUUID() : executionId!;
+    const eventKey = `${session.id}:${resolvedExecutionId}:${phase}`;
+    const delivery: TaskNotificationDelivery = {
+      eventKey,
+      userId: session.userId!,
+      sessionId: session.id,
+      executionId: resolvedExecutionId,
+      terminalPhase: phase,
+      channel: preference.channel!,
+      webhookCiphertext: preference.webhookCiphertext!,
+      titleSnapshot: this.normalizeTitle(session.title),
+      status: DeliveryStatus.WAITING_WS,
+      attemptCount: 0,
+      nextRetryAt: formatDateTime(new Date(Date.now() + 10_000)),
+    };
+    if (phase === 'FAILED' && hasText(failureReason)) {
+      delivery.failureReason = this.truncate(failureReason!, 500);
+    }
+    try {
+      delivery.id = await this.store.insert(delivery);
+      this.metrics.created(delivery.channel!, phase);
+      return delivery;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes('Duplicate') || msg.includes('ER_DUP_ENTRY')) {
+        console.info(`Task notification delivery already exists: eventKey=${eventKey}`);
+        return null;
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * 审批或提问还在等人时的外推。直接写 PENDING，延迟由 nextRetryAt 承担，调度器到点再发。
+   * 不看队列：当时就在等人，队列里有没有下一条与「这轮是否结束」无关。
+   */
+  async prepareEscalation(input: {
+    session: Session | null;
+    phase: 'ASK_USER' | 'APPROVAL';
+    requestId: string;
+    delayMs: number;
+  }): Promise<TaskNotificationDelivery | null> {
+    const { session, phase, requestId, delayMs } = input;
+    if (session == null || session.id == null || session.userId == null) {
+      return null;
+    }
+    // 提问工具不进子代理；审批不跳过——子会话的本地命令审批挂在父用户的桌面端。
+    if (phase === 'ASK_USER' && session.sessionType === 'SUBAGENT') {
+      return null;
+    }
+    if (session.projectKey === WEIXIN_PROJECT_KEY) {
+      console.debug(`Skipping task notification for weixin session: sessionId=${session.id}`);
+      return null;
+    }
+    const preference = await this.preferenceService.findEnabled(session.userId);
+    if (preference == null) {
+      return null;
+    }
+    const eventKey = phase === 'ASK_USER'
+      ? `ask-user:${session.id}:${requestId}`
+      : `approval:${session.id}:${requestId}`;
+    const delivery: TaskNotificationDelivery = {
+      eventKey,
+      userId: session.userId,
+      sessionId: session.id,
+      executionId: requestId.slice(0, 64),
+      terminalPhase: phase,
+      channel: preference.channel!,
+      webhookCiphertext: preference.webhookCiphertext!,
+      titleSnapshot: this.normalizeTitle(session.title),
+      status: DeliveryStatus.PENDING,
+      attemptCount: 0,
+      nextRetryAt: formatDateTime(new Date(Date.now() + delayMs)),
+    };
+    try {
+      delivery.id = await this.store.insert(delivery);
+      this.metrics.created(delivery.channel!, phase);
+      return delivery;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes('Duplicate') || msg.includes('ER_DUP_ENTRY')) {
+        console.info(`Task notification delivery already exists: eventKey=${eventKey}`);
+        return null;
+      }
+      throw e;
+    }
+  }
+
+  /** 审批帧只带 sessionId + requestId，按 eventKey 找到行再走 suppressPending。查不到就返回。 */
+  async suppressByEventKey(eventKey: string): Promise<void> {
+    if (!this.store.findByEventKey) return;
+    const row = await this.store.findByEventKey(eventKey);
+    await this.suppressPending(row);
+  }
+
+  /**
+   * 人已经处理（作答 / 取消 / 超时 / 批准 / 拒绝）后，抑制仍未发出的升级通知。
+   *
+   * 抑制窗口是「insert → 处理或超时」的整个等待期（最长可达 15 分钟）。调度器随时可能已把该行
+   * claim 成 SENDING，因此与 resolveWebSocket 一样需要 SENDING 兜底 CAS，否则已失效的提醒仍会被发出。
+   */
+  async suppressPending(delivery: TaskNotificationDelivery | null): Promise<void> {
+    if (delivery?.id == null) {
+      return;
+    }
+    if (!this.store.updateIfStatus) {
+      await this.store.updateById({
+        id: delivery.id,
+        status: DeliveryStatus.SUPPRESSED_WS,
+        nextRetryAt: null,
+      });
+      return;
+    }
+    const suppressed = await this.store.updateIfStatus(delivery.id, DeliveryStatus.PENDING, {
+      status: DeliveryStatus.SUPPRESSED_WS,
+      nextRetryAt: null,
+    });
+    if (suppressed) {
+      return;
+    }
+    // 已被调度器 claim 成 SENDING：webhook 可能还没发出去，deliver() 发送前会重查状态，
+    // 这里直接置抑制即可阻止本次发送（与 resolveWebSocket 的兜底策略一致）。
+    const late = await this.store.updateIfStatus(delivery.id, DeliveryStatus.SENDING, {
+      status: DeliveryStatus.SUPPRESSED_WS,
+      nextRetryAt: null,
+    });
+    if (!late) {
+      // 已 SUCCEEDED / FAILED 等终态：抑制无意义，也不该改状态。
+      console.info(`Task notification ${delivery.id}: suppression skipped (already in a terminal state)`);
+    }
+  }
+
+  async resolveWebSocket(delivery: TaskNotificationDelivery | null, delivered: boolean): Promise<void> {
+    if (delivery == null || delivery.id == null) {
+      return;
+    }
+    const nextStatus = delivered ? DeliveryStatus.SUPPRESSED_WS : DeliveryStatus.PENDING;
+    const patch: Partial<TaskNotificationDelivery> = {
+      status: nextStatus,
+      nextRetryAt: delivered ? null : formatDateTime(new Date()),
+    };
+    const updated = this.store.updateIfStatus
+      ? await this.store.updateIfStatus(delivery.id, DeliveryStatus.WAITING_WS, patch)
+      : (await this.store.updateById({ id: delivery.id, ...patch }), true);
+    if (updated && delivered) {
+      this.metrics.suppressedByWebSocket(delivery.channel!);
+      return;
+    }
+    if (!updated && delivered && this.store.updateIfStatus) {
+      // WS 结果晚到的竞态补救：行可能已被 scheduler 从 WAITING_WS claim 成 SENDING（抑制窗口内过期）。
+      // 若 webhook 尚未发出，直接抑制为 SUPPRESSED_WS；deliver() 发送前会重查状态做最后兜底。
+      const suppressed = await this.store.updateIfStatus(delivery.id, DeliveryStatus.SENDING, {
+        status: DeliveryStatus.SUPPRESSED_WS,
+        nextRetryAt: null,
+      });
+      if (suppressed) {
+        this.metrics.suppressedByWebSocket(delivery.channel!);
+      } else {
+        console.warn(`Task notification ${delivery.id}: WS result arrived after webhook dispatch, duplicate notification possible`);
+      }
+    }
+  }
+
+  private normalizeTitle(title: string | null | undefined): string {
+    const value = !hasText(title) ? '未命名任务' : title!.trim();
+    return value.length <= 255 ? value : value.slice(0, 255);
+  }
+
+  private truncate(value: string, maxLength: number): string {
+    return value.length <= maxLength ? value : value.slice(0, maxLength);
+  }
+}

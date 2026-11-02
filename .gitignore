@@ -1,0 +1,57 @@
+# Dependencies
+node_modules/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+.zcodeignore
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env & secrets
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Build outputs
+dist/
+build/
+out/
+test-results/
+
+# Electron
+desktop/release/
+.sso_token.txt
+.account.json
+
+# Android Gradle wrapper jar（由 npx cap 生成）
+android/android/gradle/wrapper/gradle-wrapper.jar
+
+# Runtime PID files
+*.pid
+
+.bash_profile
+.mao
+.zcode
+
+.claude/
+.cursor/
+
+# Local deploy script
+deploy_local.sh
+
+# Android 签名 keystore 与凭据（严禁入 git）
+/keystore/
+
+# git worktrees（并行开发用，不入库）
+.worktrees/

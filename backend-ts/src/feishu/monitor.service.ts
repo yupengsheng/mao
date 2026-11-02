@@ -1,0 +1,328 @@
+import * as Lark from '@larksuiteoapi/node-sdk';
+import { decryptAesGcm } from '../crypto/aes-gcm.js';
+import type { FeishuBotConfig } from '../config/app-config.js';
+import { normalizeFeishuEvent } from './event-normalizer.js';
+import { FeishuInboundProcessor } from './inbound-processor.js';
+import type { FeishuBot, FeishuBotRepository, FeishuNormalizedMessage } from './types.js';
+
+export interface FeishuBotHandle {
+  start(): void;
+  stop(): void;
+}
+
+export interface FeishuBotHandleCallbacks {
+  onReady?: () => void;
+  onFailure?: (error?: unknown) => void;
+  onReconnecting?: () => void;
+  onReconnected?: () => void;
+}
+
+export type FeishuBotHandleFactory = (bot: FeishuBot, callbacks?: FeishuBotHandleCallbacks) => FeishuBotHandle;
+
+/** Creates one SDK WebSocket connection for one enabled Feishu bot. */
+export function createFeishuBotHandle(
+  bot: FeishuBot,
+  config: FeishuBotConfig,
+  processor?: FeishuInboundProcessor,
+  callbacks?: FeishuBotHandleCallbacks,
+  cardActionHandler?: (data: unknown, accountId: string) => Promise<unknown>,
+): FeishuBotHandle {
+  if (!bot.id) throw new Error('飞书Bot缺少id');
+  if (!config.appSecretKey) throw new Error('飞书Bot appSecretKey未配置');
+  const appSecret = decryptAesGcm(bot.appSecret, config.appSecretKey, '飞书Bot appSecret解密失败');
+  const accountId = String(bot.id);
+  // 入站处理转入后台异步执行：事件处理器必须立即返回，让 SDK 尽快向飞书回 ack。
+  // 若在此处 await 完整 agent 执行，长连接会阻塞到整轮跑完才 ack，飞书侧 ack 超时后
+  // 会重发同一事件，造成消息重复执行（飞书已回复但任务一直运行中）。
+  // 重复执行由 claimInboundMessage 的 DB 级去重（CLAIMED + 10 分钟窗口）兜底拦截。
+  const identityClient = new Lark.Client({ appId: bot.appId, appSecret });
+  let botOpenId: string | undefined;
+  const dispatchInbound = (event: FeishuNormalizedMessage): void => {
+    if (processor == null) return;
+    void processor.process(accountId, event).catch((error) => {
+      console.error(`飞书入站处理失败, id=${bot.id}`, error);
+    });
+  };
+  const eventDispatcher = new Lark.EventDispatcher({}).register({
+    'im.message.receive_v1': async (data: unknown) => {
+      const event = normalizeFeishuEvent(data, botOpenId);
+      if (event == null) return;
+      if (event.header?.appId !== bot.appId) {
+        console.warn(`飞书事件appId不匹配, id=${bot.id}, eventAppId=${event.header?.appId ?? 'null'}, botAppId=${bot.appId}`);
+        return;
+      }
+      console.info(`飞书收到消息, id=${bot.id}, messageId=${event.messageId ?? 'null'}, chatType=${event.chatType}, mentioned=${event.isBotMentioned}`);
+      // 群聊消息带提及但未命中机器人时打印原始 mentions，便于排查 botOpenId 与事件身份形态不一致导致的漏判。
+      const rawMentions = asRecord(asRecord((data as { event?: unknown }).event ?? data).message).mentions;
+      if (event.chatType === 'group' && !event.isBotMentioned && Array.isArray(rawMentions) && rawMentions.length > 0) {
+        console.warn(`飞书群消息含提及但未命中机器人, id=${bot.id}, botOpenId=${botOpenId ?? 'null'}, mentions=${JSON.stringify(rawMentions)}`);
+      }
+      dispatchInbound(event);
+    },
+    // 卡片按钮回调（card.action.trigger）：SDK 类型未内置该键，通过泛型扩展注册。
+  } as never);
+  if (cardActionHandler != null) {
+    (eventDispatcher as unknown as { register<T>(handles: T): unknown }).register({
+      'card.action.trigger': async (data: unknown) => {
+        try {
+          return await cardActionHandler(data, String(bot.id));
+        } catch (error) {
+          console.error(`飞书卡片动作处理失败, id=${bot.id}`, error);
+          return undefined;
+        }
+      },
+    });
+  }
+  const wsClient = new Lark.WSClient({
+    appId: bot.appId,
+    appSecret,
+    onReady: () => {
+      void identityClient.request<{ bot?: { open_id?: string } }>({ url: '/open-apis/bot/v3/info', method: 'GET' })
+        .then((response) => { botOpenId = response.bot?.open_id; })
+        .catch((error) => { console.warn(`获取飞书Bot open_id失败, id=${bot.id}`, error); });
+      console.info(`飞书Bot长连接已连接, id=${bot.id}, appId=${bot.appId}`);
+      callbacks?.onReady?.();
+    },
+    onError: (error: Error) => {
+      console.error(`飞书Bot长连接失败, id=${bot.id}`, error);
+      callbacks?.onFailure?.(error);
+    },
+    onReconnecting: () => callbacks?.onReconnecting?.(),
+    onReconnected: () => callbacks?.onReconnected?.(),
+  });
+
+  return {
+    start(): void {
+      void wsClient.start({ eventDispatcher }).catch((error: unknown) => {
+        console.error(`飞书Bot长连接启动失败, id=${bot.id}`, error);
+        callbacks?.onFailure?.(error);
+      });
+    },
+    stop(): void {
+      wsClient.close();
+    },
+  };
+}
+
+/**
+ * Reconciles enabled database bots with their runtime handles. The SDK owns
+ * the Feishu long-connection endpoint and reconnect behavior; this service
+ * deliberately does not construct or override an endpoint.
+ */
+export type FeishuBotConnectionStatus = 'ready' | 'reconnecting' | 'failed' | 'disabled';
+
+export interface FeishuBotRuntimeStatus {
+  botId: number;
+  status: FeishuBotConnectionStatus;
+  lastFailureReason: string | null;
+  lastFailureAt: string | null;
+  lastReadyAt: string | null;
+}
+
+interface FeishuBotRuntimeState {
+  status: FeishuBotConnectionStatus;
+  lastFailureReason: string | null;
+  lastFailureAt: string | null;
+  lastReadyAt: string | null;
+}
+
+function describeError(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+
+export class FeishuMonitorService {
+  private readonly active = new Map<number, { handle: FeishuBotHandle; generation: symbol; fingerprint: string; clearRetryTimer: () => void }>();
+  /**
+   * botId -> 连续失败次数：跨 launch 常驻。
+   * 重连到点后删 entry 靠 reconcile() 重新 launch，计数若放在 launch 局部会被每次
+   * 清零，指数退避永远走不到第二档，reconnectMaxMs / maxConsecutiveFailures 也失效
+   * （与 dingtalk/monitor.service.ts 同一修法）。
+   */
+  private readonly failureCounts = new Map<number, number>();
+  /** botId -> 连接运行状态（仅内存记录，进程重启后由 SDK 回调重新填充）。 */
+  private readonly runtimeStates = new Map<number, FeishuBotRuntimeState>();
+  private timer: NodeJS.Timeout | null = null;
+  private started = false;
+  private reconciling = false;
+
+  constructor(
+    private readonly config: FeishuBotConfig,
+    private readonly repository: FeishuBotRepository,
+    private readonly processor?: FeishuInboundProcessor,
+    private readonly cardActionHandler?: (data: unknown, accountId: string) => Promise<unknown>,
+  ) {}
+
+  start(): void {
+    if (!this.config.enabled || !this.config.longConnection.enabled) {
+      console.info('飞书Bot监控未启用');
+      return;
+    }
+    if (!this.config.appSecretKey) {
+      console.error('飞书Bot已启用但 APP_FEISHU_BOT_SECRET 未配置，无法启动机器人长连接');
+      return;
+    }
+    if (this.started) return;
+    this.started = true;
+    void this.reconcile();
+    this.timer = setInterval(() => { void this.reconcile(); }, this.config.longConnection.reconcileIntervalMs);
+    this.timer.unref();
+    console.info('飞书Bot监控已启动');
+  }
+
+  /** 返回指定 bot 的连接运行状态；未知 bot 返回 null。 */
+  getStatus(botId: number): FeishuBotRuntimeStatus | null {
+    const state = this.runtimeStates.get(botId);
+    if (state == null) return null;
+    return { botId, ...state };
+  }
+
+  /** 返回全部 bot 的连接运行状态（含 DB 中存在但 monitor 未启用的 bot，状态为 disabled/unknown）。 */
+  listStatuses(enabledIds?: Set<number>): FeishuBotRuntimeStatus[] {
+    return [...this.runtimeStates.entries()]
+      .map(([botId, state]) => ({ botId, ...state }))
+      .filter((s) => enabledIds == null || enabledIds.has(s.botId));
+  }
+
+  /**
+   * 触发指定 bot 立即重连：丢弃当前 handle，下一轮 reconcile 会重建连接。
+   * 返回是否成功调度（bot 不存在/未启用时返回 false）。
+   */
+  async reconnect(botId: number): Promise<boolean> {
+    if (!this.started) return false;
+    const bots = await this.repository.list();
+    const bot = bots.find((b) => b.id === botId && b.enabled === 1);
+    if (bot == null) return false;
+    const entry = this.active.get(botId);
+    if (entry != null) {
+      try { entry.clearRetryTimer(); entry.handle.stop(); } catch (error) { console.error(`重连前停止飞书Bot失败, id=${botId}`, error); }
+      this.active.delete(botId);
+    }
+    // 手动重连是管理员显式动作，退避计数归零，别让上一次故障的退避继续生效。
+    this.failureCounts.delete(botId);
+    this.markRuntimeState(botId, { status: 'reconnecting' });
+    void this.reconcile();
+    return true;
+  }
+
+  private markRuntimeState(botId: number, patch: Partial<FeishuBotRuntimeState>): void {
+    const current = this.runtimeStates.get(botId) ?? { status: 'reconnecting' as FeishuBotConnectionStatus, lastFailureReason: null, lastFailureAt: null, lastReadyAt: null };
+    this.runtimeStates.set(botId, { ...current, ...patch });
+  }
+
+  shutdown(): void {
+    if (this.timer != null) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    for (const [id, entry] of this.active) {
+      try { entry.clearRetryTimer(); entry.handle.stop(); } catch (error) { console.error(`停止飞书Bot失败, id=${id}`, error); }
+    }
+    this.active.clear();
+    this.failureCounts.clear();
+    this.started = false;
+    console.info('飞书Bot监控已停止');
+  }
+
+  private async reconcile(): Promise<void> {
+    if (!this.started || this.reconciling) return;
+    this.reconciling = true;
+    try {
+      const bots = await this.repository.list();
+      const enabledIds = new Set(bots.filter((bot) => bot.enabled === 1 && bot.id != null).map((bot) => bot.id!));
+      const currentFingerprints = new Map(bots.filter((bot) => bot.id != null).map((bot) => [bot.id!, `${bot.appId}:${bot.appSecret}`]));
+      for (const [id, entry] of this.active) {
+        if (!enabledIds.has(id) || entry.fingerprint !== currentFingerprints.get(id)) {
+          try { entry.clearRetryTimer(); entry.handle.stop(); } catch (error) { console.error(`停止飞书Bot失败, id=${id}`, error); }
+          this.active.delete(id);
+        }
+      }
+      for (const bot of bots) {
+        if (!this.started) return;
+        if (bot.id == null) continue;
+        if (bot.enabled !== 1) {
+          this.markRuntimeState(bot.id, { status: 'disabled', lastFailureReason: null, lastFailureAt: null, lastReadyAt: null });
+          continue;
+        }
+        if (this.active.has(bot.id)) continue;
+        try {
+          // 退避计数按 botId 常驻：reconcile 会用全新的 launch 重连，计数放在 launch 局部
+          // 会被每次清零，指数退避永远走不到第二档，reconnectMaxMs 也随之失效。
+          let failureCount = this.failureCounts.get(bot.id) ?? 0;
+          let retryTimer: NodeJS.Timeout | null = null;
+          const clearRetryTimer = (): void => {
+            if (retryTimer != null) {
+              clearTimeout(retryTimer);
+              retryTimer = null;
+            }
+          };
+          const generation = Symbol(String(bot.id));
+          this.markRuntimeState(bot.id, { status: 'reconnecting' });
+          const callbacks: FeishuBotHandleCallbacks = {
+            onReady: () => {
+              failureCount = 0;
+              this.failureCounts.set(bot.id!, 0);
+              clearRetryTimer();
+              this.markRuntimeState(bot.id!, { status: 'ready', lastReadyAt: new Date().toISOString() });
+            },
+            onReconnected: () => {
+              failureCount = 0;
+              this.failureCounts.set(bot.id!, 0);
+              clearRetryTimer();
+              this.markRuntimeState(bot.id!, { status: 'ready', lastReadyAt: new Date().toISOString() });
+            },
+            onFailure: (error?: unknown) => {
+              if (this.active.get(bot.id!)?.generation !== generation) return;
+              failureCount += 1;
+              this.failureCounts.set(bot.id!, failureCount);
+              this.markRuntimeState(bot.id!, {
+                status: 'failed',
+                lastFailureReason: error != null ? describeError(error) : '未知错误',
+                lastFailureAt: new Date().toISOString(),
+              });
+              if (failureCount > this.config.longConnection.maxConsecutiveFailures) {
+                console.warn(`飞书Bot长连接连续失败, id=${bot.id}, count=${failureCount}, 进入退避重连`);
+                failureCount = 1;
+                this.failureCounts.set(bot.id!, 1);
+              }
+              const delay = Math.min(
+                this.config.longConnection.reconnectMaxMs,
+                this.config.longConnection.reconnectBaseMs * 2 ** (failureCount - 1),
+              );
+              if (retryTimer == null) {
+                retryTimer = setTimeout(() => {
+                  retryTimer = null;
+                  const entry = this.active.get(bot.id!);
+                  if (entry?.generation === generation) {
+                    this.active.delete(bot.id!);
+                    try { entry.handle.stop(); } catch (error) { console.error(`停止失败连接失败, id=${bot.id}`, error); }
+                    void this.reconcile();
+                  }
+                }, delay);
+                retryTimer.unref();
+              }
+            },
+          };
+          const handle = createFeishuBotHandle(bot, this.config, this.processor, callbacks, this.cardActionHandler);
+          this.active.set(bot.id, { handle, generation, fingerprint: `${bot.appId}:${bot.appSecret}`, clearRetryTimer });
+          handle.start();
+        } catch (error) {
+          console.error(`启动飞书Bot失败, id=${bot.id}`, error);
+          this.markRuntimeState(bot.id, {
+            status: 'failed',
+            lastFailureReason: error instanceof Error ? error.message : String(error),
+            lastFailureAt: new Date().toISOString(),
+          });
+        }
+      }
+    } catch (error) {
+      console.error('飞书Bot监控 reconcile 失败', error);
+    } finally {
+      this.reconciling = false;
+    }
+  }
+}
+
+function asRecord(value: unknown): Record<string, any> {
+  return value != null && typeof value === 'object' ? value as Record<string, any> : {};
+}

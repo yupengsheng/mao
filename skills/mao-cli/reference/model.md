@@ -1,0 +1,273 @@
+# 模型模块（model）
+
+## 模块职责
+
+查询用户端可用的 LLM 模型，以及管理端的模型增删改、启停与连通性测试。
+
+## 命令选择
+
+| 场景 | 命令 |
+|------|------|
+| 列出启用中的模型 | `model list-active` |
+| 获取默认模型 | `model default` |
+| 分页筛选（含停用） | `model list` |
+| 按 ID 查询 | `model get` |
+| 列出提供商 | `model providers` |
+| 新建模型配置 | `model create` |
+| 更新模型配置 | `model update` |
+| 删除 | `model delete` |
+| 启停 | `model set-status` |
+| 连通性测试 | `model test` |
+
+`create`/`update` 的 `--base-url` 是**模型服务商 API 地址**。服务端地址请用环境变量 `MAO_BASE_URL`，不要同时用全局 `--base-url`。
+
+---
+
+## 命令：mao model list-active
+
+### 用途
+
+获取状态为启用的模型列表，创建会话时常用。
+
+### 参数说明
+
+无业务参数。需要鉴权。
+
+### 返回结果
+
+数组，元素常见字段：`id`、`name`、`provider`、`modelId`、`supportsVision`、`isDefault`、`contextWindowTokens`、`status`。
+
+### 示例
+
+```bash
+mao model list-active --json
+```
+
+---
+
+## 命令：mao model default
+
+### 用途
+
+获取系统默认模型；若无默认可能返回 `null`。
+
+### 参数说明
+
+无。
+
+### 示例
+
+```bash
+mao model default
+```
+
+---
+
+## 命令：mao model get
+
+### 用途
+
+按主键 ID 获取模型详情。
+
+### 参数说明
+
+| 参数 | 必填 | 类型 | 含义 |
+|------|------|------|------|
+| `--id` | 是 | 数字 | 模型主键 ID，对应路径 `/models/{id}` |
+
+注意：这里的 `--id` 是数据库主键，不是模型厂商的 `modelId` 字符串。
+
+### 示例
+
+```bash
+mao model get --id 3
+```
+
+---
+
+## 命令：mao model providers
+
+### 用途
+
+列出已配置的模型提供商名称列表。
+
+### 参数说明
+
+无。
+
+### 示例
+
+```bash
+mao model providers
+```
+
+---
+
+## 命令：mao model list
+
+### 用途
+
+分页筛选全部模型（含停用）。管理端常用。
+
+### 参数说明
+
+| 参数 | 必填 | 类型 | 默认 | 含义 | 后端字段 |
+|------|------|------|------|------|----------|
+| `--page` | 否 | 整数 | 1 | 页码 | `page` |
+| `--size` | 否 | 整数 | 10 | 每页 | `size` |
+| `--keyword` | 否 | 字符串 | — | 关键词 | `keyword` |
+| `--provider` | 否 | 字符串 | — | 提供商 | `provider` |
+| `--status` | 否 | 整数 | — | 状态 | `status` |
+| `--supports-vision` | 否 | 整数 | — | 是否支持视觉 `0/1` | `supportsVision` |
+| `--is-default` | 否 | 整数 | — | 是否默认 `0/1` | `isDefault` |
+
+`GET /models`
+
+```bash
+mao model list --provider openai --status 1
+```
+
+---
+
+## 命令：mao model create
+
+### 用途
+
+新建 OpenAI 兼容模型配置。需要管理权限。
+
+### 参数说明
+
+| 参数 | 必填 | 类型 | 含义 | 后端字段 |
+|------|------|------|------|----------|
+| `--name` | 是 | 字符串 | 显示名称 | `name` |
+| `--provider` | 是 | 字符串 | 提供商标识 | `provider` |
+| `--base-url` | 是 | 字符串 | 模型 API Base URL | `baseUrl` |
+| `--api-key` | 是 | 字符串 | API Key | `apiKey` |
+| `--model-id` | 是 | 字符串 | 上游模型 ID | `modelId` |
+| `--context-window-tokens` | 否 | 整数 | 上下文窗口 token 数 | `contextWindowTokens` |
+| `--supports-vision` | 否 | `0`/`1` | 是否支持视觉 | `supportsVision` |
+| `--is-default` | 否 | `0`/`1` | 是否默认模型 | `isDefault` |
+| `--price-input` | 否 | 数字 | 每百万**非缓存输入** token 价格（成本单位）；留空表示该类不计成本 | `priceInput` |
+| `--price-cache-read` | 否 | 数字 | 每百万**缓存命中**输入 token 价格（OpenAI `cached_tokens` / Anthropic `cache_read_input_tokens`）；留空表示该类不计成本 | `priceCacheRead` |
+| `--price-cache-write` | 否 | 数字 | 每百万**缓存写入** token 价格（Anthropic `cache_creation_input_tokens`，OpenAI 系无此概念）；留空表示该类不计成本 | `priceCacheWrite` |
+| `--price-output` | 否 | 数字 | 每百万**输出** token 价格（成本单位）；留空表示该类不计成本 | `priceOutput` |
+
+价格规则（`price_input` / `price_output` 自 0.0.243、缓存两档自 0.0.250 起）：
+
+- 单位是「成本单位/百万 token」，与用量分析页展示的成本同一口径；落库为 `DECIMAL(12,6)`，上限 999999.999999、最多 6 位小数。
+- **留空（不传）= 该类 token 不计成本**，该模型的调用不产生成本；填 `0` 表示免费模型（成本按 0 计，与"不计"在分析页呈现不同）。
+- 四类 token 分别计价：非缓存输入、缓存读、缓存写、输出。某类 token 实际产生了但对应价格留空，该次调用成本整行留空（不计入聚合），避免低估；只填输入/输出即可覆盖无缓存的调用。可直接照抄官方价目表，不必自行折算折扣。
+- 价格在每次 LLM 调用**写入时快照**，之后改价只影响新调用，历史调用成本不回填。
+- 本 CLI 只能设置价格、不能清空已设价格；清空请用管理后台模型编辑弹窗（清空输入框即显式置空）。
+
+`POST /models`
+
+```bash
+export MAO_BASE_URL=https://mao.example.com
+mao model create \
+  --name 'GPT-4o' \
+  --provider openai \
+  --base-url 'https://api.openai.com/v1' \
+  --api-key 'sk-xxx' \
+  --model-id 'gpt-4o' \
+  --context-window-tokens 128000 \
+  --supports-vision 1 \
+  --is-default 0 \
+  --price-input 2.5 \
+  --price-cache-read 0.25 \
+  --price-cache-write 3.12 \
+  --price-output 10
+```
+
+---
+
+## 命令：mao model update
+
+### 用途
+
+更新已有模型配置。需要管理权限。
+
+### 参数说明
+
+| 参数 | 必填 | 类型 | 含义 | 后端字段 |
+|------|------|------|------|----------|
+| `--id` | 是 | 整数 | 模型 ID | 路径 |
+| `--name` | 否 | 字符串 | 显示名 | `name` |
+| `--provider` | 否 | 字符串 | 提供商 | `provider` |
+| `--base-url` | 否 | 字符串 | 模型 API 地址 | `baseUrl` |
+| `--api-key` | 否 | 字符串 | API Key；**留空表示不修改**（0.0.84 起编辑弹窗不回填掩码值，误提交掩码会被拦截提示） | `apiKey` |
+| `--model-id` | 否 | 字符串 | 模型 ID | `modelId` |
+| `--context-window-tokens` | 否 | 整数 | 上下文窗口 | `contextWindowTokens` |
+| `--supports-vision` | 否 | `0`/`1` | 视觉 | `supportsVision` |
+| `--is-default` | 否 | `0`/`1` | 默认 | `isDefault` |
+| `--price-input` | 否 | 数字 | 每百万非缓存输入 token 价格（成本单位） | `priceInput` |
+| `--price-cache-read` | 否 | 数字 | 每百万缓存命中输入 token 价格（成本单位） | `priceCacheRead` |
+| `--price-cache-write` | 否 | 数字 | 每百万缓存写入 token 价格（成本单位） | `priceCacheWrite` |
+| `--price-output` | 否 | 数字 | 每百万输出 token 价格（成本单位） | `priceOutput` |
+
+价格口径与限制同 `create`（见上文「价格规则」）。
+
+`PUT /models/{id}`
+
+```bash
+mao model update --id 1 --name 'GPT-4o-prod' --is-default 1
+```
+
+---
+
+## 命令：mao model delete
+
+### 用途
+
+删除模型。需要管理权限。
+
+| 参数 | 必填 | 类型 | 含义 |
+|------|------|------|------|
+| `--id` | 是 | 整数 | 模型 ID |
+
+`DELETE /models/{id}`
+
+```bash
+mao model delete --id 1
+```
+
+---
+
+## 命令：mao model set-status
+
+### 用途
+
+启停模型。需要管理权限。
+
+| 参数 | 必填 | 类型 | 含义 | 后端字段 |
+|------|------|------|------|----------|
+| `--id` | 是 | 整数 | 模型 ID | 路径 |
+| `--status` | 是 | 整数 | 状态（通常 `1` 启用 / `0` 停用） | `status` |
+
+`PATCH /models/{id}/status`
+
+```bash
+mao model set-status --id 1 --status 1
+```
+
+---
+
+## 命令：mao model test
+
+### 用途
+
+测试模型连通性。需要管理权限。文本模型仅发送一条 `Hi` 用户消息进行基础调用，不探测 mid system message 支持；返回 `connectivity`、`connectivityOutput`、`durationMs`，失败时包含 `error`。语音模型仍执行语音合成测试。
+
+| 参数 | 必填 | 类型 | 含义 |
+|------|------|------|------|
+| `--id` | 是 | 整数 | 模型 ID |
+
+`POST /models/{id}/test`
+
+```bash
+mao model test --id 1 --raw
+```
+
+## 与会话的关系
+
+创建/更新会话时可传 `--model-id`（模型主键）。不传则服务端使用默认模型。

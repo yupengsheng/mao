@@ -1,0 +1,841 @@
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { appendFileSync, chmodSync, mkdirSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { harnessLog } from '../log.js';
+import { GitCredentialService } from '../../user/git-credential.service.js';
+import { ASKPASS } from '../../file/git-write-operation.service.js';
+import { isReservedEnvKey, sanitizeInheritedEnv } from '../../common/sensitive-env.js';
+
+/** 已写入 stdin 但尚未读到结束标记的命令。 */
+export interface PendingCommand {
+  marker: string;
+  keepSession: boolean;
+  /** false 表示 cd/pwd 等协议命令，输出不落盘。 */
+  persist: boolean;
+  /** 非空表示读取权归该后台任务，其他调用方不得直接读缓冲区。 */
+  taskId: string | null;
+}
+
+/** 缓冲区上限；超限时把最旧的一段落盘后丢出内存，输出文件仍然完整。 */
+const MAX_BUFFER_CHARS = 262_144;
+/** 裁剪时保留的尾部长度，确保结束标记不会被切成两半。 */
+const BUFFER_KEEP_TAIL_CHARS = 8192;
+
+export class ShellSession {
+  readonly createdAt = Date.now();
+  lastActiveAt = Date.now();
+  alive = true;
+  currentWorkdir: string;
+  commandCount = 0;
+  /** 未读完的命令；提前放行（wait_for 命中或超时）后仍然保留，供后续续等。 */
+  pendingCommand: PendingCommand | null = null;
+  /** 最近一次被 finishCommand 消费的 marker：防止过期调用方把它重新登记成永不出现的假 pending。 */
+  private lastConsumedMarker: string | null = null;
+  private buffer = '';
+  private persistedUpTo = 0;
+  private emittedUpTo = 0;
+  private bufferTrimmed = false;
+  private waiters: Array<() => void> = [];
+  private commandQueue: Promise<void> = Promise.resolve();
+  private readonly userEnvironmentKeys = new Set<string>();
+  /** stdout 'end' 之后才不会再有输出；进程 exit 可能早于管道排空。 */
+  private stdoutEnded = false;
+  /** 子进程当前 PATH（spawn 时记录、refresh 时更新）：deps env 前置时基于它拼接。 */
+  currentPath: string | null;
+
+  constructor(
+    readonly sessionId: string,
+    readonly conversationId: number | null,
+    readonly process: ChildProcessWithoutNullStreams,
+    readonly workspaceDir: string,
+    readonly outputFile: string,
+    initialUserEnvironmentKeys: Iterable<string> = [],
+    pathValue: string | null = null,
+    /** 三级环境变量的工作区绑定键（会话创建时的 workspace，未经 cd 改写）；null 归一为全局根。 */
+    readonly envWorkspace: string | null = null,
+  ) {
+    for (const key of initialUserEnvironmentKeys) this.userEnvironmentKeys.add(key);
+    this.currentPath = pathValue;
+    this.currentWorkdir = workspaceDir;
+    this.process.stdout.setEncoding('utf8');
+    this.process.stderr.setEncoding('utf8');
+    this.process.stdin.on('error', (error) => this.handleProcessError('stdin', error));
+    this.process.stdout.on('error', (error) => this.handleProcessError('stdout', error));
+    this.process.stderr.on('error', (error) => this.handleProcessError('stderr', error));
+    this.process.on('error', (error) => this.handleProcessError('process', error));
+    // 常驻读取：读取者退出后 stdout 若无监听者，Node 会直接丢弃数据，
+    // 提前放行后剩下的输出（含结束标记）就再也读不到了。
+    this.process.stdout.on('data', (data: string | Buffer) => this.onData(data));
+    this.process.stdout.on('end', () => {
+      this.stdoutEnded = true;
+      this.wake();
+    });
+    this.process.on('exit', () => this.wake());
+  }
+
+  private handleProcessError(source: string, error: Error): void {
+    if (this.alive) {
+      harnessLog('warn', `Shell session ${this.sessionId} ${source} error: ${error.message}`);
+    }
+  }
+
+  touch(): void {
+    this.lastActiveAt = Date.now();
+  }
+
+  /** 记录一条刚写入 stdin 的命令。persist=false 用于 cd/pwd 等协议命令，其输出不落盘。 */
+  beginCommand(marker: string, keepSession: boolean, persist = true, taskId: string | null = null): void {
+    this.pendingCommand = { marker, keepSession, persist, taskId };
+  }
+
+  /** 缓冲区当前内容（含尚未出现的结束标记之后的部分）。 */
+  peekBuffer(): string {
+    return this.buffer;
+  }
+
+  /** 已被 finishCommand 消费过的 marker（供 OutputManager 防止过期调用方重新登记假 pending）。 */
+  consumedMarker(): string | null {
+    return this.lastConsumedMarker;
+  }
+
+  /** 已经返回给调用方的前缀长度：提前放行后续等时从这里继续。 */
+  emittedBoundary(): number {
+    return this.emittedUpTo;
+  }
+
+  markEmitted(end: number): void {
+    if (end > this.emittedUpTo) this.emittedUpTo = end;
+  }
+
+  /** 缓冲区因超限被裁剪过：读取者据此把结果标记为 truncated。 */
+  wasBufferTrimmed(): boolean {
+    return this.bufferTrimmed;
+  }
+
+  /** 当前命令读到结束标记：落盘剩余可见输出，丢掉已消费的前缀。 */
+  finishCommand(consumedEnd: number): void {
+    if (this.pendingCommand) this.lastConsumedMarker = this.pendingCommand.marker;
+    this.flushPersist(true);
+    this.buffer = this.buffer.slice(consumedEnd);
+    this.persistedUpTo = 0;
+    this.emittedUpTo = 0;
+    this.bufferTrimmed = false;
+    this.pendingCommand = null;
+  }
+
+  /** 等待新输出、进程退出或超时。 */
+  async waitForOutput(timeoutMs: number): Promise<void> {
+    if (timeoutMs <= 0 || !this.isAlive()) return;
+    await new Promise<void>((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        this.waiters = this.waiters.filter((w) => w !== finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, timeoutMs);
+      this.waiters.push(finish);
+    });
+  }
+
+  /** 进程已退出后仍可能有未读完的 stdout；短等管道排空。 */
+  async waitForStdoutDrain(timeoutMs: number): Promise<void> {
+    if (timeoutMs <= 0 || this.stdoutEnded) return;
+    await new Promise<void>((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        this.waiters = this.waiters.filter((w) => w !== finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, timeoutMs);
+      this.waiters.push(finish);
+    });
+  }
+
+  private onData(data: string | Buffer): void {
+    this.buffer += typeof data === 'string' ? data : data.toString('utf8');
+    // 有输出即视为活跃，否则长时间只输出不被读取的命令会被空闲清理杀掉
+    this.lastActiveAt = Date.now();
+    this.flushPersist(false);
+    this.trimBuffer();
+    this.wake();
+  }
+
+  private wake(): void {
+    const waiters = this.waiters;
+    this.waiters = [];
+    for (const waiter of waiters) waiter();
+  }
+
+  /**
+   * 把缓冲区中「确定属于命令输出」的前缀落盘：结束标记本身及其后的退出码不能写进文件，
+   * 因此未见到标记时按尾部与标记前缀的实际重叠长度回退，防止标记被切成两半后漏进文件。
+   */
+  private flushPersist(final: boolean): void {
+    const pending = this.pendingCommand;
+    if (pending && !pending.persist) return;
+    const marker = pending?.marker;
+    let visibleEnd: number;
+    if (!marker) {
+      visibleEnd = this.buffer.length;
+    } else {
+      const idx = this.buffer.indexOf(marker);
+      visibleEnd = idx >= 0
+        ? idx
+        : final ? this.buffer.length : this.buffer.length - pendingMarkerTail(this.buffer, marker);
+    }
+    if (visibleEnd <= this.persistedUpTo) return;
+    try {
+      appendFileSync(this.outputFile, this.buffer.slice(this.persistedUpTo, visibleEnd));
+      this.persistedUpTo = visibleEnd;
+    } catch { /* ignore */ }
+  }
+
+  /** 无人读取的常驻命令（dev server）不能让缓冲区无限增长；已落盘部分可以丢，输出文件仍然完整。 */
+  private trimBuffer(): void {
+    if (this.buffer.length <= MAX_BUFFER_CHARS) return;
+    const dropTo = Math.min(this.persistedUpTo, this.buffer.length - BUFFER_KEEP_TAIL_CHARS);
+    if (dropTo <= 0) return;
+    this.buffer = this.buffer.slice(dropTo);
+    this.persistedUpTo -= dropTo;
+    this.emittedUpTo = Math.max(0, this.emittedUpTo - dropTo);
+    this.bufferTrimmed = true;
+  }
+
+  isAlive(): boolean {
+    return this.alive && this.process.exitCode == null && !this.process.killed;
+  }
+
+  hasStdoutEnded(): boolean {
+    return this.stdoutEnded;
+  }
+
+  /** 进程已退出时的状态码：正常退出用 bash 的 exit code；被信号杀掉则为 -1。 */
+  processExitStatus(): number | null {
+    if (this.process.exitCode != null) return this.process.exitCode;
+    if (this.process.signalCode || !this.isAlive()) return -1;
+    return null;
+  }
+
+  isIdleTimeout(timeoutMs: number): boolean {
+    return Date.now() - this.lastActiveAt > timeoutMs;
+  }
+
+  isExpired(maxLifetimeMs: number): boolean {
+    return Date.now() - this.createdAt > maxLifetimeMs;
+  }
+
+  incrementCommandCount(): void {
+    this.commandCount++;
+  }
+
+  setCurrentWorkdir(workdir: string): void {
+    this.currentWorkdir = workdir;
+  }
+
+  writeStdin(text: string): void {
+    this.process.stdin.write(text);
+  }
+
+  refreshEnvironment(env: Record<string, string | null | undefined>): void {
+    const nextKeys = new Set(Object.keys(env));
+    // PATH 永不 unset：deps env 刷新曾把它写进 userEnvironmentKeys，某次刷新不再带 PATH 时
+    // unset 会让 shell 后续所有命令找不到二进制
+    const commands = [...this.userEnvironmentKeys]
+      .filter((key) => !nextKeys.has(key) && key !== 'PATH')
+      .map((key) => `unset ${key}`);
+    for (const [key, value] of Object.entries(env)) {
+      commands.push(value == null
+        ? `unset ${key}`
+        : `export ${key}='${value.replace(/'/g, "'\\''")}'`);
+    }
+    if (commands.length > 0) this.writeStdin(commands.join('\n') + '\n');
+    this.userEnvironmentKeys.clear();
+    for (const key of nextKeys) this.userEnvironmentKeys.add(key);
+  }
+
+  close(): void {
+    if (!this.alive) return;
+    this.alive = false;
+    // 杀掉整个进程组而非仅 bash：若 bash 退出而后代（如 gradle）残留，
+    // 管道不会 EOF，readUntilMarker 会一直空等。
+    const pid = this.process.pid;
+    if (pid != null) {
+      try {
+        process.kill(-pid, 'SIGKILL');
+      } catch { /* group already gone */ }
+    }
+    try {
+      this.process.kill('SIGKILL');
+    } catch { /* ignore */ }
+    try {
+      this.process.stdin.end();
+    } catch { /* ignore */ }
+    // 立刻唤醒等待者，否则 readUntilMarker 会空等到 yield 超时才发现会话已关闭
+    this.wake();
+    harnessLog('info', `Closed shell session: ${this.sessionId}`);
+  }
+
+  async acquireCommand(): Promise<() => void> {
+    const previous = this.commandQueue;
+    let release!: () => void;
+    this.commandQueue = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    return release;
+  }
+}
+
+export interface OutputResult {
+  output: string;
+  truncated: boolean;
+  completed: boolean;
+  elapsedMs: number;
+  /** 命令的 `$?`，仅当调用方在 marker 后回显了退出码时可用。 */
+  exitCode: number | null;
+  /** wait_for 命中的文本；命中即提前返回，命令仍在后台继续运行。 */
+  matched: string | null;
+  /** bash 已退出（命令含 exit/exec、进程崩溃或会话被关闭），没有更多输出。 */
+  shellExited?: boolean;
+}
+
+/** 匹配紧跟在 marker 之后被回显的 `$?`。 */
+const EXIT_STATUS_PATTERN = /^[ \t]*(-?\d+)[ \t]*\r?\n?/;
+/** 轮询上限：waitForOutput 已由新输出唤醒，这里只兜底超时判定。 */
+const WAIT_SLICE_MS = 200;
+
+/**
+ * 缓冲区末尾与 marker 前缀重叠的长度：这段可能是刚到一半的结束标记，
+ * 既不能当正文交给模型也不能落盘，等剩余字节到达再判定。
+ */
+function pendingMarkerTail(buffer: string, marker: string): number {
+  const max = Math.min(marker.length - 1, buffer.length);
+  for (let k = max; k > 0; k--) {
+    if (buffer.endsWith(marker.slice(0, k))) return k;
+  }
+  return 0;
+}
+
+export class OutputManager {
+  constructor(
+    private readonly maxPreviewLines = 100,
+    private readonly maxPreviewChars = 10000,
+  ) {}
+
+  /**
+   * 读到结束标记、`waitFor` 命中正文、进程退出或超时为止。
+   * 输出取自会话常驻缓冲区，因此提前返回后剩余输出不会丢失，可再次调用继续读。
+   */
+  async readUntilMarker(
+    session: ShellSession,
+    marker: string,
+    timeoutMs: number,
+    waitFor: RegExp | null = null,
+  ): Promise<OutputResult> {
+    const start = Date.now();
+    const deadline = start + timeoutMs;
+    // 直接调用（协议命令、测试）没有登记 pending，按默认落盘补登记；
+    // marker 已被其他调用方消费过（finishCommand 置空了 pending）时绝不能重新登记，
+    // 否则等于造出一条永不结束的假命令，把会话永久卡死。
+    if (session.pendingCommand?.marker !== marker) {
+      if (session.consumedMarker() === marker) {
+        return {
+          output: '',
+          truncated: false,
+          completed: true,
+          elapsedMs: 0,
+          exitCode: null,
+          matched: null,
+        };
+      }
+      session.beginCommand(marker, true);
+    }
+
+    let matched: string | null = null;
+    let markerIndex = -1;
+    while (true) {
+      const buffer = session.peekBuffer();
+      markerIndex = buffer.indexOf(marker);
+      if (markerIndex >= 0) break;
+      if (waitFor) {
+        // 只在尚未返回给调用方的部分里找，避免续等时被上一次已交付的输出立刻命中。
+        const hit = waitFor.exec(buffer.slice(session.emittedBoundary()));
+        if (hit) {
+          matched = hit[0];
+          // printf 命中后紧跟 exit 很常见：stdout 结束会先于 exitCode 到达，
+          // 必须在宽限期内等到进程真正退出，否则会误报「命令仍在运行」。
+          const graceDeadline = Date.now() + WAIT_SLICE_MS;
+          while (session.isAlive()) {
+            markerIndex = session.peekBuffer().indexOf(marker);
+            if (markerIndex >= 0) break;
+            const remain = graceDeadline - Date.now();
+            if (remain <= 0) break;
+            await session.waitForOutput(remain);
+          }
+          if (markerIndex < 0) markerIndex = session.peekBuffer().indexOf(marker);
+          break;
+        }
+      }
+      if (!session.isAlive()) {
+        // exit 可能早于 stdout：宽限期内把管道排空，再回头匹配 wait_for / 结束标记。
+        if (!session.hasStdoutEnded()) {
+          const drainDeadline = Date.now() + WAIT_SLICE_MS;
+          while (!session.hasStdoutEnded()) {
+            const remain = drainDeadline - Date.now();
+            if (remain <= 0) break;
+            await session.waitForStdoutDrain(remain);
+          }
+        }
+        const drained = session.peekBuffer();
+        markerIndex = drained.indexOf(marker);
+        if (markerIndex < 0 && waitFor && matched == null) {
+          const hit = waitFor.exec(drained.slice(session.emittedBoundary()));
+          if (hit) matched = hit[0];
+        }
+        break;
+      }
+      const remain = deadline - Date.now();
+      if (remain <= 0) break;
+      await session.waitForOutput(Math.min(remain, WAIT_SLICE_MS));
+    }
+
+    const buffer = session.peekBuffer();
+    if (markerIndex < 0) markerIndex = buffer.indexOf(marker);
+    const emitted = session.emittedBoundary();
+    if (markerIndex < 0) {
+      // 尾部可能是被切成两半的结束标记，留到下一次读取再判定，否则标记会漏进正文；
+      // 进程已退出时不会再有后续字节，按命令结束交付，避免 Agent 去续等已死会话。
+      const dead = !session.isAlive();
+      const tail = dead ? 0 : pendingMarkerTail(buffer, marker);
+      const end = Math.max(emitted, buffer.length - tail);
+      const preview = this.preview(buffer.slice(emitted, end));
+      const trimmed = session.wasBufferTrimmed();
+      session.markEmitted(end);
+      if (dead) {
+        session.finishCommand(buffer.length);
+        return {
+          output: preview.text,
+          truncated: preview.truncated || trimmed,
+          completed: true,
+          elapsedMs: Date.now() - start,
+          exitCode: session.processExitStatus(),
+          matched,
+          shellExited: true,
+        };
+      }
+      return {
+        output: preview.text,
+        truncated: preview.truncated || trimmed,
+        completed: false,
+        elapsedMs: Date.now() - start,
+        exitCode: null,
+        matched,
+      };
+    }
+
+    let consumed = markerIndex + marker.length;
+    let exitCode: number | null = null;
+    const status = EXIT_STATUS_PATTERN.exec(buffer.slice(consumed));
+    if (status) {
+      exitCode = Number(status[1]);
+      consumed += status[0].length;
+    } else {
+      const newline = /^\r?\n/.exec(buffer.slice(consumed));
+      if (newline) consumed += newline[0].length;
+    }
+    const preview = this.preview(buffer.slice(emitted, markerIndex));
+    const trimmed = session.wasBufferTrimmed();
+    session.finishCommand(consumed);
+    return {
+      output: preview.text,
+      truncated: preview.truncated || trimmed,
+      completed: true,
+      elapsedMs: Date.now() - start,
+      exitCode,
+      matched,
+      ...(!session.isAlive() ? { shellExited: true } : {}),
+    };
+  }
+
+  private preview(full: string): { text: string; truncated: boolean } {
+    const lines = full.split('\n');
+    let truncated = false;
+    let text = full;
+    if (lines.length > this.maxPreviewLines) {
+      text = lines.slice(-this.maxPreviewLines).join('\n');
+      truncated = true;
+    }
+    if (text.length > this.maxPreviewChars) {
+      text = text.slice(text.length - this.maxPreviewChars);
+      truncated = true;
+    }
+    return { text, truncated };
+  }
+}
+
+/** 子进程 PATH 缺失时的兜底（bash 编译期默认值的显式化）。 */
+const DEFAULT_CHILD_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+
+export class ShellSessionManager {
+  private readonly sessions = new Map<string, ShellSession>();
+  private readonly conversationSessions = new Map<number, Set<string>>();
+  private cleanupTimer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(
+    private readonly pathSandbox: { getEffectiveWorkspaceRoot(ws?: string | null): string; addAllowedRoot(root: string): void },
+    private readonly runtimeDataResolver: {
+      resolveShellOutputDir(userId: number, sessionId: number): string;
+      resolveSessionRuntimeDir(userId: number, sessionId: number): string;
+      resolveGitAskpassScript(userId: number, sessionId: number): string;
+      resolveUserHomeDir(userId: number | null | undefined): string | null;
+    },
+    private readonly maxSessionsPerConversation = 30,
+    private readonly sessionIdleTimeoutMinutes = 30,
+    private readonly sessionMaxLifetimeHours = 2,
+    /** 容器模式 askpass 私有目录（§5.7.2）：写 /tmp 而非宿主机共享的 runtime 路径，避免两套机制并发写同一文件。 */
+    private readonly askpassDirOverride?: string,
+    /**
+     * §5.13 依赖持久化 env 提供者（仅容器模式装配）：返回 NPM_CONFIG_PREFIX 等变量，
+     * 注入 shell 子进程使命 pip/npm 安装落到每用户 /deps 挂载。host 模式不传，行为零变化。
+     */
+    private readonly depsEnvProvider?: () => Record<string, string> | null,
+    /**
+     * 三级环境变量提供者（§5.7）：宿主侧查库 + 解密，容器侧直接取当前 envelope。
+     * 返回已合并、已过滤保留键的 KV；不传即行为零变化（LOCAL / 旧装配）。
+     */
+    private readonly envVarsProvider?: (
+      userId: number,
+      workspace: string | null,
+    ) => Record<string, string> | null | Promise<Record<string, string> | null>,
+  ) {}
+
+  /** 供 ShellSessionTool 解析（工具侧只认 ShellSessionManager，不直接依赖 EnvVariableService）。 */
+  async resolveEnvVarsFor(
+    userId: number | null,
+    workspace: string | null,
+  ): Promise<Record<string, string> | null> {
+    if (userId == null || !this.envVarsProvider) return null;
+    try {
+      const vars = await this.envVarsProvider(userId, workspace);
+      return vars && Object.keys(vars).length > 0 ? vars : null;
+    } catch (e) {
+      harnessLog('warn', `Failed to resolve env vars for user=${userId}: ${(e as Error).message}`);
+      return null;
+    }
+  }
+
+  /** 会话刷新入口：绑定键取会话创建时的 workspace，不随 cd 变化。 */
+  async resolveEnvVarsForSession(session: ShellSession, userId: number | null): Promise<Record<string, string> | null> {
+    return this.resolveEnvVarsFor(userId, session.envWorkspace);
+  }
+
+  /** askpass 脚本落点：容器模式写私有目录，host 模式沿用会话 runtime 目录。 */
+  private askpassScriptPath(userId: number, sessionId: number): string {
+    if (this.askpassDirOverride) {
+      return path.join(this.askpassDirOverride, `askpass-${userId}-${sessionId}.sh`);
+    }
+    return this.runtimeDataResolver.resolveGitAskpassScript(userId, sessionId);
+  }
+
+  /** 关闭全部会话（容器 shutdown 时调用）。 */
+  closeAllSessions(): void {
+    for (const sessionId of [...this.sessions.keys()]) {
+      this.removeSession(sessionId);
+    }
+  }
+
+  refreshUserEnvironment(
+    session: ShellSession,
+    userId: number | null,
+    domainTokenMap: Record<string, string>,
+    depsEnv?: Record<string, string> | null,
+    /** 三级合并结果（§5.7 P0-1）：必须显式传入，否则删除变量无法 unset。 */
+    envVars?: Record<string, string> | null,
+  ): void {
+    const env: Record<string, string | null> = {};
+    this.configureUserHome(env as NodeJS.ProcessEnv, userId);
+    for (const [domain, token] of Object.entries(domainTokenMap)) {
+      env[GitCredentialService.envVarNameForDomain(domain)] = token;
+    }
+    const uid = userId ?? 0;
+    if (Object.keys(domainTokenMap).length > 0) {
+      const askPassScript = this.askpassScriptPath(uid, session.conversationId ?? 0);
+      mkdirSync(path.dirname(askPassScript), { recursive: true });
+      writeFileSync(askPassScript, ASKPASS, 'utf8');
+      try { chmodSync(askPassScript, 0o700); } catch { /* non-posix */ }
+      env.GIT_ASKPASS = askPassScript;
+      env.GIT_TERMINAL_PROMPT = '0';
+    } else {
+      env.GIT_ASKPASS = null;
+      env.GIT_TERMINAL_PROMPT = null;
+    }
+    const deps = this.resolveDepsEnv(depsEnv);
+    if (deps) this.applyDepsEnv(env, deps, session.currentPath);
+    // 三层变量在 deps 之后、GIT_TOKEN_* 前缀全清之前并入 env map（§7.4 P1-2：全清位置固定）
+    if (envVars) this.applyEnvVars(env, envVars);
+    // 进程启动时继承、未登记进 userEnvironmentKeys 的 GIT_TOKEN_* 清不掉，先按前缀全清再注入当前用户
+    session.writeStdin('for k in ${!GIT_TOKEN_@}; do unset "$k"; done\n');
+    session.refreshEnvironment(env);
+    if (env.PATH != null) session.currentPath = env.PATH;
+  }
+
+  getOrCreate(
+    conversationId: number,
+    shellSessionId: string | null,
+    userId: number | null,
+    workspace: string | null,
+    domainTokenMap?: Record<string, string>,
+    /** 三级合并结果：仅在新建会话时注入 spawn env；已存在会话由 refreshUserEnvironment 刷新。 */
+    envVars?: Record<string, string> | null,
+    /**
+     * 三级变量的工作区绑定键：必须是会话创建时的工作区（`workspace` 入参），
+     * 不能取 workdir（workdir 可能是子目录，cd 到子目录不应换一套变量）。
+     * 不传时回落 `workspace`。
+     */
+    envWorkspace?: string | null,
+  ): ShellSession {
+    if (shellSessionId && this.sessions.has(shellSessionId)) {
+      const existing = this.sessions.get(shellSessionId)!;
+      if (existing.isAlive()) {
+        if (existing.conversationId === conversationId) {
+          existing.touch();
+          return existing;
+        }
+        // 会话 id 会经工具结果暴露给模型、再经模型输出暴露给用户，不属不可猜测凭证：
+        // 持他人 id 命中复用分支即可以对方的 cwd / HOME / Git Token 环境执行命令。
+        // 归属不一致时拒绝复用，落到下方新建分支（换新 id，不动他人会话）。
+        harnessLog('warn', `Shell session ${shellSessionId} belongs to conversation ${existing.conversationId}; refusing reuse for conversation ${conversationId}`);
+      } else {
+        this.removeSession(shellSessionId);
+      }
+    }
+    const convSessions = this.conversationSessions.get(conversationId)
+      ?? new Set<string>();
+    this.conversationSessions.set(conversationId, convSessions);
+    if (convSessions.size >= this.maxSessionsPerConversation) {
+      throw new Error(`Maximum number of shell sessions (${this.maxSessionsPerConversation}) reached for conversation ${conversationId}. Close existing sessions first.`);
+    }
+    // 毫秒时间戳在并行工具调用下会同毫秒撞车，追加随机段保证唯一；
+    // 请求的 id 被他人存活会话占用时（归属不一致）同样换新 id
+    if (!shellSessionId || this.sessions.has(shellSessionId)) {
+      shellSessionId = `sh-${conversationId}-${Date.now()}-${randomUUID().replace(/-/g, '').slice(0, 8)}`;
+    }
+    const session = this.createSession(
+      shellSessionId, conversationId, userId, workspace, domainTokenMap, envVars,
+      envWorkspace === undefined ? workspace : envWorkspace,
+    );
+    this.sessions.set(shellSessionId, session);
+    convSessions.add(shellSessionId);
+    harnessLog('info', `Created shell session: ${shellSessionId} for conversation: ${conversationId}`);
+    return session;
+  }
+
+  /**
+   * 按 id 取会话。传 conversationId 时校验归属：模型可能从其他会话的工具结果里
+   * 拿到（或猜到）session_id，不校验即可读写他人的 shell。
+   */
+  getSession(sessionId: string, opts?: { allowDead?: boolean; conversationId?: number | null }): ShellSession | null {
+    const session = this.sessions.get(sessionId);
+    if (!session) return null;
+    if (opts?.conversationId != null && session.conversationId !== opts.conversationId) return null;
+    if (!session.isAlive()) return opts?.allowDead ? session : null;
+    session.touch();
+    return session;
+  }
+
+  /** 关闭会话；传 conversationId 时校验归属，避免关掉他人的 shell。 */
+  close(sessionId: string, opts?: { conversationId?: number | null }): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    if (opts?.conversationId != null && session.conversationId !== opts.conversationId) return;
+    this.removeSession(sessionId);
+  }
+
+  closeByConversation(conversationId: number): void {
+    const convSessions = this.conversationSessions.get(conversationId);
+    this.conversationSessions.delete(conversationId);
+    if (!convSessions) return;
+    for (const sessionId of convSessions) {
+      const session = this.sessions.get(sessionId);
+      this.sessions.delete(sessionId);
+      session?.close();
+    }
+    harnessLog('info', `Closed ${convSessions.size} shell sessions for conversation: ${conversationId}`);
+  }
+
+  listByConversation(conversationId: number): ShellSession[] {
+    const convSessions = this.conversationSessions.get(conversationId);
+    if (!convSessions) return [];
+    const result: ShellSession[] = [];
+    for (const sessionId of convSessions) {
+      const session = this.sessions.get(sessionId);
+      if (session?.isAlive()) result.push(session);
+    }
+    return result;
+  }
+
+  startCleanup(intervalMs = 60_000): void {
+    if (this.cleanupTimer) return;
+    this.cleanupTimer = setInterval(() => this.cleanupExpiredSessions(), intervalMs);
+  }
+
+  stopCleanup(): void {
+    if (!this.cleanupTimer) return;
+    clearInterval(this.cleanupTimer);
+    this.cleanupTimer = null;
+  }
+
+  cleanupExpiredSessions(): void {
+    const idleTimeout = this.sessionIdleTimeoutMinutes * 60_000;
+    const maxLifetime = this.sessionMaxLifetimeHours * 3600_000;
+    let cleaned = 0;
+    for (const [sessionId, session] of [...this.sessions.entries()]) {
+      const dead = !session.isAlive();
+      // 刚因 exit 退出、结果尚未收取的会话留给下一次 await_async，避免 Agent 看到「会话不存在」
+      if (dead && session.pendingCommand && !session.isIdleTimeout(idleTimeout) && !session.isExpired(maxLifetime)) {
+        continue;
+      }
+      if (dead || session.isIdleTimeout(idleTimeout) || session.isExpired(maxLifetime)) {
+        this.removeSession(sessionId);
+        cleaned++;
+      }
+    }
+    if (cleaned > 0) harnessLog('info', `Cleaned up ${cleaned} expired shell sessions`);
+  }
+
+  getActiveSessionCount(): number {
+    return this.sessions.size;
+  }
+
+  private createSession(
+    shellSessionId: string,
+    conversationId: number,
+    userId: number | null,
+    workspace: string | null,
+    domainTokenMap?: Record<string, string>,
+    envVars?: Record<string, string> | null,
+    envWorkspace: string | null = workspace,
+  ): ShellSession {
+    const workDir = this.pathSandbox.getEffectiveWorkspaceRoot(workspace);
+    const uid = userId ?? 0;
+    const outputDir = this.runtimeDataResolver.resolveShellOutputDir(uid, conversationId);
+    mkdirSync(outputDir, { recursive: true });
+    this.pathSandbox.addAllowedRoot(this.runtimeDataResolver.resolveSessionRuntimeDir(uid, conversationId));
+    const outputFile = path.join(outputDir, `${shellSessionId}.out`);
+    writeFileSync(outputFile, '');
+    // 禁止继承 process.env 里的 GIT_TOKEN_* / 主密钥等，只注入当前用户凭据
+    const env: NodeJS.ProcessEnv = { ...sanitizeInheritedEnv(process.env), TERM: 'dumb', PS1: '' };
+    const initialUserEnvironmentKeys = new Set<string>(['HOME']);
+    this.configureUserHome(env, userId);
+    if (domainTokenMap && Object.keys(domainTokenMap).length > 0) {
+      this.configureGitCredentials(env, uid, conversationId, domainTokenMap);
+      initialUserEnvironmentKeys.add('GIT_ASKPASS');
+      initialUserEnvironmentKeys.add('GIT_TERMINAL_PROMPT');
+      for (const domain of Object.keys(domainTokenMap)) initialUserEnvironmentKeys.add(GitCredentialService.envVarNameForDomain(domain));
+    }
+    const deps = this.resolveDepsEnv();
+    if (deps) {
+      this.applyDepsEnv(env, deps);
+      // PATH 不登记：refreshEnvironment 的 unset 清单若含 PATH 会引爆 shell（见 refreshEnvironment 守卫）
+      for (const key of Object.keys(deps)) initialUserEnvironmentKeys.add(key);
+    }
+    if (envVars) {
+      this.applyEnvVars(env, envVars);
+      for (const key of Object.keys(envVars)) initialUserEnvironmentKeys.add(key);
+    }
+    const child = spawn('bash', ['-c', 'exec 2>&1; exec bash --norc --noprofile'], {
+      cwd: workDir,
+      env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      // 独立进程组，close() 才能一次性回收 bash 的所有后代进程
+      detached: true,
+    });
+    return new ShellSession(shellSessionId, conversationId, child, workDir, outputFile, initialUserEnvironmentKeys, env.PATH ?? null, envWorkspace);
+  }
+
+  private configureUserHome(env: NodeJS.ProcessEnv, userId: number | null): void {
+    const userHome = this.runtimeDataResolver.resolveUserHomeDir(userId);
+    if (!userHome) return;
+    mkdirSync(userHome, { recursive: true });
+    try {
+      chmodSync(userHome, 0o700);
+    } catch { /* non-posix */ }
+    env.HOME = userHome;
+    this.pathSandbox.addAllowedRoot(userHome);
+  }
+
+  private configureGitCredentials(
+    env: NodeJS.ProcessEnv,
+    userId: number,
+    sessionId: number,
+    domainTokenMap: Record<string, string>,
+  ): void {
+    for (const [domain, token] of Object.entries(domainTokenMap)) {
+      env[GitCredentialService.envVarNameForDomain(domain)] = token;
+    }
+    const askPassScript = this.askpassScriptPath(userId, sessionId);
+    mkdirSync(path.dirname(askPassScript), { recursive: true });
+    writeFileSync(askPassScript, ASKPASS, 'utf8');
+    try {
+      chmodSync(askPassScript, 0o700);
+    } catch { /* non-posix */ }
+    env.GIT_ASKPASS = askPassScript;
+    env.GIT_TERMINAL_PROMPT = '0';
+  }
+
+  /** 取当前请求的 §5.13 deps env：host 模式无提供者返回 null（零变化）。 */
+  private resolveDepsEnv(explicit?: Record<string, string> | null): Record<string, string> | null {
+    const deps = explicit ?? this.depsEnvProvider?.() ?? null;
+    return deps && Object.keys(deps).length > 0 ? deps : null;
+  }
+
+  /**
+   * 三层变量写入 env map：保留键在此再过滤一次（双保险第二道，防「清单扩充但库里已有旧数据」）。
+   * PATH 不在保留键之外还能进来：清单已禁配，refreshEnvironment 也有 PATH 守卫。
+   */
+  private applyEnvVars(
+    env: Record<string, string | null | undefined>,
+    vars: Record<string, string>,
+  ): void {
+    for (const [key, value] of Object.entries(vars)) {
+      if (isReservedEnvKey(key)) {
+        harnessLog('warn', `[env] reserved key skipped when injecting: ${key}`);
+        continue;
+      }
+      env[key] = value;
+    }
+  }
+
+  /** deps env 写入子进程环境：原样注入 + MAO_DEPS_BIN 前置 PATH（npm i -g 的可执行文件直接可用）。 */
+  private applyDepsEnv(env: Record<string, string | null | undefined>, deps: Record<string, string>, basePath?: string | null): void {
+    for (const [key, value] of Object.entries(deps)) env[key] = value;
+    const depsBin = deps.MAO_DEPS_BIN;
+    if (!depsBin) return;
+    const base = basePath ?? env.PATH;
+    // 幂等：base 里可能已含上次注入的 deps bin（持久会话每条 exec 前都会 refresh，
+    // 以 session.currentPath 为 base 再前置一份），先剥掉历史残留再前置唯一一份，
+    // 否则 PATH 随 exec 次数无界增长
+    const kept = base
+      ? base.split(path.delimiter).filter((seg) => seg !== '' && seg !== depsBin)
+      : [];
+    // PATH 缺失（sanitize 后为空 / refresh map 不带 PATH）时退回系统默认 PATH：
+    // 只留 deps bin 会让 bash 里所有命令都找不到二进制
+    env.PATH = kept.length > 0 ? `${depsBin}${path.delimiter}${kept.join(path.delimiter)}` : `${depsBin}${path.delimiter}${DEFAULT_CHILD_PATH}`;
+  }
+
+  private removeSession(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    this.sessions.delete(sessionId);
+    if (session) {
+      session.close();
+      if (session.conversationId != null) {
+        this.conversationSessions.get(session.conversationId)?.delete(sessionId);
+      }
+    }
+  }
+}

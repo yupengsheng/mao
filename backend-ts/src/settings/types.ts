@@ -1,0 +1,172 @@
+export interface SystemSetting {
+  id?: number;
+  settingKey: string;
+  value?: string | null;
+  category: string;
+  description?: string | null;
+  editable?: number | null;
+  isSecret?: number | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export interface SystemSettingRepository {
+  list(category?: string | null): Promise<SystemSetting[]>;
+  findByKey(key: string): Promise<SystemSetting | null>;
+  updateById(setting: SystemSetting): Promise<void>;
+  /** 事务内执行批量写；任一失败整体回滚。 */
+  transaction<T>(fn: (repo: SystemSettingRepository) => Promise<T>): Promise<T>;
+}
+
+export interface SettingsRuntimeConfig {
+  workspaceRoot: string;
+  skillsDir: string;
+}
+
+export interface AgentLookup {
+  findById(id: number): Promise<{ id?: number; enabled?: number | null } | null>;
+}
+
+export interface ModelLookup {
+  findById(id: number): Promise<{ id?: number } | null>;
+}
+
+export interface LdapSettings {
+  enabled: boolean;
+  url: string;
+  baseDn: string;
+  userDn: string;
+  password: string;
+  userSearchBase: string;
+}
+
+export interface FeishuOAuthSettings {
+  enabled: boolean;
+  appId: string;
+  appSecret: string;
+  redirectUri: string;
+}
+
+export interface UploadSettings {
+  storageMode: string;
+  baseUrl: string;
+  maxSizeMb: number;
+}
+
+export interface TavilySettings {
+  apiKey: string;
+  baseUrl: string;
+  connectTimeout: number;
+  readTimeout: number;
+  maxResults: number;
+}
+
+export interface TinyFishSettings {
+  apiKey: string;
+  baseUrl: string;
+  connectTimeout: number;
+  readTimeout: number;
+}
+
+export type WebSearchProvider = 'tavily' | 'tinyfish';
+
+/** 全网搜索（web_search 工具）统一配置：由后台系统设置切换 provider。 */
+export interface WebSearchConfig {
+  provider: WebSearchProvider;
+  tavily: TavilySettings;
+  tinyfish: TinyFishSettings;
+}
+
+export interface OssSettings {
+  region: string;
+  accessKeyId: string;
+  accessKeySecret: string;
+  bucket: string;
+  sts: {
+    regionId: string;
+    endpoint: string;
+    accessKeyId: string;
+    accessKeySecret: string;
+    roleArn: string;
+    roleSessionName: string;
+    expire: number;
+    maxSizeMb: number;
+  };
+}
+
+/**
+ * 实例级邮件通知（SMTP）配置（V162）。
+ * 缺行 / enabled=false 均表示邮件渠道不可用：用户保存 EMAIL 偏好时拒绝，发送时返回不可重试失败。
+ */
+export interface EmailSmtpSettings {
+  enabled: boolean;
+  smtpHost: string;
+  smtpPort: number;
+  smtpUser: string;
+  smtpPassword: string;
+  /** 发件人地址；为空时回落 smtpUser。 */
+  fromAddr: string;
+  /** true=隐式 TLS（465），false=STARTTLS（587）。 */
+  useTls: boolean;
+}
+
+/** Agent 运行参数：线程池三元组启动时构建（改后需重启），WS 空闲超时同理。 */
+export interface AgentRuntimeSettings {
+  threadPoolSize: number;
+  threadPoolMax: number;
+  threadPoolQueue: number;
+  wsIdleTimeoutMs: number;
+}
+
+/** 任务通知调度参数：每次调度循环读取，保存后即时生效。 */
+export interface NotificationTuningSettings {
+  workerDelayMs: number;
+  batchSize: number;
+  maxAttempts: number;
+}
+
+/** harness 调参：均在启动时构建（改后需重启后端）。 */
+export interface HarnessTuningSettings {
+  compaction: {
+    enabled: boolean;
+    contextWindowTokens: number;
+    triggerRatio: number;
+    /** 请求体体积触发阈值（字节）；0 表示关闭体积触发。 */
+    triggerPayloadBytes: number;
+    maxSummaryTokens: number;
+    loopMidwayCompact: boolean;
+  };
+  llm: {
+    rateLimitMaxRetries: number;
+    rateLimitRetryDelaySeconds: number;
+    rateLimitMaxRetryDelaySeconds: number;
+    callTimeoutSeconds: number;
+    httpCallTimeoutSeconds: number;
+    streamIdleTimeoutSeconds: number;
+    /** Anthropic 协议顶层自动缓存断点开关（默认启用）。 */
+    anthropicAutoCache: boolean;
+    /** Anthropic 缓存 TTL：5m（默认）或 1h。 */
+    anthropicCacheTtl: '5m' | '1h';
+  };
+  webPage: {
+    connectTimeout: number;
+    readTimeout: number;
+    maxRawBytes: number;
+    maxOutputLength: number;
+    userAgent: string;
+  };
+  shell: {
+    maxSessionsPerConversation: number;
+    sessionIdleTimeoutMinutes: number;
+    sessionMaxLifetimeHours: number;
+  };
+}
+
+/** 云端终端参数：启动时构建（改后需重启后端）。 */
+export interface TerminalSettings {
+  maxSessionsPerTask: number;
+  maxSessionsGlobal: number;
+  idleTimeoutMinutes: number;
+  maxLifetimeHours: number;
+  outputBufferBytes: number;
+}

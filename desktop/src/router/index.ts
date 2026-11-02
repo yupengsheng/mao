@@ -1,0 +1,201 @@
+import { createRouter, createWebHistory, createWebHashHistory } from 'vue-router'
+import type { RouteRecordRaw } from 'vue-router'
+import { useAuthStore } from '../stores/auth'
+import { getToken } from '../utils/auth-storage'
+import { readRedirectQuery } from '../utils/login-redirect'
+
+const routes: RouteRecordRaw[] = [
+  {
+    path: '/share/public/:token',
+    name: 'PublicShare',
+    component: () => import('../views/share/ShareView.vue'),
+    meta: { public: true }
+  },
+  {
+    path: '/share/:token',
+    name: 'Share',
+    component: () => import('../views/share/ShareView.vue')
+  },
+  {
+    path: '/login',
+    name: 'Login',
+    component: () => import('../views/auth/LoginView.vue'),
+    meta: { public: true }
+  },
+  {
+    path: '/auth/ecp/feishu-callback',
+    name: 'EcpFeishuCallback',
+    component: () => import('../views/auth/EcpFeishuCallbackView.vue'),
+    meta: { public: true }
+  },
+  {
+    path: '/',
+    name: 'Layout',
+    component: () => import('../components/common/Layout.vue'),
+    children: [
+      {
+        path: '',
+        name: 'Home',
+        component: () => import('../views/task/TaskView.vue')
+      },
+      {
+        path: 'dingtalk/bind/:state',
+        name: 'DingtalkBind',
+        component: () => import('../views/settings/DingtalkBindRedirect.vue')
+      },
+      {
+        path: 'tasks/:sessionId',
+        name: 'Task',
+        component: () => import('../views/task/TaskView.vue')
+      },
+      {
+        path: 'settings',
+        component: () => import('../views/settings/SettingsView.vue'),
+        children: [
+          {
+            path: '',
+            redirect: '/settings/profile'
+          },
+          {
+            path: 'profile',
+            name: 'Profile',
+            component: () => import('../views/settings/ProfileView.vue')
+          },
+          {
+            path: 'server',
+            name: 'ServerSettings',
+            component: () => import('../views/settings/ServerSettingsView.vue')
+          },
+          {
+            path: 'desktop',
+            name: 'DesktopSettings',
+            component: () => import('../views/settings/DesktopSettingsView.vue')
+          },
+          {
+            path: 'git-credentials',
+            name: 'GitCredentials',
+            component: () => import('../views/settings/GitCredentialsView.vue')
+          },
+          {
+            path: 'env-variables',
+            name: 'EnvVariables',
+            component: () => import('../views/settings/EnvVariablesView.vue')
+          },
+          {
+            path: 'notifications',
+            name: 'NotificationSettings',
+            component: () => import('../views/settings/NotificationSettingsView.vue')
+          },
+          {
+            path: 'memory',
+            name: 'Memory',
+            component: () => import('../views/settings/MemoryView.vue')
+          },
+          {
+            path: 'approval-rules',
+            name: 'ApprovalRules',
+            component: () => import('../views/settings/ApprovalRulesView.vue')
+          },
+          {
+            path: 'channel-bindings',
+            name: 'ChannelBindings',
+            component: () => import('../views/settings/ChannelBindingsView.vue')
+          },
+          {
+            path: 'mcp-servers',
+            name: 'McpServers',
+            component: () => import('../views/settings/McpServersView.vue')
+          },
+          {
+            path: 'skills',
+            name: 'Skills',
+            component: () => import('../views/settings/SkillsView.vue')
+          },
+          {
+            path: 'commands',
+            name: 'Commands',
+            component: () => import('../views/settings/CommandsView.vue')
+          },
+          {
+            path: 'open-api',
+            name: 'OpenApi',
+            component: () => import('../views/settings/OpenApiView.vue')
+          },
+          {
+            path: 'signal-watchers',
+            name: 'SignalWatchers',
+            component: () => import('../views/settings/SignalWatchersView.vue')
+          },
+          {
+            path: 'scheduled-tasks',
+            name: 'ScheduledTasks',
+            component: () => import('../components/ScheduledTaskPanel.vue')
+          }
+        ]
+      }
+    ]
+  }
+]
+
+function isCapacitorLocalBundle(): boolean {
+  try {
+    const capacitor = (window as any).Capacitor
+    if (capacitor?.isNativePlatform?.()) {
+      const host = window.location.hostname || ''
+      return /^(localhost|127\.0\.0\.1)$/i.test(host)
+    }
+  } catch {
+    // ignore
+  }
+  // Capacitor 注入前的兜底：旧版内嵌包以 localhost 加载
+  const host = window.location.hostname || ''
+  return /Android/i.test(navigator.userAgent || '') && /^(localhost|127\.0\.0\.1)$/i.test(host)
+}
+
+function createAppHistory() {
+  // Electron 打包后从本地 dist 加载（file://），需使用 hash 路由
+  if (typeof window !== 'undefined' && window.location.protocol === 'file:') {
+    return createWebHashHistory()
+  }
+  // 旧版安卓内嵌包（--base=./ + localhost）：History 刷新会使 ./assets 404
+  if (typeof window !== 'undefined' && isCapacitorLocalBundle()) {
+    return createWebHashHistory()
+  }
+  return createWebHistory()
+}
+
+const router = createRouter({
+  history: createAppHistory(),
+  routes
+})
+
+// Navigation guard — 未登录只能进公开页（/login），已登录访问 /login 时回跳目标页
+router.beforeEach(async (to, _from, next) => {
+  const token = getToken()
+  const isPublic = to.meta.public === true
+
+  if (!token) {
+    if (isPublic) return next()
+    return next({
+      name: 'Login',
+      query: to.fullPath && to.fullPath !== '/' ? { redirect: to.fullPath } : undefined,
+      replace: true
+    })
+  }
+
+  if (to.name === 'Login') {
+    return next({ path: readRedirectQuery(to.query), replace: true })
+  }
+
+  const authStore = useAuthStore()
+  if (!authStore.user) {
+    try {
+      await authStore.fetchUserInfo()
+    } catch {
+      // 401 由 API 拦截器处理（refresh → 失败强制下线）；其它错误不阻断导航，避免弱网被踢出
+    }
+  }
+  next()
+})
+
+export default router

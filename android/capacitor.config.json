@@ -1,0 +1,12 @@
+{
+  "appId": "cn.etarch.mao.app",
+  "appName": "Mao",
+  "webDir": "web-stub",
+  "server": {
+    "url": "https://mao.etarch.cn",
+    "androidScheme": "https"
+  },
+  "android": {
+    "adjustMarginsForEdgeToEdge": "force"
+  }
+}

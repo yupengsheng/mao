@@ -1,0 +1,1256 @@
+<template>
+  <div class="side-chat-panel">
+    <!-- 消息列表 -->
+    <div class="messages" ref="messagesContainer"
+      @touchstart.passive="handleTouchStart" @touchmove.passive="handleTouchMove"
+      @pointerdown="handlePointerDown">
+      <div v-if="sideHistoryAnchored" class="history-anchor-bar">
+        <span>正在查看较早的消息</span>
+        <button type="button" class="history-anchor-back" @click="backToLatestSide">回到最新</button>
+      </div>
+      <!-- 创建会话中 loading -->
+      <div v-if="!hasRealSession && sending && displayMessages.length === 0" class="side-chat-loading">
+        <el-icon :size="32" class="is-loading"><Loading /></el-icon>
+      </div>
+
+      <!-- Fork 预览加载中 -->
+      <div v-else-if="forkPreviewLoading && displayMessages.length === 0" class="side-chat-loading">
+        <el-icon :size="32" class="is-loading"><Loading /></el-icon>
+      </div>
+
+      <!-- 首条消息提示 -->
+      <div v-else-if="!hasRealSession && displayMessages.length === 0 && !sending" class="side-chat-empty">
+        <template v-if="forkPreviewSelected">
+          <el-icon :size="48" class="empty-icon"><Connection /></el-icon>
+          <p>Fork 预览：下面是新任务创建时会被一同写入的历史消息</p>
+          <p class="side-chat-empty-hint">仅为预览，发出首条消息后才会真正保存</p>
+        </template>
+        <template v-else>
+          <el-icon :size="48" class="empty-icon"><Opportunity /></el-icon>
+          <p>边路任务：独立的对话通道，不影响主任务上下文</p>
+        </template>
+      </div>
+
+      <!-- Fork 预览提示条：明确接下来这几条会随新任务落库，避免误以为已经在跑 -->
+      <div v-if="forkPreviewSelected" class="fork-preview-banner" role="status">
+        <el-icon :size="14"><Connection /></el-icon>
+        <span>Fork 预览：以下历史消息将在你发出首条消息时一并写入这条新任务</span>
+      </div>
+
+      <!-- 消息列表（轮次折叠，与主聊天一致）。
+           fork 预览态走本地 ref（不写 sessionStore）：真实会话还没创建，缓存会在会话
+           转正 / Tab 复用 / 卸载清理上与后端 fork 回来的消息抢镜。 -->
+      <ChatRoundList
+        v-if="displayMessages.length > 0"
+        :messages="displayMessages"
+        :sending="sending"
+        :session-id="hasRealSession ? String(realSessionId) : ''"
+        :compaction-events="compactionEvents"
+        :dislike-enabled="hasRealSession"
+        :fork-enabled="true"
+        :share-enabled="hasRealSession"
+        @add-to-command="(content: string) => commandEditDialogRef?.open({ content })"
+        @fork="openSideTask?.('fork', $event)"
+        @share="openShareDialog"
+      />
+
+      <div v-if="sideCompacting" class="compaction-hint" role="status">
+        <span class="compaction-spinner" aria-hidden="true"></span>
+        <span>正在整理历史对话，腾出上下文空间…</span>
+      </div>
+
+      <!-- 流式输出指示器 -->
+      <div v-if="showTypingIndicator" class="typing-indicator">
+        <div class="typing-dots">
+          <span></span>
+          <span></span>
+          <span></span>
+        </div>
+        <div v-if="typingRetry?.attempt" class="typing-retry">
+          <span class="typing-retry-spinner"></span>
+          <span>上游响应异常{{ typingRetry.statusCode ? `（HTTP ${typingRetry.statusCode}）` : '' }}，正在第 {{ typingRetry.attempt }}/{{ typingRetry.maxRetries }} 次重试，{{ typingRetry.delaySeconds }} 秒后继续…</span>
+        </div>
+      </div>
+
+      <!-- Agent 提问面板（边路任务） -->
+      <QuestionPanel
+        v-if="sidePendingQuestions.length > 0"
+        :items="sidePendingQuestions"
+        @submit="submitQuestionAnswer"
+      />
+    </div>
+
+    <!-- 消息队列面板 -->
+    <QueuePanel
+      v-if="hasRealSession"
+      :session-id="String(realSessionId)"
+      @edit="handleQueueEdit"
+      @insert="insertQueueMessage"
+      @delete="deleteQueueMessage"
+      @reorder="reorderQueueMessage"
+    />
+
+    <ApprovalStack
+      v-if="sidePendingApprovals.length > 0"
+      :items="sidePendingApprovals"
+      @confirm="confirmApproval"
+    />
+
+    <!-- 输入区 -->
+    <div class="input-area">
+      <div class="side-task-entry">
+        <button type="button" class="side-task-btn" @click="openSideTask?.()">
+          + 边路任务
+        </button>
+      </div>
+
+      <ExecutionErrorBanner
+        :message="executionError"
+        :can-retry="!sending && hasRealSession"
+        :session-id="realSessionId > 0 ? String(realSessionId) : ''"
+        @retry="handleRetryExecution"
+      />
+
+      <!-- 继承方式单选：会话创建前可选。fork 预览态也必须保留——预览消息来自来源会话，
+           用户看完要能改回不继承 / 摘要，否则一旦选中 Fork 就失去了选择权。 -->
+      <div v-if="!hasRealSession && (displayMessages.length === 0 || forkPreviewSelected)" class="inherit-bar">
+        <el-radio-group v-model="contextMode" size="small">
+          <el-radio value="none">不继承</el-radio>
+          <el-radio value="summary">{{ sourceLabelText }}摘要</el-radio>
+          <el-radio value="fork">Fork {{ sourceLabelText }}</el-radio>
+        </el-radio-group>
+      </div>
+
+      <ChatInput
+        ref="chatInputRef"
+        :register-key="tabId"
+        :draft-key="tabId"
+        :loading="sending"
+        :can-continue="canContinue"
+        :waiting-for-save="waitingForSave"
+        :workspace="parentWorkspace"
+        :cloud-project-key="parentCloudProjectKey"
+        :project-key="parentProjectKey"
+        :execution-mode="parentExecutionMode"
+        :model-id="currentModelId"
+        :model-supports-vision="currentModelSupportsVision"
+        :permission-level="sidePermissionLevel"
+        :is-new-task="false"
+        @send="handleChatSend"
+        @stop="handleStop"
+        @continue="handleRetryExecution"
+        @update:model-id="handleModelSwitch"
+        @update:permission-level="handleSidePermissionChange"
+      />
+    </div>
+
+    <CommandEditDialog ref="commandEditDialogRef" />
+    <ShareDialog v-model="shareVisible" :session-id="shareSessionId" />
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, computed, watch, nextTick, onMounted, onUnmounted, onActivated, inject, provide, type Ref } from 'vue'
+import { Opportunity, Loading, Connection } from '@element-plus/icons-vue'
+import { useSessionStore } from '../../stores/session'
+import { useDraftStore } from '../../stores/draft'
+import { useStreamWS } from '../../composables/useStreamWS'
+import { api } from '../../api'
+import { cloudProjectKeyForNewTask } from '../../utils/cloud-project'
+import { mapMessagesWithFileChanges, mapCompactionEvents } from '../../utils/chatMessage'
+import { generateUUID } from '../../utils/uuid'
+import { collectLocalUnsyncedSkills } from '../../utils/localSkills'
+import { collectAgentsMdContent } from '../../utils/agentsMd'
+import { nowDateTime } from '../../utils/datetime'
+import { normalizeMessageRole } from '../../types/chat'
+import type { QuestionAnswer } from '../../types/chat'
+import { useToolApprovals } from '../../composables/useChat'
+import { loadDislikedIds } from '../../composables/useMessageFeedback'
+import { useForkPreview } from '../../composables/useForkPreview'
+import { useChatScroll } from '../../composables/useChatScroll'
+import { useChatQueue } from '../../composables/useChatQueue'
+import { guardUploadsBeforeSend, waitForMessageSaved, awaitExecutionSettled, finalizeCancelledSession } from '../../composables/chatSessionActions'
+import { LOCATE_FLASH_KEY, useMessageLocate } from '../../composables/useMessageLocate'
+import { uploadImages } from '../../utils/imageUpload'
+import { uploadPendingFiles } from '../../utils/chatFileUpload'
+import { copyLocalPendingFiles } from '../../utils/chatLocalAttach'
+import type { PendingUploadFile } from '../../composables/useChat'
+import type { SideTaskContextMode } from '../../types/file-browser'
+import ChatRoundList from './ChatRoundList.vue'
+import ChatInput from './ChatInput.vue'
+import QuestionPanel from './QuestionPanel.vue'
+import QueuePanel from './QueuePanel.vue'
+import ApprovalStack from './ApprovalStack.vue'
+import ExecutionErrorBanner from './ExecutionErrorBanner.vue'
+import CommandEditDialog from '../command/CommandEditDialog.vue'
+import ShareDialog from '../task/ShareDialog.vue'
+import { ElMessage } from 'element-plus'
+
+const chatInputRef = ref<InstanceType<typeof ChatInput>>()
+
+const messagesContainer = ref<HTMLElement>()
+
+const props = defineProps<{
+  tabId: string
+  sideSessionId: number
+  /** 创建入口预置的上下文继承方式（fork 图标入口）；未传默认「不继承」 */
+  contextMode?: SideTaskContextMode
+  /** 分叉切点：被点击那一轮的助手最终回复 id（字符串形式），仅按轮分叉时传入 */
+  forkFromMessageId?: string
+  /** 分叉来源标签（该轮用户消息摘录 + 时间），仅用于 Tab hover，不参与发送 */
+  forkFromLabel?: string
+  /** 本次创建的来源会话 id：从边路任务发起时为该边路会话；缺省 = 主会话 */
+  sourceSessionId?: number
+}>()
+
+const sessionStore = useSessionStore()
+const draftStore = useDraftStore()
+const { connect, createSideSession, sendMessage, cancel, retryExecution, subscribe, unsubscribe, sendAskUserQuestionsResult, enqueueMessage } = useStreamWS()
+const { pendingApprovals, confirmApproval } = useToolApprovals()
+
+const commandEditDialogRef = ref<InstanceType<typeof CommandEditDialog>>()
+
+
+const parentExecutionMode = inject<Ref<string>>('executionMode', ref('CLOUD'))
+const isElectron = typeof window !== 'undefined' && !!(window as any).electronAPI
+
+/** 创建入口（每轮 fork 按钮 / + 边路任务），与主会话 ChatPanel 同源于 TaskView provide */
+const openSideTask = inject<
+  ((contextMode?: SideTaskContextMode, fork?: { messageId: string; label: string }) => void) | undefined
+>('openSideTask', undefined)
+
+const parentSession = computed(() => sessionStore.activeSession)
+
+/** 来源会话：边路任务发起时为该边路会话，缺省回落主会话。创建边路会话时作为父会话上报后端。 */
+const sourceSession = computed(() => {
+  if (props.sourceSessionId != null && props.sourceSessionId > 0) return String(props.sourceSessionId)
+  return sessionStore.activeSessionId ?? ''
+})
+
+/** 继承单选文案：来源为边路任务 → 「来源会话」，缺省 → 「主会话」 */
+const sourceLabelText = computed(() =>
+  props.sourceSessionId != null && props.sourceSessionId > 0 ? '来源会话' : '主会话'
+)
+
+// 来源为边路会话时补拉其 modelId / permissionLevel 作占位缺省：
+// 边路任务这两项可改（PATCH），与主会话可能不一致，缺省必须跟随来源会话
+// 而非主会话——否则 fork 出的新任务会静默拿到主会话的模型 / 权限。
+const sourceSessionMeta = ref<{ modelId?: number; permissionLevel?: string } | null>(null)
+const fetchedSourceMetaId = ref<number | null>(null)
+
+async function fetchSourceSessionMeta(sourceId: number) {
+  if (fetchedSourceMetaId.value === sourceId) return
+  fetchedSourceMetaId.value = sourceId
+  try {
+    const { data } = await api.get(`/sessions/${sourceId}`)
+    // 补拉返回前来源可能已被覆写/清除（占位复用的竞态窗口）：迟到响应不得覆盖最新选择
+    if (fetchedSourceMetaId.value !== sourceId) return
+    if (data) {
+      sourceSessionMeta.value = { modelId: data.modelId, permissionLevel: data.permissionLevel }
+    }
+  } catch {
+    if (fetchedSourceMetaId.value !== sourceId) return
+    sourceSessionMeta.value = null
+    fetchedSourceMetaId.value = null
+  }
+}
+
+watch(
+  () => props.sourceSessionId,
+  (id) => {
+    // 已转正的真实会话不再消费入口预置
+    if (props.sideSessionId != null && props.sideSessionId > 0) return
+    if (id != null && id > 0) {
+      void fetchSourceSessionMeta(id)
+    } else {
+      // 来源回退主会话（占位复用）：必须清除上一个边路来源补拉的缺省，
+      // 否则新任务会静默继承无关边路会话的模型 / 权限（发送时显式传值、后端传值优先）
+      sourceSessionMeta.value = null
+      fetchedSourceMetaId.value = null
+    }
+  },
+  { immediate: true },
+)
+
+const parentWorkspace = computed(() => parentSession.value?.workspace || '')
+const parentProjectKey = computed(() => parentSession.value?.projectKey)
+const parentCloudProjectKey = computed(() => {
+  const session = parentSession.value
+  return session ? cloudProjectKeyForNewTask(session) || '' : ''
+})
+
+// Real session ID: start with props if positive, otherwise 0
+const realSessionId = ref(props.sideSessionId > 0 ? props.sideSessionId : 0)
+const hasRealSession = computed(() => realSessionId.value > 0)
+
+// 队列操作与主会话共用同一实现；差异只有会话 id 来源（占位态还没有真实会话）
+const { fetchQueue, insertQueueMessage, deleteQueueMessage, reorderQueueMessage, handleQueueEdit } = useChatQueue(
+  () => hasRealSession.value ? String(realSessionId.value) : null,
+  () => chatInputRef.value,
+)
+
+/** 分享会话弹窗（与任务列表右键「分享…」共用 ShareDialog）：只分享当前边路会话 */
+const shareVisible = ref(false)
+const shareSessionId = ref('')
+
+function openShareDialog() {
+  if (!hasRealSession.value) return
+  shareSessionId.value = String(realSessionId.value)
+  shareVisible.value = true
+}
+const { flashId: locateFlashId } = useMessageLocate({
+  sessionId: () => hasRealSession.value ? String(realSessionId.value) : null,
+  container: messagesContainer,
+  onLocate: () => pauseFollow(),
+})
+provide(LOCATE_FLASH_KEY, locateFlashId)
+const sideHistoryAnchored = computed(() => hasRealSession.value && sessionStore.isHistoryAnchored(String(realSessionId.value)))
+async function backToLatestSide() {
+  if (!hasRealSession.value) return
+  sessionStore.setHistoryAnchored(String(realSessionId.value), false)
+  await fetchMessages()
+  // 「回到最新」是显式动作：重置上滑状态并定位到底部（与主会话 backToLatest 对齐）
+  resumeFollow()
+}
+
+// Stable cache key for placeholder tabs — tabId does not change when sideSessionId is assigned
+const placeholderCacheKey = computed(() => props.tabId)
+
+const contextMode = ref<'none' | 'summary' | 'fork'>(props.contextMode ?? 'none')
+/** 消息 id 是数字字符串，解析失败（NaN）按无切点处理，等价于全量分叉 */
+function parseCutPoint(value: string | undefined): number | null {
+  if (!value) return null
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null
+}
+const forkFromMessageId = ref<number | null>(parseCutPoint(props.forkFromMessageId))
+// 占位 Tab 已挂载时入口又改了预置值（fork 图标 / 普通「+ 边路任务」）：同步到单选组。
+// 只在会话创建前生效——创建后再改不影响已开始的执行。
+watch([() => props.contextMode, () => props.forkFromMessageId], ([mode, messageId]) => {
+  if (hasRealSession.value) return
+  if (mode) contextMode.value = mode
+  forkFromMessageId.value = parseCutPoint(messageId)
+})
+
+// --- Fork 预览：把「发出后会复制过来的历史」先画出来，不落任何会话缓存 ---
+const forkPreview = useForkPreview({
+  sourceSessionId: computed(() => sourceSession.value || null),
+  contextMode,
+  forkFromMessageId,
+  hasRealSession,
+})
+/**
+ * 占位态是否展示 fork 预览。
+ * `sending` 也要排除：首条消息发出后乐观气泡与流式占位都写在 sessionStore 的占位缓存里，
+ * 若继续显示预览，用户会看不到自己刚发出去的那条消息和正在生成的回复。
+ * 发送被拒时 sending 复位、乐观消息回滚，自然回到预览。
+ */
+const forkPreviewSelected = computed(() =>
+  !hasRealSession.value && contextMode.value === 'fork' && !sending.value
+)
+/** 预览请求在途：仅在预览还没有任何消息时展示 loading，避免与消息列表抖动 */
+const forkPreviewLoading = computed(() => forkPreviewSelected.value && forkPreview.loading.value)
+/** 预览是否真正有数据：切换模式 / 会话转正后立刻回到真实数据源 */
+const forkPreviewActive = computed(() => forkPreviewSelected.value && forkPreview.messages.value.length > 0)
+/** 向上翻页加载更早的历史轮次（滚到顶部触发，与真实会话聊天一致） */
+async function loadOlderForkPreview(): Promise<boolean> {
+  return forkPreview.loadOlder()
+}
+
+const sending = ref(false)
+/** 发送互斥：仅防双击/双 Enter 重入。与 sending（忙碌/loading）分离——执行中 sending 由 phase 置位，不能拿来拦入队。 */
+const sendInFlight = ref(false)
+const waitingForSave = ref(false)
+
+/** 边路会话处于 CANCELLED 终态且未在执行时，输入框为空显示「继续」按钮（续跑语义同重试） */
+const canContinue = computed(() =>
+  hasRealSession.value && !sending.value
+  && sessionStore.getSessionPhase(String(realSessionId.value)) === 'CANCELLED'
+)
+
+/** 等待 user_message_saved 期间的清理回调（卸载时需主动调用，避免泄漏 watcher / 回调） */
+let pendingSendCleanup: (() => void) | null = null
+const selectedModelId = ref<number | undefined>(undefined)
+const sideModelId = ref<number | undefined>(undefined)
+
+const sidePermissionTouched = ref(false)
+const sidePermissionLevel = ref('READ_ONLY')
+
+function inheritedPermissionLevel(): string {
+  if (realSessionId.value > 0) {
+    const side = sessionStore.sessions.find(item => String(item.id) === String(realSessionId.value))
+    if (side?.permissionLevel) return side.permissionLevel
+  }
+  // 占位态缺省链：来源会话（边路发起，可能改过权限）> 主会话（现状回退）
+  const sourceLevel = sourceSessionMeta.value?.permissionLevel
+  if (sourceLevel) return sourceLevel
+  return parentSession.value?.permissionLevel || 'READ_ONLY'
+}
+
+watch(inheritedPermissionLevel, (level) => {
+  if (!sidePermissionTouched.value) sidePermissionLevel.value = level
+}, { immediate: true })
+
+async function handleSidePermissionChange(level: string) {
+  if (level === sidePermissionLevel.value) return
+  sidePermissionTouched.value = true
+  const previous = sidePermissionLevel.value
+  sidePermissionLevel.value = level
+  if (!hasRealSession.value) return
+  const sid = String(realSessionId.value)
+  sessionStore.updateSession(sid, { permissionLevel: level })
+  try {
+    await api.patch(`/sessions/${sid}`, { permissionLevel: level })
+  } catch {
+    sidePermissionLevel.value = previous
+    sessionStore.updateSession(sid, { permissionLevel: previous })
+    ElMessage.error('权限级别更新失败，请重试')
+  }
+}
+
+const currentModelId = computed(() => {
+  if (hasRealSession.value) {
+    return sideModelId.value ?? parentSession.value?.modelId
+  }
+  // 占位态缺省链：用户已选 > 来源会话（边路发起，可能改过模型）> 主会话（现状回退）
+  return selectedModelId.value ?? sourceSessionMeta.value?.modelId ?? parentSession.value?.modelId
+})
+
+// 可用模型列表（判断当前模型的视觉能力；占位会话 / PATCH 未完成时无法依赖会话缓存）
+const models = ref<Array<{ id: number; supportsVision: boolean }>>([])
+async function loadModels() {
+  try {
+    const { data } = await api.get('/models/active')
+    models.value = data || []
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * 当前模型视觉能力 tri-state：true=支持 / false=不支持 / undefined=未知（不拦截，交给后端校验）。
+ * 优先按用户当前选择的模型从模型列表查（切换后立即生效，不受 PATCH 时序影响）；
+ * 列表未命中时回退会话缓存。
+ */
+const currentModelSupportsVision = computed<boolean | undefined>(() => {
+  const mid = currentModelId.value
+  if (mid == null) return undefined
+  const m = models.value.find(x => x.id === mid)
+  if (m) return m.supportsVision
+  if (hasRealSession.value) {
+    const s = sessionStore.sessions.find(x => String(x.id) === String(realSessionId.value))
+    if (s?.modelSupportsVision != null) return s.modelSupportsVision
+  }
+  return undefined
+})
+
+/**
+ * 消息区数据源：
+ *  - 真实会话：会话自己的消息缓存（流式 + REST 回填都在里面）；
+ *  - 占位 + Fork 预览：preview.messages（本地 ref，不发请求落库）；
+ *  - 占位 + 其他模式：占位 Tab 的乐观消息（发送前为空，发送后的流式气泡走这里）。
+ */
+const displayMessages = computed(() => {
+  if (hasRealSession.value) {
+    return sessionStore.getMessages(String(realSessionId.value))
+  }
+  if (forkPreviewSelected.value) return forkPreview.messages.value
+  return sessionStore.getMessages(placeholderCacheKey.value)
+})
+
+const compactionEvents = computed(() => {
+  if (!hasRealSession.value) {
+    return forkPreviewSelected.value ? forkPreview.compactionEvents.value : []
+  }
+  return sessionStore.getCompactionEvents(String(realSessionId.value))
+})
+
+const sideCompacting = computed(() => {
+  if (!hasRealSession.value) return false
+  return sessionStore.isSessionCompacting(String(realSessionId.value))
+})
+
+const showTypingIndicator = computed(() => {
+  if (!sending.value) return false
+  const sid = hasRealSession.value ? String(realSessionId.value) : placeholderCacheKey.value
+  if (sessionStore.isSessionStreaming(sid)) return false
+  const msgs = displayMessages.value
+  const lastMsg = msgs[msgs.length - 1]
+  if (!lastMsg) return true
+  if (normalizeMessageRole(lastMsg.role ?? '') !== 'assistant') return true
+  const hasRunningTool = lastMsg.toolCalls?.some(
+    tc => tc.status === 'pending' || tc.status === 'running'
+  ) ?? false
+  if (hasRunningTool) return false
+  // 执行中但暂无流式输出/工具进行中 → 底部三点
+  return true
+})
+
+/** 底部重试提示：仅当消息区无 assistant 消息承载重试条时显示（如边路首轮重试） */
+const typingRetry = computed(() => {
+  if (!hasRealSession.value) return null
+  const retry = sessionStore.getLlmRetry(String(realSessionId.value))
+  if (!retry) return null
+  const msgs = displayMessages.value
+  const lastMsg = msgs[msgs.length - 1]
+  if (lastMsg && normalizeMessageRole(lastMsg.role ?? '') === 'assistant') return null
+  return retry
+})
+
+const sidePendingQuestions = computed(() => {
+  if (!hasRealSession.value) return []
+  return sessionStore.sessionPendingQuestions.get(String(realSessionId.value)) ?? []
+})
+
+const sidePendingApprovals = computed(() => {
+  if (!hasRealSession.value) return []
+  const sid = String(realSessionId.value)
+  return pendingApprovals.value.filter(a => a.sessionId === sid)
+})
+
+const executionError = computed(() => {
+  if (!hasRealSession.value) return null
+  return sessionStore.sessionExecutionErrors.get(String(realSessionId.value)) ?? null
+})
+
+const ACTIVE_PHASES = new Set(['RUNNING', 'RESUMING', 'WAITING_APPROVAL', 'CANCELLING'])
+const TERMINAL_PHASES = new Set(['COMPLETED', 'FAILED', 'CANCELLED', 'IDLE'])
+
+/** 边路任务 session 是否正在执行中 */
+const isSideActive = computed(() => {
+  if (!hasRealSession.value) return false
+  const phase = sessionStore.getSessionPhase(String(realSessionId.value))
+  return phase != null && ACTIVE_PHASES.has(phase)
+})
+
+// Watch phase changes to reset sending state and re-fetch structured messages
+watch(
+  () => {
+    const sid = realSessionId.value
+    if (sid <= 0) return null
+    return sessionStore.getSessionPhase(String(sid))
+  },
+  (phase, prevPhase) => {
+    if (!phase) return
+    if (TERMINAL_PHASES.has(phase)) {
+      sending.value = false
+      if (hasRealSession.value && prevPhase && ACTIVE_PHASES.has(prevPhase)) {
+        if (sessionStore.getQueueMessages(String(realSessionId.value)).length === 0) {
+          fetchMessages()
+        }
+      }
+    } else if (ACTIVE_PHASES.has(phase)) {
+      sending.value = true
+    }
+  }
+)
+
+watch(
+  () => props.sideSessionId,
+  async (newId) => {
+    // 切换会话后容器内容整体更换，旧基准失效
+    resetScrollBaseline()
+    if (newId > 0 && realSessionId.value <= 0) {
+      // 会话已转正：预览使命结束，丢弃在途请求与残留消息，
+      // 真实数据改由下方 fetchMessages 从 REST 拉回来后填。
+      forkPreview.clear()
+      const tempMsgs = sessionStore.getMessages(placeholderCacheKey.value)
+      if (tempMsgs.length > 0) {
+        sessionStore.setMessages(String(newId), [...tempMsgs])
+        sessionStore.clearMessages(placeholderCacheKey.value)
+      }
+
+      if (selectedModelId.value != null) {
+        sideModelId.value = selectedModelId.value
+      }
+
+      realSessionId.value = newId
+      subscribe(String(newId))
+      await loadSideSessionMeta()
+      // Fork 模式下后端已将主会话消息复制到边路会话，需从 REST 拉取以展示历史消息
+      if (contextMode.value === 'fork') {
+        await fetchMessages()
+      }
+    } else if (newId > 0 && realSessionId.value !== newId) {
+      realSessionId.value = newId
+    }
+  }
+)
+
+async function loadSideSessionMeta() {
+  if (!hasRealSession.value) return
+  const sid = realSessionId.value
+  const rootKey = sessionStore.findSideTaskRootKey(sid)
+  const agentAtRequest = rootKey
+    ? sessionStore.getSideTasks(rootKey).find(t => t.id === sid)?.agentId
+    : undefined
+  try {
+    const { data } = await api.get(`/sessions/${sid}`)
+    // 同一 Tab 可能在请求返回前被指派给另一个边路会话。迟到响应不得把来源会话的 phase 写进去。
+    if (realSessionId.value !== sid) return
+    if (data?.modelId != null) {
+      sideModelId.value = sideModelId.value ?? data.modelId
+    }
+    if (data?.agentId != null) {
+      const rootNow = sessionStore.findSideTaskRootKey(sid)
+      const agentNow = rootNow
+        ? sessionStore.getSideTasks(rootNow).find(t => t.id === sid)?.agentId
+        : undefined
+      if (agentNow === agentAtRequest) {
+        sessionStore.updateSideTaskAgent(
+          sid,
+          String(data.agentId),
+          typeof data.agentName === 'string' ? data.agentName : undefined,
+        )
+      }
+    }
+    if (data?.phase) {
+      // 补拉可能读到执行启动前的旧 phase（IDLE）：WS 已登记实时 phase 时不得回退，
+      // 否则刚开始运行的边路任务会被打回空闲态（徽标与圆点一起消失）。
+      const effectivePhase = sessionStore.applySnapshotPhase(String(sid), data.phase)
+      sending.value = ACTIVE_PHASES.has(effectivePhase)
+    }
+  } catch {
+    // ignore
+  }
+}
+
+async function fetchMessages() {
+  if (!hasRealSession.value) return
+  const sid = String(realSessionId.value)
+  if (sessionStore.isHistoryAnchored(sid)) return
+  const anchorEpoch = sessionStore.historyAnchorEpochOf(sid)
+  sessionStore.clearMessagePageState(sid)
+  try {
+    const { data } = await api.get(`/sessions/${sid}/messages`, { params: { roundLimit: 5 } })
+    if (sessionStore.historyAnchorEpochOf(sid) !== anchorEpoch) return
+    const raw: Array<Record<string, unknown>> = data?.messages || []
+    const { messages, allChanges } = mapMessagesWithFileChanges(raw)
+    if (messages.length > 0) {
+      sessionStore.applyFetchedMessages(sid, messages)
+      sessionStore.setFileChanges(sid, allChanges)
+    }
+    if (Array.isArray(data?.compactionEvents)) {
+      sessionStore.setCompactionEvents(sid, mapCompactionEvents(data.compactionEvents))
+    }
+    sessionStore.setMessagePageState(
+      sid,
+      Boolean(data?.hasMore),
+      data?.nextBeforeMessageId != null ? String(data.nextBeforeMessageId) : null,
+    )
+    // 会话消息加载后回显该会话内的点踩状态
+    void loadDislikedIds(sid)
+  } catch {
+    // session might not exist yet
+  }
+}
+
+const sideMessageHasMore = computed(() => {
+  if (forkPreviewActive.value) return forkPreview.hasMore.value
+  if (!hasRealSession.value) return false
+  return sessionStore.getMessageHasMore(String(realSessionId.value))
+})
+
+const sideMessageLoadingOlder = computed(() => {
+  if (forkPreviewActive.value) return forkPreview.loadingOlder.value
+  if (!hasRealSession.value) return false
+  return sessionStore.getMessageLoadingOlder(String(realSessionId.value))
+})
+
+/** 滚到顶部加载更早历史：真实会话走会话分页，Fork 预览走预览分页（同一套 roundLimit 口径） */
+async function loadOlderMessages(): Promise<boolean> {
+  if (forkPreviewActive.value) return loadOlderForkPreview()
+  if (!hasRealSession.value) return false
+  const sid = String(realSessionId.value)
+  const hasMore = sessionStore.getMessageHasMore(sid)
+  const loading = sessionStore.getMessageLoadingOlder(sid)
+  const nextBeforeId = sessionStore.getMessageNextBeforeId(sid)
+  if (loading || !hasMore || !nextBeforeId) return false
+  sessionStore.setLoadingOlderMessages(sid, true)
+  try {
+    const { data } = await api.get(`/sessions/${sid}/messages`, {
+      params: { roundLimit: 5, beforeMessageId: nextBeforeId }
+    })
+    const raw: Array<Record<string, unknown>> = data?.messages || []
+    const { messages: olderMessages, allChanges } = mapMessagesWithFileChanges(raw)
+    sessionStore.prependMessages(sid, olderMessages)
+    const existingChanges = sessionStore.getFileChanges(sid)
+    sessionStore.setFileChanges(sid, [...allChanges, ...existingChanges])
+    sessionStore.setMessagePageState(
+      sid,
+      Boolean(data?.hasMore),
+      data?.nextBeforeMessageId != null ? String(data.nextBeforeMessageId) : null,
+    )
+    return true
+  } catch {
+    return false
+  } finally {
+    sessionStore.setLoadingOlderMessages(sid, false)
+  }
+}
+
+// --- 自动滚动：与主聊天共用 useChatScroll（同一套手势判定与定位时序） ---
+const {
+  scrollToBottom, resumeFollow, pauseFollow, handleMarkdownRendered,
+  handleWheel, handleTouchStart, handleTouchMove, handlePointerDown, handleKeyDown, handleScroll,
+  resetScrollBaseline, dispose: disposeScroll,
+} = useChatScroll(messagesContainer, {
+  loadOlder: loadOlderMessages,
+  canLoadOlder: () => sideMessageHasMore.value && !sideMessageLoadingOlder.value,
+})
+
+onMounted(async () => {
+  const el = messagesContainer.value
+  el?.addEventListener('scroll', handleScroll, { passive: true })
+  el?.addEventListener('wheel', handleWheel, { passive: true })
+  el?.addEventListener('keydown', handleKeyDown)
+  window.addEventListener('mao:markdown-rendered', handleMarkdownRendered)
+
+  if (hasRealSession.value) {
+    subscribe(String(realSessionId.value))
+    await Promise.all([loadSideSessionMeta(), fetchMessages(), fetchQueue()])
+    resumeFollow()
+  }
+  void loadModels()
+  nextTick(() => chatInputRef.value?.focusInput())
+})
+
+onActivated(() => {
+  // KeepAlive 恢复的容器 scrollTop 与缓存前无关，重新度量避免拿旧位置当基准
+  resetScrollBaseline()
+  // 切回边路会话 tab（KeepAlive 恢复）时恢复跟随并定位到底部
+  resumeFollow()
+  nextTick(() => chatInputRef.value?.focusInput())
+})
+
+onUnmounted(() => {
+  pendingSendCleanup?.()
+  pendingSendCleanup = null
+
+  const el = messagesContainer.value
+  el?.removeEventListener('scroll', handleScroll)
+  el?.removeEventListener('wheel', handleWheel)
+  el?.removeEventListener('keydown', handleKeyDown)
+  window.removeEventListener('mao:markdown-rendered', handleMarkdownRendered)
+  disposeScroll()
+
+  if (hasRealSession.value) {
+    unsubscribe(String(realSessionId.value))
+  } else {
+    sessionStore.clearMessages(placeholderCacheKey.value)
+  }
+})
+
+function handleModelSwitch(modelId: number) {
+  if (hasRealSession.value) {
+    sideModelId.value = modelId
+    void sessionStore.updateSessionModel(String(realSessionId.value), modelId)
+  } else {
+    selectedModelId.value = modelId
+  }
+}
+
+async function handleChatSend(text: string, files: File[], pendingUploads?: PendingUploadFile[]) {
+  const trimmed = text.trim()
+  if (!trimmed && (!files || files.length === 0) && (!pendingUploads || pendingUploads.length === 0)) return
+
+  // 发送互斥只防双击/双 Enter 重入，不能用 sending——执行中 phase watch 会把 sending 置 true
+  // 表示忙碌/loading，若在此拦下则执行中永远走不到入队分支。
+  if (sendInFlight.value) return
+  sendInFlight.value = true
+  // 发送即跟随：与主会话同一语义。不能沿用历史的上滑状态——用户点发送就是要看最新内容，
+  // 而边路滚动条是隐藏的，内部状态与「看起来在底部」经常并不一致。
+  resumeFollow()
+  /** 是否已进入非执行中发送路径并占用 sending（忙碌）；用于外层 catch 只在该路径复位 */
+  let busyClaimed = false
+
+  try {
+    await connect()
+
+    if (hasRealSession.value) {
+      sessionStore.clearExecutionError(String(realSessionId.value))
+    }
+
+    const uploadSessionId = hasRealSession.value
+      ? String(realSessionId.value)
+      : (sourceSession.value || null)
+    const imageUrls = files.length > 0 ? await uploadImages(files, uploadSessionId) : []
+
+    // Upload non-image files to runtime incoming (uses parent session ID for first side send)
+    // LOCAL + Electron 则拷贝到本机 ~/.mao/attachments（边路首发用来源会话 id，附件落来源会话目录）
+    let resolvedText = trimmed
+    let uploadedFileCount = 0
+    if (pendingUploads && pendingUploads.length > 0 && uploadSessionId) {
+      if (parentExecutionMode.value === 'LOCAL' && isElectron) {
+        const copied = await copyLocalPendingFiles(resolvedText, pendingUploads, uploadSessionId)
+        resolvedText = copied.text
+        uploadedFileCount = copied.copiedCount
+      } else {
+        const uploaded = await uploadPendingFiles(
+          resolvedText,
+          pendingUploads.map((item) => item.file),
+          uploadSessionId
+        )
+        resolvedText = uploaded.text
+        uploadedFileCount = uploaded.uploadedCount
+      }
+    }
+    // 与主会话同一道防线：全部失败阻断、部分失败二次确认、空内容拦截
+    const canSend = await guardUploadsBeforeSend({
+      imageCount: files.length,
+      imageUrls,
+      fileCount: pendingUploads?.length ?? 0,
+      uploadedFileCount,
+      resolvedText,
+      failureLabel: parentExecutionMode.value === 'LOCAL' && isElectron ? '拷贝' : undefined,
+    })
+    if (!canSend) return
+
+    // 边路任务正在执行中：消息入队。不改动 sending——它由 phase 维护表示执行中，
+    // 入队后若误清会导致停止按钮/loading 提前消失。
+    if (hasRealSession.value && isSideActive.value) {
+      const enqueued = await enqueueMessage(String(realSessionId.value), resolvedText, generateUUID(), imageUrls)
+      if (!enqueued) {
+        ElMessage.error('消息发送失败，网络连接不可用，请重试')
+        return
+      }
+      draftStore.clearDraft(props.tabId)
+      chatInputRef.value?.clearInput()
+      // 入队成功后补一次定位：QueuePanel 出现会压缩消息区高度，底部会无声下移
+      scrollToBottom()
+      return
+    }
+
+    // 非执行中发送/首发：置忙碌。成功后由 phase 终态/watcher 收敛 sending；失败路径自行复位。
+    sending.value = true
+    busyClaimed = true
+    const releaseBusy = () => {
+      sending.value = false
+    }
+
+    const localSkills = await collectLocalUnsyncedSkills(parentExecutionMode.value, isElectron)
+    const agentsMdContent = await collectAgentsMdContent(parentWorkspace.value, parentExecutionMode.value, isElectron)
+
+    // 设置发送中状态
+    waitingForSave.value = true
+
+    // 首次创建边路会话时尚未有真实 sessionId；后端先发 side_session_created 再发 user_message_saved。
+    // TaskView 会在同事件中同步把 tab.sideSessionId 写成正数，不能再靠「占位 tab」判定。
+    // 本监听仅在本次首次发送期间注册，用本地 realSessionId 绑定即可。
+    const isFirstSideSend = !hasRealSession.value
+    let expectedSavedSessionId: string | null = isFirstSideSend ? null : String(realSessionId.value)
+    // 本次发送注册的监听统一收尾：被拒、发送失败、异常、保存确认、卸载都必须走到它，
+    // 否则残留的 side_session_created 监听会被别处成功的创建命中，清掉本面板的输入框。
+    let disposeSendListeners: (() => void) | null = null
+    // 等待 user_message_saved 的取消信号：卸载 / 创建被拒 / 超时都要能立刻收尾
+    const saveAbort = new AbortController()
+    try {
+      if (isFirstSideSend) {
+        // 首次发送：先校验来源会话存在，再插乐观消息，避免校验失败后留下幽灵消息。
+        // 来源会话 = 边路发起时的边路会话，缺省主会话；WS 事件键即来源会话 id。
+        const parentSessionId = sourceSession.value
+        if (!parentSessionId) {
+          waitingForSave.value = false
+          releaseBusy()
+          ElMessage.warning('来源会话不存在，无法创建边路任务')
+          return
+        }
+
+        const optimisticUserId = 'side_user_' + Date.now()
+        // 两个事件都按父会话 id 过滤：同父会话的另一个边路面板的开创 / 被拒，
+        // 不该写错本面板的等待状态。
+        const onSideCreated = (e: Event) => {
+          const detail = (e as CustomEvent).detail
+          if (detail?.sideSessionId == null || realSessionId.value > 0) return
+          if (detail?.parentSessionId != null && String(detail.parentSessionId) !== parentSessionId) return
+          expectedSavedSessionId = String(detail.sideSessionId)
+        }
+        const onSideRejected = (e: Event) => {
+          const detail = (e as CustomEvent).detail
+          if (detail?.parentSessionId != null && String(detail.parentSessionId) !== parentSessionId) return
+          // 创建被拒（切点失效 / 模型不支持图片 / 本地端未连接）：后端不建会话、也不发
+          // user_message_saved，必须在这里收尾。否则占位 Tab 里留下两条发不出去的幽灵消息，
+          // waitingForSave 还要干等 60 秒。
+          rollbackOptimisticMessages(placeholderCacheKey.value, optimisticUserId)
+          saveAbort.abort()
+          disposeSendListeners?.()
+          pendingSendCleanup = null
+          waitingForSave.value = false
+          releaseBusy()
+          ElMessage.error(detail?.message || '边路任务创建失败，请重试')
+        }
+        window.addEventListener('side_session_created', onSideCreated)
+        window.addEventListener('side_session_rejected', onSideRejected)
+        disposeSendListeners = () => {
+          window.removeEventListener('side_session_created', onSideCreated)
+          window.removeEventListener('side_session_rejected', onSideRejected)
+        }
+        // 监听已挂上：await createSideSession 期间被卸载也要能摘掉
+        pendingSendCleanup = () => {
+          saveAbort.abort()
+          disposeSendListeners?.()
+          waitingForSave.value = false
+        }
+
+        sessionStore.addUserMessage(placeholderCacheKey.value, {
+          id: optimisticUserId,
+          role: 'user',
+          content: resolvedText,
+          createdAt: nowDateTime(),
+          images: imageUrls.length > 0 ? imageUrls : undefined,
+        })
+        sessionStore.ensureStreamingAssistantMessage(placeholderCacheKey.value)
+
+        const created = await createSideSession(
+          parentSessionId,
+          resolvedText,
+          contextMode.value,
+          currentModelId.value,
+          localSkills,
+          agentsMdContent,
+          imageUrls,
+          sidePermissionLevel.value,
+          forkFromMessageId.value
+        )
+        if (!created) {
+          rollbackOptimisticMessages(placeholderCacheKey.value, optimisticUserId)
+          disposeSendListeners?.()
+          pendingSendCleanup = null
+          waitingForSave.value = false
+          releaseBusy()
+          ElMessage.error('边路任务创建失败，网络连接不可用，请重试')
+          return
+        }
+      } else {
+        const sid = String(realSessionId.value)
+        if (sessionStore.isHistoryAnchored(sid)) {
+          sessionStore.setHistoryAnchored(sid, false)
+          await fetchMessages()
+        }
+
+        const optimisticUserId = 'side_user_' + Date.now()
+        sessionStore.addUserMessage(sid, {
+          id: optimisticUserId,
+          role: 'user',
+          content: resolvedText,
+          createdAt: nowDateTime(),
+          images: imageUrls.length > 0 ? imageUrls : undefined,
+        })
+        sessionStore.ensureStreamingAssistantMessage(sid)
+        const sent = await sendMessage(sid, resolvedText, generateUUID(), imageUrls, localSkills, agentsMdContent, currentModelId.value)
+        if (!sent) {
+          rollbackOptimisticMessages(sid, optimisticUserId)
+          waitingForSave.value = false
+          releaseBusy()
+          ElMessage.error('消息发送失败，网络连接不可用，请重试')
+          return
+        }
+      }
+    } catch (e) {
+      disposeSendListeners?.()
+      waitingForSave.value = false
+      releaseBusy()
+      ElMessage.error((e as Error)?.message || '消息发送失败，请重试')
+      return
+    }
+
+    // 等待消息保存确认：仅在保存成功时清空输入（与主会话同一实现）；
+    // 超时/卸载只解锁 waitingForSave，保留草稿以便重试。
+    // 发送前捕获 tabId：等待期间 tab 可能被关闭/晋升，保存成功后必须清掉对应草稿槽位。
+    const draftKeyAtSend = props.tabId
+    pendingSendCleanup = () => {
+      saveAbort.abort()
+      disposeSendListeners?.()
+      waitingForSave.value = false
+    }
+    const saved = await waitForMessageSaved(() => expectedSavedSessionId, { signal: saveAbort.signal })
+    pendingSendCleanup = null
+    disposeSendListeners?.()
+    waitingForSave.value = false
+    // 成功路径由 phase 终态/watcher 收敛 sending；保存确认本身不释放忙碌态
+    if (saved) {
+      draftStore.clearDraft(draftKeyAtSend)
+      chatInputRef.value?.clearInput()
+    }
+  } catch (e) {
+    // connect/upload 等前置 await 异常；若已占用 sending（非执行中路径）则复位，避免忙碌卡住
+    if (busyClaimed) sending.value = false
+    waitingForSave.value = false
+    ElMessage.error((e as Error)?.message || '消息发送失败，请重试')
+  } finally {
+    sendInFlight.value = false
+  }
+  // 首发/普通发送成功：乐观消息与流式占位已入列表，DOM 更新后补一次定位
+  scrollToBottom()
+}
+
+async function handleStop() {
+  const sid = realSessionId.value
+  if (sid <= 0) return
+  const ok = await cancel(String(sid))
+  if (!ok) {
+    ElMessage.error('停止失败，网络连接不可用，请重试')
+    return
+  }
+  // 与主会话同一套本地收尾：清流式/思考/压缩状态并标记气泡已中止
+  finalizeCancelledSession(String(sid))
+  sending.value = false
+}
+
+async function handleRetryExecution() {
+  const sid = realSessionId.value
+  if (sid <= 0) return
+  sending.value = true
+  sessionStore.clearExecutionError(String(sid))
+  const ok = await retryExecution(String(sid))
+  if (!ok) {
+    sending.value = false
+    ElMessage.error('重试失败，网络连接不可用，请重试')
+    return
+  }
+  sessionStore.ensureStreamingAssistantMessage(String(sid))
+  // 与主会话一致：等本轮执行收敛（终态/失败）后再收敛本地忙碌态
+  try {
+    await awaitExecutionSettled(String(sid))
+  } catch {
+    // 失败提示由流事件负责，这里只收敛本地状态
+  }
+  if (realSessionId.value === sid) sending.value = false
+}
+
+async function submitQuestionAnswer(requestId: string, answers: QuestionAnswer[], done: (ok: boolean) => void) {
+  if (!hasRealSession.value) {
+    done(false)
+    return
+  }
+  const ok = await sendAskUserQuestionsResult(String(realSessionId.value), requestId, answers)
+  done(ok)
+  // Keep the panel until the server confirms completion with ask_user_questions_cancelled.
+}
+
+// --- 消息队列操作 ---
+
+/** 发送失败时回滚乐观插入的用户消息与空 assistant 占位（二者必然位于列表尾部）。 */
+function rollbackOptimisticMessages(cacheKey: string, optimisticUserId: string) {
+  const list = sessionStore.getMessages(cacheKey)
+  if (!list || list.length < 2) return
+  const last = list[list.length - 1]
+  const prev = list[list.length - 2]
+  if (last.role === 'assistant' && !last.content && prev.id === optimisticUserId) {
+    list.pop()
+    list.pop()
+  }
+}
+
+</script>
+
+<style scoped>
+.history-anchor-bar {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--aw-surface-hover, rgba(0, 0, 0, 0.04));
+  color: var(--aw-ink-muted-80, #555);
+  font-size: 13px;
+}
+.history-anchor-back {
+  border: 0;
+  background: transparent;
+  color: var(--aw-accent, #409eff);
+  cursor: pointer;
+  font: inherit;
+}
+.side-chat-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  background: var(--aw-canvas);
+  padding: 0 20px;
+}
+
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding-top: 16px;
+  margin-bottom: 10px;
+  scrollbar-width: none;
+}
+
+.messages::-webkit-scrollbar {
+  display: none;
+}
+
+.input-area {
+  flex-shrink: 0;
+  margin-bottom: 10px;
+}
+
+/* 与主会话 ChatPanel 的边路任务入口同款（窗口右下角） */
+.side-task-entry {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 8px;
+}
+
+.side-task-btn {
+  height: var(--aw-btn-height);
+  border: 1px solid var(--aw-divider-soft);
+  background: var(--aw-canvas-parchment);
+  color: var(--aw-ink-muted-48);
+  font-size: var(--aw-text-fine);
+  padding: var(--aw-btn-padding);
+  border-radius: var(--aw-radius-xs);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.side-task-btn:hover {
+  background: var(--aw-divider-soft);
+  color: var(--aw-ink);
+  border-color: var(--aw-hairline);
+}
+
+.side-chat-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--aw-ink-muted-48, #909399);
+}
+
+.side-chat-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--aw-ink-muted-48);
+  gap: 12px;
+}
+
+.side-chat-empty p {
+  font-size: 14px;
+  margin: 0;
+}
+
+.side-chat-empty-hint {
+  font-size: var(--aw-text-caption);
+  color: var(--aw-ink-muted-48);
+  opacity: 0.8;
+}
+
+/* Fork 预览提示条：与压缩提示同款轻量样式，说明下面这批消息的来源与生效时机 */
+.fork-preview-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+  padding: 6px 12px;
+  font-size: var(--aw-text-caption);
+  color: var(--aw-ink-muted-48);
+  background: var(--aw-canvas-parchment);
+  border: 1px solid var(--aw-divider-soft);
+  border-radius: var(--aw-radius-xs);
+}
+
+.inherit-bar {
+  padding: 6px 0 8px;
+  border-top: 1px solid var(--aw-hairline);
+  background: var(--aw-canvas);
+}
+
+.typing-indicator {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 12px 0;
+}
+
+.typing-dots {
+  display: flex;
+  gap: 4px;
+}
+
+.typing-dots span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--aw-ink-muted-48);
+  animation: typing 1.4s infinite ease-in-out;
+}
+
+.typing-dots span:nth-child(1) { animation-delay: -0.32s; }
+.typing-dots span:nth-child(2) { animation-delay: -0.16s; }
+
+.typing-retry {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  border: 1px solid var(--aw-warning, #e6a23c);
+  border-radius: var(--aw-radius-sm, 8px);
+  background: color-mix(in srgb, var(--aw-warning, #e6a23c) 10%, transparent);
+  color: var(--aw-warning, #e6a23c);
+  font-size: var(--aw-text-caption, 12px);
+  line-height: 1.5;
+}
+
+.typing-retry-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid color-mix(in srgb, var(--aw-warning, #e6a23c) 30%, transparent);
+  border-top-color: var(--aw-warning, #e6a23c);
+  border-radius: 50%;
+  animation: typing-retry-spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes typing-retry-spin {
+  to { transform: rotate(360deg); }
+}
+
+.compaction-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+  padding: 6px 12px;
+  font-size: var(--aw-text-caption);
+  color: var(--aw-ink-muted-48);
+  background: var(--aw-canvas-parchment);
+  border: 1px solid var(--aw-divider-soft);
+  border-radius: var(--aw-radius-xs);
+}
+
+.compaction-spinner {
+  flex-shrink: 0;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid var(--aw-primary-line);
+  border-top-color: var(--aw-primary);
+  border-radius: 50%;
+  animation: compaction-spin 0.8s linear infinite;
+}
+
+@keyframes compaction-spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes typing {
+  0%, 80%, 100% { transform: scale(0.8); opacity: 0.3; }
+  40% { transform: scale(1); opacity: 1; }
+}
+
+.empty-icon {
+  color: var(--aw-ink-muted-48);
+}
+</style>

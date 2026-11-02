@@ -1,0 +1,338 @@
+import type { ChatRequest, ChatUsage, LlmModelConfig } from './llm/chat-request.js';
+import type { Db } from '../db/db.js';
+import type { ClientImpersonation } from '@mao/contracts';
+import { parsePriceColumn } from '../usage/cost-micros.js';
+
+export interface Session {
+  id?: number;
+  userId?: number | null;
+  agentId?: number | null;
+  modelId?: number | null;
+  parentSessionId?: number | null;
+  sessionType?: string | null;
+  projectKey?: string | null;
+  executionMode?: string | null;
+  permissionLevel?: string | null;
+  memoryInjectionDisabled?: number | null;
+  workspace?: string | null;
+  isGit?: boolean | number | null;
+  platform?: string | null;
+  shellPath?: string | null;
+  osVersion?: string | null;
+  phase?: string | null;
+  title?: string | null;
+  lastActivityAt?: string | null;
+  lastPromptTokens?: number | null;
+  contextAnchorMsgId?: number | null;
+}
+
+export interface Message {
+  id?: number;
+  sessionId?: number;
+  role?: string;
+  content?: string | null;
+  thinkingContent?: string | null;
+  toolCallId?: string | null;
+  toolCalls?: string | null;
+  metadata?: string | null;
+  tokenCount?: number | null;
+  modelId?: number | null;
+  sourceSessionId?: number | null;
+  createdAt?: string | null;
+}
+
+export interface Agent {
+  id?: number;
+  name?: string | null;
+  systemPrompt?: string | null;
+  tools?: string | null;
+  skills?: string | null;
+  skillNames?: string | null;
+  configJson?: string | null;
+  mcpServerIds?: string | null;
+  httpToolIds?: string | null;
+  defaultModelId?: number | null;
+  /** 团队经验库开关（V169）：0-不注入路标；缺省或 1 为启用 */
+  experienceLibraryEnabled?: number | null;
+  compactionEnabled?: number | boolean | null;
+  compactionContextWindowTokens?: number | null;
+  compactionTriggerRatio?: number | null;
+  compactionMaxSummaryTokens?: number | null;
+}
+
+export interface LlmModel {
+  id?: number;
+  name?: string | null;
+  provider?: string | null;
+  apiProtocol?: string | null;
+  effort?: string | null;
+  baseUrl?: string | null;
+  apiKey?: string | null;
+  modelId?: string | null;
+  clientImpersonation?: string | null;
+  contextWindowTokens?: number | null;
+  /** 供应商请求体上限（字节）；null=未声明。用于推导压缩体积阈值。 */
+  maxRequestBodyBytes?: number | null;
+  /** 每百万「非缓存」输入 token 价格（成本单位）。DECIMAL 列经 mysql2 读出为 string，计价前 parsePriceColumn 归一。 */
+  priceInput?: string | number | null;
+  priceCacheRead?: string | number | null;
+  priceCacheWrite?: string | number | null;
+  priceOutput?: string | number | null;
+  supportsVision?: number | boolean | null;
+  isDefault?: number | boolean | null;
+  status?: number | null;
+}
+
+export interface FileChange {
+  id?: number;
+  messageId?: number;
+  sessionId?: number;
+  path?: string | null;
+  type?: string | null;
+  linesAdded?: number | null;
+  linesDeleted?: number | null;
+  totalLines?: number | null;
+  diffMode?: string | null;
+  beforeContent?: string | null;
+  afterContent?: string | null;
+  patchContent?: string | null;
+  patchTruncated?: number | boolean | null;
+  diffUnavailableReason?: string | null;
+}
+
+export interface SessionCompaction {
+  id?: number;
+  sessionId?: number;
+  summaryText?: string | null;
+  lastCompactedMsgId?: number | null;
+  compactCount?: number | null;
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  compactModel?: string | null;
+}
+
+export interface SessionCompactionEvent {
+  id?: number;
+  sessionId?: number;
+  triggerMode?: string | null;
+  prevBoundaryMsgId?: number | null;
+  boundaryMsgId?: number | null;
+  compactedMessageCount?: number | null;
+  promptTokens?: number | null;
+  cachedTokens?: number | null;
+  completionTokens?: number | null;
+  summaryTokens?: number | null;
+  savedTokens?: number | null;
+  durationMs?: number | null;
+  compactModel?: string | null;
+}
+
+export interface UserCommand {
+  id?: number;
+  userId?: number;
+  name?: string;
+  content?: string;
+}
+
+export interface ContextAnchor {
+  lastPromptTokens: number;
+  contextAnchorMsgId: number;
+}
+
+export interface SessionMapper {
+  selectById(id: number): Promise<Session | null>;
+  lockActiveSessionById?(sessionId: number): Promise<Session | null>;
+  selectByPhase?(phase: string): Promise<Session[]>;
+  updateById?(session: Session): Promise<void>;
+  /** CAS: SET phase=RUNNING WHERE id=? AND (phase <> 'RUNNING' OR phase IS NULL). Returns affected rows. */
+  claimRunningIfIdle?(sessionId: number): Promise<number>;
+  updatePhase?(sessionId: number, phase: string): Promise<void>;
+}
+
+export interface SessionService {
+  getSession(sessionId: number): Promise<Session | null>;
+  getMaxMessageId(sessionId: number): Promise<number>;
+  loadContextAnchor(sessionId: number): Promise<ContextAnchor>;
+  updateContextAnchor(sessionId: number, promptTokens: number, anchorMsgId: number): Promise<void>;
+  clearContextAnchor(sessionId: number): Promise<void>;
+  updateContextTokens(sessionId: number, tokens: number, manifestJson?: string | null): Promise<void>;
+  updatePhase(sessionId: number, phase: string): Promise<void>;
+  saveMessage(
+    sessionId: number,
+    role: string,
+    content: string | null,
+    thinkingContent?: string | null,
+    toolCallId?: string | null,
+    toolCallsJson?: string | null,
+    tokenCount?: number,
+    modelId?: number | null,
+    metadataJson?: string | null,
+  ): Promise<Message>;
+  getMessagesAfterId(sessionId: number, boundary: number): Promise<Message[]>;
+  /** 按 id 单调序取最后一条用户消息；压缩后回注最新真实用户原话时使用。 */
+  getLastUserMessage?(sessionId: number): Promise<Message | null>;
+  /**
+   * 最近 N 条「真实用户消息」（id 倒序取、正序返回）：dump_user_messages 工具的数据源。
+   * 「真实」口径与压缩 / 无进展判定共用 isRealUserMessage（排除 handoff 摘要与系统注入）。
+   */
+  getRecentUserMessages?(sessionId: number, limit: number): Promise<Message[]>;
+  /** 会话首条现存用户消息（id 最小）：系统提示 current-date 的日期锚点（技术方案 2026-10-12 §5.1）。 */
+  getFirstUserStamp?(sessionId: number): Promise<Pick<Message, 'id' | 'createdAt'> | null>;
+  /** beforeId 之前最近的一条现存用户消息：跨天 `<date-change>` 提示的比较参照。 */
+  getPreviousUserStamp?(sessionId: number, beforeId: number): Promise<Pick<Message, 'id' | 'createdAt'> | null>;
+  getMessages?(sessionId: number): Promise<Message[]>;
+  /** 从（可能是多模态 JSON 的）消息 content 中提取可见文本，供摘要等场景使用。 */
+  extractVisibleText?(content: string | null): string | null;
+  cleanupIncompleteTail(sessionId: number): Promise<number>;
+  cleanupIncompleteTailAfterId?(sessionId: number, afterMessageId: number): Promise<number>;
+  enterWaitingApproval(sessionId: number): Promise<boolean>;
+  restoreRunningAfterApproval(sessionId: number): Promise<boolean>;
+  createSession?(
+    userId: number | null | undefined,
+    agentId: number | null | undefined,
+    title: string,
+    executionMode?: string | null,
+    workspace?: string | null,
+    permissionLevel?: string | null,
+    isGit?: boolean | number | null,
+    platform?: string | null,
+    shellPath?: string | null,
+    osVersion?: string | null,
+    modelId?: number | null,
+  ): Promise<Session>;
+}
+
+export interface SessionCompactionService {
+  loadValidated(sessionId: number): Promise<SessionCompaction | null>;
+  persist(
+    sessionId: number,
+    expectedRecord: SessionCompaction | null,
+    expectedOldBoundary: number,
+    newBoundary: number,
+    boundaryContentSnapshot: string,
+    summaryText: string,
+    inputTokens: number,
+    outputTokens: number,
+    compactModel: string | null,
+  ): Promise<boolean>;
+  boundaryOf(record: SessionCompaction | null): number;
+  findBySessionId?(sessionId: number): Promise<SessionCompaction | null>;
+  deleteBySessionId?(sessionId: number): Promise<number>;
+}
+
+export interface SessionCompactionEventService {
+  record(
+    sessionId: number,
+    triggerMode: string,
+    prevBoundaryMsgId: number,
+    boundaryMsgId: number,
+    compactedCount: number,
+    promptTokens: number,
+    cachedTokens: number | null | undefined,
+    completionTokens: number,
+    summaryTokens: number,
+    savedTokens: number,
+    durationMs: number,
+    compactModel: string | null,
+  ): Promise<SessionCompactionEvent>;
+}
+
+export interface AgentMapper {
+  selectById(id: number): Promise<Agent | null>;
+}
+
+export interface AgentExperienceService {
+  listEnabledContents(agentId: number): Promise<string[]>;
+}
+
+export interface LlmModelMapper {
+  selectById(id: number): Promise<LlmModel | null>;
+  selectDefault?(): Promise<LlmModel | null>;
+}
+
+export interface FileChangeMapper {
+  insert(change: FileChange): Promise<number>;
+  selectByMessageAndPath?(messageId: number, path: string): Promise<FileChange | null>;
+  updateById?(id: number, data: Partial<FileChange>): Promise<void>;
+}
+
+export interface UserCommandService {
+  getByUserIdAndName(userId: number, name: string): Promise<UserCommand | null>;
+}
+
+export interface WsEvent {
+  type: string;
+  sessionId: number | null;
+  data: unknown;
+}
+
+export function wsEvent(type: string, sessionId: number | null, data: unknown): WsEvent {
+  return { type, sessionId, data };
+}
+
+export interface StreamingWsRegistry {
+  hasConnection(userId: number): boolean;
+  hasLocalClientConnection(userId: number): boolean;
+  send(userId: number, event: WsEvent): void;
+  sendToLocalClients(userId: number, event: WsEvent): void;
+  subscribe?(userId: number, sessionId: number): void;
+}
+
+export interface SessionActivityHeartbeat {
+  touch(sessionId: number | null | undefined): void;
+  /** 执行开始：挂独立定时心跳（长工具调用期间也要保持 last_activity_at 新鲜）。 */
+  start(sessionId: number | null | undefined): void;
+  /** 执行结束：停掉定时心跳。 */
+  stop(sessionId: number | null | undefined): void;
+  clear(sessionId: number): void;
+}
+
+export interface ActivityService {
+  record?(sessionId: number, type: string, payload?: unknown): void;
+}
+
+export interface TaskTerminalService {
+  finishExecution(sessionId: number, userId: number | null | undefined, phase: string, executionId: string, error?: string): Promise<void>;
+}
+
+export interface MessageMapper {
+  selectValidBoundaryMessage(sessionId: number, boundary: number): Promise<Message | null>;
+  selectLast?(sessionId: number): Promise<Message | null>;
+  deleteById?(id: number): Promise<void>;
+  deleteFromId?(sessionId: number, fromId: number): Promise<void>;
+}
+
+export function llmModelToConfig(model: LlmModel): LlmModelConfig {
+  return {
+    id: model.id,
+    name: model.name ?? undefined,
+    provider: model.provider ?? undefined,
+    apiProtocol: model.apiProtocol ?? undefined,
+    effort: model.effort ?? undefined,
+    baseUrl: model.baseUrl ?? undefined,
+    apiKey: model.apiKey ?? undefined,
+    modelId: model.modelId ?? undefined,
+    contextWindowTokens: model.contextWindowTokens ?? undefined,
+    maxRequestBodyBytes: model.maxRequestBodyBytes ?? undefined,
+    supportsVision: model.supportsVision === 1 || model.supportsVision === true,
+    clientImpersonation: toClientImpersonation(model.clientImpersonation),
+    // 价格随模型解析链下发（成本快照主路径，决策 8）；NULL 价归一为 undefined，
+    // 落库侧对 undefined 走兜底缓存再解析同一行，结果一致（NULL → 成本 NULL）。
+    priceInput: parsePriceColumn(model.priceInput) ?? undefined,
+    priceCacheRead: parsePriceColumn(model.priceCacheRead) ?? undefined,
+    priceCacheWrite: parsePriceColumn(model.priceCacheWrite) ?? undefined,
+    priceOutput: parsePriceColumn(model.priceOutput) ?? undefined,
+  };
+}
+
+function toClientImpersonation(value: string | null | undefined): ClientImpersonation {
+  if (value === 'codex' || value === 'claude_code') return value;
+  return 'none';
+}
+
+export function boolish(value: boolean | number | null | undefined): boolean | undefined {
+  if (value == null) return undefined;
+  return value === true || value === 1;
+}
+
+export type { ChatRequest, ChatUsage, LlmModelConfig, ClientImpersonation, Db };

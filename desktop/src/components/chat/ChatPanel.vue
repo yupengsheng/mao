@@ -1,0 +1,1166 @@
+<template>
+  <div class="chat-panel" :class="{ 'is-center-composer': showCenterComposer }">
+    <!-- 新建会话中心态：默认垂直居中；移动软键盘弹出时切上锚定 -->
+    <div
+      v-if="showCenterComposer"
+      class="center-stage"
+      :class="{ 'is-keyboard-open': keyboardOpen }"
+    >
+      <div class="center-brand" aria-hidden="true">
+        <img :src="appIcon" alt="" class="brand-mark" />
+      </div>
+      <h1 class="center-greeting">今天想完成什么？</h1>
+      <div class="center-composer">
+        <ExecutionErrorBanner
+          v-if="executionError"
+          :message="executionError"
+          :can-retry="!agentRunning"
+          :action-label="budgetBlocked ? '查看我的预算' : undefined"
+          @retry="handleRetry"
+          @action="openBudgetDrawer"
+        />
+        <ChatInput
+          ref="chatInputRef"
+          layout="centered"
+          :loading="agentRunning"
+          :can-continue="canContinue"
+          :initializing-workspace="initializingWorkspace"
+          :initializing-workspace-label="initializingWorkspaceLabel"
+          :workspace="newTaskWorkspace"
+          :cloud-project-key="newTaskCloudProjectKey"
+          :execution-mode="newTaskMode"
+          :model-id="newTaskModelId"
+          :model-supports-vision="currentModelSupportsVision"
+          :permission-level="permissionLevel"
+          :is-new-task="true"
+          :selected-agent-id="newTaskAgentId"
+          :agents="agentStore.agents"
+          :workspace-mode="newTaskWorkspaceMode"
+          :git-clone-url="newTaskGitCloneUrl"
+          :git-branch="newTaskGitBranch"
+          :cloud-projects="newTaskCloudProjects"
+          :waiting-for-save="waitingForSave"
+          :draft-key="currentDraftKey"
+          @send="handleSend"
+          @stop="handleStop"
+          @continue="handleRetry"
+          @update:permission-level="handlePermissionLevelChange"
+          @update:execution-mode="handleNewTaskModeChange"
+          @update:workspace="handleNewTaskWorkspaceChange"
+          @update:cloud-project-key="handleNewTaskCloudProjectKeyChange"
+          @update:selected-agent-id="handleNewTaskAgentChange"
+          @update:model-id="handleModelSwitch"
+          @select:model="handleModelSelect"
+          @update:workspace-mode="handleNewTaskWorkspaceModeChange"
+          @update:git-clone-url="handleNewTaskGitCloneUrlChange"
+          @update:git-branch="handleNewTaskGitBranchChange"
+        />
+      </div>
+      <StarterPrompts
+        class="center-tips"
+        :is-mobile="isMobileViewport"
+        @select="handleStarterSelect"
+      />
+    </div>
+
+    <!-- 会话态 / 加载态：底部 Composer -->
+    <template v-else>
+        <!-- .messages-wrap 提供轮次目录把手/浮层的定位宿主：absolute 直接挂 .messages 会随内容
+             滚走，且整条祖先链无定位祖先时回落视口（0.0.337 类 bug） -->
+        <div class="messages-wrap">
+        <div class="messages" ref="messagesContainer" :aria-busy="historyLoading"
+        @touchstart.passive="handleTouchStart" @touchmove.passive="handleTouchMove"
+        @pointerdown="handlePointerDown">
+        <div v-if="historyLoading" class="history-loading"
+          :class="{ 'empty-state': messages.length === 0 }" role="status" aria-live="polite">
+          <el-icon :size="messages.length === 0 ? 28 : 16" class="is-loading" aria-hidden="true"><Loading /></el-icon>
+          <p>正在加载历史对话…</p>
+        </div>
+        <div v-else-if="initializingWorkspace && messages.length === 0" class="empty-state workspace-init-state">
+          <el-icon :size="32" class="is-loading"><Loading /></el-icon>
+          <p>{{ initializingWorkspaceLabel }}</p>
+        </div>
+        <div v-else-if="messages.length === 0 && !agentRunning && !initialLoading" class="empty-state">
+          <template v-if="!sessionId">
+            <el-icon :size="48" class="empty-icon"><ChatDotRound /></el-icon>
+            <p>我可以帮你做点什么？</p>
+          </template>
+          <template v-else>
+            <p class="guidance-text">在下方输入框描述你的任务，我会帮你完成</p>
+          </template>
+        </div>
+
+        <!-- 历史轮次 + 当前轮次 -->
+        <ChatRoundList
+          :messages="messages"
+          :sending="agentRunning"
+          :session-id="sessionId ?? ''"
+          :editing-message-id="editingMessageId"
+          :can-edit-message="canEditMessage"
+          :compaction-events="sessionStore.activeCompactionEvents"
+          :dislike-enabled="true"
+          :fork-enabled="true"
+          :share-enabled="!!sessionId"
+          @edit="startEdit"
+          @cancel-edit="cancelEdit"
+          @confirm-edit="confirmEdit"
+          @add-to-command="(content: string) => commandEditDialogRef?.open({ content })"
+          @fork="openSideTask?.('fork', $event)"
+          @share="openShareDialog"
+        />
+
+        <div v-if="showTypingIndicator" class="typing-indicator">
+          <div class="typing-dots">
+            <span></span>
+            <span></span>
+            <span></span>
+          </div>
+          <div v-if="typingRetry?.attempt" class="typing-retry">
+            <span class="typing-retry-spinner"></span>
+              <span>上游响应异常{{ typingRetry.statusCode ? `（HTTP ${typingRetry.statusCode}）` : '' }}，正在第 {{ typingRetry.attempt }}/{{ typingRetry.maxRetries }} 次重试，{{ typingRetry.delaySeconds }} 秒后继续…</span>
+          </div>
+        </div>
+        </div>
+
+        <!-- 轮次目录：右缘浮动把手（小屏降级隐藏，决策 3 的移动端延伸） -->
+        <RoundDirectory
+          v-if="sessionId && !isMobileViewport"
+          :messages="messages"
+          :sending="agentRunning"
+          @locate="onRoundLocate"
+        />
+        </div>
+
+      <QueuePanel
+        @edit="handleQueueEdit"
+        @insert="insertQueueMessage"
+        @delete="deleteQueueMessage"
+        @reorder="reorderQueueMessage"
+      />
+
+      <ApprovalStack
+        v-if="activePendingApprovals.length > 0"
+        :items="activePendingApprovals"
+        @confirm="confirmApproval"
+      />
+
+      <QuestionPanel
+        v-if="activePendingQuestions.length > 0"
+        :items="activePendingQuestions"
+        @submit="handleSubmitQuestion"
+      />
+
+      <div v-if="sessionId && !isNewTaskMode" class="side-task-entry">
+        <button type="button" class="side-task-btn" @click="openSideTask?.()">
+          + 边路任务
+        </button>
+      </div>
+
+      <div v-if="sessionStore.activeCompacting" class="compaction-hint" role="status">
+        <span class="compaction-spinner" aria-hidden="true"></span>
+        <span>正在整理历史对话，腾出上下文空间…</span>
+      </div>
+
+      <ExecutionErrorBanner
+        :message="executionError"
+        :can-retry="!agentRunning"
+        :session-id="sessionId ?? ''"
+        :action-label="budgetBlocked ? '查看我的预算' : undefined"
+        @retry="handleRetry"
+        @action="openBudgetDrawer"
+      />
+
+      <ChatInput
+        ref="chatInputRef"
+        layout="docked"
+        :loading="agentRunning"
+        :can-continue="canContinue"
+        :initializing-workspace="initializingWorkspace"
+        :initializing-workspace-label="initializingWorkspaceLabel"
+        :workspace="isNewTaskMode ? newTaskWorkspace : workspace"
+        :cloud-project-key="isNewTaskMode ? newTaskCloudProjectKey : cloudProjectKey"
+        :project-key="currentSession?.projectKey"
+        :execution-mode="isNewTaskMode ? newTaskMode : executionMode"
+        :model-id="isNewTaskMode ? newTaskModelId : currentSession?.modelId"
+        :model-supports-vision="currentModelSupportsVision"
+        :permission-level="permissionLevel"
+        :is-new-task="isNewTaskMode"
+        :selected-agent-id="newTaskAgentId"
+        :agents="agentStore.agents"
+        :workspace-mode="isNewTaskMode ? newTaskWorkspaceMode : 'new'"
+        :git-clone-url="isNewTaskMode ? newTaskGitCloneUrl : ''"
+        :git-branch="isNewTaskMode ? newTaskGitBranch : ''"
+        :cloud-projects="isNewTaskMode ? newTaskCloudProjects : []"
+        :waiting-for-save="waitingForSave"
+        :draft-key="currentDraftKey"
+        @send="handleSend"
+        @stop="handleStop"
+        @continue="handleRetry"
+        @update:permission-level="handlePermissionLevelChange"
+        @update:execution-mode="handleNewTaskModeChange"
+        @update:workspace="handleNewTaskWorkspaceChange"
+        @update:cloud-project-key="handleNewTaskCloudProjectKeyChange"
+        @update:selected-agent-id="handleNewTaskAgentChange"
+        @update:model-id="handleModelSwitch"
+        @select:model="handleModelSelect"
+        @update:workspace-mode="handleNewTaskWorkspaceModeChange"
+        @update:git-clone-url="handleNewTaskGitCloneUrlChange"
+        @update:git-branch="handleNewTaskGitBranchChange"
+      />
+    </template>
+
+    <CommandEditDialog ref="commandEditDialogRef" />
+    <ShareDialog v-model="shareVisible" :session-id="shareSessionId" />
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, computed, inject, provide, watch, nextTick, onActivated, onMounted, onUnmounted, type Ref } from 'vue'
+import { useRouter } from 'vue-router'
+import { ChatDotRound, Loading } from '@element-plus/icons-vue'
+import { useChat, normalizeMessageRole, type ChatMessage, type PendingUploadFile } from '../../composables/useChat'
+import { useChatScroll } from '../../composables/useChatScroll'
+import { useChatQueue } from '../../composables/useChatQueue'
+import { LOCATE_FLASH_KEY, useMessageLocate } from '../../composables/useMessageLocate'
+import { useAgentStore } from '../../stores/agent'
+import { useSessionStore, type TaskPhase } from '../../stores/session'
+import { useDraftStore } from '../../stores/draft'
+import { api } from '../../api'
+import { ElMessage } from 'element-plus'
+import type { QuestionAnswer } from '../../types/chat'
+import type { SideTaskContextMode } from '../../types/file-browser'
+import ChatRoundList from './ChatRoundList.vue'
+import ChatInput from './ChatInput.vue'
+import QueuePanel from './QueuePanel.vue'
+import ApprovalStack from './ApprovalStack.vue'
+import CommandEditDialog from '../command/CommandEditDialog.vue'
+import ShareDialog from '../task/ShareDialog.vue'
+import QuestionPanel from './QuestionPanel.vue'
+import ExecutionErrorBanner from './ExecutionErrorBanner.vue'
+import StarterPrompts from './StarterPrompts.vue'
+import RoundDirectory from './RoundDirectory.vue'
+import appIcon from '../../assets/app-icon-small.png'
+
+// Inject shared refs from TaskView
+const agentId = inject<Ref<string>>('agentId')!
+const executionMode = inject<Ref<string>>('executionMode')!
+const newTaskModelId = inject<Ref<number | undefined>>('newTaskModelId')!
+const permissionLevel = inject<Ref<string>>('permissionLevel')!
+const isNewTaskMode = inject<Ref<boolean>>('isNewTaskMode')!
+const newTaskAgentId = inject<Ref<string | null>>('newTaskAgentId')!
+const newTaskMode = inject<Ref<'CLOUD' | 'LOCAL'>>('newTaskMode')!
+const newTaskWorkspace = inject<Ref<string>>('newTaskWorkspace')!
+const newTaskCloudProjectKey = inject<Ref<string>>('newTaskCloudProjectKey')!
+const newTaskWorkspaceMode = inject<Ref<string>>('newTaskWorkspaceMode')!
+const newTaskGitCloneUrl = inject<Ref<string>>('newTaskGitCloneUrl')!
+const newTaskGitBranch = inject<Ref<string>>('newTaskGitBranch')!
+const newTaskCloudProjects = inject<Ref<Array<{ name: string; path: string; isGit: boolean }>>>('newTaskCloudProjects')!
+const initialLoading = inject<Ref<boolean>>('initialLoading')!
+const currentPhase = inject<Ref<TaskPhase>>('currentPhase')!
+
+// 消息发送中状态，等待后端保存确认
+const waitingForSave = ref(false)
+// 用于在 KeepAlive 切回时作废进行中的发送 UI 副作用（避免晚到的 clearInput 清掉新输入）
+let sendGeneration = 0
+
+// Non-reactive callback to sync state to TaskView (avoids recursive updates)
+type SyncChatStateFn = (state: {
+  workspace?: string; agentName?: string; todos?: any[]; contextWindow?: any
+  sending?: boolean; pendingApprovals?: any[]
+}) => void
+const syncChatState = inject<SyncChatStateFn>('syncChatState')!
+const chatFocusInput = inject<Ref<(() => void) | null>>('chatFocusInput')!
+const chatPrefillInput = inject<Ref<((text: string) => void) | null> | null>('chatPrefillInput', null)
+const openSideTask = inject<
+  ((contextMode?: SideTaskContextMode, fork?: { messageId: string; label: string }) => void) | undefined
+>('openSideTask', undefined)
+
+const agentStore = useAgentStore()
+const sessionStore = useSessionStore()
+const draftStore = useDraftStore()
+const router = useRouter()
+const commandEditDialogRef = ref<InstanceType<typeof CommandEditDialog>>()
+
+const chatInputRef = ref<InstanceType<typeof ChatInput>>()
+const models = ref<Array<{ id: number; supportsVision: boolean }>>([])
+
+const {
+  messages,
+  sending,
+  switchingSession,
+  initializingWorkspace,
+  initializingWorkspaceLabel,
+  sessionId,
+  workspace,
+  cloudProjectKey,
+  workspaceMode,
+  gitCloneUrl,
+  gitBranch,
+  agentName,
+  pendingApprovals,
+  todos,
+  contextWindow,
+  sendMessageAndWaitForSave,
+  sendMessageWithQueue,
+  isActive,
+  editAndResend,
+  stopExecution,
+  retryExecution,
+  loadOlderMessages,
+  newSession,
+  restoreSession,
+  confirmApproval,
+  submitQuestionAnswer,
+  cleanup,
+  insertQueueMessage,
+  deleteQueueMessage,
+  reorderQueueMessage
+} = useChat(agentId, executionMode, newTaskModelId, permissionLevel)
+
+/** 分享会话弹窗（与任务列表右键「分享…」共用 ShareDialog）：只分享当前会话 */
+const shareVisible = ref(false)
+const shareSessionId = ref('')
+
+function openShareDialog() {
+  const id = sessionId.value
+  if (!id) return
+  shareSessionId.value = id
+  shareVisible.value = true
+}
+
+function handleSubmitQuestion(requestId: string, answers: QuestionAnswer[], done: (ok: boolean) => void) {
+  submitQuestionAnswer(requestId, answers).then(done, () => done(false))
+}
+
+const historyLoading = computed(() => initialLoading.value || switchingSession.value)
+
+/** 新建会话中心态：无 session 且不在加载历史时展示居中 Composer */
+const showCenterComposer = computed(() => isNewTaskMode.value && !historyLoading.value)
+
+const isMobileViewport = ref(typeof window !== 'undefined' ? window.innerWidth <= 768 : false)
+function syncMobileViewport() {
+  isMobileViewport.value = window.innerWidth <= 768
+}
+
+/** 软键盘弹出（visualViewport 明显矮于布局视口）时关闭几何居中，避免发送键被遮挡 */
+const keyboardOpen = ref(false)
+function syncKeyboardOpen() {
+  if (typeof window === 'undefined') return
+  const vv = window.visualViewport
+  if (!vv) {
+    keyboardOpen.value = false
+    return
+  }
+  // 预留 120px：浏览器工具栏/轻微缩放不误判
+  keyboardOpen.value = window.innerHeight - vv.height > 120
+}
+
+function handleStarterSelect(text: string) {
+  chatInputRef.value?.insertText?.(text)
+  nextTick(() => chatInputRef.value?.focusInput())
+}
+
+// Sync workspace source state from ChatInput events to useChat
+watch(newTaskWorkspaceMode, (val) => { workspaceMode.value = val })
+watch(newTaskGitCloneUrl, (val) => { gitCloneUrl.value = val })
+watch(newTaskGitBranch, (val) => { gitBranch.value = val })
+
+// Provide focusInput to TaskView
+chatFocusInput.value = () => chatInputRef.value?.focusInput()
+// Provide prefill to TaskView（首启向导「开始任务」把示例文案填进新建态 Composer）
+if (chatPrefillInput) {
+  chatPrefillInput.value = (text: string) => chatInputRef.value?.insertText?.(text)
+}
+
+// Sync state to TaskView via non-reactive callback (called explicitly, not via watchers)
+function syncToTaskView() {
+  syncChatState({
+    workspace: workspace.value,
+    agentName: agentName.value,
+    todos: todos.value,
+    contextWindow: contextWindow.value,
+    sending: sending.value,
+    pendingApprovals: pendingApprovals.value,
+  })
+}
+
+// Sync after restoreSession completes and on key state changes
+watch(workspace, () => syncToTaskView())
+watch(agentName, () => syncToTaskView())
+watch(todos, () => syncToTaskView(), { deep: true })
+watch(contextWindow, () => syncToTaskView())
+watch(sending, () => syncToTaskView())
+watch(pendingApprovals, () => syncToTaskView(), { deep: true })
+
+// Session restore — ChatPanel watches sessionStore.activeSessionId
+const messagesContainer = ref<HTMLElement>()
+const {
+  userScrolledUp, scrollToBottom, pauseFollow, beginRestore, completeRestore,
+  handleMarkdownRendered, handleWheel, handleTouchStart, handleTouchMove, handlePointerDown, handleKeyDown, handleScroll, cancelRestore, resetScrollBaseline, dispose: disposeScroll,
+} = useChatScroll(messagesContainer, {
+  loadOlder: loadOlderMessages,
+  canLoadOlder: () => sessionStore.activeMessageHasMore && !sessionStore.activeMessageLoadingOlder,
+})
+const { flashId, flash } = useMessageLocate({
+  sessionId: () => sessionId.value,
+  container: messagesContainer,
+  onLocate: pauseFollow,
+})
+provide(LOCATE_FLASH_KEY, flashId)
+
+/** 轮次目录定位：与全局搜索跳转同构（flash 内部含 pauseFollow 与 nextTick 滚动，展开由 ChatRoundList 的 flashId 监听完成） */
+function onRoundLocate(messageId: string) {
+  flash(messageId)
+}
+
+let restoreGeneration = 0
+
+function restoreForActiveSession(newSid: string | null) {
+  const generation = ++restoreGeneration
+  cancelRestore()
+  if (!newSid) {
+    if (sessionId.value) {
+      cleanup()
+      newSession()
+    }
+    return
+  }
+  if (newSid === sessionId.value) return
+  const scrollGeneration = beginRestore()
+  const session = sessionStore.sessions.find(s => String(s.id) === String(newSid))
+  const mode = session?.executionMode || executionMode.value
+  const ws = session?.workspace || undefined
+  restoreSession(newSid, mode, ws).finally(() => {
+    if (generation !== restoreGeneration) return
+    syncToTaskView()
+    completeRestore(scrollGeneration)
+    nextTick(() => chatInputRef.value?.focusInput())
+  })
+}
+
+watch(() => sessionStore.activeSessionId, (newSid) => {
+  restoreForActiveSession(newSid)
+})
+
+watch(isNewTaskMode, (enabled) => {
+  if (!enabled) return
+  if (sessionId.value) {
+    cleanup()
+    newSession()
+    syncToTaskView()
+  }
+  nextTick(() => chatInputRef.value?.focusInput())
+})
+
+const currentSession = computed(() => sessionStore.activeSession)
+
+/**
+ * 当前草稿绑定键：新建任务共用 'new'，已有会话按会话 ID 隔离。
+ * 加载过渡期（无 activeSessionId 且非新建任务）返回 null，输入框跳过存取。
+ */
+const currentDraftKey = computed<string | null>(() => {
+  if (isNewTaskMode.value) return 'new'
+  return sessionStore.activeSessionId ? `s:${sessionStore.activeSessionId}` : null
+})
+
+const currentModelSupportsVision = computed(() => {
+  if (isNewTaskMode.value) {
+    // 新建任务模式：从模型列表中查找
+    const modelId = newTaskModelId.value
+    if (!modelId) return undefined
+    const model = models.value.find(m => m.id === modelId)
+    return model?.supportsVision
+  }
+  // 已有会话模式：从会话中获取
+  return currentSession.value?.modelSupportsVision
+})
+
+const activePendingApprovals = computed(() => {
+  const parentId = sessionStore.activeSessionId
+  if (!parentId) {
+    return pendingApprovals.value.filter(a => !a.sessionId)
+  }
+  const subIds = new Set(
+    sessionStore.getSubagents(parentId).map(s => String(s.id))
+  )
+  return pendingApprovals.value.filter(a => {
+    if (!a.sessionId || a.sessionId === parentId) return true
+    // 子代理 Tab 未激活时，仍在主聊天展示其 LOCAL 审批，避免卡死
+    return subIds.has(String(a.sessionId))
+  })
+})
+
+const activePendingQuestions = computed(() => sessionStore.activePendingQuestions)
+
+const executionError = computed(() => sessionStore.activeExecutionError)
+
+/**
+ * 预算 BLOCK（技术方案 §5.7）：useStreamWS 收到 code=budget_exceeded 的 error 帧后派发
+ * budget_blocked 窗口事件。仅当事件归属当前会话时置位，给错误横幅加「查看我的预算」跳转。
+ * 复位只发生在错误消失（重试/新一轮执行清掉 executionError）或切换会话时——不能监听
+ * executionError 的每次变化：budget_blocked 先于 setExecutionError 同步派发，watcher 在
+ * 之后微任务运行，无条件复位会把刚置位的标志清掉。
+ */
+const budgetBlocked = ref(false)
+
+function handleBudgetBlocked(e: Event) {
+  const detail = (e as CustomEvent<{ sessionId?: number | string }>).detail
+  if (detail?.sessionId != null && String(detail.sessionId) !== String(sessionId.value ?? '')) return
+  budgetBlocked.value = true
+}
+
+watch(executionError, (v) => {
+  if (!v) budgetBlocked.value = false
+})
+
+watch(sessionId, () => {
+  budgetBlocked.value = false
+})
+
+function openBudgetDrawer() {
+  window.dispatchEvent(new CustomEvent('open_usage_drawer', { detail: { tab: 'budget' } }))
+}
+
+const ACTIVE_PHASES: TaskPhase[] = ['RUNNING', 'RESUMING', 'WAITING_APPROVAL', 'CANCELLING']
+const agentRunning = computed(() => {
+  const phase = sessionId.value ? sessionStore.getSessionPhase(sessionId.value) : null
+  return sending.value || (phase != null && ACTIVE_PHASES.includes(phase))
+})
+
+/** 会话处于 CANCELLED 终态且未在执行时，输入框为空显示「继续」按钮（续跑语义同重试） */
+const canContinue = computed(() => {
+  if (isNewTaskMode.value || !sessionId.value) return false
+  if (agentRunning.value) return false
+  return sessionStore.getSessionPhase(sessionId.value) === 'CANCELLED'
+})
+
+const showTypingIndicator = computed(() => {
+  if (historyLoading.value) return false
+  if (initializingWorkspace.value) return false
+  if (!agentRunning.value) return false
+  if (sessionStore.activeStreaming) return false
+  const lastMsg = messages.value[messages.value.length - 1]
+  if (!lastMsg) return true
+  if (normalizeMessageRole(lastMsg.role ?? '') !== 'assistant') return true
+  const hasRunningTool = lastMsg.toolCalls?.some(
+    tc => tc.status === 'pending' || tc.status === 'running'
+  ) ?? false
+  if (hasRunningTool) return false
+  // 执行中但暂无流式输出/工具进行中（含恢复会话后等待下一事件、工具间隙）→ 底部三点
+  return true
+})
+
+/**
+ * 底部打字区的重试提示：仅当消息区没有合适的 MessageBubble 承载重试条时显示
+ * （如恢复会话后最后一条消息为 user 的重试场景），避免与消息气泡内的重试条重复。
+ * 首轮重试由占位 assistant 消息 + MessageBubble 承载，此处不重复显示。
+ * 返回 null 时不显示。
+ */
+const typingRetry = computed(() => {
+  if (!sessionStore.activeLlmRetry) return null
+  const lastMsg = messages.value[messages.value.length - 1]
+  if (lastMsg && normalizeMessageRole(lastMsg.role ?? '') === 'assistant') return null
+  return sessionStore.activeLlmRetry
+})
+
+// 中心态 → 会话态切换后 messages 容器会重建，需重新挂载滚动监听
+watch(messagesContainer, (el, oldEl) => {
+  oldEl?.removeEventListener('scroll', handleScroll)
+  oldEl?.removeEventListener('wheel', handleWheel)
+  oldEl?.removeEventListener('keydown', handleKeyDown)
+  // 新容器的 scrollTop 起点与旧容器无关，重新度量避免误判上滑
+  resetScrollBaseline()
+  el?.addEventListener('scroll', handleScroll, { passive: true })
+  el?.addEventListener('wheel', handleWheel, { passive: true })
+  el?.addEventListener('keydown', handleKeyDown)
+}, { flush: 'post' })
+
+onMounted(async () => {
+  window.addEventListener('mao:markdown-rendered', handleMarkdownRendered)
+  window.addEventListener('budget_blocked', handleBudgetBlocked)
+  window.addEventListener('resize', syncMobileViewport, { passive: true })
+  window.visualViewport?.addEventListener('resize', syncKeyboardOpen, { passive: true })
+  syncKeyboardOpen()
+
+  // 任务执行中进入设置页再返回工作台时，TaskView/ChatPanel 整体卸载重建，
+  // 而 store 的 activeSessionId 未变化，watcher 不会触发 → 新实例的
+  // restoreSession 不执行，表现为执行状态不更新。挂载时兜底恢复一次。
+  restoreForActiveSession(sessionStore.activeSessionId)
+
+  // 获取模型列表，用于新建任务模式下判断视觉能力
+  try {
+    const { data } = await api.get('/models/active')
+    models.value = data || []
+  } catch {
+    // ignore
+  }
+})
+
+onUnmounted(() => {
+  const el = messagesContainer.value
+  el?.removeEventListener('scroll', handleScroll)
+  el?.removeEventListener('wheel', handleWheel)
+  el?.removeEventListener('keydown', handleKeyDown)
+  // 组件卸载（KeepAlive 关 Tab / 切 Settings）必须退订 WS 并清理审批队列，
+  // 否则订阅与 pendingApprovals 一直残留，依赖 KeepAlive LRU 淘汰才释放
+  cleanup()
+  // 恢复期可能注册的渲染监听与收尾定时器一并清理
+  window.removeEventListener('mao:markdown-rendered', handleMarkdownRendered)
+  window.removeEventListener('budget_blocked', handleBudgetBlocked)
+  window.removeEventListener('resize', syncMobileViewport)
+  window.visualViewport?.removeEventListener('resize', syncKeyboardOpen)
+  disposeScroll()
+  restoreGeneration++
+})
+
+// Edit message
+const editingMessageId = ref<string | null>(null)
+
+function canEditMessage(msg: ChatMessage): boolean {
+  if (agentRunning.value) return false
+  if (normalizeMessageRole(msg.role) !== 'user') return false
+  const msgs = messages.value
+  const lastUserMsg = [...msgs].reverse().find(m => normalizeMessageRole(m.role) === 'user')
+  return lastUserMsg?.id === msg.id
+}
+
+function startEdit(msg: ChatMessage) {
+  editingMessageId.value = msg.id
+}
+
+function cancelEdit() {
+  editingMessageId.value = null
+}
+
+async function confirmEdit(messageId: string, newContent: string) {
+  editingMessageId.value = null
+  userScrolledUp.value = false
+  await editAndResend(messageId, newContent)
+  nextTick(scrollToBottomSmooth)
+}
+
+// --- 队列消息撤回编辑 ---
+
+const { handleQueueEdit } = useChatQueue(
+  () => sessionId.value,
+  () => chatInputRef.value,
+)
+
+function scrollToBottomSmooth() {
+  scrollToBottom()
+}
+
+// Phase sync
+// When sending goes false, verify against the server-side phase before
+// resetting currentPhase.  sending is a single ref shared by all sessions;
+// a non-active session completing can resolve its pendingCallbacks and set
+// sending=false even though the *active* session is still running.
+watch(() => sending.value, (isSending) => {
+  if (!sessionStore.activeSessionId) return
+  if (isSending) {
+    currentPhase.value = 'RUNNING'
+  } else {
+    if (currentPhase.value === 'RUNNING') {
+      const serverPhase = sessionStore.activeSession?.phase as TaskPhase | undefined
+      if (serverPhase && ACTIVE_PHASES.includes(serverPhase)) {
+        currentPhase.value = serverPhase
+      } else {
+        currentPhase.value = 'IDLE'
+      }
+    }
+  }
+})
+
+watch(() => sessionStore.activeSession?.phase, (serverPhase) => {
+  if (serverPhase && serverPhase !== currentPhase.value) {
+    currentPhase.value = serverPhase
+  }
+})
+
+// Scroll to bottom when switching back to chat tab (KeepAlive restore)
+onActivated(() => {
+  userScrolledUp.value = false
+  // KeepAlive 缓存期间若仍卡在 waitingForSave（异步挂起/超时未完成），切回后需解锁发送按钮
+  if (waitingForSave.value) {
+    waitingForSave.value = false
+    sendGeneration++
+  }
+  scrollToBottom()
+})
+
+// Send/stop handlers
+const pendingNewTaskNav = ref(false)
+
+// Navigate to new session as soon as it's created (don't wait for sendMessage to finish)
+watch(sessionId, (newSid) => {
+  if (pendingNewTaskNav.value && newSid) {
+    pendingNewTaskNav.value = false
+    router.replace(`/tasks/${newSid}`)
+  }
+})
+
+async function handleSend(text: string, files: File[], pendingUploads?: PendingUploadFile[]) {
+  if (isNewTaskMode.value) {
+    if (!newTaskAgentId.value) return
+    agentId.value = newTaskAgentId.value
+    executionMode.value = newTaskMode.value
+    workspace.value = newTaskWorkspace.value
+    cloudProjectKey.value = newTaskCloudProjectKey.value
+    pendingNewTaskNav.value = true
+  }
+  userScrolledUp.value = false
+
+  // 发送前捕获草稿键：等待保存期间用户可能切走会话，
+  // 无论 UI 是否被作废，已发出的草稿槽位都必须清除
+  const draftKeyAtSend = currentDraftKey.value
+
+  // Agent 运行中走队列，不阻塞输入框
+  if (isActive.value) {
+    const generation = ++sendGeneration
+    const sent = await sendMessageWithQueue(text, files, pendingUploads)
+    if (sent) {
+      if (draftKeyAtSend) draftStore.clearDraft(draftKeyAtSend)
+      // await 期间用户可能已切走并改过输入：原文未改仍清空，避免再发一次
+      clearInputIfUnedited(text, generation)
+      nextTick(scrollToBottomSmooth)
+    }
+    return
+  }
+
+  // 首条消息：等待保存确认后再清空输入框并解锁；失败时保留输入以便重试
+  const generation = ++sendGeneration
+  waitingForSave.value = true
+  try {
+    const saved = await sendMessageAndWaitForSave(text, files, pendingUploads)
+    if (saved && draftKeyAtSend) draftStore.clearDraft(draftKeyAtSend)
+    // 切回聊天 Tab 会作废本轮代数，避免清掉用户回来后新打的字。
+    // 输入仍是刚发出的原文时仍要清空，否则看起来像没发出去、再按一次会重发。
+    if (saved) clearInputIfUnedited(text, generation)
+    // 新建任务首发失败：createSession 成功已跳转新会话，键切换时草稿被存入 'new' 槽位、
+    // 编辑器被清空。失败需回填到当前输入框，避免用户误以为内容丢失。
+    // 输入框已有内容（用户切回新建任务时草稿已自动恢复/重新输入）则跳过，防止覆盖。
+    if (!saved && generation === sendGeneration && draftKeyAtSend === 'new') {
+      const entry = draftStore.getDraft('new')
+      if (entry && !chatInputRef.value?.hasDraft()) {
+        // 回填时按文件类型重建预览 URL，旧 blob URL 不再使用，先释放
+        entry.files.forEach((item) => { if (item.previewUrl) URL.revokeObjectURL(item.previewUrl) })
+        draftStore.clearDraft('new')
+        chatInputRef.value?.restoreContent(
+          entry.text,
+          entry.files.map((item) => item.file),
+          entry.quotes ?? [],
+        )
+      }
+    }
+  } finally {
+    if (generation === sendGeneration) {
+      waitingForSave.value = false
+    }
+  }
+
+  nextTick(scrollToBottomSmooth)
+}
+
+function clearInputIfUnedited(sentText: string, _generation: number) {
+  const current = chatInputRef.value?.getPlainText() ?? ''
+  // 只在原文没被改过时清空。等待保存期间用户可以继续打字，代数没变不能当成「输入没变」。
+  if (current === sentText.trim()) {
+    chatInputRef.value?.clearInput()
+  }
+}
+
+function handleStop() {
+  stopExecution()
+}
+
+function handleRetry() {
+  retryExecution()
+}
+
+async function handleModelSwitch(modelId: number) {
+  // Keep new-task draft in sync so "新建会话" inherits the model just selected mid-chat
+  const prevModelId = newTaskModelId.value
+  newTaskModelId.value = modelId
+  if (!isNewTaskMode.value && sessionStore.activeSessionId) {
+    try {
+      await sessionStore.updateSessionModel(sessionStore.activeSessionId, modelId)
+    } catch {
+      newTaskModelId.value = prevModelId
+      ElMessage.error('模型切换失败，请重试')
+    }
+  }
+}
+
+function handleModelSelect(modelId: number, _modelIdStr: string) {
+  newTaskModelId.value = modelId
+}
+
+async function handlePermissionLevelChange(level: string) {
+  const prevLevel = permissionLevel.value
+  permissionLevel.value = level
+  if (!sessionStore.activeSessionId) return
+  const sid = sessionStore.activeSessionId
+  sessionStore.updateSession(sid, { permissionLevel: level })
+  try {
+    await api.patch(`/sessions/${sid}`, { permissionLevel: level })
+  } catch (e) {
+    // 失败回滚本地乐观修改，避免 UI 与服务端不一致
+    permissionLevel.value = prevLevel
+    sessionStore.updateSession(sid, { permissionLevel: prevLevel })
+    ElMessage.error('权限级别更新失败，请重试')
+  }
+}
+
+function handleNewTaskModeChange(mode: string) {
+  newTaskMode.value = mode as 'CLOUD' | 'LOCAL'
+  // 模式互斥：本地目录与云端工作区来源各只对自己模式有意义，切换即清空对面选择
+  //（CLOUD 带入的显式工作区是服务器路径，不能留作本地目录候选；反之本地路径也不能用于 CLOUD）
+  newTaskWorkspace.value = ''
+  if (mode !== 'CLOUD') {
+    newTaskCloudProjectKey.value = ''
+  }
+}
+
+function handleNewTaskWorkspaceChange(ws: string) {
+  newTaskWorkspace.value = ws
+}
+
+function handleNewTaskCloudProjectKeyChange(key: string) {
+  newTaskCloudProjectKey.value = key
+  // 手动选 / 填项目即放弃总览带入的显式目录：后端按 cloudProjectKey 解析
+  // projects/{key}，显式路径若仍在会优先生效，与界面选择不符
+  newTaskWorkspace.value = ''
+}
+
+function handleNewTaskWorkspaceModeChange(mode: string) {
+  if (mode !== newTaskWorkspaceMode.value) {
+    // 主动切换工作区来源同样让位：否则旧显式路径仍优先生成会话
+    newTaskWorkspace.value = ''
+  }
+  newTaskWorkspaceMode.value = mode
+  if (mode === 'git') {
+    newTaskCloudProjectKey.value = ''
+  } else {
+    newTaskGitCloneUrl.value = ''
+    newTaskGitBranch.value = ''
+  }
+}
+
+function handleNewTaskGitCloneUrlChange(url: string) {
+  newTaskGitCloneUrl.value = url
+}
+
+function handleNewTaskGitBranchChange(branch: string) {
+  newTaskGitBranch.value = branch
+}
+
+function handleNewTaskAgentChange(id: string | null) {
+  newTaskAgentId.value = id
+  if (id) {
+    agentStore.fetchAgent(id)
+  }
+}
+</script>
+
+<style scoped>
+/* 轮次目录把手/浮层的定位宿主：absolute 挂滚动容器内会随内容滚走，
+   且 .chat-panel 整条祖先链无定位祖先，缺了它 absolute 回落视口（0.0.337 教训） */
+.messages-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  padding: 0px 20px;
+}
+
+/* ===== 新建会话中心态 ===== */
+.center-stage {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 24px 0 32px;
+  scrollbar-width: none;
+}
+
+.center-stage::-webkit-scrollbar {
+  display: none;
+}
+
+.center-brand {
+  margin-bottom: 12px;
+}
+
+.brand-mark {
+  width: 52px;
+  height: 52px;
+  aspect-ratio: 1 / 1;
+  border-radius: 14px;
+  object-fit: cover;
+  display: block;
+  flex-shrink: 0;
+}
+
+.center-greeting {
+  margin: 0 0 20px;
+  font-family: var(--aw-font-display);
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--aw-ink);
+  text-align: center;
+}
+
+.center-composer {
+  width: min(720px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.center-tips {
+  flex-shrink: 0;
+}
+
+/* 768–959：上半屏居中 */
+@media (min-width: 769px) and (max-width: 959px) {
+  .center-stage {
+    justify-content: flex-start;
+    padding-top: 12vh;
+  }
+
+  .center-greeting {
+    font-size: 20px;
+  }
+}
+
+/* ≤768：默认仍垂直居中；软键盘弹出时（.is-keyboard-open）改上锚定 */
+@media (max-width: 768px) {
+  .chat-panel {
+    padding: 0 12px;
+  }
+
+  .center-stage {
+    justify-content: center;
+    padding: 16px 0 24px;
+    overflow-y: auto;
+  }
+
+  .center-stage.is-keyboard-open {
+    justify-content: flex-start;
+    padding: 8px 0 16px;
+  }
+
+  .center-brand {
+    margin-bottom: 8px;
+  }
+
+  .brand-mark {
+    width: 44px;
+    height: 44px;
+    aspect-ratio: 1 / 1;
+    border-radius: 12px;
+  }
+
+  .center-greeting {
+    font-size: 18px;
+    font-weight: 600;
+    margin-bottom: 14px;
+    align-self: center;
+    text-align: center;
+  }
+
+  .center-composer {
+    width: 100%;
+  }
+}
+
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding-top: 16px;
+  margin-bottom: 10px;
+}
+
+.messages > *:last-child {
+  margin-bottom: 16px;
+}
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--aw-ink-muted-48);
+}
+
+.history-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 12px 0;
+  box-sizing: border-box;
+  color: var(--aw-ink-muted-48);
+}
+
+.history-loading p {
+  margin: 0;
+  font-size: var(--aw-text-body);
+}
+
+.history-loading.empty-state {
+  margin-bottom: 0;
+}
+
+.empty-icon {
+  color: var(--aw-hairline);
+  margin-bottom: 12px;
+}
+
+.workspace-init-state p {
+  margin-top: 12px;
+  font-size: var(--aw-text-body);
+  color: var(--aw-ink-muted-64);
+}
+
+.guidance-text {
+  font-size: var(--aw-text-body);
+  color: var(--aw-ink-muted-48);
+  margin: 0;
+}
+
+.empty-state p {
+  margin: 0;
+  font-size: var(--aw-text-body);
+}
+
+.typing-dots {
+  display: flex;
+  gap: 4px;
+  padding: 4px 0;
+}
+
+.typing-dots span {
+  width: 6px;
+  height: 6px;
+  background: var(--aw-ink-muted-48);
+  border-radius: 50%;
+  animation: typing 1.4s infinite ease-in-out;
+}
+
+.typing-dots span:nth-child(1) { animation-delay: -0.32s; }
+.typing-dots span:nth-child(2) { animation-delay: -0.16s; }
+
+@keyframes typing {
+  0%, 80%, 100% { transform: scale(0.8); opacity: 0.3; }
+  40% { transform: scale(1); opacity: 1; }
+}
+
+.typing-indicator {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.typing-retry {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  border: 1px solid var(--aw-warning, #e6a23c);
+  border-radius: var(--aw-radius-sm, 8px);
+  background: color-mix(in srgb, var(--aw-warning, #e6a23c) 10%, transparent);
+  color: var(--aw-warning, #e6a23c);
+  font-size: var(--aw-text-caption, 12px);
+  line-height: 1.5;
+}
+
+.typing-retry-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid color-mix(in srgb, var(--aw-warning, #e6a23c) 30%, transparent);
+  border-top-color: var(--aw-warning, #e6a23c);
+  border-radius: 50%;
+  animation: typing-retry-spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes typing-retry-spin {
+  to { transform: rotate(360deg); }
+}
+
+.compaction-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 12px 8px;
+  padding: 6px 12px;
+  font-size: var(--aw-text-caption);
+  color: var(--aw-ink-muted-48);
+  background: var(--aw-canvas-parchment);
+  border: 1px solid var(--aw-divider-soft);
+  border-radius: var(--aw-radius-xs);
+}
+
+.compaction-spinner {
+  flex-shrink: 0;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid var(--aw-primary-line);
+  border-top-color: var(--aw-primary);
+  border-radius: 50%;
+  animation: compaction-spin 0.8s linear infinite;
+}
+
+@keyframes compaction-spin {
+  to { transform: rotate(360deg); }
+}
+
+.side-task-entry {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 8px;
+}
+
+.side-task-btn {
+  height: var(--aw-btn-height);
+  border: 1px solid var(--aw-divider-soft);
+  background: var(--aw-canvas-parchment);
+  color: var(--aw-ink-muted-48);
+  font-size: var(--aw-text-fine);
+  padding: var(--aw-btn-padding);
+  border-radius: var(--aw-radius-xs);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.side-task-btn:hover {
+  background: var(--aw-divider-soft);
+  color: var(--aw-ink);
+  border-color: var(--aw-hairline);
+}
+
+.messages {
+  scrollbar-width: none;
+}
+
+.messages::-webkit-scrollbar {
+  display: none;
+}
+</style>

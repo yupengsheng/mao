@@ -1,0 +1,1862 @@
+import type { Db } from '../db/db.js';
+import { notDeleted } from '../db/db.js';
+import type { Agent, LlmModel, UserRow } from '../domain/types.js';
+import { addDaysYmd, formatDateTime, shanghaiYmd } from '../common/json.js';
+import { CANCELLED_SQL, NOT_CANCELLED_SQL } from '../common/llm-cancel.js';
+import { ACTIVE_PHASES } from '../session/util/session-group-key.js';
+import type { StatisticsService } from '../statistics/statistics.service.js';
+
+/** 统计窗口：闭区间日期 + 半开时间区间 [startAt, endAtExclusive)，避免 23:59:59 边界丢数据。 */
+export interface AnalyticsRange {
+  days: number;
+  startYmd: string;
+  endYmd: string;
+  startAt: string;
+  endAtExclusive: string;
+}
+
+/** 趋势横轴：day 为日历日，hour 为 Asia/Shanghai 整点。 */
+export type TrendGranularity = 'day' | 'hour';
+
+export interface DailySessionRow {
+  day: string;
+  count: number;
+}
+
+export interface DailyMessageRow {
+  day: string;
+  count: number;
+  tokens: number;
+}
+
+export interface DailyUsageRow {
+  day: string;
+  totalTokens: number;
+  callCount: number;
+}
+
+export interface PhaseCountRow {
+  phase: string;
+  count: number;
+}
+
+export interface GroupSessionRow {
+  id: number;
+  sessionCount: number;
+}
+
+export interface GroupMessageRow {
+  id: number;
+  messageCount: number;
+  totalTokens: number;
+}
+
+export interface GroupUsageRow {
+  id: number;
+  totalTokens: number;
+  callCount: number;
+}
+
+export interface NamedCountRow {
+  key: string;
+  count: number;
+}
+
+export interface LlmCallModelRow {
+  id: number;
+  callCount: number;
+  successCount: number;
+  failCount: number;
+  /** 取消数（error_message 含取消标记）：不计入 failCount，也不进成功率分母 */
+  cancelledCount: number;
+  retryCallCount: number;
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  callTokens: number;
+  /** 窗口内成本合计（成本单位 = 模型价格填写口径；SUM(cost_micros)/1e6） */
+  cost: number;
+  firstTokenMsSum: number;
+  firstTokenMsCount: number;
+  durationMsSum: number;
+  /** 可解码行的输出 token 合计（吞吐均值的分子；技术方案 2026-10-27-llm-output-speed §5.3） */
+  decodeTokensSum: number;
+  /** 可解码行的解码耗时合计（ms，= Σ(duration_ms − first_token_ms)；吞吐均值的分母） */
+  decodeMsSum: number;
+}
+
+export interface LlmCallDailyRow {
+  day: string;
+  callCount: number;
+  failCount: number;
+  cancelledCount: number;
+  promptTokens: number;
+  cachedTokens: number;
+  callTokens: number;
+  cost: number;
+  /** 流式行首字耗时合计（ms）与非空行数：平均首字耗时 = sum / count，口径同模型页 */
+  firstTokenMsSum: number;
+  firstTokenMsCount: number;
+  /** 全部调用总耗时合计（ms）：平均总耗时 = sum / callCount */
+  durationMsSum: number;
+}
+
+export interface LlmCallNamedRow {
+  key: string;
+  callCount: number;
+  failCount: number;
+  cancelledCount: number;
+  callTokens: number;
+}
+
+export interface LlmCallDimRow {
+  id: number;
+  callCount: number;
+  failCount: number;
+  cancelledCount: number;
+  callTokens: number;
+  cost: number;
+}
+
+export interface LlmCallQualitySummary {
+  callCount: number;
+  successCount: number;
+  failCount: number;
+  /** 取消数：成功率分母 = callCount - cancelledCount（取消不是失败） */
+  cancelledCount: number;
+  retryCallCount: number;
+  promptTokens: number;
+  cachedTokens: number;
+  callTokens: number;
+  cost: number;
+}
+
+/** 运行轨迹聚合的排行维度：按 Agent 或按用户（技术方案 §5.4）。 */
+export type RunTraceDimension = 'agent' | 'user';
+
+/** 最慢 / 最贵轮的原始行（每个维度取一圈代表调用）。 */
+export interface RunTraceRoundRow {
+  scopeKey: number;
+  sessionId: number | null;
+  modelName: string | null;
+  createdAt: string | null;
+  durationMs: number;
+  totalTokens: number;
+  costMicros: number | null;
+  /** 该维度在窗口内的调用总数，供界面标注样本量 */
+  callCount: number;
+}
+
+/** 工具失败率原始行：按活动 type 分组，状态沿用活动表现有口径。 */
+export interface RunTraceToolFailureRow {
+  toolType: string;
+  errorCount: number;
+  totalCount: number;
+}
+
+/** 自定义 HTTP 工具调用统计行（§9.4）：一次算出调用次数 / 失败数 / 活跃用户数 / 首末次调用时间。 */
+export interface HttpToolCallStatRow {
+  slug: string;
+  calls: number;
+  errors: number;
+  users: number;
+  firstAt: string | null;
+  lastAt: string | null;
+}
+
+export interface LlmCallFilterOpts {
+  excludeConnectivity?: boolean;
+  modelId?: number | null;
+  successOnly?: boolean;
+}
+
+/**
+ * 延迟 / 吞吐分位指标（技术方案 2026-10-27-llm-output-speed §5.3）：前两个是列，
+ * throughput 是派生表达式——输出 tokens ÷ 解码秒，与 desktop utils/throughput.ts 同口径。
+ * 分位用 ORDER BY <expr> LIMIT offset 取第 N 个值，吞吐没有列可依，只能泛化成表达式。
+ */
+export type LlmCallLatencyMetric = 'first_token_ms' | 'duration_ms' | 'throughput';
+
+const LLM_CALL_LATENCY_METRICS: Record<LlmCallLatencyMetric, { expr: string; where: string }> = {
+  first_token_ms: { expr: 'first_token_ms', where: 'first_token_ms IS NOT NULL AND first_token_ms > 0' },
+  duration_ms: { expr: 'duration_ms', where: 'duration_ms IS NOT NULL AND duration_ms > 0' },
+  throughput: {
+    expr: 'completion_tokens / ((duration_ms - first_token_ms) / 1000)',
+    // 与 desktop utils/throughput.ts 的 throughput() 逐条同口径：非流式（first_token_ms 缺失）、
+    // 解码为 0（first_token_ms 不早于结束，除零会出 NULL）、零输出的行都不进样本
+    where: 'first_token_ms IS NOT NULL AND first_token_ms < duration_ms AND completion_tokens > 0',
+  },
+};
+
+export interface AdminAnalyticsStore {
+  selectDailySessionCounts(range: AnalyticsRange, granularity?: TrendGranularity): Promise<DailySessionRow[]>;
+  selectDailyMessageStats(range: AnalyticsRange, granularity?: TrendGranularity): Promise<DailyMessageRow[]>;
+  selectDailyUsageStats(range: AnalyticsRange, granularity?: TrendGranularity): Promise<DailyUsageRow[]>;
+  selectLivePhaseCounts(): Promise<PhaseCountRow[]>;
+  selectPhaseCounts(range: AnalyticsRange): Promise<PhaseCountRow[]>;
+  selectSessionCountsByAgent(range: AnalyticsRange): Promise<GroupSessionRow[]>;
+  selectMessageStatsByAgent(range: AnalyticsRange): Promise<GroupMessageRow[]>;
+  selectSessionCountsByUser(range: AnalyticsRange): Promise<GroupSessionRow[]>;
+  selectMessageStatsByUser(range: AnalyticsRange): Promise<GroupMessageRow[]>;
+  selectSessionCountsByModel(range: AnalyticsRange): Promise<GroupSessionRow[]>;
+  selectMessageStatsByModel(range: AnalyticsRange): Promise<GroupMessageRow[]>;
+  selectUsageStatsByModel(range: AnalyticsRange): Promise<GroupUsageRow[]>;
+  selectSessionTypeCounts(range: AnalyticsRange): Promise<NamedCountRow[]>;
+  selectExecutionModeCounts(range: AnalyticsRange): Promise<NamedCountRow[]>;
+  selectDailyLlmCallStats(
+    range: AnalyticsRange,
+    opts?: LlmCallFilterOpts,
+    granularity?: TrendGranularity,
+  ): Promise<LlmCallDailyRow[]>;
+  selectLlmCallStatsByModel(range: AnalyticsRange, opts?: LlmCallFilterOpts): Promise<LlmCallModelRow[]>;
+  selectLlmCallSceneStats(range: AnalyticsRange, opts?: LlmCallFilterOpts): Promise<LlmCallNamedRow[]>;
+  selectLlmCallProtocolStats(range: AnalyticsRange, opts?: LlmCallFilterOpts): Promise<LlmCallNamedRow[]>;
+  selectLlmCallStatsByUser(range: AnalyticsRange, opts?: LlmCallFilterOpts): Promise<LlmCallDimRow[]>;
+  selectLlmCallStatsByAgent(range: AnalyticsRange, opts?: LlmCallFilterOpts): Promise<LlmCallDimRow[]>;
+  selectLlmCallQualitySummary(range: AnalyticsRange, opts?: LlmCallFilterOpts): Promise<LlmCallQualitySummary>;
+  countLlmCallLatency(range: AnalyticsRange, metric: LlmCallLatencyMetric, opts?: LlmCallFilterOpts): Promise<number>;
+  selectLlmCallLatencyAtOffset(
+    range: AnalyticsRange,
+    metric: LlmCallLatencyMetric,
+    offset: number,
+    opts?: LlmCallFilterOpts,
+  ): Promise<number | null>;
+  countActiveUsers(range: AnalyticsRange): Promise<number>;
+  countSessions(range: AnalyticsRange): Promise<number>;
+  sumMessages(range: AnalyticsRange): Promise<{ count: number; tokens: number }>;
+  sumUsageTokens(range: AnalyticsRange): Promise<number>;
+  selectRunTraceSlowestRounds(
+    range: AnalyticsRange,
+    scene: string,
+    dimension: RunTraceDimension,
+    limit: number,
+  ): Promise<RunTraceRoundRow[]>;
+  selectRunTraceMostExpensiveRounds(
+    range: AnalyticsRange,
+    scene: string,
+    dimension: RunTraceDimension,
+    limit: number,
+  ): Promise<RunTraceRoundRow[]>;
+  selectRunTraceToolFailureRates(range: AnalyticsRange): Promise<RunTraceToolFailureRow[]>;
+  /** 自定义 HTTP 工具调用统计（§9.4）：type='TOOL' AND target IS NOT NULL 即 http_call 行，按内层 slug 聚合。 */
+  selectHttpToolCallStats(slug?: string | null): Promise<HttpToolCallStatRow[]>;
+  listAgents(): Promise<Agent[]>;
+  listUsers(): Promise<UserRow[]>;
+  listModelsOrderByCreatedDesc(): Promise<LlmModel[]>;
+}
+
+export class AdminAnalyticsDbStore implements AdminAnalyticsStore {
+  constructor(private readonly db: Db) {}
+
+  /** 小时桶用墙上时钟整点，与连接时区 +08:00 一致，不随进程时区变化。 */
+  private trendBucketExpr(granularity: TrendGranularity = 'day'): string {
+    return granularity === 'hour'
+      ? `DATE_FORMAT(created_at, '%Y-%m-%d %H:00')`
+      : `DATE(created_at)`;
+  }
+
+  selectDailySessionCounts(range: AnalyticsRange, granularity: TrendGranularity = 'day'): Promise<DailySessionRow[]> {
+    const bucket = this.trendBucketExpr(granularity);
+    return this.db.query(
+      `SELECT ${bucket} AS day, COUNT(*) AS count
+       FROM session
+       WHERE created_at >= ? AND created_at < ? AND deleted = 0
+       GROUP BY ${bucket}`,
+      [range.startAt, range.endAtExclusive],
+    );
+  }
+
+  selectDailyMessageStats(range: AnalyticsRange, granularity: TrendGranularity = 'day'): Promise<DailyMessageRow[]> {
+    const bucket = this.trendBucketExpr(granularity);
+    return this.db.query(
+      `SELECT ${bucket} AS day, COUNT(*) AS count, COALESCE(SUM(token_count), 0) AS tokens
+       FROM message
+       WHERE created_at >= ? AND created_at < ? AND deleted = 0
+       GROUP BY ${bucket}`,
+      [range.startAt, range.endAtExclusive],
+    );
+  }
+
+  selectDailyUsageStats(range: AnalyticsRange, granularity: TrendGranularity = 'day'): Promise<DailyUsageRow[]> {
+    const bucket = this.trendBucketExpr(granularity);
+    return this.db.query(
+      `SELECT ${bucket} AS day, COALESCE(SUM(total_tokens), 0) AS totalTokens, COUNT(*) AS callCount
+       FROM llm_usage
+       WHERE created_at >= ? AND created_at < ?
+       GROUP BY ${bucket}`,
+      [range.startAt, range.endAtExclusive],
+    );
+  }
+
+  selectLivePhaseCounts(): Promise<PhaseCountRow[]> {
+    return this.db.query(
+      `SELECT COALESCE(phase, 'IDLE') AS phase, COUNT(*) AS count
+       FROM session WHERE deleted = 0 GROUP BY COALESCE(phase, 'IDLE')`,
+    );
+  }
+
+  selectPhaseCounts(range: AnalyticsRange): Promise<PhaseCountRow[]> {
+    return this.db.query(
+      `SELECT COALESCE(phase, 'IDLE') AS phase, COUNT(*) AS count
+       FROM session
+       WHERE created_at >= ? AND created_at < ? AND deleted = 0
+       GROUP BY COALESCE(phase, 'IDLE')`,
+      [range.startAt, range.endAtExclusive],
+    );
+  }
+
+  selectSessionCountsByAgent(range: AnalyticsRange): Promise<GroupSessionRow[]> {
+    return this.db.query(
+      `SELECT agent_id AS id, COUNT(*) AS sessionCount
+       FROM session
+       WHERE created_at >= ? AND created_at < ? AND deleted = 0
+       GROUP BY agent_id`,
+      [range.startAt, range.endAtExclusive],
+    );
+  }
+
+  selectMessageStatsByAgent(range: AnalyticsRange): Promise<GroupMessageRow[]> {
+    return this.db.query(
+      `SELECT ${MESSAGE_FIRST_HINT} s.agent_id AS id, COUNT(m.id) AS messageCount, COALESCE(SUM(m.token_count), 0) AS totalTokens
+       FROM message m JOIN session s ON m.session_id = s.id
+       WHERE m.created_at >= ? AND m.created_at < ? AND m.deleted = 0 AND s.deleted = 0
+       GROUP BY s.agent_id`,
+      [range.startAt, range.endAtExclusive],
+    );
+  }
+
+  selectSessionCountsByUser(range: AnalyticsRange): Promise<GroupSessionRow[]> {
+    return this.db.query(
+      `SELECT user_id AS id, COUNT(*) AS sessionCount
+       FROM session
+       WHERE created_at >= ? AND created_at < ? AND deleted = 0
+       GROUP BY user_id`,
+      [range.startAt, range.endAtExclusive],
+    );
+  }
+
+  selectMessageStatsByUser(range: AnalyticsRange): Promise<GroupMessageRow[]> {
+    return this.db.query(
+      `SELECT ${MESSAGE_FIRST_HINT} s.user_id AS id, COUNT(m.id) AS messageCount, COALESCE(SUM(m.token_count), 0) AS totalTokens
+       FROM message m JOIN session s ON m.session_id = s.id
+       WHERE m.created_at >= ? AND m.created_at < ? AND m.deleted = 0 AND s.deleted = 0
+       GROUP BY s.user_id`,
+      [range.startAt, range.endAtExclusive],
+    );
+  }
+
+  selectSessionCountsByModel(range: AnalyticsRange): Promise<GroupSessionRow[]> {
+    return this.db.query(
+      `SELECT model_id AS id, COUNT(*) AS sessionCount
+       FROM session
+       WHERE created_at >= ? AND created_at < ? AND model_id IS NOT NULL AND deleted = 0
+       GROUP BY model_id`,
+      [range.startAt, range.endAtExclusive],
+    );
+  }
+
+  selectMessageStatsByModel(range: AnalyticsRange): Promise<GroupMessageRow[]> {
+    return this.db.query(
+      `SELECT ${MESSAGE_FIRST_HINT} m.model_id AS id, COUNT(*) AS messageCount, COALESCE(SUM(m.token_count), 0) AS totalTokens
+       FROM message m JOIN session s ON m.session_id = s.id
+       WHERE m.created_at >= ? AND m.created_at < ? AND m.model_id IS NOT NULL AND m.deleted = 0 AND s.deleted = 0
+       GROUP BY m.model_id`,
+      [range.startAt, range.endAtExclusive],
+    );
+  }
+
+  selectUsageStatsByModel(range: AnalyticsRange): Promise<GroupUsageRow[]> {
+    return this.db.query(
+      `SELECT model_id AS id, COALESCE(SUM(total_tokens), 0) AS totalTokens, COUNT(*) AS callCount
+       FROM llm_usage
+       WHERE created_at >= ? AND created_at < ?
+       GROUP BY model_id`,
+      [range.startAt, range.endAtExclusive],
+    );
+  }
+
+  selectSessionTypeCounts(range: AnalyticsRange): Promise<NamedCountRow[]> {
+    return this.db.query(
+      `SELECT COALESCE(session_type, 'NORMAL') AS \`key\`, COUNT(*) AS count
+       FROM session
+       WHERE created_at >= ? AND created_at < ? AND deleted = 0
+       GROUP BY COALESCE(session_type, 'NORMAL')`,
+      [range.startAt, range.endAtExclusive],
+    );
+  }
+
+  selectExecutionModeCounts(range: AnalyticsRange): Promise<NamedCountRow[]> {
+    return this.db.query(
+      `SELECT COALESCE(execution_mode, 'CLOUD') AS \`key\`, COUNT(*) AS count
+       FROM session
+       WHERE created_at >= ? AND created_at < ? AND deleted = 0
+       GROUP BY COALESCE(execution_mode, 'CLOUD')`,
+      [range.startAt, range.endAtExclusive],
+    );
+  }
+
+  private llmCallWhere(range: AnalyticsRange, opts?: LlmCallFilterOpts): { sql: string; params: unknown[] } {
+    const clauses = ['created_at >= ?', 'created_at < ?'];
+    const params: unknown[] = [range.startAt, range.endAtExclusive];
+    if (opts?.excludeConnectivity !== false) {
+      clauses.push(`scene != 'connectivity_test'`);
+    }
+    if (opts?.modelId != null) {
+      // 聚合口径把 NULL 归并为 id=0（「未关联模型」），筛选必须同口径：NULL 不能用 = 0 命中。
+      if (opts.modelId === 0) {
+        clauses.push('model_id IS NULL');
+      } else {
+        clauses.push('model_id = ?');
+        params.push(opts.modelId);
+      }
+    }
+    if (opts?.successOnly) {
+      clauses.push('success = 1');
+    }
+    return { sql: clauses.join(' AND '), params };
+  }
+
+  selectDailyLlmCallStats(
+    range: AnalyticsRange,
+    opts?: LlmCallFilterOpts,
+    granularity: TrendGranularity = 'day',
+  ): Promise<LlmCallDailyRow[]> {
+    const { sql, params } = this.llmCallWhere(range, opts);
+    const bucket = this.trendBucketExpr(granularity);
+    return this.db.query(
+      `SELECT ${bucket} AS day,
+              COUNT(*) AS callCount,
+              COALESCE(SUM(CASE WHEN success = 0 AND ${NOT_CANCELLED_SQL} THEN 1 ELSE 0 END), 0) AS failCount,
+              COALESCE(SUM(CASE WHEN ${CANCELLED_SQL} THEN 1 ELSE 0 END), 0) AS cancelledCount,
+              COALESCE(SUM(prompt_tokens), 0) AS promptTokens,
+              COALESCE(SUM(cached_tokens), 0) AS cachedTokens,
+              COALESCE(SUM(total_tokens), 0) AS callTokens,
+              COALESCE(SUM(cost_micros), 0) / 1000000 AS cost,
+              COALESCE(SUM(CASE WHEN first_token_ms IS NOT NULL THEN first_token_ms ELSE 0 END), 0) AS firstTokenMsSum,
+              COALESCE(SUM(CASE WHEN first_token_ms IS NOT NULL THEN 1 ELSE 0 END), 0) AS firstTokenMsCount,
+              COALESCE(SUM(duration_ms), 0) AS durationMsSum
+       FROM llm_call
+       WHERE ${sql}
+       GROUP BY ${bucket}`,
+      params,
+    );
+  }
+
+  selectLlmCallStatsByModel(range: AnalyticsRange, opts?: LlmCallFilterOpts): Promise<LlmCallModelRow[]> {
+    const { sql, params } = this.llmCallWhere(range, { ...opts, modelId: null });
+    return this.db.query(
+      `SELECT COALESCE(model_id, 0) AS id,
+              COUNT(*) AS callCount,
+              COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS successCount,
+              COALESCE(SUM(CASE WHEN success = 0 AND ${NOT_CANCELLED_SQL} THEN 1 ELSE 0 END), 0) AS failCount,
+              COALESCE(SUM(CASE WHEN ${CANCELLED_SQL} THEN 1 ELSE 0 END), 0) AS cancelledCount,
+              COALESCE(SUM(CASE WHEN retry_count > 0 THEN 1 ELSE 0 END), 0) AS retryCallCount,
+              COALESCE(SUM(prompt_tokens), 0) AS promptTokens,
+              COALESCE(SUM(completion_tokens), 0) AS completionTokens,
+              COALESCE(SUM(cached_tokens), 0) AS cachedTokens,
+              COALESCE(SUM(total_tokens), 0) AS callTokens,
+              COALESCE(SUM(cost_micros), 0) / 1000000 AS cost,
+              COALESCE(SUM(CASE WHEN first_token_ms IS NOT NULL THEN first_token_ms ELSE 0 END), 0) AS firstTokenMsSum,
+              COALESCE(SUM(CASE WHEN first_token_ms IS NOT NULL THEN 1 ELSE 0 END), 0) AS firstTokenMsCount,
+              COALESCE(SUM(duration_ms), 0) AS durationMsSum,
+              COALESCE(SUM(CASE WHEN first_token_ms IS NOT NULL AND first_token_ms < duration_ms AND completion_tokens > 0
+                                THEN completion_tokens ELSE 0 END), 0) AS decodeTokensSum,
+              COALESCE(SUM(CASE WHEN first_token_ms IS NOT NULL AND first_token_ms < duration_ms AND completion_tokens > 0
+                                THEN duration_ms - first_token_ms ELSE 0 END), 0) AS decodeMsSum
+       FROM llm_call
+       WHERE ${sql}
+       GROUP BY COALESCE(model_id, 0)`,
+      params,
+    );
+  }
+
+  selectLlmCallSceneStats(range: AnalyticsRange, opts?: LlmCallFilterOpts): Promise<LlmCallNamedRow[]> {
+    const { sql, params } = this.llmCallWhere(range, opts);
+    return this.db.query(
+      `SELECT COALESCE(scene, 'unknown') AS \`key\`,
+              COUNT(*) AS callCount,
+              COALESCE(SUM(CASE WHEN success = 0 AND ${NOT_CANCELLED_SQL} THEN 1 ELSE 0 END), 0) AS failCount,
+              COALESCE(SUM(CASE WHEN ${CANCELLED_SQL} THEN 1 ELSE 0 END), 0) AS cancelledCount,
+              COALESCE(SUM(total_tokens), 0) AS callTokens
+       FROM llm_call
+       WHERE ${sql}
+       GROUP BY COALESCE(scene, 'unknown')`,
+      params,
+    );
+  }
+
+  selectLlmCallProtocolStats(range: AnalyticsRange, opts?: LlmCallFilterOpts): Promise<LlmCallNamedRow[]> {
+    const { sql, params } = this.llmCallWhere(range, opts);
+    // protocol 空串 = OpenAI 兼容（与 llm_model.api_protocol 同语义，见迁移 V091），COALESCE 只兜 NULL 兜不住空串；
+    // 分组表达式在 SELECT 与 GROUP BY 复用同一常量，避免两处漂移。
+    const protocolKey = `CASE WHEN protocol IS NULL THEN 'unknown' WHEN TRIM(protocol) = '' THEN 'openai-compatible' ELSE protocol END`;
+    return this.db.query(
+      `SELECT ${protocolKey} AS \`key\`,
+              COUNT(*) AS callCount,
+              COALESCE(SUM(CASE WHEN success = 0 AND ${NOT_CANCELLED_SQL} THEN 1 ELSE 0 END), 0) AS failCount,
+              COALESCE(SUM(CASE WHEN ${CANCELLED_SQL} THEN 1 ELSE 0 END), 0) AS cancelledCount,
+              COALESCE(SUM(total_tokens), 0) AS callTokens
+       FROM llm_call
+       WHERE ${sql}
+       GROUP BY ${protocolKey}`,
+      params,
+    );
+  }
+
+  selectLlmCallStatsByUser(range: AnalyticsRange, opts?: LlmCallFilterOpts): Promise<LlmCallDimRow[]> {
+    const { sql, params } = this.llmCallWhere(range, opts);
+    return this.db.query(
+      `SELECT user_id AS id,
+              COUNT(*) AS callCount,
+              COALESCE(SUM(CASE WHEN success = 0 AND ${NOT_CANCELLED_SQL} THEN 1 ELSE 0 END), 0) AS failCount,
+              COALESCE(SUM(CASE WHEN ${CANCELLED_SQL} THEN 1 ELSE 0 END), 0) AS cancelledCount,
+              COALESCE(SUM(total_tokens), 0) AS callTokens,
+              COALESCE(SUM(cost_micros), 0) / 1000000 AS cost
+       FROM llm_call
+       WHERE ${sql} AND user_id IS NOT NULL
+       GROUP BY user_id`,
+      params,
+    );
+  }
+
+  selectLlmCallStatsByAgent(range: AnalyticsRange, opts?: LlmCallFilterOpts): Promise<LlmCallDimRow[]> {
+    const { sql, params } = this.llmCallWhere(range, opts);
+    return this.db.query(
+      `SELECT agent_id AS id,
+              COUNT(*) AS callCount,
+              COALESCE(SUM(CASE WHEN success = 0 AND ${NOT_CANCELLED_SQL} THEN 1 ELSE 0 END), 0) AS failCount,
+              COALESCE(SUM(CASE WHEN ${CANCELLED_SQL} THEN 1 ELSE 0 END), 0) AS cancelledCount,
+              COALESCE(SUM(total_tokens), 0) AS callTokens,
+              COALESCE(SUM(cost_micros), 0) / 1000000 AS cost
+       FROM llm_call
+       WHERE ${sql} AND agent_id IS NOT NULL
+       GROUP BY agent_id`,
+      params,
+    );
+  }
+
+  async selectLlmCallQualitySummary(range: AnalyticsRange, opts?: LlmCallFilterOpts): Promise<LlmCallQualitySummary> {
+    const { sql, params } = this.llmCallWhere(range, opts);
+    const row = await this.db.queryOne<{
+      callCount: number;
+      successCount: number;
+      failCount: number;
+      cancelledCount: number;
+      retryCallCount: number;
+      promptTokens: number;
+      cachedTokens: number;
+      callTokens: number;
+      cost: number;
+    }>(
+      `SELECT COUNT(*) AS callCount,
+              COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS successCount,
+              COALESCE(SUM(CASE WHEN success = 0 AND ${NOT_CANCELLED_SQL} THEN 1 ELSE 0 END), 0) AS failCount,
+              COALESCE(SUM(CASE WHEN ${CANCELLED_SQL} THEN 1 ELSE 0 END), 0) AS cancelledCount,
+              COALESCE(SUM(CASE WHEN retry_count > 0 THEN 1 ELSE 0 END), 0) AS retryCallCount,
+              COALESCE(SUM(prompt_tokens), 0) AS promptTokens,
+              COALESCE(SUM(cached_tokens), 0) AS cachedTokens,
+              COALESCE(SUM(total_tokens), 0) AS callTokens,
+              COALESCE(SUM(cost_micros), 0) / 1000000 AS cost
+       FROM llm_call
+       WHERE ${sql}`,
+      params,
+    );
+    return {
+      callCount: toNumber(row?.callCount),
+      successCount: toNumber(row?.successCount),
+      failCount: toNumber(row?.failCount),
+      cancelledCount: toNumber(row?.cancelledCount),
+      retryCallCount: toNumber(row?.retryCallCount),
+      promptTokens: toNumber(row?.promptTokens),
+      cachedTokens: toNumber(row?.cachedTokens),
+      callTokens: toNumber(row?.callTokens),
+      cost: toNumber(row?.cost),
+    };
+  }
+
+  async countLlmCallLatency(
+    range: AnalyticsRange,
+    metric: LlmCallLatencyMetric,
+    opts?: LlmCallFilterOpts,
+  ): Promise<number> {
+    const { sql, params } = this.llmCallWhere(range, opts);
+    const { where } = LLM_CALL_LATENCY_METRICS[metric];
+    const row = await this.db.queryOne<{ c: number }>(
+      `SELECT COUNT(*) AS c FROM llm_call WHERE ${sql} AND ${where}`,
+      params,
+    );
+    return toNumber(row?.c);
+  }
+
+  async selectLlmCallLatencyAtOffset(
+    range: AnalyticsRange,
+    metric: LlmCallLatencyMetric,
+    offset: number,
+    opts?: LlmCallFilterOpts,
+  ): Promise<number | null> {
+    const { sql, params } = this.llmCallWhere(range, opts);
+    const { expr, where } = LLM_CALL_LATENCY_METRICS[metric];
+    const row = await this.db.queryOne<{ v: number }>(
+      `SELECT ${expr} AS v FROM llm_call
+       WHERE ${sql} AND ${where}
+       ORDER BY ${expr} ASC
+       LIMIT 1 OFFSET ?`,
+      [...params, Math.max(0, Math.trunc(offset) || 0)],
+    );
+    return row?.v == null ? null : toNumber(row.v);
+  }
+
+  async countActiveUsers(range: AnalyticsRange): Promise<number> {
+    const row = await this.db.queryOne<{ c: number }>(
+      `SELECT COUNT(*) AS c FROM (
+         SELECT user_id FROM session
+          WHERE created_at >= ? AND created_at < ? AND deleted = 0
+         UNION
+         SELECT ${MESSAGE_FIRST_HINT} s.user_id FROM message m JOIN session s ON m.session_id = s.id
+          WHERE m.created_at >= ? AND m.created_at < ? AND m.deleted = 0 AND s.deleted = 0
+       ) t`,
+      [range.startAt, range.endAtExclusive, range.startAt, range.endAtExclusive],
+    );
+    return Number(row?.c ?? 0);
+  }
+
+  async countSessions(range: AnalyticsRange): Promise<number> {
+    const row = await this.db.queryOne<{ c: number }>(
+      'SELECT COUNT(*) AS c FROM session WHERE created_at >= ? AND created_at < ? AND deleted = 0',
+      [range.startAt, range.endAtExclusive],
+    );
+    return Number(row?.c ?? 0);
+  }
+
+  async sumMessages(range: AnalyticsRange): Promise<{ count: number; tokens: number }> {
+    const row = await this.db.queryOne<{ count: number; tokens: number }>(
+      `SELECT COUNT(*) AS count, COALESCE(SUM(token_count), 0) AS tokens
+       FROM message WHERE created_at >= ? AND created_at < ? AND deleted = 0`,
+      [range.startAt, range.endAtExclusive],
+    );
+    return { count: Number(row?.count ?? 0), tokens: Number(row?.tokens ?? 0) };
+  }
+
+  async sumUsageTokens(range: AnalyticsRange): Promise<number> {
+    const row = await this.db.queryOne<{ tokens: number }>(
+      'SELECT COALESCE(SUM(total_tokens), 0) AS tokens FROM llm_usage WHERE created_at >= ? AND created_at < ?',
+      [range.startAt, range.endAtExclusive],
+    );
+    return Number(row?.tokens ?? 0);
+  }
+
+  /**
+   * 每个维度的「最慢一圈」：窗口函数按维度分区取 duration_ms 最大的一圈。
+   * 不按 RunTraceService 读模型：这里只做管理视角排行，维度内取代表调用即可。
+   * 未关联维度（agent_id / user_id 为 NULL）的调用不进榜，与其它按维度统计保持一致。
+   */
+  private runTraceRoundQuery(
+    range: AnalyticsRange,
+    scene: string,
+    dimension: RunTraceDimension,
+    limit: number,
+    orderColumn: 'duration_ms' | 'cost_micros',
+  ): Promise<RunTraceRoundRow[]> {
+    const dimColumn = dimension === 'agent' ? 'agent_id' : 'user_id';
+    return this.db.query<RunTraceRoundRow>(
+      `SELECT scopeKey, sessionId, modelName, createdAt, durationMs, totalTokens, costMicros, callCount
+       FROM (
+         SELECT c.${dimColumn} AS scopeKey,
+                c.session_id AS sessionId,
+                c.model_name AS modelName,
+                c.created_at AS createdAt,
+                c.duration_ms AS durationMs,
+                c.total_tokens AS totalTokens,
+                c.cost_micros AS costMicros,
+                COUNT(*) OVER (PARTITION BY c.${dimColumn}) AS callCount,
+                ROW_NUMBER() OVER (PARTITION BY c.${dimColumn} ORDER BY c.${orderColumn} DESC, c.id DESC) AS rn
+         FROM llm_call c
+         WHERE c.created_at >= ? AND c.created_at < ?
+           AND c.scene = ? AND c.${dimColumn} IS NOT NULL
+           AND c.duration_ms IS NOT NULL
+           ${orderColumn === 'cost_micros' ? 'AND c.cost_micros IS NOT NULL' : ''}
+       ) t
+       WHERE rn = 1
+       ORDER BY ${orderColumn === 'cost_micros' ? 'costMicros' : 'durationMs'} DESC
+       LIMIT ?`,
+      [range.startAt, range.endAtExclusive, scene, limit],
+    );
+  }
+
+  selectRunTraceSlowestRounds(
+    range: AnalyticsRange,
+    scene: string,
+    dimension: RunTraceDimension,
+    limit: number,
+  ): Promise<RunTraceRoundRow[]> {
+    return this.runTraceRoundQuery(range, scene, dimension, limit, 'duration_ms');
+  }
+
+  selectRunTraceMostExpensiveRounds(
+    range: AnalyticsRange,
+    scene: string,
+    dimension: RunTraceDimension,
+    limit: number,
+  ): Promise<RunTraceRoundRow[]> {
+    return this.runTraceRoundQuery(range, scene, dimension, limit, 'cost_micros');
+  }
+
+  /** 工具失败率原始行：按 type 分组，排序与截断由 service 按失败率做（分母不同不能直接比次数）。 */
+  selectRunTraceToolFailureRates(range: AnalyticsRange): Promise<RunTraceToolFailureRow[]> {
+    return this.db.query<RunTraceToolFailureRow>(
+      `SELECT type AS toolType,
+              COUNT(*) AS totalCount,
+              COALESCE(SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END), 0) AS errorCount
+       FROM session_activity
+       WHERE created_at >= ? AND created_at < ?
+       GROUP BY type`,
+      [range.startAt, range.endAtExclusive],
+    );
+  }
+
+  /**
+   * 自定义 HTTP 工具调用聚合（§9.4）：http_call 的 target 即内层 slug
+   * （ws-streaming-event-listener extractActivityTarget 分支），http_describe target 为 null 天然不计入。
+   * slug 入参仅供清单页按行下钻，为空时返回全部工具。
+   */
+  selectHttpToolCallStats(slug?: string | null): Promise<HttpToolCallStatRow[]> {
+    const clauses = [`a.type = 'TOOL'`, `a.target IS NOT NULL`];
+    const params: unknown[] = [];
+    const trimmed = slug?.trim();
+    if (trimmed) {
+      clauses.push('a.target = ?');
+      params.push(trimmed);
+    }
+    return this.db.query<HttpToolCallStatRow>(
+      `SELECT a.target AS slug,
+              COUNT(*) AS calls,
+              COALESCE(SUM(CASE WHEN a.status = 'ERROR' THEN 1 ELSE 0 END), 0) AS errors,
+              COUNT(DISTINCT s.user_id) AS users,
+              MIN(a.created_at) AS firstAt,
+              MAX(a.created_at) AS lastAt
+       FROM session_activity a
+       JOIN session s ON s.id = a.session_id
+       WHERE ${clauses.join(' AND ')}
+       GROUP BY a.target
+       ORDER BY calls DESC`,
+      params,
+    );
+  }
+
+  listAgents(): Promise<Agent[]> {
+    return this.db.query(`SELECT * FROM agent WHERE ${notDeleted()}`);
+  }
+
+  listUsers(): Promise<UserRow[]> {
+    return this.db.query(`SELECT * FROM user WHERE ${notDeleted()}`);
+  }
+
+  listModelsOrderByCreatedDesc(): Promise<LlmModel[]> {
+    return this.db.query(`SELECT * FROM llm_model WHERE ${notDeleted()} ORDER BY created_at DESC`);
+  }
+}
+
+/** 阶段展示顺序：活跃相位与 session-group-key 的 ACTIVE_PHASES 同源（含 CANCELLING），再接终态。 */
+const PHASES = ['IDLE', ...ACTIVE_PHASES, 'COMPLETED', 'FAILED', 'CANCELLED'];
+const RANK_LIMIT = 20;
+const MAX_SCOPE_LIMIT = 100;
+
+/**
+ * 阶段分布必须覆盖 store 返回的每个 phase：未知 phase 追加在末尾，
+ * 保证「分布合计 == 会话总数」这条不变量在新增相位时不会被硬编码列表打破。
+ */
+function phaseDistributionOf(phases: Map<string, number>): Array<{ phase: string; count: number }> {
+  const rows = PHASES.map((phase) => ({ phase, count: phases.get(phase) ?? 0 }));
+  const known = new Set<string>(PHASES);
+  for (const [phase, count] of phases) {
+    if (!known.has(phase)) rows.push({ phase, count });
+  }
+  return rows;
+}
+
+/**
+ * 强制 message 驱动、按主键回查 session（MySQL 8 优化器提示；5.7 会当普通注释忽略）。
+ *
+ * 默认计划会反过来：以 session 为驱动，按 idx_session 逐个会话回查 message。
+ * message 表约 40 万行 / 2.1GB，每个会话平均回查 287 行 → 数十万次随机回表，
+ * 实测昨日的活跃用户查询 0.97~1.25s、30 天的用户消息聚合 1.15s；固定连接顺序后
+ * 分别降到 0.12s / 0.64s（配 V168 覆盖索引后约 0.2s），也不再随统计信息在窗口间漂移。
+ */
+const MESSAGE_FIRST_HINT = '/*+ JOIN_ORDER(m, s) */';
+
+/** 环比窗口（已结束区间）聚合缓存：过去窗口数据基本不再变化，但所有 Tab 每次都要取一次。 */
+export const PREVIOUS_TOTALS_TTL_MS = 5 * 60 * 1000;
+const PREVIOUS_TOTALS_CACHE_MAX = 64;
+
+export interface AnalyticsPeriodMeta {
+  days: number;
+  start: string;
+  end: string;
+  previousStart: string;
+  previousEnd: string;
+}
+
+export interface AnalyticsInsight {
+  level: 'info' | 'warn';
+  text: string;
+  path?: string;
+}
+
+export class AdminAnalyticsService {
+  /** 环比窗口聚合结果短 TTL 缓存，key = 窗口起止 + 连通性口径；跨 Tab / 刷新复用同一份环比。 */
+  private readonly previousTotalsCache = new Map<string, { at: number; value: Record<string, number | null> }>();
+
+  constructor(
+    private readonly statisticsService: StatisticsService,
+    private readonly store: AdminAnalyticsStore,
+  ) {}
+
+  /**
+   * 汇总统计窗口内的趋势、结构与环比；overview 中的阶段数是实时快照而非窗口内数据。
+   * endOffset 将窗口结束日往前偏移 N 天（0=今日结尾，1=昨日结尾），用于「昨日」等固定日窗口。
+   * @deprecated 管理后台已按 scope 拆分调用；本方法暂留给 mao-cli 与兼容路径。
+   */
+  async summary(days: number, endOffset = 0): Promise<Record<string, unknown>> {
+    const { range, previous } = this.resolveWindows(days, endOffset);
+    const safeDays = range.days;
+
+    // 各分支互不依赖，并行取数：message 聚合单条就要数百毫秒，串行会把页面拖到秒级
+    const [
+      baseOverview,
+      livePhaseRows,
+      periodPhaseRows,
+      trends,
+      activeUsers,
+      previousTotals,
+      agentStats,
+      userActivity,
+      modelStats,
+    ] = await Promise.all([
+      this.statisticsService.getOverview(),
+      this.store.selectLivePhaseCounts(),
+      this.store.selectPhaseCounts(range),
+      this.trends(range),
+      this.store.countActiveUsers(range),
+      this.previousTotals(previous),
+      this.agentStats(range, RANK_LIMIT),
+      this.userActivity(range, RANK_LIMIT),
+      this.modelStats(range),
+    ]);
+
+    const livePhases = phaseMap(livePhaseRows);
+    const periodPhases = phaseMap(periodPhaseRows);
+
+    return {
+      period: this.periodMeta(range, previous),
+      overview: {
+        ...baseOverview,
+        runningSessions: livePhases.get('RUNNING') ?? 0,
+        waitingSessions: livePhases.get('WAITING_APPROVAL') ?? 0,
+        failedSessions: livePhases.get('FAILED') ?? 0,
+        cancelledSessions: livePhases.get('CANCELLED') ?? 0,
+      },
+      periodTotals: {
+        ...sumTrends(trends),
+        activeUsers,
+        completedSessions: periodPhases.get('COMPLETED') ?? 0,
+        failedSessions: periodPhases.get('FAILED') ?? 0,
+      },
+      previousTotals,
+      trends,
+      phaseDistribution: phaseDistributionOf(periodPhases),
+      agentStats,
+      userActivity,
+      modelStats,
+      days: safeDays,
+    };
+  }
+
+  /** 总览：运行态 + 窗口合计 + 环比 + Token spark + 规则洞察；不拉维度排行。 */
+  async overview(days: number, endOffset = 0): Promise<Record<string, unknown>> {
+    const { range, previous } = this.resolveWindows(days, endOffset);
+    const [baseOverview, livePhaseRows, periodPhaseRows, trends, activeUsers, previousTotals, quality] = await Promise.all([
+      this.statisticsService.getOverview(),
+      this.store.selectLivePhaseCounts(),
+      this.store.selectPhaseCounts(range),
+      this.trends(range),
+      this.store.countActiveUsers(range),
+      this.previousTotals(previous),
+      // 缓存命中率口径 llm_call，默认排除连通性自检（与趋势 Tab 一致）
+      this.store.selectLlmCallQualitySummary(range),
+    ]);
+
+    const livePhases = phaseMap(livePhaseRows);
+    const periodPhases = phaseMap(periodPhaseRows);
+    const periodTotals = {
+      ...sumTrends(trends),
+      activeUsers,
+      completedSessions: periodPhases.get('COMPLETED') ?? 0,
+      failedSessions: periodPhases.get('FAILED') ?? 0,
+      promptTokens: quality.promptTokens,
+      cachedTokens: quality.cachedTokens,
+      cacheHitRate: qualitySummaryFields(quality).cacheHitRate,
+    };
+
+    return {
+      period: this.periodMeta(range, previous),
+      overview: {
+        ...baseOverview,
+        runningSessions: livePhases.get('RUNNING') ?? 0,
+        waitingSessions: livePhases.get('WAITING_APPROVAL') ?? 0,
+        failedSessions: livePhases.get('FAILED') ?? 0,
+        cancelledSessions: livePhases.get('CANCELLED') ?? 0,
+      },
+      periodTotals,
+      previousTotals,
+      spark: trends.map((row) => ({
+        date: String(row.date),
+        totalTokens: toNumber(row.totalTokens),
+      })),
+      phaseDistribution: phaseDistributionOf(periodPhases),
+      insights: buildOverviewInsights(periodTotals, previousTotals),
+    };
+  }
+
+  /** 趋势：按天或按小时补零（含 llm_call 调用质量）+ 窗口合计 + 环比。 */
+  async trendsScope(
+    days: number,
+    endOffset = 0,
+    opts?: { excludeConnectivity?: boolean; granularity?: TrendGranularity },
+  ): Promise<Record<string, unknown>> {
+    const { range, previous } = this.resolveWindows(days, endOffset);
+    const granularity: TrendGranularity = opts?.granularity === 'hour' ? 'hour' : 'day';
+    const callOpts = { excludeConnectivity: opts?.excludeConnectivity !== false };
+    const [trends, activeUsers, previousTotals, quality, prevQuality] = await Promise.all([
+      this.trends(range, { ...callOpts, granularity }),
+      this.store.countActiveUsers(range),
+      this.previousTotals(previous, callOpts),
+      this.store.selectLlmCallQualitySummary(range, callOpts),
+      this.store.selectLlmCallQualitySummary(previous, callOpts),
+    ]);
+    const periodPhases = phaseMap(await this.store.selectPhaseCounts(range));
+    const periodTotals = {
+      ...sumTrends(trends),
+      activeUsers,
+      completedSessions: periodPhases.get('COMPLETED') ?? 0,
+      failedSessions: periodPhases.get('FAILED') ?? 0,
+      callCount: quality.callCount,
+      callFailCount: quality.failCount,
+      callCancelledCount: quality.cancelledCount,
+      callTokens: quality.callTokens,
+      promptTokens: quality.promptTokens,
+      cachedTokens: quality.cachedTokens,
+    };
+    return {
+      period: this.periodMeta(range, previous),
+      granularity,
+      trends,
+      periodTotals,
+      previousTotals: {
+        ...previousTotals,
+        callCount: prevQuality.callCount,
+        callFailCount: prevQuality.failCount,
+        callCancelledCount: prevQuality.cancelledCount,
+        callTokens: prevQuality.callTokens,
+      },
+      callQuality: qualitySummaryFields(quality),
+    };
+  }
+
+  /** 模型：窗口内有用量的模型聚合 + llm_call 质量列 + scene/protocol 分布。 */
+  async modelsScope(
+    days: number,
+    endOffset = 0,
+    opts?: { excludeConnectivity?: boolean; sceneModelId?: number | null },
+  ): Promise<Record<string, unknown>> {
+    const { range, previous } = this.resolveWindows(days, endOffset);
+    const callOpts = { excludeConnectivity: opts?.excludeConnectivity !== false };
+    const sceneModelId = opts?.sceneModelId != null && Number.isFinite(opts.sceneModelId) ? Number(opts.sceneModelId) : null;
+    const [modelStats, previousTotals, trends, sceneRows, protocolRows, userTokenTop] = await Promise.all([
+      this.modelStats(range, callOpts),
+      this.previousTotals(previous, callOpts),
+      this.trends(range, callOpts),
+      this.store.selectLlmCallSceneStats(range, { ...callOpts, modelId: sceneModelId }),
+      this.store.selectLlmCallProtocolStats(range, callOpts),
+      this.userTokenTop(range, MAX_SCOPE_LIMIT),
+    ]);
+    return {
+      period: this.periodMeta(range, previous),
+      modelStats,
+      periodTotals: {
+        totalTokens: modelStats.reduce((sum, row) => sum + toNumber((row as { totalTokens?: unknown }).totalTokens), 0),
+        totalCost: modelStats.reduce((sum, row) => sum + toNumber((row as { cost?: unknown }).cost), 0),
+      },
+      previousTotals,
+      sceneStats: namedCountRows(sceneRows),
+      protocolStats: namedCountRows(protocolRows),
+      sceneModelId,
+      excludeConnectivity: callOpts.excludeConnectivity,
+      // 模型页并排展示「用户 Token 占比」：与用户 Tab tokenTop 同源，按 Token 截断
+      userTokenTop,
+    };
+  }
+
+  /** 用户：窗口内活跃用户排行/明细，默认 Top 20，附带 llm_call 消耗与失败。 */
+  async usersScope(
+    days: number,
+    endOffset = 0,
+    limit = RANK_LIMIT,
+    opts?: { excludeConnectivity?: boolean },
+  ): Promise<Record<string, unknown>> {
+    const { range, previous } = this.resolveWindows(days, endOffset);
+    const safeLimit = clampLimit(limit);
+    const callOpts = { excludeConnectivity: opts?.excludeConnectivity !== false };
+    const [userActivity, tokenTop, activeUsers, previousTotals] = await Promise.all([
+      this.userActivity(range, safeLimit, callOpts),
+      this.userTokenTop(range, safeLimit),
+      this.store.countActiveUsers(range),
+      this.previousTotals(previous, callOpts),
+    ]);
+    return {
+      period: this.periodMeta(range, previous),
+      userActivity,
+      tokenTop,
+      periodTotals: { activeUsers },
+      previousTotals,
+    };
+  }
+
+  /** Agent：窗口内会话/消息/Token 排行 + llm_call 成功率/消耗。 */
+  async agentsScope(
+    days: number,
+    endOffset = 0,
+    limit = RANK_LIMIT,
+    opts?: { excludeConnectivity?: boolean },
+  ): Promise<Record<string, unknown>> {
+    const { range, previous } = this.resolveWindows(days, endOffset);
+    const safeLimit = clampLimit(limit);
+    const callOpts = { excludeConnectivity: opts?.excludeConnectivity !== false };
+    const [agentStats, tokenTop, previousTotals] = await Promise.all([
+      this.agentStats(range, safeLimit, callOpts),
+      this.agentTokenTop(range, safeLimit),
+      this.previousTotals(previous, callOpts),
+    ]);
+    return {
+      period: this.periodMeta(range, previous),
+      agentStats,
+      tokenTop,
+      previousTotals,
+    };
+  }
+
+  /**
+   * 运行轨迹聚合（技术方案 §5.4）：最慢轮 / 最贵轮按维度各取一圈，工具失败率按活动 type 分组。
+   * scene 默认 agent：不默认的话，标题生成与连通性测试会占据「最慢轮」。
+   * 直接聚合 llm_call 与 session_activity，不经 RunTraceService（这里是管理视角，不是任务视角）。
+   */
+  async runTraceScope(
+    days: number,
+    endOffset = 0,
+    opts?: { scene?: string; scope?: RunTraceDimension; limit?: number },
+  ): Promise<Record<string, unknown>> {
+    const { range, previous } = this.resolveWindows(days, endOffset);
+    const scene = opts?.scene != null && opts.scene.trim() !== '' ? opts.scene.trim() : 'agent';
+    const dimension: RunTraceDimension = opts?.scope === 'user' ? 'user' : 'agent';
+    const limit = clampLimit(opts?.limit ?? RANK_LIMIT);
+    const [slowRows, expensiveRows, toolRows, agents, users] = await Promise.all([
+      this.store.selectRunTraceSlowestRounds(range, scene, dimension, limit),
+      this.store.selectRunTraceMostExpensiveRounds(range, scene, dimension, limit),
+      this.store.selectRunTraceToolFailureRates(range),
+      dimension === 'agent' ? this.store.listAgents() : Promise.resolve([] as Agent[]),
+      dimension === 'user' ? this.store.listUsers() : Promise.resolve([] as UserRow[]),
+    ]);
+    const names = new Map<number, string>();
+    for (const agent of agents) {
+      if (agent.id != null) names.set(Number(agent.id), agent.name ?? '未知');
+    }
+    for (const user of users) {
+      if (user.id != null) names.set(Number(user.id), user.displayName || user.username || `用户 ${user.id}`);
+    }
+    const toRound = (row: RunTraceRoundRow): Record<string, unknown> => {
+      const scopeKey = toNumber(row.scopeKey);
+      return {
+        scopeKey,
+        scopeName: names.get(scopeKey) ?? (dimension === 'agent' ? '未关联 Agent' : '未关联用户'),
+        sessionId: row.sessionId == null ? null : toNumber(row.sessionId),
+        modelName: row.modelName ?? null,
+        createdAt: row.createdAt ?? null,
+        durationMs: toNumber(row.durationMs),
+        totalTokens: toNumber(row.totalTokens),
+        costMicros: row.costMicros == null ? null : toNumber(row.costMicros),
+        callCount: toNumber(row.callCount),
+      };
+    };
+    // 失败率按比例排：分母不同，直接比次数会让小样本工具霸榜
+    const toolFailureRates = toolRows
+      .map((row) => {
+        const totalCount = toNumber(row.totalCount);
+        const errorCount = toNumber(row.errorCount);
+        return {
+          toolType: String(row.toolType),
+          errorCount,
+          totalCount,
+          failRate: totalCount > 0 ? Math.round((errorCount / totalCount) * 1000) / 10 : 0,
+        };
+      })
+      .filter((row) => row.totalCount > 0)
+      .sort((a, b) => b.failRate - a.failRate || b.errorCount - a.errorCount || a.toolType.localeCompare(b.toolType))
+      .slice(0, limit);
+    return {
+      period: this.periodMeta(range, previous),
+      scene,
+      scope: dimension,
+      slowestRounds: slowRows.map(toRound),
+      mostExpensiveRounds: expensiveRows.map(toRound),
+      toolFailureRates,
+    };
+  }
+
+  /** 会话：窗口 phase 分布 + 结构 + 实时运行态 + llm_call 质量面板。 */
+  async sessionsScope(    days: number,
+    endOffset = 0,
+    opts?: { excludeConnectivity?: boolean },
+  ): Promise<Record<string, unknown>> {
+    const { range, previous } = this.resolveWindows(days, endOffset);
+    const callOpts = { excludeConnectivity: opts?.excludeConnectivity !== false };
+    const [phaseRows, liveRows, typeRows, modeRows, activeUsers, previousTotals, quality] = await Promise.all([
+      this.store.selectPhaseCounts(range),
+      this.store.selectLivePhaseCounts(),
+      this.store.selectSessionTypeCounts(range),
+      this.store.selectExecutionModeCounts(range),
+      this.store.countActiveUsers(range),
+      this.previousTotals(previous, callOpts),
+      this.store.selectLlmCallQualitySummary(range, callOpts),
+    ]);
+    const latency = await this.latencyPercentiles(range, callOpts);
+    const failTop = await this.failTopSlices(range, callOpts);
+    const periodPhases = phaseMap(phaseRows);
+    const livePhases = phaseMap(liveRows);
+    const completedSessions = periodPhases.get('COMPLETED') ?? 0;
+    const failedSessions = periodPhases.get('FAILED') ?? 0;
+    const sessions = [...periodPhases.values()].reduce((sum, count) => sum + count, 0);
+    return {
+      period: this.periodMeta(range, previous),
+      phaseDistribution: phaseDistributionOf(periodPhases),
+      sessionTypes: typeRows
+        .filter((row) => toNumber(row.count) > 0)
+        .map((row) => ({ sessionType: String(row.key), count: toNumber(row.count) })),
+      executionModes: modeRows
+        .filter((row) => toNumber(row.count) > 0)
+        .map((row) => ({ executionMode: String(row.key), count: toNumber(row.count) })),
+      livePhases: phaseDistributionOf(livePhases),
+      periodTotals: { sessions, activeUsers, completedSessions, failedSessions },
+      previousTotals,
+      callQuality: {
+        ...qualitySummaryFields(quality),
+        firstTokenP50: latency.firstTokenP50,
+        firstTokenP95: latency.firstTokenP95,
+        durationP50: latency.durationP50,
+        durationP95: latency.durationP95,
+        throughputP50: latency.throughputP50,
+        throughputP95: latency.throughputP95,
+      },
+      failTop,
+      excludeConnectivity: callOpts.excludeConnectivity,
+    };
+  }
+
+  private async latencyPercentiles(
+    range: AnalyticsRange,
+    callOpts: { excludeConnectivity: boolean },
+  ): Promise<{
+    firstTokenP50: number | null;
+    firstTokenP95: number | null;
+    durationP50: number | null;
+    durationP95: number | null;
+    throughputP50: number | null;
+    throughputP95: number | null;
+  }> {
+    const [ftCount, durCount, tpsCount] = await Promise.all([
+      this.store.countLlmCallLatency(range, 'first_token_ms', callOpts),
+      this.store.countLlmCallLatency(range, 'duration_ms', callOpts),
+      this.store.countLlmCallLatency(range, 'throughput', callOpts),
+    ]);
+    const pick = async (metric: LlmCallLatencyMetric, count: number, p: number) => {
+      if (count <= 0) return null;
+      const offset = Math.min(count - 1, Math.max(0, Math.floor((count - 1) * p)));
+      return this.store.selectLlmCallLatencyAtOffset(range, metric, offset, callOpts);
+    };
+    const [firstTokenP50, firstTokenP95, durationP50, durationP95, throughputP50, throughputP95] = await Promise.all([
+      pick('first_token_ms', ftCount, 0.5),
+      pick('first_token_ms', ftCount, 0.95),
+      pick('duration_ms', durCount, 0.5),
+      pick('duration_ms', durCount, 0.95),
+      pick('throughput', tpsCount, 0.5),
+      pick('throughput', tpsCount, 0.95),
+    ]);
+    return { firstTokenP50, firstTokenP95, durationP50, durationP95, throughputP50, throughputP95 };
+  }
+
+  private async failTopSlices(
+    range: AnalyticsRange,
+    callOpts: { excludeConnectivity: boolean },
+  ): Promise<{ byModel: Array<Record<string, unknown>>; byScene: Array<Record<string, unknown>> }> {
+    const [modelRows, sceneRows, models] = await Promise.all([
+      this.store.selectLlmCallStatsByModel(range, callOpts),
+      this.store.selectLlmCallSceneStats(range, callOpts),
+      this.store.listModelsOrderByCreatedDesc(),
+    ]);
+    const modelNames = new Map(
+      models.filter((m) => m.id != null).map((m) => [Number(m.id), m.name ?? '未知']),
+    );
+    const byModel = modelRows
+      .filter((row) => toNumber(row.failCount) > 0)
+      .map((row) => ({
+        key: Number(row.id),
+        name: Number(row.id) === 0 ? '未关联模型' : modelNames.get(Number(row.id)) ?? `模型 ${row.id}`,
+        failCount: toNumber(row.failCount),
+        callCount: toNumber(row.callCount),
+      }))
+      .sort((a, b) => b.failCount - a.failCount)
+      .slice(0, 5);
+    const byScene = sceneRows
+      .filter((row) => toNumber(row.failCount) > 0)
+      .map((row) => ({
+        key: String(row.key),
+        name: String(row.key),
+        failCount: toNumber(row.failCount),
+        callCount: toNumber(row.callCount),
+      }))
+      .sort((a, b) => b.failCount - a.failCount)
+      .slice(0, 5);
+    return { byModel, byScene };
+  }
+
+  private resolveWindows(days: number, endOffset: number): { range: AnalyticsRange; previous: AnalyticsRange } {
+    const safeDays = Math.max(1, Math.min(Math.trunc(days) || 1, 90));
+    const safeOffset = Math.max(0, Math.min(Math.trunc(endOffset) || 0, 365));
+    const range = buildRange(addDaysYmd(shanghaiYmd(), -safeOffset), safeDays);
+    const previous = buildRange(addDaysYmd(range.startYmd, -1), safeDays);
+    return { range, previous };
+  }
+
+  private periodMeta(range: AnalyticsRange, previous: AnalyticsRange): AnalyticsPeriodMeta {
+    return {
+      days: range.days,
+      start: range.startYmd,
+      end: range.endYmd,
+      previousStart: previous.startYmd,
+      previousEnd: previous.endYmd,
+    };
+  }
+
+  private async trends(
+    range: AnalyticsRange,
+    callOpts?: { excludeConnectivity?: boolean; granularity?: TrendGranularity },
+  ): Promise<Array<Record<string, unknown>>> {
+    const granularity: TrendGranularity = callOpts?.granularity === 'hour' ? 'hour' : 'day';
+    const opts = { excludeConnectivity: callOpts?.excludeConnectivity !== false };
+    const [sessionRows, messageRows, usageRows, callRows] = await Promise.all([
+      this.store.selectDailySessionCounts(range, granularity),
+      this.store.selectDailyMessageStats(range, granularity),
+      this.store.selectDailyUsageStats(range, granularity),
+      this.store.selectDailyLlmCallStats(range, opts, granularity),
+    ]);
+    const sessions = bucketMap(sessionRows, (r) => r.day, (r) => r.count, granularity);
+    const messages = bucketMap(messageRows, (r) => r.day, (r) => r.count, granularity);
+    const chatTokens = bucketMap(messageRows, (r) => r.day, (r) => r.tokens, granularity);
+    const backgroundTokens = bucketMap(usageRows, (r) => r.day, (r) => r.totalTokens, granularity);
+    const backgroundCalls = bucketMap(usageRows, (r) => r.day, (r) => r.callCount, granularity);
+    const callCount = bucketMap(callRows, (r) => r.day, (r) => r.callCount, granularity);
+    const callFailCount = bucketMap(callRows, (r) => r.day, (r) => r.failCount, granularity);
+    const callCancelledCount = bucketMap(callRows, (r) => r.day, (r) => r.cancelledCount, granularity);
+    const callTokens = bucketMap(callRows, (r) => r.day, (r) => r.callTokens, granularity);
+    const promptTokens = bucketMap(callRows, (r) => r.day, (r) => r.promptTokens, granularity);
+    const cachedTokens = bucketMap(callRows, (r) => r.day, (r) => r.cachedTokens, granularity);
+    // 成本唯一口径 = llm_call（决策 13）；chat/background 的 message/llm_usage 无成本列，不参与
+    const callCost = bucketMap(callRows, (r) => r.day, (r) => r.cost, granularity);
+    const firstTokenMsSum = bucketMap(callRows, (r) => r.day, (r) => r.firstTokenMsSum, granularity);
+    const firstTokenMsCount = bucketMap(callRows, (r) => r.day, (r) => r.firstTokenMsCount, granularity);
+    const durationMsSum = bucketMap(callRows, (r) => r.day, (r) => r.durationMsSum, granularity);
+
+    const rows: Array<Record<string, unknown>> = [];
+    for (const date of buildTrendBucketKeys(range, granularity)) {
+      const chat = chatTokens.get(date) ?? 0;
+      const background = backgroundTokens.get(date) ?? 0;
+      const calls = callCount.get(date) ?? 0;
+      const fails = callFailCount.get(date) ?? 0;
+      const cancels = callCancelledCount.get(date) ?? 0;
+      const callTok = callTokens.get(date) ?? 0;
+      const prompt = promptTokens.get(date) ?? 0;
+      const cached = cachedTokens.get(date) ?? 0;
+      const firstTokSum = firstTokenMsSum.get(date) ?? 0;
+      const firstTokCount = firstTokenMsCount.get(date) ?? 0;
+      const durationSum = durationMsSum.get(date) ?? 0;
+      const bucketCost = callCost.get(date) ?? 0;
+      rows.push({
+        date,
+        sessions: sessions.get(date) ?? 0,
+        messages: messages.get(date) ?? 0,
+        chatTokens: chat,
+        backgroundTokens: background,
+        totalTokens: chat + background,
+        backgroundCalls: backgroundCalls.get(date) ?? 0,
+        callCount: calls,
+        callFailCount: fails,
+        callCancelledCount: cancels,
+        callTokens: callTok,
+        promptTokens: prompt,
+        cachedTokens: cached,
+        cost: bucketCost,
+        // 取消不是失败：分母剔除取消，成功率不再被用户主动停止拉低
+        callSuccessRate: calls - cancels > 0 ? Math.round(((calls - fails - cancels) / (calls - cancels)) * 1000) / 10 : null,
+        cacheHitRate: prompt > 0 ? Math.round((cached / prompt) * 1000) / 10 : null,
+        // 平均耗时口径与模型页一致：首字均值只统计流式行（first_token_ms 非空），总耗时分母为全部调用；
+        // 桶内无调用 / 无流式调用时为 null，前端断线不画 0
+        avgFirstTokenMs: firstTokCount > 0 ? Math.round(firstTokSum / firstTokCount) : null,
+        avgDurationMs: calls > 0 ? Math.round(durationSum / calls) : null,
+        // 每百万 Token 平均成本 = 桶内成本 ÷ 桶内 llm_call 调用 Token × 1e6（分母与成本同口径）；
+        // 无调用（分母 0）为 null，前端断线不画 0
+        costPerMTokens: callTok > 0 ? Math.round((bucketCost / callTok) * 1e6 * 100) / 100 : null,
+      });
+    }
+    return rows;
+  }
+
+  private async previousTotals(
+    previous: AnalyticsRange,
+    callOpts?: { excludeConnectivity?: boolean },
+  ): Promise<Record<string, number | null>> {
+    const opts = { excludeConnectivity: callOpts?.excludeConnectivity !== false };
+    const cacheKey = `${previous.startAt}|${previous.endAtExclusive}|${opts.excludeConnectivity ? 1 : 0}`;
+    const cached = this.previousTotalsCache.get(cacheKey);
+    if (cached != null && Date.now() - cached.at < PREVIOUS_TOTALS_TTL_MS) {
+      return cached.value;
+    }
+    const value = await this.queryPreviousTotals(previous, opts);
+    this.rememberPreviousTotals(cacheKey, value);
+    return value;
+  }
+
+  /** 环比窗口已结束，数据只会因跨零点补齐少量变化：5 分钟内复用，避免每个 Tab 重复扫 message / llm_call。 */
+  private async queryPreviousTotals(
+    previous: AnalyticsRange,
+    opts: { excludeConnectivity: boolean },
+  ): Promise<Record<string, number | null>> {
+    const [sessions, messages, backgroundTokens, activeUsers, quality] = await Promise.all([
+      this.store.countSessions(previous),
+      this.store.sumMessages(previous),
+      this.store.sumUsageTokens(previous),
+      this.store.countActiveUsers(previous),
+      this.store.selectLlmCallQualitySummary(previous, opts),
+    ]);
+    return {
+      sessions,
+      messages: messages.count,
+      chatTokens: messages.tokens,
+      backgroundTokens,
+      totalTokens: messages.tokens + backgroundTokens,
+      activeUsers,
+      callCount: quality.callCount,
+      callFailCount: quality.failCount,
+      callCancelledCount: quality.cancelledCount,
+      callTokens: quality.callTokens,
+      // 与 sumTrends 的 totalCost 同键名：admin 环比读 previousTotals.totalCost
+      totalCost: quality.cost,
+      // 与 trendsScope.periodTotals 同键名：admin 环比读 previousTotals.cacheHitRate
+      cacheHitRate: qualitySummaryFields(quality).cacheHitRate,
+    };
+  }
+
+  /** 写入缓存并做有界清理：先清过期，再按写入序淘汰最旧，保证长跑进程不会无限增长。 */
+  private rememberPreviousTotals(cacheKey: string, value: Record<string, number | null>): void {
+    const now = Date.now();
+    if (this.previousTotalsCache.size >= PREVIOUS_TOTALS_CACHE_MAX) {
+      for (const [key, slot] of this.previousTotalsCache) {
+        if (now - slot.at >= PREVIOUS_TOTALS_TTL_MS) {
+          this.previousTotalsCache.delete(key);
+        }
+      }
+      while (this.previousTotalsCache.size >= PREVIOUS_TOTALS_CACHE_MAX) {
+        const oldest = this.previousTotalsCache.keys().next().value;
+        if (oldest == null) break;
+        this.previousTotalsCache.delete(oldest);
+      }
+    }
+    this.previousTotalsCache.set(cacheKey, { at: now, value });
+  }
+
+  private async agentStats(
+    range: AnalyticsRange,
+    limit = RANK_LIMIT,
+    callOpts?: { excludeConnectivity?: boolean },
+  ): Promise<Array<Record<string, unknown>>> {
+    const opts = { excludeConnectivity: callOpts?.excludeConnectivity !== false };
+    const [agents, sessionRows, messageRows, callRows] = await Promise.all([
+      this.store.listAgents(),
+      this.store.selectSessionCountsByAgent(range),
+      this.store.selectMessageStatsByAgent(range),
+      this.store.selectLlmCallStatsByAgent(range, opts),
+    ]);
+    const names = new Map(agents.filter((a) => a.id != null).map((a) => [a.id!, a.name ?? '未知']));
+    const sessionCounts = idMap(sessionRows, (r) => r.sessionCount);
+    const messageCounts = idMap(messageRows, (r) => r.messageCount);
+    const tokens = idMap(messageRows, (r) => r.totalTokens);
+    const callCounts = idMap(callRows, (r) => r.callCount);
+    const failCounts = idMap(callRows, (r) => r.failCount);
+    const cancelledCounts = idMap(callRows, (r) => r.cancelledCount);
+    const callTokens = idMap(callRows, (r) => r.callTokens);
+    const callCosts = idMap(callRows, (r) => r.cost);
+    const rows: Array<Record<string, unknown>> = [];
+    for (const agentId of unionKeys(sessionCounts, messageCounts, callCounts, failCounts, callTokens)) {
+      const calls = callCounts.get(agentId) ?? 0;
+      const fails = failCounts.get(agentId) ?? 0;
+      const cancels = cancelledCounts.get(agentId) ?? 0;
+      rows.push({
+        agentId,
+        agentName: names.get(agentId) ?? '未知',
+        sessionCount: sessionCounts.get(agentId) ?? 0,
+        messageCount: messageCounts.get(agentId) ?? 0,
+        totalTokens: tokens.get(agentId) ?? 0,
+        callCount: calls,
+        callFailCount: fails,
+        callCancelledCount: cancels,
+        callTokens: callTokens.get(agentId) ?? 0,
+        cost: callCosts.get(agentId) ?? 0,
+        // 取消不是失败：分母剔除取消
+        callSuccessRate: calls - cancels > 0 ? Math.round(((calls - fails - cancels) / (calls - cancels)) * 1000) / 10 : null,
+      });
+    }
+    rows.sort(byNumberDesc('sessionCount', 'messageCount'));
+    return rows.slice(0, clampLimit(limit));
+  }
+
+  private async userActivity(
+    range: AnalyticsRange,
+    limit = RANK_LIMIT,
+    callOpts?: { excludeConnectivity?: boolean },
+  ): Promise<Array<Record<string, unknown>>> {
+    const opts = { excludeConnectivity: callOpts?.excludeConnectivity !== false };
+    const [users, sessionRows, messageRows, callRows] = await Promise.all([
+      this.store.listUsers(),
+      this.store.selectSessionCountsByUser(range),
+      this.store.selectMessageStatsByUser(range),
+      this.store.selectLlmCallStatsByUser(range, opts),
+    ]);
+    const sessionCounts = idMap(sessionRows, (r) => r.sessionCount);
+    const messageCounts = idMap(messageRows, (r) => r.messageCount);
+    const tokens = idMap(messageRows, (r) => r.totalTokens);
+    const callCounts = idMap(callRows, (r) => r.callCount);
+    const failCounts = idMap(callRows, (r) => r.failCount);
+    const cancelledCounts = idMap(callRows, (r) => r.cancelledCount);
+    const callTokens = idMap(callRows, (r) => r.callTokens);
+    const callCosts = idMap(callRows, (r) => r.cost);
+    const rows: Array<Record<string, unknown>> = [];
+    for (const user of users) {
+      const uid = user.id!;
+      const sessionCount = sessionCounts.get(uid) ?? 0;
+      const messageCount = messageCounts.get(uid) ?? 0;
+      const calls = callCounts.get(uid) ?? 0;
+      const fails = failCounts.get(uid) ?? 0;
+      if (sessionCount === 0 && messageCount === 0 && calls === 0) {
+        continue;
+      }
+      rows.push({
+        userId: user.id,
+        username: user.username,
+        displayName: user.displayName,
+        sessionCount,
+        messageCount,
+        totalTokens: tokens.get(uid) ?? 0,
+        lastLoginAt: user.lastLoginAt != null ? String(user.lastLoginAt) : null,
+        callCount: calls,
+        callFailCount: fails,
+        callCancelledCount: cancelledCounts.get(uid) ?? 0,
+        callTokens: callTokens.get(uid) ?? 0,
+        cost: callCosts.get(uid) ?? 0,
+      });
+    }
+    rows.sort(byNumberDesc('messageCount', 'totalTokens'));
+    return rows.slice(0, clampLimit(limit));
+  }
+
+  /** Token 排行独立按 totalTokens 排序截断，避免依赖消息数截断的明细集而遗漏重消耗用户。 */
+  private async userTokenTop(
+    range: AnalyticsRange,
+    limit: number,
+  ): Promise<Array<Record<string, unknown>>> {
+    const [users, messageRows] = await Promise.all([
+      this.store.listUsers(),
+      this.store.selectMessageStatsByUser(range),
+    ]);
+    const tokens = idMap(messageRows, (r) => r.totalTokens);
+    const meta = new Map(users.filter((u) => u.id != null).map((u) => [u.id!, u]));
+    const rows: Array<Record<string, unknown>> = [];
+    for (const [userId, totalTokens] of tokens) {
+      if (totalTokens <= 0) continue;
+      const user = meta.get(userId);
+      rows.push({
+        userId,
+        username: user?.username,
+        displayName: user?.displayName,
+        totalTokens,
+      });
+    }
+    rows.sort(byNumberDesc('totalTokens', 'userId'));
+    return rows.slice(0, clampLimit(limit));
+  }
+
+  /** Token 排行独立按 totalTokens 排序截断，避免依赖会话/消息数截断的明细集而遗漏重消耗 Agent。 */
+  private async agentTokenTop(
+    range: AnalyticsRange,
+    limit: number,
+  ): Promise<Array<Record<string, unknown>>> {
+    const [agents, messageRows] = await Promise.all([
+      this.store.listAgents(),
+      this.store.selectMessageStatsByAgent(range),
+    ]);
+    const tokens = idMap(messageRows, (r) => r.totalTokens);
+    const names = new Map(agents.filter((a) => a.id != null).map((a) => [a.id!, a.name ?? '未知']));
+    const rows: Array<Record<string, unknown>> = [];
+    for (const [agentId, totalTokens] of tokens) {
+      if (totalTokens <= 0) continue;
+      rows.push({ agentId, agentName: names.get(agentId) ?? '未知', totalTokens });
+    }
+    rows.sort(byNumberDesc('totalTokens', 'agentId'));
+    return rows.slice(0, clampLimit(limit));
+  }
+
+  private async modelStats(
+    range: AnalyticsRange,
+    callOpts?: { excludeConnectivity?: boolean },
+  ): Promise<Array<Record<string, unknown>>> {
+    const opts = { excludeConnectivity: callOpts?.excludeConnectivity !== false };
+    const [models, sessionRows, messageRows, usageRows, callRows] = await Promise.all([
+      this.store.listModelsOrderByCreatedDesc(),
+      this.store.selectSessionCountsByModel(range),
+      this.store.selectMessageStatsByModel(range),
+      this.store.selectUsageStatsByModel(range),
+      this.store.selectLlmCallStatsByModel(range, opts),
+    ]);
+    const sessionCounts = idMap(sessionRows, (r) => r.sessionCount);
+    const messageCounts = idMap(messageRows, (r) => r.messageCount);
+    const chatTokens = idMap(messageRows, (r) => r.totalTokens);
+    const backgroundTokens = idMap(usageRows, (r) => r.totalTokens);
+    const backgroundCalls = idMap(usageRows, (r) => r.callCount);
+    const callByModel = new Map<number, LlmCallModelRow>();
+    for (const row of callRows) {
+      callByModel.set(Number(row.id), row);
+    }
+    const rows: Array<Record<string, unknown>> = [];
+    const knownIds = new Set(models.map((m) => Number(m.id)));
+    const allIds = new Set<number>([...knownIds, ...callByModel.keys()]);
+    for (const modelId of allIds) {
+      const model = models.find((m) => Number(m.id) === modelId);
+      const call = callByModel.get(modelId);
+      const chat = chatTokens.get(modelId) ?? 0;
+      const background = backgroundTokens.get(modelId) ?? 0;
+      const sessionCount = sessionCounts.get(modelId) ?? 0;
+      const messageCount = messageCounts.get(modelId) ?? 0;
+      const usageCalls = backgroundCalls.get(modelId) ?? 0;
+      const callCount = toNumber(call?.callCount);
+      const callFailCount = toNumber(call?.failCount);
+      const callCancelledCount = toNumber(call?.cancelledCount);
+      const callTokens = toNumber(call?.callTokens);
+      const callCost = toNumber(call?.cost);
+      const promptTokens = toNumber(call?.promptTokens);
+      const cachedTokens = toNumber(call?.cachedTokens);
+      // 窗口内完全未被调用的模型不返回，避免明细表被大量全零行淹没
+      if (
+        sessionCount === 0 &&
+        messageCount === 0 &&
+        chat === 0 &&
+        background === 0 &&
+        usageCalls === 0 &&
+        callCount === 0 &&
+        callTokens === 0 &&
+        callCost === 0
+      ) {
+        continue;
+      }
+      const avgFirstTokenMs =
+        toNumber(call?.firstTokenMsCount) > 0
+          ? Math.round(toNumber(call?.firstTokenMsSum) / toNumber(call?.firstTokenMsCount))
+          : null;
+      const avgDurationMs = callCount > 0 ? Math.round(toNumber(call?.durationMsSum) / callCount) : null;
+      // 吞吐均值是加权平均：Σ可解码行输出 ÷ Σ可解码行解码秒（与桌面用量抽屉总览卡同口径）；
+      // 窗口内没有可解码行（全非流式 / 全零输出）时为 null，前端显示「—」，不显示 0 误导
+      const decodeTokensSum = toNumber(call?.decodeTokensSum);
+      const decodeMsSum = toNumber(call?.decodeMsSum);
+      const avgThroughput =
+        decodeMsSum > 0 && decodeTokensSum > 0
+          ? Math.round((decodeTokensSum / (decodeMsSum / 1000)) * 10) / 10
+          : null;
+      rows.push({
+        modelId,
+        modelName: model?.name ?? (modelId === 0 ? '未关联模型' : `模型 ${modelId}`),
+        provider: model?.provider,
+        status: model?.status,
+        isDefault: model?.isDefault,
+        sessionCount,
+        messageCount,
+        chatTokens: chat,
+        backgroundTokens: background,
+        // 口径与总览页一致：chat + background（llm_call 与二者为包含关系，不能叠加，否则重复计一倍）
+        totalTokens: chat + background,
+        backgroundCalls: usageCalls,
+        contextWindowTokens: model?.contextWindowTokens,
+        callCount,
+        callFailCount,
+        callCancelledCount,
+        // 取消不是失败：分母剔除取消，模型成功率不再被用户主动停止拉低
+        callSuccessRate:
+          callCount - callCancelledCount > 0
+            ? Math.round(((callCount - callFailCount - callCancelledCount) / (callCount - callCancelledCount)) * 1000) / 10
+            : null,
+        callTokens,
+        cost: callCost,
+        promptTokens,
+        cachedTokens,
+        cacheHitRate: promptTokens > 0 ? Math.round((cachedTokens / promptTokens) * 1000) / 10 : null,
+        avgFirstTokenMs,
+        avgDurationMs,
+        avgThroughput,
+        retryCallCount: toNumber(call?.retryCallCount),
+      });
+    }
+    rows.sort(byNumberDesc('totalTokens', 'messageCount'));
+    return rows;
+  }
+}
+
+function qualitySummaryFields(quality: LlmCallQualitySummary): Record<string, number | null> {
+  // 取消不是失败：成功率分母 = 调用数 − 取消数，用户主动停止不再拉低成功率
+  const rateBase = toNumber(quality.callCount) - toNumber(quality.cancelledCount);
+  return {
+    callCount: quality.callCount,
+    successCount: quality.successCount,
+    failCount: quality.failCount,
+    cancelledCount: quality.cancelledCount,
+    retryCallCount: quality.retryCallCount,
+    promptTokens: quality.promptTokens,
+    cachedTokens: quality.cachedTokens,
+    callTokens: quality.callTokens,
+    cost: quality.cost,
+    successRate: rateBase > 0 ? Math.round((quality.successCount / rateBase) * 1000) / 10 : null,
+    retryRatio: quality.callCount > 0 ? Math.round((quality.retryCallCount / quality.callCount) * 1000) / 10 : null,
+    cacheHitRate:
+      quality.promptTokens > 0 ? Math.round((quality.cachedTokens / quality.promptTokens) * 1000) / 10 : null,
+  };
+}
+
+function namedCountRows(rows: LlmCallNamedRow[]): Array<Record<string, unknown>> {
+  return rows
+    .filter((row) => toNumber(row.callCount) > 0 || toNumber(row.callTokens) > 0)
+    .map((row) => ({
+      key: String(row.key),
+      callCount: toNumber(row.callCount),
+      failCount: toNumber(row.failCount),
+      cancelledCount: toNumber(row.cancelledCount),
+      callTokens: toNumber(row.callTokens),
+    }))
+    .sort((a, b) => b.callTokens - a.callTokens || b.callCount - a.callCount);
+}
+
+/**
+ * 趋势横轴刻度。按天为窗口内每个日历日；按小时为每个整点。
+ * 窗口包含今天时，小时序列停在当前整点，避免未到来的小时被画成 0。
+ */
+export function buildTrendBucketKeys(
+  range: AnalyticsRange,
+  granularity: TrendGranularity,
+  now: Date = new Date(),
+): string[] {
+  if (granularity !== 'hour') {
+    const keys: string[] = [];
+    for (let i = 0; i < range.days; i++) {
+      keys.push(addDaysYmd(range.startYmd, i));
+    }
+    return keys;
+  }
+  const keys: string[] = [];
+  const limit = range.days * 24;
+  let cursor = `${range.startYmd} 00:00`;
+  const endExclusive = `${addDaysYmd(range.endYmd, 1)} 00:00`;
+  const nowKey = `${formatDateTime(now).slice(0, 13)}:00`;
+  const capAtNow = range.endYmd >= shanghaiYmd(now);
+  for (let i = 0; i < limit && cursor < endExclusive; i++) {
+    if (capAtNow && cursor > nowKey) break;
+    keys.push(cursor);
+    cursor = addHoursKey(cursor, 1);
+  }
+  return keys.length > 0 ? keys : [`${range.startYmd} 00:00`];
+}
+
+function addHoursKey(key: string, hours: number): string {
+  const [date, time] = key.split(' ');
+  const [y, m, d] = date.split('-').map(Number);
+  const hh = Number(time.slice(0, 2));
+  const dt = new Date(Date.UTC(y, m - 1, d, hh + hours));
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${dt.getUTCFullYear()}-${pad(dt.getUTCMonth() + 1)}-${pad(dt.getUTCDate())} ${pad(dt.getUTCHours())}:00`;
+}
+
+function buildRange(endYmd: string, days: number): AnalyticsRange {
+  const startYmd = addDaysYmd(endYmd, -(days - 1));
+  return {
+    days,
+    startYmd,
+    endYmd,
+    startAt: `${startYmd} 00:00:00`,
+    endAtExclusive: `${addDaysYmd(endYmd, 1)} 00:00:00`,
+  };
+}
+
+function clampLimit(limit: number): number {
+  return Math.max(1, Math.min(Math.trunc(limit) || RANK_LIMIT, MAX_SCOPE_LIMIT));
+}
+
+function deltaPercent(current: number, previous: number | undefined): number | null {
+  if (previous == null || previous === 0) return current > 0 ? null : 0;
+  return Math.round(((current - previous) / previous) * 100);
+}
+
+/** 总览洞察只依赖窗口合计与环比，避免 overview 被维度排行拖慢。 */
+function buildOverviewInsights(
+  totals: Record<string, number | null>,
+  previous: Record<string, number | null>,
+): AnalyticsInsight[] {
+  const insights: AnalyticsInsight[] = [];
+  const sessions = toNumber(totals.sessions);
+  const messages = toNumber(totals.messages);
+  const totalTokens = toNumber(totals.totalTokens);
+  const completed = toNumber(totals.completedSessions);
+  const failed = toNumber(totals.failedSessions);
+  const ended = completed + failed;
+
+  if (sessions === 0 && messages === 0 && totalTokens === 0) {
+    insights.push({
+      level: 'info',
+      text: '当前时间窗内没有会话与消息，可放宽到近 7 天观察。',
+      path: '/analytics?tab=trends',
+    });
+  }
+
+  if (ended > 0) {
+    const failRate = Math.round((failed / ended) * 1000) / 10;
+    if (failRate >= 20) {
+      insights.push({
+        level: 'warn',
+        text: `窗口内会话失败率 ${failRate}%（失败 ${failed} / 已结局 ${ended}），建议查看会话结构。`,
+        path: '/analytics?tab=sessions',
+      });
+    } else if (failed > 0) {
+      insights.push({
+        level: 'info',
+        text: `窗口内失败会话 ${failed} 个（失败率 ${failRate}%）。`,
+        path: '/sessions?phase=FAILED',
+      });
+    }
+  }
+
+  const tokenDelta = deltaPercent(totalTokens, toNumber(previous.totalTokens));
+  if (tokenDelta != null && Math.abs(tokenDelta) >= 30) {
+    insights.push({
+      level: tokenDelta > 0 ? 'warn' : 'info',
+      text: `Token 消耗环比${tokenDelta > 0 ? '上升' : '下降'} ${Math.abs(tokenDelta)}%。`,
+      path: '/analytics?tab=models',
+    });
+  }
+
+  const userDelta = deltaPercent(toNumber(totals.activeUsers), toNumber(previous.activeUsers));
+  if (userDelta != null && userDelta <= -30) {
+    insights.push({
+      level: 'warn',
+      text: `活跃用户环比下降 ${Math.abs(userDelta)}%。`,
+      path: '/analytics?tab=users',
+    });
+  }
+
+  return insights.slice(0, 3);
+}
+
+/** 日桶截成 YYYY-MM-DD；小时桶规范成 YYYY-MM-DD HH:00。 */
+function bucketMap<T>(
+  rows: T[],
+  key: (row: T) => unknown,
+  value: (row: T) => unknown,
+  granularity: TrendGranularity,
+): Map<string, number> {
+  const result = new Map<string, number>();
+  for (const row of rows) {
+    const id = normalizeBucket(key(row), granularity);
+    if (id != null) {
+      result.set(id, toNumber(value(row)));
+    }
+  }
+  return result;
+}
+
+function normalizeBucket(raw: unknown, granularity: TrendGranularity): string | null {
+  if (raw == null) return null;
+  const text = String(raw);
+  if (granularity === 'hour') {
+    if (text.length < 13) return null;
+    return `${text.slice(0, 13)}:00`;
+  }
+  return text.slice(0, 10);
+}
+
+function phaseMap(rows: PhaseCountRow[]): Map<string, number> {
+  const result = new Map<string, number>();
+  for (const row of rows) {
+    if (row.phase != null) {
+      result.set(String(row.phase), toNumber(row.count));
+    }
+  }
+  return result;
+}
+
+function idMap<T extends { id: number }>(rows: T[], value: (row: T) => unknown): Map<number, number> {
+  const result = new Map<number, number>();
+  for (const row of rows) {
+    if (row.id != null) {
+      result.set(toNumber(row.id), toNumber(value(row)));
+    }
+  }
+  return result;
+}
+
+function sumTrends(trends: Array<Record<string, unknown>>): Record<string, number> {
+  const totals = { sessions: 0, messages: 0, chatTokens: 0, backgroundTokens: 0, totalTokens: 0, backgroundCalls: 0, totalCost: 0 };
+  for (const row of trends) {
+    totals.sessions += toNumber(row.sessions);
+    totals.messages += toNumber(row.messages);
+    totals.chatTokens += toNumber(row.chatTokens);
+    totals.backgroundTokens += toNumber(row.backgroundTokens);
+    totals.totalTokens += toNumber(row.totalTokens);
+    totals.backgroundCalls += toNumber(row.backgroundCalls);
+    totals.totalCost += toNumber(row.cost);
+  }
+  return totals;
+}
+
+function unionKeys(...maps: Array<Map<number, number>>): number[] {
+  const keys = new Set<number>();
+  for (const map of maps) {
+    for (const key of map.keys()) {
+      keys.add(key);
+    }
+  }
+  return [...keys];
+}
+
+function byNumberDesc(primary: string, secondary: string) {
+  return (a: Record<string, unknown>, b: Record<string, unknown>): number =>
+    toNumber(b[primary]) - toNumber(a[primary]) || toNumber(b[secondary]) - toNumber(a[secondary]);
+}
+
+function toNumber(value: unknown): number {
+  if (typeof value === 'number') {
+    return value;
+  }
+  if (value == null) {
+    return 0;
+  }
+  return Number(value);
+}

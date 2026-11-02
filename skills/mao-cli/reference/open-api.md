@@ -1,0 +1,203 @@
+# 开放接口模块（open）
+
+## 模块职责
+
+把 Mao Agent 开放给外部系统，三条通道：
+
+| 方向 | 能力 | 形态 |
+|------|------|------|
+| 入站（P1） | 外部系统带 API Token 远程触发一次 Agent 运行 | `POST /v1/open/agents/:agentId/run` |
+| 入站（P2） | 外部系统（CI、工单、自建脚本）以 HMAC 验签方式 POST 触发 | `POST /v1/open/hooks/:pathToken` |
+| 出站（P3） | 任务完成 / 失败、提问待答、每日运营摘要事件推送到自建 HTTPS 端点 | `task.completed` / `task.failed` / `question.pending` / `digest.daily` |
+
+管理面（Token / 触发器 / 订阅 CRUD）在桌面端「设置 → 开放接口」与 `mao open` 命令行均可操作；所有管理接口只接受登录会话（JWT），且只能管理本人资源。该页面顶部有「接口文档」卡片：可弹窗查阅完整调用说明（鉴权、端点与字段、签名算法、错误码、排障），也可下载或复制 Markdown（`mao-open-api.md`，随桌面端版本内置，不对外暴露 Swagger）。
+
+鉴权与边界要点：
+
+- **API Token**：`mao_` 前缀 + 48 位随机字符，sha256 落库；明文另以 AES-GCM 密文加密留存（密钥 `APP_OPENAPI_TOKEN_SECRET`，未配置回退内置默认密钥），属主可随时用 `open token reveal` 或桌面端「复制 Token」再次获取，不再限于创建时一次。2026-10-10 之前签发、未留密文的旧 Token 无法再取回明文，需吊销重签。scope 首期仅 `open:run`，只能在 `/v1/open/**` 端点使用（调用其它 REST 接口一律 401）。每人最多 20 个未吊销 Token，默认 90 天过期，吊销即时生效。轮换加密密钥后旧 Token 不能再复制明文（sha256 鉴权不受影响）。
+- **Webhook 触发器**：`pathToken` 决定公开 URL，`secret` 用于 HMAC-SHA256 签名（创建 / 轮换时只展示一次）。时间戳容忍 ±300 秒，签名基于原始请求体原文。不存在 / 已停用 / 验签失败统一返回 404 + `{code:3040,message:"not found"}`，不探测资源是否存在。连续 5 次执行失败自动停用，并在收件箱推送「触发器停用」。
+- **run 端点**：恒返回 202 异步语义（`sessionId` / `messageId` / `queued`）；目标会话忙时消息自动进入待发送队列（`queued=true`）。指定 `sessionId` 时，会话必须属于路径上的同一个 Agent，不一致返回参数错误，不会改用会话里的另一个 Agent 执行。触发器绑定会话同样要求与触发器的 Agent 一致。限流：每 Token 60 次/分钟，超限 429 + `Retry-After`。
+- **出站订阅**：目标 URL 必须 HTTPS（禁止 userinfo 与 hash 片段）；请求带 `X-Mao-Event` / `X-Mao-Timestamp` / `X-Mao-Signature`；失败按 1 / 5 / 25 分钟退避重试，3 次后置 FAILED 保留记录，不无限重投。`GET /v1/open/subscriptions/:id/deliveries` 可查最近投递。
+
+## 明确不包含
+
+- Token 不能调用 `/v1/open` 之外的任何 REST 接口（设计上的最小权限，不是 bug）。
+- 管理接口不接受 API Token（防止泄露后自我续期 / 克隆）。
+- 发送对话消息仍是 WS / mao-agent 的职责；open 只做「触发一轮」与「事件外发」。
+
+## 命令选择
+
+| 场景 | 命令 |
+|------|------|
+| 签发 / 查看 / 再次复制 / 吊销 Token | `open token create` / `list` / `reveal` / `delete` |
+| 建 / 改 / 删 / 启停触发器 | `open trigger create` / `update` / `delete` / `update --enabled` |
+| 轮换触发器密钥 | `open trigger rotate-secret` |
+| 配 / 启停 / 删出站订阅 | `open subscription create` / `set-enabled` / `delete` |
+| 查看投递记录 | `open subscription deliveries` |
+| 以 API Token 触发运行 | `open run` |
+| 查看入站调用流水 | `open calls list` / `open calls get` |
+| 开关完整请求记录 / 重新启用 Token | `open token log-full-body` / `open token re-enable` |
+
+---
+
+## 命令：mao open token create
+
+### 用途
+
+签发 API Token。明文在响应里返回一次，同时加密留存，之后可随时用 `open token reveal` 再次获取。
+
+### 参数说明
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| `--name` | 是 | 用途备注，便于列表识别 |
+| `--scope` | 否 | 逗号分隔 scope，缺省 `open:run`；首期仅此一个合法值 |
+
+### 示例
+
+```bash
+mao open token create --name "ci-trigger" --scope open:run
+```
+
+响应 `data.token`（或 `--json` 下的字段）即 `mao_...` 明文，`tokenPrefix` 为前 12 位。
+
+## 命令：mao open token reveal
+
+### 用途
+
+再次打印指定 API Token 的明文（服务端解密加密留存的密文）。用于创建时没保存好、或需要把同一个 Token 配到新系统的场景；吊销后取回的 Token 也无法再鉴权。
+
+### 参数说明
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| `--id` | 是 | 令牌 ID（`open token list` 可见） |
+
+### 示例
+
+```bash
+mao open token reveal --id 3
+```
+
+输出 `data.plainToken`。改动生效（V147 迁移）前签发的旧 Token 未留密文，会返回参数错误，需吊销重签。
+
+## 命令：mao open trigger create
+
+### 用途
+
+为一个 Agent 创建入站 Webhook 触发器，返回可直接交给外部系统的公开 URL 与签名密钥。
+
+### 参数说明
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| `--name` | 是 | 触发器名称 |
+| `--agent-id` | 是 | 目标 Agent ID |
+| `--session-id` | 否 | 绑定固定会话；缺省每次触发新建会话 |
+
+### 示例
+
+```bash
+mao open trigger create --name "pagerduty" --agent-id 12
+```
+
+外部系统随后 POST 该 `url`，头部带 `X-Mao-Timestamp`（Unix 秒）与 `X-Mao-Signature`：
+
+```
+signature = `sha256=${hex(hmac_sha256(secret, `${timestamp}.${rawBody}`))}`
+```
+
+（时间戳与原始请求体原文以英文句点连接后签名；容忍 ±300 秒。）
+
+Python 示例：
+
+```python
+import hashlib, hmac, json, time, urllib.request
+
+secret = "<trigger-secret>"
+url = "<trigger-url>"
+body = json.dumps({"issue": "disk almost full"}).encode()
+ts = str(int(time.time()))
+digest = hmac.new(secret.encode(), f"{ts}.".encode() + body, hashlib.sha256).hexdigest()
+req = urllib.request.Request(url, data=body, method="POST", headers={
+    "Content-Type": "application/json",
+    "X-Mao-Timestamp": ts,
+    "X-Mao-Signature": f"sha256={digest}",
+})
+print(urllib.request.urlopen(req).read())
+```
+
+## 命令：mao open subscription create
+
+### 用途
+
+把事件推送到自建 HTTPS 端点。明文 `secret` 只展示一次，用于校验回调签名。
+
+### 参数说明
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| `--event` | 是 | `task.completed` / `task.failed` / `question.pending` / `digest.daily` |
+| `--target-url` | 是 | HTTPS 地址；禁止 URL 内嵌 userinfo（`https://user:pass@host`）与 `#hash` |
+
+### 示例
+
+```bash
+mao open subscription create --event task.failed --target-url https://ops.example.com/mao-hook
+```
+
+回调请求头：`X-Mao-Event`、`X-Mao-Timestamp`、`X-Mao-Signature`（对实际发送字节签名，算法同触发器）。2xx 视为成功；429 与 5xx 会重试。
+
+`digest.daily`（每日运营摘要）payload 为 `{ event, coveredDate, digest, text, sentAt }`：`digest` 是六板块结构化数据（tasks / scheduled / watchers / approvals / cost / openApi，空板块为 null），`text` 是 Markdown 全文，任选其一渲染。
+
+## 命令：mao open run
+
+### 用途
+
+不依赖 mao-agent，直接用 API Token 触发一轮 Agent 运行（202 异步）。
+
+### 参数说明
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| `--api-token` | 是 | `mao_` 前缀 API Token（Bearer 直传，不写入本地缓存） |
+| `--agent-id` | 是 | 目标 Agent ID |
+| `--message` | 是 | 触发消息全文 |
+| `--session-id` | 否 | 复用会话；缺省新建 |
+
+### 示例
+
+```bash
+mao open run --agent-id 12 --message "跑一遍 nightly 巡检" --api-token mao_xxxx
+```
+
+`queued=true` 表示目标会话忙，消息已进待发送队列。
+
+## 调用流水
+
+每次 API Token 触发和 Webhook 触发都会留下一条流水，包括参数错误、鉴权失败、限流和预算拒绝。桌面端 Token / 触发器卡片上的「调用记录」看自己的；管理后台「开放调用」看全量、统计和导出。
+
+- 默认只记消息长度和字段名，不记正文。`mao open token log-full-body --id <id> --enabled true` 才记录完整请求体（敏感字段名会被打码），操作留审计。
+- 排队中的调用在执行结束后回写成功、失败或取消。长时间没有终态、而且队列里也已经没有这条消息的，统计里算「结果未知」。
+- Token 一小时内连续失败达到阈值（默认 10，系统设置可关）会自动停用，之后调用返回 403。属主用 `mao open token re-enable --id <id>` 恢复。限流和取消不计入次数。
+- 管理端「重发」只对 API 调用开放，用量记在 Token 属主头上。没开完整记录时需要手工粘贴 message。Webhook 不能从服务端重发。
+
+```bash
+mao open calls list --token-id 3
+mao open calls get --id 100
+```
+
+## 排障
+
+| 现象 | 原因与处理 |
+|------|-----------|
+| `run` 返回 403「该端点仅接受 API Token」 | 用了 JWT 调 run；run 只认 `mao_` Token |
+| `run` 返回 401 | Token 过期 / 已吊销，或 Token 用在了 `/v1/open` 之外的端点 |
+| `token reveal` 报「该 Token 签发于旧版本」 | 2026-10-10 之前签发的 Token 未留存加密明文，无法再取回；吊销后重新签发 |
+| `run` 返回 403「Token 已因连续失败被自动停用」 | 一小时内失败达到阈值；属主 `open token re-enable` 后恢复 |
+| hook 返回 404 + `not found` | 触发器不存在、已停用、或签名 / 时间戳不通过（统一措辞，不区分） |
+| hook 返回 429 | 该触发器限流；读 `Retry-After` 后重试 |
+| 收件箱出现「触发器停用」 | 连续 5 次执行失败，已自动停用；排除外部系统问题后重新启用 |
+| 订阅一直重试 | 目标 URL 非 2xx；用 `open subscription deliveries --id <id>` 看 `lastHttpStatus` / `lastError` |
+
+相关文档：桌面端「设置 → 开放接口」页面（含内嵌「接口文档」卡片的查阅 / 下载 / 复制）；设计细节见仓库 `docs/plan/2026-10-05-open-api-webhook-technical-design.md`。

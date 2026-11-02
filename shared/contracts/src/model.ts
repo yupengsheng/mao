@@ -1,0 +1,58 @@
+/**
+ * 模型管理契约。
+ * 注意：ModelVO 含 `apiKey` 字段，后端会原样返回（管理后台编辑模型时用于回显完整 Key）。
+ * 若后续需要脱敏，须同步调整前端「留空则不修改」的编辑逻辑，避免把脱敏值写回覆盖原 Key。
+ */
+export type ClientImpersonation = 'none' | 'codex' | 'claude_code';
+
+/**
+ * API 协议 code，与 `llm_model.api_protocol` / `llm_call.protocol` 同取值。
+ * 注意空串是第三种写法：存量数据用 '' 表示 OpenAI 兼容（见迁移 V091），
+ * 入库原样保留，由聚合 SQL 与展示侧汉化表按此语义归一；联合内只声明显式 code。
+ */
+export type ApiProtocol = 'openai-compatible' | 'anthropic' | 'openai-responses';
+
+export interface ModelVO {
+  id?: number;
+  name?: string;
+  provider?: string | null;
+  apiProtocol?: string | null;
+  /** reasoning effort：none/low/medium/high/xhigh/max，空串=协议默认值（high） */
+  effort?: string | null;
+  baseUrl?: string;
+  apiKey?: string;
+  modelId?: string;
+  modelType?: string | null;
+  clientImpersonation?: ClientImpersonation;
+  contextWindowTokens?: number | null;
+  /** 供应商请求体上限（字节）；null=未声明。用于推导压缩的请求体体积阈值。 */
+  maxRequestBodyBytes?: number | null;
+  /** 每百万「非缓存」输入 token 价格（成本单位；null=该类不计成本）。仅影响后续调用的成本快照，不追溯历史。 */
+  priceInput?: number | null;
+  /** 每百万缓存命中输入 token 价格（成本单位；null=该类不计成本）。语义同 priceInput。 */
+  priceCacheRead?: number | null;
+  /** 每百万缓存写入输入 token 价格（成本单位；Anthropic cache_creation；OpenAI 系无此概念）。语义同 priceInput。 */
+  priceCacheWrite?: number | null;
+  /** 每百万输出 token 价格（成本单位；null=该类不计成本）。语义同 priceInput。 */
+  priceOutput?: number | null;
+  supportsVision?: boolean;
+  isDefault?: boolean;
+  status?: number | null;
+  createdAt?: string | null;
+}
+
+export interface ModelPageResult {
+  records: ModelVO[];
+  total: number;
+  page: number;
+  size: number;
+}
+
+export interface ModelListFilter {
+  keyword?: string | null;
+  provider?: string | null;
+  status?: number | null;
+  supportsVision?: number | null;
+  isDefault?: number | null;
+  modelType?: string | null;
+}

@@ -1,0 +1,769 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { BusinessException } from '../common/business-exception.js';
+import { SystemSettingService } from './settings.service.js';
+import { encryptAesGcmNonNull } from '../crypto/aes-gcm.js';
+import type { AgentLookup, ModelLookup, SystemSetting, SystemSettingRepository } from './types.js';
+
+function setting(key: string, category: string, editable: number): SystemSetting {
+  return { id: 1, settingKey: key, category, value: '20', editable };
+}
+
+describe('SystemSettingService', () => {
+  beforeEach(() => {
+    vi.mocked(mapper.list).mockReset();
+    vi.mocked(mapper.findByKey).mockReset();
+    vi.mocked(mapper.updateById).mockReset();
+    vi.mocked(agentLookup.findById).mockReset();
+    vi.mocked(modelLookup.findById).mockReset();
+  });
+
+  const mapper: SystemSettingRepository = {
+    list: vi.fn(),
+    findByKey: vi.fn(),
+    updateById: vi.fn(),
+    transaction: vi.fn(async (fn: (repo: SystemSettingRepository) => Promise<unknown>) => fn(mapper)),
+  };
+  const agentLookup: AgentLookup = { findById: vi.fn() };
+  const modelLookup: ModelLookup = { findById: vi.fn() };
+  const runtime = {
+    workspaceRoot: '/workspace',
+    skillsDir: '/skills',
+  };
+
+  function service(): SystemSettingService {
+    return new SystemSettingService(mapper, agentLookup, modelLookup, { ...runtime });
+  }
+
+  it('updateRejectsReadonlySetting', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting('workspace.root', '运行环境', 0));
+    await expect(service().update('workspace.root', '/tmp/workspace')).rejects.toThrow(BusinessException);
+    await expect(service().update('workspace.root', '/tmp/workspace')).rejects.toThrow(/仅展示/);
+  });
+
+  it('updateValidatesPositiveIntegerSettings', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting('audit.retentionDays', '审计', 1));
+    await expect(service().update('audit.retentionDays', '0')).rejects.toThrow(/正整数/);
+  });
+
+  it('updateValidatesContainerHostsSettings', async () => {
+    // 容器域名解析（V176）：继承开关只接受 true/false；自定义规则走 JSON + 保留段校验
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting('runtime.container.inheritHostHosts', '运行环境', 1));
+    await expect(service().update('runtime.container.inheritHostHosts', 'yes')).rejects.toThrow(/true 或 false/);
+
+    const extra = setting('runtime.container.extraHosts', '运行环境', 1);
+    vi.mocked(mapper.findByKey).mockResolvedValue(extra);
+    await expect(service().update('runtime.container.extraHosts', '[{"host":"a.com","ip":"127.0.0.1"}]'))
+      .rejects.toThrow(/容器域名解析规则不合法/);
+    const updated = await service().update('runtime.container.extraHosts', '[{"host":"A.com.","ip":"10.0.0.1"}]');
+    expect(updated.value).toBe('[{"host":"A.com.","ip":"10.0.0.1"}]');
+  });
+
+  it('updateValidatesContainerAutoUpgradeSwitch', async () => {
+    // 容器自动升级总开关（V178）：只接受 true / false
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting('runtime.container.autoUpgrade', '运行环境', 1));
+    await expect(service().update('runtime.container.autoUpgrade', 'yes')).rejects.toThrow(/容器自动升级开关/);
+    const updated = await service().update('runtime.container.autoUpgrade', 'false');
+    expect(updated.value).toBe('false');
+  });
+
+  it('updatePersistsEditableSetting', async () => {
+    const row = setting('audit.retentionDays', '审计', 1);
+    vi.mocked(mapper.findByKey).mockResolvedValue(row);
+    const updated = await service().update('audit.retentionDays', '365');
+    expect(updated.value).toBe('365');
+    expect(mapper.updateById).toHaveBeenCalledWith(row);
+  });
+
+  it('updateAllowsEmptyWeixinAgentId', async () => {
+    const row = setting(SystemSettingService.WEIXIN_AGENT_ID_KEY, '微信', 1);
+    vi.mocked(mapper.findByKey).mockResolvedValue(row);
+    const updated = await service().update(SystemSettingService.WEIXIN_AGENT_ID_KEY, '');
+    expect(updated.value).toBe('');
+    expect(mapper.updateById).toHaveBeenCalledWith(row);
+  });
+
+  it('updateValidatesWeixinAgentExists', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting(SystemSettingService.WEIXIN_AGENT_ID_KEY, '微信', 1));
+    vi.mocked(agentLookup.findById).mockResolvedValue(null);
+    await expect(service().update(SystemSettingService.WEIXIN_AGENT_ID_KEY, '9')).rejects.toThrow(/Agent 不存在/);
+  });
+
+  it('updateRejectsNewlyAssignedDisabledWeixinAgent', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting(SystemSettingService.WEIXIN_AGENT_ID_KEY, '微信', 1));
+    vi.mocked(agentLookup.findById).mockResolvedValue({ id: 9, enabled: 0 });
+    await expect(service().update(SystemSettingService.WEIXIN_AGENT_ID_KEY, '9')).rejects.toThrow(/已停用/);
+  });
+
+  it('updateKeepsAlreadyConfiguredDisabledWeixinAgent', async () => {
+    const row = setting(SystemSettingService.WEIXIN_AGENT_ID_KEY, '微信', 1);
+    row.value = '9';
+    vi.mocked(mapper.findByKey).mockResolvedValue(row);
+    vi.mocked(agentLookup.findById).mockResolvedValue({ id: 9, enabled: 0 });
+    const updated = await service().update(SystemSettingService.WEIXIN_AGENT_ID_KEY, '9');
+    expect(updated.value).toBe('9');
+  });
+
+  it('updateAcceptsValidWeixinAgentId', async () => {
+    const row = setting(SystemSettingService.WEIXIN_AGENT_ID_KEY, '微信', 1);
+    vi.mocked(mapper.findByKey).mockResolvedValue(row);
+    vi.mocked(agentLookup.findById).mockResolvedValue({ id: 9 });
+    const updated = await service().update(SystemSettingService.WEIXIN_AGENT_ID_KEY, '9');
+    expect(updated.value).toBe('9');
+  });
+
+  it('updateAllowsEmptyEmbedAgentId', async () => {
+    const row = setting(SystemSettingService.EMBED_AGENT_ID_KEY, '集成配置', 1);
+    vi.mocked(mapper.findByKey).mockResolvedValue(row);
+    const updated = await service().update(SystemSettingService.EMBED_AGENT_ID_KEY, '');
+    expect(updated.value).toBe('');
+    expect(mapper.updateById).toHaveBeenCalledWith(row);
+  });
+
+  it('updateRejectsNonNumericEmbedAgentId', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting(SystemSettingService.EMBED_AGENT_ID_KEY, '集成配置', 1));
+    await expect(service().update(SystemSettingService.EMBED_AGENT_ID_KEY, 'abc')).rejects.toThrow(/浮窗助手配置必须是有效的 Agent ID/);
+    expect(agentLookup.findById).not.toHaveBeenCalled();
+  });
+
+  it('updateValidatesEmbedAgentExists', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting(SystemSettingService.EMBED_AGENT_ID_KEY, '集成配置', 1));
+    vi.mocked(agentLookup.findById).mockResolvedValue(null);
+    await expect(service().update(SystemSettingService.EMBED_AGENT_ID_KEY, '9')).rejects.toThrow(/Agent 不存在/);
+  });
+
+  it('updateRejectsNewlyAssignedDisabledEmbedAgent', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting(SystemSettingService.EMBED_AGENT_ID_KEY, '集成配置', 1));
+    vi.mocked(agentLookup.findById).mockResolvedValue({ id: 9, enabled: 0 });
+    await expect(service().update(SystemSettingService.EMBED_AGENT_ID_KEY, '9')).rejects.toThrow(/已停用/);
+  });
+
+  it('updateKeepsAlreadyConfiguredDisabledEmbedAgent', async () => {
+    const row = setting(SystemSettingService.EMBED_AGENT_ID_KEY, '集成配置', 1);
+    row.value = '9';
+    vi.mocked(mapper.findByKey).mockResolvedValue(row);
+    vi.mocked(agentLookup.findById).mockResolvedValue({ id: 9, enabled: 0 });
+    const updated = await service().update(SystemSettingService.EMBED_AGENT_ID_KEY, '9');
+    expect(updated.value).toBe('9');
+  });
+
+  it('updateAcceptsValidEmbedAgentId', async () => {
+    const row = setting(SystemSettingService.EMBED_AGENT_ID_KEY, '集成配置', 1);
+    vi.mocked(mapper.findByKey).mockResolvedValue(row);
+    vi.mocked(agentLookup.findById).mockResolvedValue({ id: 9 });
+    const updated = await service().update(SystemSettingService.EMBED_AGENT_ID_KEY, '9');
+    expect(updated.value).toBe('9');
+  });
+
+  it('updateAllowsEmptyWeixinModelId', async () => {
+    const row = setting(SystemSettingService.WEIXIN_MODEL_ID_KEY, '微信', 1);
+    vi.mocked(mapper.findByKey).mockResolvedValue(row);
+    const updated = await service().update(SystemSettingService.WEIXIN_MODEL_ID_KEY, '');
+    expect(updated.value).toBe('');
+  });
+
+  it('updateValidatesWeixinModelExists', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting(SystemSettingService.WEIXIN_MODEL_ID_KEY, '微信', 1));
+    vi.mocked(modelLookup.findById).mockResolvedValue(null);
+    await expect(service().update(SystemSettingService.WEIXIN_MODEL_ID_KEY, '8')).rejects.toThrow(/模型不存在/);
+  });
+
+  it('updateAcceptsValidWeixinModelId', async () => {
+    const row = setting(SystemSettingService.WEIXIN_MODEL_ID_KEY, '微信', 1);
+    vi.mocked(mapper.findByKey).mockResolvedValue(row);
+    vi.mocked(modelLookup.findById).mockResolvedValue({ id: 8 });
+    const updated = await service().update(SystemSettingService.WEIXIN_MODEL_ID_KEY, '8');
+    expect(updated.value).toBe('8');
+  });
+
+  it('updateAllowsEmptyTitleModelId', async () => {
+    const row = setting(SystemSettingService.SESSION_TITLE_MODEL_ID_KEY, '会话', 1);
+    vi.mocked(mapper.findByKey).mockResolvedValue(row);
+    const updated = await service().update(SystemSettingService.SESSION_TITLE_MODEL_ID_KEY, '');
+    expect(updated.value).toBe('');
+  });
+
+  it('updateValidatesTitleModelExists', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting(SystemSettingService.SESSION_TITLE_MODEL_ID_KEY, '会话', 1));
+    vi.mocked(modelLookup.findById).mockResolvedValue(null);
+    await expect(service().update(SystemSettingService.SESSION_TITLE_MODEL_ID_KEY, '8')).rejects.toThrow(/模型不存在/);
+  });
+
+  it('updateAcceptsValidTitleModelId', async () => {
+    const row = setting(SystemSettingService.SESSION_TITLE_MODEL_ID_KEY, '会话', 1);
+    vi.mocked(mapper.findByKey).mockResolvedValue(row);
+    vi.mocked(modelLookup.findById).mockResolvedValue({ id: 8 });
+    const updated = await service().update(SystemSettingService.SESSION_TITLE_MODEL_ID_KEY, '8');
+    expect(updated.value).toBe('8');
+  });
+
+  it('updateAllowsEmptyGitCommitMessageModelId', async () => {
+    const row = setting(SystemSettingService.GIT_COMMIT_MESSAGE_MODEL_ID_KEY, '代码', 1);
+    vi.mocked(mapper.findByKey).mockResolvedValue(row);
+    const updated = await service().update(SystemSettingService.GIT_COMMIT_MESSAGE_MODEL_ID_KEY, '');
+    expect(updated.value).toBe('');
+  });
+
+  it('updateValidatesGitCommitMessageModelExists', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting(SystemSettingService.GIT_COMMIT_MESSAGE_MODEL_ID_KEY, '代码', 1));
+    vi.mocked(modelLookup.findById).mockResolvedValue(null);
+    await expect(service().update(SystemSettingService.GIT_COMMIT_MESSAGE_MODEL_ID_KEY, '8')).rejects.toThrow(/模型不存在/);
+  });
+
+  it('updateAcceptsValidGitCommitMessageModelId', async () => {
+    const row = setting(SystemSettingService.GIT_COMMIT_MESSAGE_MODEL_ID_KEY, '代码', 1);
+    vi.mocked(mapper.findByKey).mockResolvedValue(row);
+    vi.mocked(modelLookup.findById).mockResolvedValue({ id: 8 });
+    const updated = await service().update(SystemSettingService.GIT_COMMIT_MESSAGE_MODEL_ID_KEY, '8');
+    expect(updated.value).toBe('8');
+  });
+
+  it('listReturnsLdapSwitchAsStoredDbValue', async () => {
+    vi.mocked(mapper.list).mockResolvedValue([setting('auth.ldap.enabled', '集成配置', 1)]);
+    const svc = new SystemSettingService(mapper, agentLookup, modelLookup, { ...runtime });
+    expect((await svc.list(null))[0].value).toBe('20');
+  });
+
+  it('listMasksSecretValues', async () => {
+    const secretRow = setting('auth.feishu.appSecret', '集成配置', 1);
+    secretRow.isSecret = 1;
+    secretRow.value = 'enc:v1:ciphertext';
+    vi.mocked(mapper.list).mockResolvedValue([secretRow]);
+    const svc = new SystemSettingService(mapper, agentLookup, modelLookup, { ...runtime }, 'k');
+    expect((await svc.list(null))[0].value).toBe('******');
+  });
+
+  it('updateSecretEncryptsAndDecryptsRoundTrip', async () => {
+    const secretRow = setting('auth.feishu.appSecret', '集成配置', 1);
+    secretRow.isSecret = 1;
+    vi.mocked(mapper.findByKey).mockImplementation(async (key: string) => {
+      if (key === 'auth.feishu.appSecret') return secretRow;
+      return null;
+    });
+    const svc = new SystemSettingService(mapper, agentLookup, modelLookup, { ...runtime }, 'test-secret-key');
+    const updated = await svc.update('auth.feishu.appSecret', 'my-app-secret');
+    expect(updated.value).toBe('******');
+    expect(secretRow.value).not.toBe('my-app-secret');
+    expect(String(secretRow.value)).toContain(':');
+    const cfg = await svc.getFeishuOAuthConfig();
+    expect(cfg.appSecret).toBe('my-app-secret');
+    expect(cfg.redirectUri).toBe('http://localhost:9080/api/v1/auth/feishu/callback');
+  });
+
+  it('updateSecretRejectsMaskSubmission', async () => {
+    const secretRow = setting('auth.ldap.password', '集成配置', 1);
+    secretRow.isSecret = 1;
+    secretRow.value = 'enc:v1:ciphertext';
+    vi.mocked(mapper.findByKey).mockResolvedValue(secretRow);
+    const svc = new SystemSettingService(mapper, agentLookup, modelLookup, { ...runtime }, 'k');
+    await expect(svc.update('auth.ldap.password', '******')).rejects.toThrow(/掩码/);
+  });
+
+  it('updateSecretNullMeansNoChange', async () => {
+    const secretRow = setting('auth.ldap.password', '集成配置', 1);
+    secretRow.isSecret = 1;
+    secretRow.value = 'enc:v1:ciphertext';
+    vi.mocked(mapper.findByKey).mockResolvedValue(secretRow);
+    const svc = new SystemSettingService(mapper, agentLookup, modelLookup, { ...runtime }, 'k');
+    const result = await svc.update('auth.ldap.password', null);
+    expect(result.value).toBe('******');
+    expect(mapper.updateById).not.toHaveBeenCalled();
+  });
+
+  it('updateSecretRejectsWhenSecretKeyMissing', async () => {
+    const secretRow = setting('tools.tavilyApiKey', '集成配置', 1);
+    secretRow.isSecret = 1;
+    vi.mocked(mapper.findByKey).mockResolvedValue(secretRow);
+    const svc = new SystemSettingService(mapper, agentLookup, modelLookup, { ...runtime }, '');
+    await expect(svc.update('tools.tavilyApiKey', 'tvly-xxx')).rejects.toThrow(/SETTINGS_SECRET/);
+  });
+
+  it('updateValidatesStorageModeEnum', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting('upload.storageMode', '集成配置', 1));
+    await expect(service().update('upload.storageMode', 's3')).rejects.toThrow(/local 或 oss/);
+  });
+
+  it('updateValidatesWebSearchProviderEnum', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting('tools.webSearchProvider', '集成配置', 1));
+    await expect(service().update('tools.webSearchProvider', 'bing')).rejects.toThrow(/tavily 或 tinyfish/);
+  });
+
+  it('getWebSearchConfigDefaultsToTavily', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(null);
+    const cfg = await service().getWebSearchConfig();
+    expect(cfg.provider).toBe('tavily');
+    expect(cfg.tavily.apiKey).toBe('');
+    expect(cfg.tavily.maxResults).toBe(5);
+    expect(cfg.tinyfish.apiKey).toBe('');
+    expect(cfg.tinyfish.baseUrl).toBe('https://api.search.tinyfish.ai');
+  });
+
+  it('getWebSearchConfigReadsTinyfishProvider', async () => {
+    vi.mocked(mapper.findByKey).mockImplementation(async (key: string) => {
+      if (key === 'tools.webSearchProvider') return { id: 1, settingKey: key, value: 'tinyfish', category: '集成配置', editable: 1 } as SystemSetting;
+      return null;
+    });
+    const cfg = await service().getWebSearchConfig();
+    expect(cfg.provider).toBe('tinyfish');
+  });
+
+  it('updateValidatesLdapUrlScheme', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting('auth.ldap.url', '集成配置', 1));
+    await expect(service().update('auth.ldap.url', 'example.test')).rejects.toThrow(/ldap:\/\/ 或 ldaps:\/\//);
+  });
+
+  it('getUploadConfigAppliesDefaults', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(null);
+    const cfg = await service().getUploadConfig();
+    expect(cfg).toEqual({ storageMode: 'local', baseUrl: '', maxSizeMb: 1024 });
+  });
+
+  it('getSiteBaseUrlPrefersSiteSetting', async () => {
+    vi.mocked(mapper.findByKey).mockImplementation(async (key: string) => (
+      key === 'site.baseUrl'
+        ? { id: 1, settingKey: key, category: '集成配置', value: 'https://mao.etarch.cn', editable: 1 }
+        : null
+    ));
+    await expect(service().getSiteBaseUrl()).resolves.toBe('https://mao.etarch.cn');
+  });
+
+  it('getSiteBaseUrlFallsBackToUploadBaseUrl', async () => {
+    vi.mocked(mapper.findByKey).mockImplementation(async (key: string) => (
+      key === 'upload.baseUrl'
+        ? { id: 1, settingKey: key, category: '集成配置', value: 'https://mao.etarch.cn', editable: 1 }
+        : null
+    ));
+    await expect(service().getSiteBaseUrl()).resolves.toBe('https://mao.etarch.cn');
+  });
+
+  it('getSiteBaseUrlReturnsNullWhenBothUnset', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(null);
+    await expect(service().getSiteBaseUrl()).resolves.toBeNull();
+  });
+
+  it('updateRejectsSiteBaseUrlWithoutScheme', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting('site.baseUrl', '集成配置', 1));
+    await expect(service().update('site.baseUrl', 'mao.example.com')).rejects.toThrow(/http/);
+  });
+
+  it('getAgentRuntimeConfigAppliesDefaults', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(null);
+    const cfg = await service().getAgentRuntimeConfig();
+    expect(cfg).toEqual({ threadPoolSize: 20, threadPoolMax: 100, threadPoolQueue: 200, wsIdleTimeoutMs: 90000 });
+  });
+
+  it('getAgentRuntimeConfigReadsStoredValues', async () => {
+    const rows: Record<string, string> = {
+      'agent.threadPoolSize': '8',
+      'agent.threadPoolMax': '16',
+      'agent.threadPoolQueue': '32',
+      'ws.idleTimeoutMs': '60000',
+    };
+    vi.mocked(mapper.findByKey).mockImplementation(async (key: string) => {
+      if (rows[key] != null) return { id: 1, settingKey: key, value: rows[key], category: '运行参数', editable: 1 };
+      return null;
+    });
+    const cfg = await service().getAgentRuntimeConfig();
+    expect(cfg).toEqual({ threadPoolSize: 8, threadPoolMax: 16, threadPoolQueue: 32, wsIdleTimeoutMs: 60000 });
+  });
+
+  it('getNotificationTuningConfigAppliesDefaultsAndReadsValues', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(null);
+    expect(await service().getNotificationTuningConfig()).toEqual({ workerDelayMs: 30000, batchSize: 100, maxAttempts: 4 });
+
+    const rows: Record<string, string> = {
+      'notify.workerDelayMs': '5000',
+      'notify.batchSize': '20',
+      'notify.maxAttempts': '6',
+    };
+    vi.mocked(mapper.findByKey).mockImplementation(async (key: string) => {
+      if (rows[key] != null) return { id: 1, settingKey: key, value: rows[key], category: '运行参数', editable: 1 };
+      return null;
+    });
+    expect(await service().getNotificationTuningConfig()).toEqual({ workerDelayMs: 5000, batchSize: 20, maxAttempts: 6 });
+  });
+
+  it('updateRejectsInvalidRuntimeTuningValues', async () => {
+    for (const key of ['agent.threadPoolSize', 'ws.idleTimeoutMs', 'notify.workerDelayMs', 'notify.batchSize', 'notify.maxAttempts']) {
+      vi.mocked(mapper.findByKey).mockResolvedValue(setting(key, '运行参数', 1));
+      await expect(service().update(key, '0')).rejects.toThrow(/正整数/);
+      await expect(service().update(key, 'abc')).rejects.toThrow(/正整数/);
+    }
+  });
+
+  it('updateRejectsInvalidPayloadTriggerBytes', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting('harness.compaction.triggerPayloadBytes', '运行参数', 1));
+    await expect(service().update('harness.compaction.triggerPayloadBytes', '-1')).rejects.toThrow(/非负整数/);
+    await expect(service().update('harness.compaction.triggerPayloadBytes', 'abc')).rejects.toThrow(/非负整数/);
+  });
+
+  it('getHarnessTuningConfigAppliesDefaults', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(null);
+    const cfg = await service().getHarnessTuningConfig();
+    expect(cfg).toEqual({
+      compaction: { enabled: true, contextWindowTokens: 256000, triggerRatio: 0.8, triggerPayloadBytes: 41943040, maxSummaryTokens: 12000, loopMidwayCompact: true },
+      llm: { rateLimitMaxRetries: 10, rateLimitRetryDelaySeconds: 2, rateLimitMaxRetryDelaySeconds: 30, callTimeoutSeconds: 120, httpCallTimeoutSeconds: 180, streamIdleTimeoutSeconds: 300, anthropicAutoCache: true, anthropicCacheTtl: '5m' },
+      webPage: { connectTimeout: 10000, readTimeout: 30000, maxRawBytes: 1048576, maxOutputLength: 50000, userAgent: 'Mozilla/5.0 (compatible; AgentWorkbench/1.0)' },
+      shell: { maxSessionsPerConversation: 30, sessionIdleTimeoutMinutes: 30, sessionMaxLifetimeHours: 2 },
+    });
+  });
+
+  it('getHarnessTuningConfigReadsStoredValues', async () => {
+    const rows: Record<string, string> = {
+      'harness.compaction.enabled': 'false',
+      'harness.compaction.contextWindowTokens': '128000',
+      'harness.compaction.triggerRatio': '0.9',
+      'harness.llm.callTimeoutSeconds': '60',
+      'harness.webPage.userAgent': 'TestUA/2.0',
+      'harness.shell.maxSessionsPerConversation': '8',
+    };
+    vi.mocked(mapper.findByKey).mockImplementation(async (key: string) => {
+      if (rows[key] != null) return { id: 1, settingKey: key, value: rows[key], category: '运行参数', editable: 1 };
+      return null;
+    });
+    const cfg = await service().getHarnessTuningConfig();
+    expect(cfg.compaction.enabled).toBe(false);
+    expect(cfg.compaction.contextWindowTokens).toBe(128000);
+    expect(cfg.compaction.triggerRatio).toBe(0.9);
+    expect(cfg.llm.callTimeoutSeconds).toBe(60);
+    expect(cfg.webPage.userAgent).toBe('TestUA/2.0');
+    expect(cfg.shell.maxSessionsPerConversation).toBe(8);
+  });
+
+  it('getHarnessTuningConfigReadsAnthropicCacheSettings', async () => {
+    const rows: Record<string, string> = {
+      'harness.llm.anthropicAutoCache': 'false',
+      'harness.llm.anthropicCacheTtl': '1h',
+    };
+    vi.mocked(mapper.findByKey).mockImplementation(async (key: string) => {
+      if (rows[key] != null) return { id: 1, settingKey: key, value: rows[key], category: '运行参数', editable: 1 };
+      return null;
+    });
+    const cfg = await service().getHarnessTuningConfig();
+    expect(cfg.llm.anthropicAutoCache).toBe(false);
+    expect(cfg.llm.anthropicCacheTtl).toBe('1h');
+  });
+
+  it('getHarnessTuningConfigFallsBackForInvalidAnthropicCacheTtl', async () => {
+    vi.mocked(mapper.findByKey).mockImplementation(async (key: string) => (
+      key === 'harness.llm.anthropicCacheTtl'
+        ? { id: 1, settingKey: key, value: '2h', category: '运行参数', editable: 1 }
+        : null
+    ));
+    const cfg = await service().getHarnessTuningConfig();
+    expect(cfg.llm.anthropicCacheTtl).toBe('5m');
+    expect(cfg.llm.anthropicAutoCache).toBe(true);
+  });
+
+  it('updateRejectsInvalidAnthropicCacheValues', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting('harness.llm.anthropicCacheTtl', '运行参数', 1));
+    await expect(service().update('harness.llm.anthropicCacheTtl', '2h')).rejects.toThrow(/5m 或 1h/);
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting('harness.llm.anthropicAutoCache', '运行参数', 1));
+    await expect(service().update('harness.llm.anthropicAutoCache', 'yes')).rejects.toThrow(/true 或 false/);
+  });
+
+  it('getHarnessTuningConfigReadsMixedCaseBoolValues', async () => {
+    // update 校验对开关值大小写不敏感（'True' 能写入），读取侧必须同口径解析，
+    // 否则写进去的值会被回落成默认值，表现为「保存了但不生效」。
+    vi.mocked(mapper.findByKey).mockImplementation(async (key: string) => (
+      key === 'harness.llm.anthropicAutoCache'
+        ? { id: 1, settingKey: key, value: 'False', category: '运行参数', editable: 1 }
+        : null
+    ));
+    const cfg = await service().getHarnessTuningConfig();
+    expect(cfg.llm.anthropicAutoCache).toBe(false);
+  });
+
+  it('updateRejectsInvalidHarnessTuningValues', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting('harness.compaction.contextWindowTokens', '运行参数', 1));
+    await expect(service().update('harness.compaction.contextWindowTokens', '0')).rejects.toThrow(/正整数/);
+    await expect(service().update('harness.compaction.contextWindowTokens', 'abc')).rejects.toThrow(/正整数/);
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting('harness.compaction.triggerRatio', '运行参数', 1));
+    await expect(service().update('harness.compaction.triggerRatio', '1.5')).rejects.toThrow(/0~1/);
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting('harness.compaction.enabled', '运行参数', 1));
+    await expect(service().update('harness.compaction.enabled', 'yes')).rejects.toThrow(/true 或 false/);
+  });
+
+  it('getOssConfigReturnsNullWhenUnconfigured', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(null);
+    expect(await service().getOssConfig()).toBeNull();
+  });
+
+  it('getOssConfigReturnsFullConfigWhenSet', async () => {
+    const rows: Record<string, string> = {
+      'oss.region': 'cn-hangzhou',
+      'oss.accessKeyId': 'ak',
+      'oss.accessKeySecret': encryptAesGcmNonNull('sk', 'test-secret-key'),
+      'oss.bucket': 'bucket',
+      'oss.sts.roleArn': 'acs:ram::1:role/x',
+    };
+    vi.mocked(mapper.findByKey).mockImplementation(async (key: string) => {
+      if (rows[key] != null) return { id: 1, settingKey: key, value: rows[key], category: '集成配置', editable: 1 };
+      return null;
+    });
+    const cfg = await new SystemSettingService(mapper, agentLookup, modelLookup, { ...runtime }, 'test-secret-key').getOssConfig();
+    expect(cfg).not.toBeNull();
+    expect(cfg!.region).toBe('cn-hangzhou');
+    expect(cfg!.sts.roleSessionName).toBe('mao-sts');
+    expect(cfg!.sts.expire).toBe(3600);
+  });
+
+  it('getLdapConfigReadsEnabledFlag', async () => {
+    const rows: Record<string, string> = {
+      'auth.ldap.enabled': 'true',
+      'auth.ldap.url': 'ldap://example.test:389',
+      'auth.ldap.baseDn': 'dc=example,dc=test',
+      'auth.ldap.userDn': 'cn=admin,dc=example,dc=test',
+    };
+    vi.mocked(mapper.findByKey).mockImplementation(async (key: string) => {
+      if (rows[key] != null) return { id: 1, settingKey: key, value: rows[key], category: '集成配置', editable: 1 };
+      return null;
+    });
+    const cfg = await service().getLdapConfig();
+    expect(cfg.enabled).toBe(true);
+    expect(cfg.url).toBe('ldap://example.test:389');
+    expect(cfg.userSearchBase).toBe('ou=users');
+  });
+
+  it('updateBatchValidatesAllBeforeApplying', async () => {
+    const okRow = setting('upload.storageMode', '集成配置', 1);
+    vi.mocked(mapper.findByKey).mockImplementation(async (key: string) => {
+      if (key === 'upload.storageMode') return okRow;
+      return null;
+    });
+    await expect(service().updateBatch([
+      { key: 'upload.storageMode', value: 'oss' },
+      { key: 'missing.key', value: 'x' },
+    ])).rejects.toThrow(/不存在/);
+    expect(mapper.updateById).not.toHaveBeenCalled();
+  });
+
+  it('updateBatchWriteFailurePropagatesSoTransactionCanRollback', async () => {
+    // 写入阶段抛错必须向上传播，由 transaction 回滚前 N-1 条，不得吞成部分成功
+    const rowA = setting('upload.storageMode', '集成配置', 1);
+    const rowB = setting('audit.retentionDays', '审计', 1);
+    vi.mocked(mapper.findByKey).mockImplementation(async (key: string) => {
+      if (key === 'upload.storageMode') return { ...rowA };
+      if (key === 'audit.retentionDays') return { ...rowB };
+      return null;
+    });
+    let calls = 0;
+    vi.mocked(mapper.updateById).mockImplementation(async () => {
+      calls += 1;
+      if (calls === 2) throw new Error('db down');
+    });
+    await expect(service().updateBatch([
+      { key: 'upload.storageMode', value: 'oss' },
+      { key: 'audit.retentionDays', value: '365' },
+    ])).rejects.toThrow('db down');
+    expect(mapper.transaction).toHaveBeenCalled();
+  });
+});
+
+describe('SystemSettingService 邮件 SMTP 配置（V162）', () => {
+  const mapper: SystemSettingRepository = {
+    list: vi.fn(),
+    findByKey: vi.fn(),
+    updateById: vi.fn(),
+    transaction: vi.fn(async (fn: (repo: SystemSettingRepository) => Promise<unknown>) => fn(mapper)),
+  };
+  const agentLookup: AgentLookup = { findById: vi.fn() };
+  const modelLookup: ModelLookup = { findById: vi.fn() };
+  const runtime = { workspaceRoot: '/workspace', skillsDir: '/skills' };
+
+  function service(secretKey = ''): SystemSettingService {
+    return new SystemSettingService(mapper, agentLookup, modelLookup, { ...runtime }, secretKey);
+  }
+
+  function emailRow(key: string, value: string | null, isSecret = 0): SystemSetting {
+    return { id: 1, settingKey: key, value, category: '通知与消息', editable: 1, isSecret };
+  }
+
+  function mockRows(rows: Record<string, SystemSetting | null>): void {
+    vi.mocked(mapper.findByKey).mockImplementation(async (key: string) => rows[key] ?? null);
+  }
+
+  const fullRows = (): Record<string, SystemSetting | null> => ({
+    'notify.email.enabled': emailRow('notify.email.enabled', '1'),
+    'notify.email.smtpHost': emailRow('notify.email.smtpHost', 'smtp.example.com'),
+    'notify.email.smtpPort': emailRow('notify.email.smtpPort', '587'),
+    'notify.email.smtpSecure': emailRow('notify.email.smtpSecure', '0'),
+    'notify.email.smtpUser': emailRow('notify.email.smtpUser', 'sender@example.com'),
+    'notify.email.smtpPassword': emailRow('notify.email.smtpPassword', encryptAesGcmNonNull('smtp-pass', 'unit-secret'), 1),
+    'notify.email.fromAddr': emailRow('notify.email.fromAddr', 'noreply@example.com'),
+  });
+
+  beforeEach(() => {
+    vi.mocked(mapper.findByKey).mockReset();
+    vi.mocked(mapper.updateById).mockReset();
+    vi.mocked(mapper.transaction).mockClear();
+  });
+
+  it('getEmailSmtpConfig：缺行回落默认值（端口 465 / 隐式 TLS / 关闭）', async () => {
+    mockRows({});
+    const cfg = await service().getEmailSmtpConfig();
+    expect(cfg).toEqual({
+      enabled: false, smtpHost: '', smtpPort: 465, smtpUser: '', smtpPassword: '', fromAddr: '', useTls: true,
+    });
+  });
+
+  it('getEmailSmtpConfig：读取已存值并解密密码', async () => {
+    mockRows(fullRows());
+    const cfg = await service('unit-secret').getEmailSmtpConfig();
+    expect(cfg).toEqual({
+      enabled: true,
+      smtpHost: 'smtp.example.com',
+      smtpPort: 587,
+      smtpUser: 'sender@example.com',
+      smtpPassword: 'smtp-pass',
+      fromAddr: 'noreply@example.com',
+      useTls: false,
+    });
+  });
+
+  it('getEmailSmtpConfig：端口越界回落默认 465', async () => {
+    mockRows({ ...fullRows(), 'notify.email.smtpPort': emailRow('notify.email.smtpPort', '70000') });
+    const cfg = await service('unit-secret').getEmailSmtpConfig();
+    expect(cfg.smtpPort).toBe(465);
+  });
+
+  it('emailSmtpEnabled 反映开关行', async () => {
+    mockRows({ 'notify.email.enabled': emailRow('notify.email.enabled', 'true') });
+    expect(await service().emailSmtpEnabled()).toBe(true);
+    mockRows({ 'notify.email.enabled': emailRow('notify.email.enabled', '0') });
+    expect(await service().emailSmtpEnabled()).toBe(false);
+    mockRows({});
+    expect(await service().emailSmtpEnabled()).toBe(false);
+  });
+
+  it('保存校验：端口越界 / 发件人格式 / TLS 开关值', async () => {
+    mockRows({ ...fullRows() });
+    await expect(service().update('notify.email.smtpPort', '70000')).rejects.toThrow(/1-65535/);
+    await expect(service().update('notify.email.smtpPort', 'abc')).rejects.toThrow(/1-65535/);
+    await expect(service().update('notify.email.fromAddr', 'not-an-email')).rejects.toThrow(/邮箱格式/);
+    await expect(service().update('notify.email.smtpSecure', 'yes')).rejects.toThrow(/TLS 开关/);
+    expect(mapper.updateById).not.toHaveBeenCalled();
+  });
+
+  it('组校验：enabled=1 时清空 host 被拒绝', async () => {
+    mockRows(fullRows());
+    await expect(service().update('notify.email.smtpHost', '')).rejects.toThrow(/SMTP 服务器地址/);
+  });
+
+  it('组校验：enabled=1 时缺发件人被拒绝', async () => {
+    mockRows({ ...fullRows(), 'notify.email.fromAddr': emailRow('notify.email.fromAddr', null) });
+    await expect(service().update('notify.email.fromAddr', '')).rejects.toThrow(/发件人地址/);
+  });
+
+  it('组校验：enabled=1 时端口留空被拒绝', async () => {
+    mockRows({ ...fullRows(), 'notify.email.smtpPort': emailRow('notify.email.smtpPort', null) });
+    await expect(service().update('notify.email.smtpPort', '')).rejects.toThrow(/SMTP 端口/);
+  });
+
+  it('组校验：关闭开关时留空 host/fromAddr 放行', async () => {
+    mockRows({
+      'notify.email.enabled': emailRow('notify.email.enabled', '0'),
+      'notify.email.smtpHost': emailRow('notify.email.smtpHost', null),
+      'notify.email.fromAddr': emailRow('notify.email.fromAddr', null),
+    });
+    await expect(service().update('notify.email.smtpHost', '')).resolves.toBeDefined();
+  });
+
+  it('组校验：batch 同批保存 enabled+host+port+fromAddr 成功（顺序无关）', async () => {
+    mockRows({
+      'notify.email.enabled': emailRow('notify.email.enabled', '0'),
+      'notify.email.smtpHost': emailRow('notify.email.smtpHost', null),
+      'notify.email.smtpPort': emailRow('notify.email.smtpPort', '465'),
+      'notify.email.fromAddr': emailRow('notify.email.fromAddr', null),
+    });
+    const result = await service().updateBatch([
+      { key: 'notify.email.enabled', value: 'true' },
+      { key: 'notify.email.smtpHost', value: 'smtp.example.com' },
+      { key: 'notify.email.smtpPort', value: '587' },
+      { key: 'notify.email.fromAddr', value: 'noreply@example.com' },
+    ]);
+    expect(result).toHaveLength(4);
+    expect(mapper.updateById).toHaveBeenCalledTimes(4);
+  });
+
+  it('组校验：batch 启用但缺 host 整体失败且不落库', async () => {
+    mockRows({
+      'notify.email.enabled': emailRow('notify.email.enabled', '0'),
+      'notify.email.smtpHost': emailRow('notify.email.smtpHost', null),
+      'notify.email.smtpPort': emailRow('notify.email.smtpPort', '465'),
+    });
+    await expect(service().updateBatch([
+      { key: 'notify.email.enabled', value: 'true' },
+      { key: 'notify.email.smtpPort', value: '587' },
+    ])).rejects.toThrow(/SMTP 服务器地址/);
+    expect(mapper.updateById).not.toHaveBeenCalled();
+  });
+
+  it('密码行加密存储：secret 未提交（null）不修改', async () => {
+    mockRows(fullRows());
+    const updated = await service('unit-secret').update('notify.email.smtpPassword', null);
+    expect(updated.value).toBe('******');
+    expect(mapper.updateById).not.toHaveBeenCalled();
+  });
+
+  it('密码行加密存储：新密码加密落库', async () => {
+    mockRows(fullRows());
+    await service('unit-secret').update('notify.email.smtpPassword', 'new-pass');
+    const written = vi.mocked(mapper.updateById).mock.calls[0][0];
+    expect(written.value).not.toBe('new-pass');
+    const decrypted = await service('unit-secret').getEmailSmtpConfig();
+    expect(decrypted.smtpPassword).toBe('new-pass');
+  });
+});
+
+describe('SystemSettingService 自定义 HTTP 工具设置项（V163）', () => {
+  const mapper: SystemSettingRepository = {
+    list: vi.fn(),
+    findByKey: vi.fn(),
+    updateById: vi.fn(),
+    transaction: vi.fn(async (fn: (repo: SystemSettingRepository) => Promise<unknown>) => fn(mapper)),
+  };
+  const agentLookup: AgentLookup = { findById: vi.fn() };
+  const modelLookup: ModelLookup = { findById: vi.fn() };
+
+  function service(): SystemSettingService {
+    return new SystemSettingService(mapper, agentLookup, modelLookup, { workspaceRoot: '/ws', skillsDir: '/skills' });
+  }
+
+  function setting(key: string, value: string): SystemSetting {
+    return { id: 1, settingKey: key, category: '自定义 HTTP 工具', value, editable: 1 };
+  }
+
+  it('接受合法 CIDR 数组并落库', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting('tools.http.privateAllowlist', '[]'));
+    const updated = await service().update('tools.http.privateAllowlist', '["10.0.0.0/8","192.168.1.5"]');
+    expect(updated.value).toBe('["10.0.0.0/8","192.168.1.5"]');
+  });
+
+  it('拒绝非 JSON / 非数组 / 非法 CIDR 的放行清单', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting('tools.http.privateAllowlist', '[]'));
+    await expect(service().update('tools.http.privateAllowlist', '10.0.0.0/8')).rejects.toThrow(/JSON 数组/);
+    await expect(service().update('tools.http.privateAllowlist', '{"a":"10.0.0.0/8"}')).rejects.toThrow(/JSON 数组/);
+    await expect(service().update('tools.http.privateAllowlist', '["10.0.0.0/33"]')).rejects.toThrow(/CIDR/);
+    await expect(service().update('tools.http.privateAllowlist', '["example.com"]')).rejects.toThrow(/CIDR/);
+    await expect(service().update('tools.http.privateAllowlist', '[1]')).rejects.toThrow(/CIDR/);
+  });
+
+  it('拒绝与环回 / 云元数据网段相交的放行清单（配了也不生效，保存时就报错）', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting('tools.http.privateAllowlist', '[]'));
+    await expect(service().update('tools.http.privateAllowlist', '["127.0.0.0/8"]'))
+      .rejects.toThrow(/环回（127\.0\.0\.0\/8）或云元数据/);
+    await expect(service().update('tools.http.privateAllowlist', '["169.254.169.254"]'))
+      .rejects.toThrow(/环回（127\.0\.0\.0\/8）或云元数据/);
+    await expect(service().update('tools.http.privateAllowlist', '["10.0.0.0/8","169.254.0.0/16"]'))
+      .rejects.toThrow(/环回（127\.0\.0\.0\/8）或云元数据/);
+    await expect(service().update('tools.http.privateAllowlist', '["10.0.0.0/8","172.16.0.0/12"]'))
+      .resolves.toMatchObject({ value: '["10.0.0.0/8","172.16.0.0/12"]' });
+  });
+
+  it('getPrivateAllowlistCidrs 解析合法 CIDR，非法/缺失按空数组（失败即拒绝）', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting('tools.http.privateAllowlist', '["10.0.0.0/8","bogus"]'));
+    await expect(service().getPrivateAllowlistCidrs()).resolves.toEqual(['10.0.0.0/8']);
+    vi.mocked(mapper.findByKey).mockResolvedValue(null);
+    await expect(service().getPrivateAllowlistCidrs()).resolves.toEqual([]);
+  });
+});

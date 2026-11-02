@@ -1,0 +1,277 @@
+<template>
+  <el-container class="layout-container">
+    <el-aside v-if="!isMobile" :width="asideWidth" class="layout-aside">
+      <SideMenu :show-logo="true" :collapsed="collapsed" />
+    </el-aside>
+
+    <el-drawer
+      v-model="drawerVisible"
+      direction="ltr"
+      size="72%"
+      :with-header="false"
+      class="mobile-side-drawer"
+    >
+      <SideMenu :show-logo="true" @select="drawerVisible = false" />
+    </el-drawer>
+
+    <el-container>
+      <el-header class="layout-header">
+        <div class="header-left">
+          <el-icon v-if="isMobile" class="menu-toggle" @click="drawerVisible = true">
+            <Menu />
+          </el-icon>
+          <el-icon v-else class="menu-toggle" :title="collapsed ? '展开菜单' : '收起菜单'" @click="toggleCollapsed">
+            <Fold v-if="!collapsed" />
+            <Expand v-else />
+          </el-icon>
+          <nav v-if="crumbs.length > 1" class="page-crumb" aria-label="面包屑">
+            <template v-for="(crumb, idx) in crumbs" :key="crumb.title">
+              <router-link v-if="crumb.path" class="page-crumb-link" :to="crumb.path">{{ crumb.title }}</router-link>
+              <span v-else class="page-title">{{ crumb.title }}</span>
+              <span v-if="idx < crumbs.length - 1" class="page-crumb-sep">/</span>
+            </template>
+          </nav>
+          <span v-else class="page-title">{{ currentTitle }}</span>
+        </div>
+
+        <div class="header-right">
+          <el-dropdown @command="handleCommand">
+            <span class="user-info">
+              <el-avatar :size="28" icon="User" />
+              <span v-if="!isMobile" class="username">{{ authStore.user?.displayName || '管理员' }}</span>
+            </span>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item v-if="canWrite" command="change-password">修改密码</el-dropdown-item>
+                <el-dropdown-item command="logout" divided>退出登录</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+        </div>
+      </el-header>
+
+      <TabBar v-if="!isMobile" />
+
+      <ReadinessBanner :refresh-key="readinessRefreshKey" @change-password="changePasswordVisible = true" />
+
+      <el-main class="layout-main">
+        <div class="layout-content">
+          <router-view v-slot="{ Component, route: viewRoute }">
+            <keep-alive :max="8">
+              <component
+                :is="Component"
+                :key="viewRoute.name === 'SessionDetail' ? viewRoute.fullPath : viewRoute.path"
+              />
+            </keep-alive>
+          </router-view>
+        </div>
+      </el-main>
+    </el-container>
+
+    <ChangePasswordDialog
+      v-if="changePasswordVisible"
+      :visible="changePasswordVisible"
+      @update:visible="changePasswordVisible = $event"
+    />
+  </el-container>
+</template>
+
+<script setup lang="ts">
+import { computed, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { ElMessageBox } from 'element-plus'
+import { useAuthStore } from '../stores/auth'
+import { useTabStore } from '../stores/tabs'
+import { useBreakpoint } from '../composables/useBreakpoint'
+import { useEmbedChat } from '../composables/useEmbedChat'
+import { homeTitle, pickHomePath } from '../utils/home'
+import TabBar from './TabBar.vue'
+import SideMenu from './SideMenu.vue'
+import ReadinessBanner from './ReadinessBanner.vue'
+import ChangePasswordDialog from '../views/user/ChangePasswordDialog.vue'
+
+const SIDEBAR_KEY = 'admin-sidebar-collapsed'
+
+const route = useRoute()
+const router = useRouter()
+const authStore = useAuthStore()
+const tabStore = useTabStore()
+const { isMobile } = useBreakpoint()
+// 浮窗助手：Layout 仅在登录后路由树挂载，卸载（登出跳 /login）时自动销毁 SDK 实例
+useEmbedChat()
+
+const drawerVisible = ref(false)
+const collapsed = ref(localStorage.getItem(SIDEBAR_KEY) === '1')
+
+const asideWidth = computed(() => (collapsed.value ? '64px' : '232px'))
+const currentTitle = computed(() => (route.meta?.title as string) || '')
+
+const crumbs = computed(() => {
+  if (route.name === 'SessionDetail') {
+    return [
+      { title: '会话管理', path: '/sessions' },
+      { title: currentTitle.value }
+    ]
+  }
+  return [{ title: currentTitle.value }]
+})
+
+function toggleCollapsed() {
+  collapsed.value = !collapsed.value
+  localStorage.setItem(SIDEBAR_KEY, collapsed.value ? '1' : '0')
+}
+
+watch(
+  currentTitle,
+  (title) => {
+    document.title = title ? `${title} · Mao 管理后台` : 'Mao 管理后台'
+  },
+  { immediate: true }
+)
+
+watch(isMobile, (mobile) => {
+  if (!mobile) drawerVisible.value = false
+})
+
+watch(() => authStore.user, (user) => {
+  if (!user) return
+  const path = pickHomePath((permission) => authStore.hasPermission(permission))
+  tabStore.setHomePath(path, homeTitle(path))
+}, { immediate: true })
+
+watch(route, (newRoute) => {
+  tabStore.addTab(newRoute)
+}, { immediate: true })
+
+const changePasswordVisible = ref(false)
+// 改密弹窗关闭后触发就绪横幅重查（无论是否保存成功，多查一次无害）
+const readinessRefreshKey = ref(0)
+
+watch(changePasswordVisible, (visible, prev) => {
+  if (!visible && prev) readinessRefreshKey.value += 1
+})
+
+const canWrite = computed(() => authStore.hasPermission('user:write'))
+
+async function handleCommand(command: string) {
+  if (command === 'logout') {
+    try {
+      await ElMessageBox.confirm('确定要退出登录吗？', '退出登录', {
+        confirmButtonText: '退出',
+        cancelButtonText: '取消',
+        type: 'warning'
+      })
+    } catch {
+      return
+    }
+    await authStore.logout()
+    router.push('/login')
+    return
+  }
+  if (command === 'change-password') {
+    changePasswordVisible.value = true
+  }
+}
+</script>
+
+<style scoped>
+.layout-container {
+  height: 100vh;
+  height: 100dvh;
+}
+
+.layout-aside {
+  background: var(--mao-surface);
+  border-right: 1px solid var(--mao-border);
+  overflow: hidden;
+  transition: width 0.2s ease;
+}
+
+.layout-header {
+  box-sizing: border-box;
+  min-height: 56px;
+  height: calc(56px + env(safe-area-inset-top));
+  padding-top: env(safe-area-inset-top);
+  padding-left: max(16px, env(safe-area-inset-left));
+  padding-right: max(16px, env(safe-area-inset-right));
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--mao-border);
+  background: var(--mao-surface);
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.page-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--mao-ink);
+}
+
+.page-crumb {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.page-crumb-link {
+  font-size: 15px;
+  color: var(--mao-accent);
+  text-decoration: none;
+}
+
+.page-crumb-link:hover {
+  text-decoration: underline;
+}
+
+.page-crumb-sep {
+  color: var(--mao-muted);
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+}
+
+.user-info {
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  gap: 8px;
+}
+
+.username {
+  font-size: 13px;
+  color: var(--mao-muted);
+}
+
+.menu-toggle {
+  font-size: 20px;
+  cursor: pointer;
+  color: var(--mao-muted);
+}
+
+.menu-toggle:hover {
+  color: var(--mao-ink);
+}
+
+.layout-main {
+  background: var(--mao-canvas);
+  padding: 0;
+  overflow: hidden;
+}
+
+.layout-content {
+  height: 100%;
+  padding: 20px;
+  padding-bottom: calc(20px + env(safe-area-inset-bottom));
+  overflow-y: auto;
+}
+</style>

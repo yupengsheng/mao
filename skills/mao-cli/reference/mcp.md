@@ -1,0 +1,85 @@
+# MCP 模块
+
+管理 MCP 服务器：用户级私有 MCP、全局 MCP（管理员）、以及用户对全局/私有 MCP 的启用偏好。
+
+工具注入命名：`mcp__{server}__{tool}`。CLOUD 模式服务端直连；LOCAL 由桌面端/Electron 或 `mao-agent --local` 代理并纳入审批。
+
+**MCP 工作集（0.0.306 起默认）**：会话不再把每个工具的完整 JSON Schema 塞进模型请求，系统提示只列服务器、用途与工具名；模型按需用 `mcp_describe(server, tool)` 查参数、用 `mcp_call(server, tool, arguments)` 执行。可在桌面端「设置 → MCP 服务器 → 工具加载模式」切换为「全量注入」（旧行为）。模式是用户级单值偏好，与每台服务器的启用开关互不影响；切换对新会话生效。加载模式接口：`GET/PUT /v1/mcp-servers/load-mode`，body `{"loadMode":"WORKING_SET"|"FULL"}`。系统级默认值由管理员在系统设置 `mcp.loadMode` 调整。
+
+生产环境使用 MCP 时建议配置 `APP_MCP_SECRET`（见 [config.md](config.md)）。
+
+## 命令选择
+
+| 场景 | 命令 |
+|------|------|
+| 查看我可用的 MCP 及启用状态 | `mcp preferences` |
+| 启用/禁用某个 MCP（全局或自己的） | `mcp preferences-set` |
+| 我的私有 MCP 列表 | `mcp me-list` |
+| 创建/改/删/测 私有 MCP | `mcp me-create` / `me-update` / `me-delete` / `me-test` |
+| 管理员：列表/详情/CRUD/启停/测试 | `mcp list` / `get` / `create` / `update` / `set-status` / `delete` / `test` |
+| 仅已启用的全局 MCP | `mcp enabled` |
+
+全局 MCP 的列表和详情需要 `mcp:read`；创建、修改、启停、删除、测试需要 `mcp:write`。`mcp enabled` 同时接受 `mcp:read` 或 `agent:write`。私有 MCP（`mcp me-*`）只要求登录。
+
+## 服务器类型
+
+| server-type | 字段 |
+|-------------|------|
+| `stdio` | `--command`、`--args`（逗号分隔）、可选 `--env` JSON |
+| `http` | `--url`、可选 `--env` |
+
+`--env` 示例：`--env '{"API_KEY":"xxx"}'`（敏感值由服务端加密存储）。
+
+## 示例
+
+```bash
+# 查看偏好
+mao mcp preferences --json
+
+# 禁用全局 MCP id=2
+mao mcp preferences-set --server-id 2 --enabled false
+
+# 用户私有 stdio MCP
+mao mcp me-create --name my-mcp --server-type stdio \
+  --command npx --args -y,@modelcontextprotocol/server-filesystem,/tmp
+
+# 测试连接（返回工具列表）
+mao mcp me-test --id 3 --json
+
+# 管理员创建全局 HTTP MCP
+mao mcp create --name corp-gateway --server-type http \
+  --url https://mcp.example.com/mcp --env '{"TOKEN":"secret"}'
+
+mao mcp test --id 1
+mao mcp set-status --id 1 --status DISABLED
+```
+
+## API 映射
+
+| CLI | HTTP |
+|-----|------|
+| `preferences` | GET `/mcp-servers/preferences` |
+| `preferences-set` | PUT `/mcp-servers/preferences` |
+| 加载模式（UI 使用） | GET/PUT `/mcp-servers/load-mode` |
+| `me-list` | GET `/mcp-servers/me` |
+| `me-create` | POST `/mcp-servers/me` |
+| `me-update` | PUT `/mcp-servers/me/:id` |
+| `me-delete` | DELETE `/mcp-servers/me/:id` |
+| `me-test` | POST `/mcp-servers/me/:id/test` |
+| `list` | GET `/mcp-servers` |
+| `enabled` | GET `/mcp-servers/enabled` |
+| `get` | GET `/mcp-servers/:id` |
+| `create` | POST `/mcp-servers` |
+| `update` | PUT `/mcp-servers/:id` |
+| `set-status` | PUT `/mcp-servers/:id/status` |
+| `delete` | DELETE `/mcp-servers/:id` |
+| `test` | POST `/mcp-servers/:id/test` |
+
+测试失败时 HTTP 200 但 `code !== 0`，message 含连接错误详情；可用 `--raw` 查看完整 Result。
+
+## 与 UI 的关系
+
+- 管理后台「MCP 服务器」对应全局 `mcp list/create/...`
+- 桌面端「MCP」对应 `mcp me-*` 与 `mcp preferences`
+
+对话中 Agent 实际调用 MCP 工具不走本 CLI，走 WebSocket 会话与 Harness。模型给出的参数不是合法 JSON 对象时（输出被截断等），0.0.177 起直接返回「MCP 工具参数不是合法 JSON 对象，请重新生成参数后重试」并跳过本次调用，不再兜底成 `{}` 发给 MCP 服务器。

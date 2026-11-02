@@ -1,0 +1,30 @@
+# 部署指南
+
+生产自托管部署的**完整正文**已迁入可独立分发的 Mao 产品文档：
+
+| 主题 | 文档 |
+|------|------|
+| 服务器目录、Nginx、HTTPS、蓝绿重启、升级、运维 | [skills/mao-cli/reference/deploy.md](skills/mao-cli/reference/deploy.md) |
+| 已有双域名环境合并为单域名 | [docs/guides/single-domain-nginx-migration.md](docs/guides/single-domain-nginx-migration.md) |
+| 环境变量与数据目录 | [skills/mao-cli/reference/config.md](skills/mao-cli/reference/config.md) |
+| Electron / 安卓可选部署 | [skills/mao-cli/reference/electron.md](skills/mao-cli/reference/electron.md)、[skills/mao-cli/reference/android.md](skills/mao-cli/reference/android.md) |
+| 部署排障 | [skills/mao-cli/reference/troubleshooting.md](skills/mao-cli/reference/troubleshooting.md) |
+| 首次部署与上线清单 | [skills/mao-cli/business_process.md](skills/mao-cli/business_process.md) |
+| 公司 SSO 换票与 SDK 自动续期 | [skills/mao-cli/reference/embed-sdk.md](skills/mao-cli/reference/embed-sdk.md#公司-sso-接入)、[配置参考](skills/mao-cli/reference/config.md)；在管理后台「系统设置 → 登录认证 → 公司 SSO」配置校验域名白名单（V107 迁移，SSO 环境变量不再读取）以允许 SDK `auth.checkUrl` 的完整域名或上级域名，上线前验证官方校验协议、邮箱唯一性和 SSO 网关 Token 日志脱敏 |
+| ECP 飞书登录（CLOUD CLI 网关凭证） | [docs/plan/2026-09-14-ecp-native-login-technical-design.md](docs/plan/2026-09-14-ecp-native-login-technical-design.md)、[配置参考](skills/mao-cli/reference/config.md)；V111 迁移后在管理后台「系统设置 → 登录认证 → ECP 飞书登录」启用；须在 ECP 登记桌面/管理后台回调 URL；开启后新增 ECP 飞书入口（不关闭其它登录），后端常驻 renew，CLOUD shell 注入 AccessOne 布局供 `bigdata-cli` 等使用 Bearer；飞书机器人通道同时要求发送者有有效 ECP 票 |
+| Web Embed SDK 接入与产物上线 | [skills/mao-cli/reference/embed-sdk.md](skills/mao-cli/reference/embed-sdk.md)、[docs/plan/2026-09-04-embed-sdk-technical-design.md](docs/plan/2026-09-04-embed-sdk-technical-design.md) §4.6 |
+| 管理后台浮窗助手（Embed SDK 内置接入） | [skills/mao-cli/reference/embed-sdk.md](skills/mao-cli/reference/embed-sdk.md#管理后台浮窗助手)、[docs/plan/2026-10-16-admin-embed-chat-technical-design.md](docs/plan/2026-10-16-admin-embed-chat-technical-design.md)；管理员登录后台即用，Agent 在「系统设置 → 集成配置」选（`embed.agentId`，V156 迁移随启动执行）。**须先部署 desktop 再部署 admin**（SDK 产物由 desktop 部署提供，反序则浮窗不出现但不影响后台其他功能） |
+| 开放接口（API Token / 入站 Webhook 触发器 / 出站订阅） | [skills/mao-cli/reference/open-api.md](skills/mao-cli/reference/open-api.md)；入站 hook 走公网可达的 `/api/v1/open/hooks/*`（Nginx 已放开 `/api/`），触发器与订阅 secret 由 `APP_NOTIFICATION_WEBHOOK_SECRET` 加密（未配置时回退与任务通知 Webhook 相同的内置默认密钥，仍建议显式设置）；API Token 明文由 `APP_OPENAPI_TOKEN_SECRET` 加密留存以支持再次复制（未配置回退内置默认密钥；轮换该密钥后旧 Token 不能再复制明文，sha256 鉴权不受影响）；V133 / V147 迁移随 TS 启动自动执行 |
+| 用量成本核算与预算管控 | [skills/mao-cli/reference/budget.md](skills/mao-cli/reference/budget.md)、[模型价格](skills/mao-cli/reference/model.md)；V138 / V139 迁移随 TS 启动自动执行，无新环境变量。模型价格在管理后台「模型管理」填（每百万 token 成本单位），历史调用成本不回填；预算在「用量预算」页按全局 / 用户 / Agent 建月度上限，BLOCK 命中会拒绝新任务发起，开放 API / Webhook 一并生效 |
+| 全局消息全文检索 | [部署说明](skills/mao-cli/reference/deploy.md#全文检索索引v146)；V146 随启动建 ngram 索引，低峰发版并先加长 `MAO_BLUE_GREEN_HEALTH_RETRIES`。应急 `SEARCH_FULLTEXT_ENABLED=false` |
+| 信号哨兵（定时探测外部接口，变化触发 Agent） | [skills/mao-cli/reference/signal-watcher.md](skills/mao-cli/reference/signal-watcher.md)；用户在桌面「设置 → 信号哨兵」自助管理，管理后台 `signal:read` 权限提供只读清单；哨兵请求头 / 请求体由 `APP_SIGNAL_SECRET` 加密（未配置时回退内置默认密钥，仍建议显式设置；轮换该密钥后已存哨兵需重新填写请求头与请求体）；V148 迁移随 TS 启动自动执行，无额外 Nginx 配置（探测由后端主动出站）。0.0.361 起 V174 迁移（`signal_watcher.trigger_mode` / `reuse_session_id` 两列，带列默认值）同样随启动自动执行，无新环境变量、无需数据回填 |
+| 用户运行时容器隔离（docker 模式，默认关闭） | [部署说明](skills/mao-cli/reference/deploy.md#容器隔离运行时v0295)；全局开关在管理后台「系统设置 → 运行环境 → 用户运行时模式」切换，保存即生效（DB `system_setting.runtime.mode` 优先于 `MAO_CLOUD_RUNTIME`，V160 迁移随 TS 启动自动执行）；生产机需预装 Docker 并先运行 `bash scripts/build-runtime-image.sh` 构建 `mao-runtime` 镜像（含与镜像 Node ABI 匹配的 sharp / node-pty，宿主机 Node 升级后必须重建镜像）；`MAO_CONTAINER_IDLE_MINUTES`（默认 60）必须大于管理后台的 shell 会话空闲超时（默认 30）；灰度也可用管理后台「用户管理 → 运行时模式」按用户切换；V154 迁移（`user.runtime_mode`）随 TS 启动自动执行 |
+| 邮件通知渠道（SMTP，默认关闭） | [设置说明](skills/mao-cli/reference/settings.md#邮件通知配置notifyemail0.0.318-起)；在管理后台「系统设置 → 通知与消息 → 邮件（SMTP）」配置（`notify.email.*`，V162 迁移随 TS 启动自动执行，密码行加密存储），「测试连接」发测试信到管理员本人邮箱；用户在桌面「设置 → 消息通知」选「邮件」，收件地址取个人资料邮箱。**发信可达性取决于服务器出网与发信域名信誉，产品内不做 SPF/DKIM 引导**：建议为发件域名添加 SPF（放行 SMTP 服务器出口 IP）与 DKIM（SMTP 服务商提供的 DNS 记录），出口 25/465/587 未被云厂商封锁；无法自建信誉时用企业邮箱 / 中继（如 SMTP 中继服务）发信。正确发出不保证送达（进垃圾箱是自托管固有风险） |
+| 自定义 HTTP 工具（把用户接口封装成 Agent 工具） | [skills/mao-cli/reference/user-tool.md](skills/mao-cli/reference/user-tool.md)；用户在桌面「设置 → 我的工具」自助管理，管理后台「运行 → 自定义工具」（`user_tool:read`）提供只读清单与调用统计；工具请求头敏感值由 `APP_USER_TOOL_SECRET` 加密（未配置时回退内置默认密钥，仍建议显式设置；轮换该密钥后已存工具的敏感请求头需重新填写）；SSRF 默认拒私网，确需访问内网时由管理员在「系统设置 → 工具与终端 → 自定义 HTTP 工具」按 CIDR 放行（环回与云元数据永拒）；V163 迁移随 TS 启动自动执行，无额外 Nginx 配置（请求由后端主动出站） |
+| Agent 团队经验库（渐进式发现，0.0.342 起） | [部署说明](skills/mao-cli/reference/deploy.md#公共共享目录)、[Agent 参考](skills/mao-cli/reference/agent.md)；经验库位于 `<MAO_SHARE_DIR>/agent-experience/<agentId>/`，CLOUD 会话经工作区 `团队经验/` 符号链接读写、系统提示注入固定路标；V169 迁移随 TS 启动自动执行；**容器模式共享目录挂载由 ro 改 rw，存量容器随指纹漂移自动重建**；管理员投放内容建议每日快照兜底（cron 示例见部署说明） |
+
+**维护者注意**：服务器上真实部署目录为 `/opt/mao`（与云端 Agent 会话工作区路径不同）。`git pull`、构建、`restart.sh` 应在 `/opt/mao` 执行。开机自启安装 `scripts/systemd/mao-backend.service`（见部署文档「开机自启」）。
+
+本地开发安装见 [skills/mao-cli/reference/install.md](skills/mao-cli/reference/install.md)。
+
+Agent 执行部署任务时应阅读 `skills/mao-cli` 内上述文档，而非依赖本短入口。

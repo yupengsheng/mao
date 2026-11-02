@@ -1,0 +1,841 @@
+import http from 'node:http';
+import https from 'node:https';
+import { URL } from 'node:url';
+import { ensureContentPresent } from '../core/message-history-normalizer.js';
+import { PromptImageResizer } from '../tool/prompt-image-resizer.js';
+import { harnessLog } from '../log.js';
+import { remoteImageCache } from './remote-image-cache.js';
+import type {
+  ChatCallback,
+  ChatMessage,
+  ChatRequest,
+  ChatResponse,
+  ChatUsage,
+  ContentPart,
+  LlmAdapter,
+  LlmModelConfig,
+  LlmRetryConfig,
+  StreamCallback,
+  StreamChunk,
+} from './chat-request.js';
+import { DEFAULT_LLM_RETRY, notifyPartialUsage } from './chat-request.js';
+import { EmptyResponseExhaustedException } from './empty-response-exhausted.js';
+import { parseChatResponse, parseStreamChunk, parseStreamErrorEvent, parseUsageFromSse, serializeChatRequest } from './json.js';
+import { applyClientImpersonationHeaders } from './client-impersonation-headers.js';
+import { isSupported, markUnsupported, shouldDegrade } from './prompt-cache-key-support.js';
+
+const IMAGE_PLACEHOLDER = '「此处用户上传了图片」';
+
+class StreamInterruptedAfterOutputException extends Error {
+  constructor(cause?: unknown) {
+    super('LLM stream interrupted after output started; automatic retry disabled');
+    this.name = 'StreamInterruptedAfterOutputException';
+    this.cause = cause;
+  }
+}
+
+/** 推理模型思考被输出长度上限截断（finish_reason=length 且无正式 content / tool calls），
+ *  该轮只有思考没有回答，按可重试异常处理，重试前丢弃思考过程。 */
+class StreamThinkingTruncatedException extends Error {
+  constructor() {
+    super('Model thinking truncated by output limit (finish_reason=length without content)');
+    this.name = 'StreamThinkingTruncatedException';
+  }
+}
+
+/** 上游在流已开始（HTTP 200 已发出）后失败，错误只能内嵌在 SSE 事件里下发。
+ *  典型是 OpenRouter 免费模型的中途限流：`{"error":{"code":429}}` + `finish_reason:"error"`。
+ *  必须显式识别，否则会被当成一次内容为空的正常响应，进而被误判为「LLM 返回空响应」。 */
+class StreamErrorEventException extends Error {
+  constructor(readonly statusCode: number | null, detail: string) {
+    super(`LLM stream reported error event${statusCode != null ? ` (code ${statusCode})` : ''}: ${detail}`);
+    this.name = 'StreamErrorEventException';
+  }
+
+  /** 限流与服务端故障可重试；参数、鉴权、余额类错误重试无意义。 */
+  get retryable(): boolean {
+    if (this.statusCode == null) return true;
+    return this.statusCode === 408 || this.statusCode === 429
+      || (this.statusCode >= 500 && this.statusCode < 600);
+  }
+}
+
+interface HttpResult {
+  status: number;
+  headers: http.IncomingHttpHeaders;
+  body: http.IncomingMessage;
+  started: number;
+  req: http.ClientRequest;
+}
+
+export class OpenAiLlmAdapter implements LlmAdapter {
+  constructor(private readonly retry: LlmRetryConfig = DEFAULT_LLM_RETRY) {}
+
+  async chat(
+    request: ChatRequest,
+    config: LlmModelConfig,
+    cancelFlag?: { get(): boolean } | null,
+    callback?: ChatCallback | null,
+  ): Promise<ChatResponse> {
+    let payload = await this.buildRequestBody(request, config, false);
+    const totalStarted = process.hrtime.bigint();
+    for (let attempt = 1; ; attempt++) {
+      if (this.isCancelled(cancelFlag)) throw this.cancelledException();
+      const attemptStarted = process.hrtime.bigint();
+      try {
+        const awaited = await this.awaitResponse(payload, config, false, cancelFlag, callback ?? null, config.modelId ?? '', attempt);
+        harnessLog('info', `LLM response headers model=${config.modelId} phase=response_headers attempt=${attempt}`);
+        if (this.isRetryableStatus(awaited.status)) {
+          if (attempt > this.retry.rateLimitMaxRetries) {
+            const detail = await this.readErrorBody(awaited.body);
+            throw new Error(`LLM API returned ${awaited.status} after ${this.retry.rateLimitMaxRetries} retries: ${detail}`);
+          }
+          const delaySeconds = this.resolveRetryDelaySeconds(awaited.headers, attempt);
+          this.logRetry(config.modelId, 'http_status', awaited.status, attempt, delaySeconds, attemptStarted, totalStarted);
+          callback?.onRetry?.('http_status', awaited.status, attempt, this.retry.rateLimitMaxRetries, delaySeconds);
+          awaited.body.resume();
+          if (!(await this.sleepSecondsRespectingCancel(delaySeconds, cancelFlag))) {
+            throw this.cancelledException();
+          }
+          continue;
+        }
+        if (awaited.status < 200 || awaited.status >= 300) {
+          const detail = await this.readErrorBody(awaited.body);
+          // 400 且错误体点名 prompt_cache_key：去掉字段重试（不消耗限流重试额度）
+          const degraded = await this.degradePromptCacheKeyOn400(payload, awaited.status, detail, config);
+          if (degraded != null) {
+            payload = degraded;
+            continue;
+          }
+          this.logRequestError(payload, config, `LLM API returned ${awaited.status}: ${detail}`);
+          throw new Error(`LLM API returned ${awaited.status}: ${detail}`);
+        }
+        const json = await this.readBodyRespectingCancel(
+          awaited.body, cancelFlag, awaited.started + this.retry.httpCallTimeoutSeconds * 1000, awaited.req,
+        );
+        if (this.isCancelled(cancelFlag)) throw this.cancelledException();
+        const parsed = JSON.parse(json) as unknown;
+        // L-7：部分网关以 200 + body 内嵌 {error:{...}} 返回错误，直接按业务错误抛出，
+        // 避免被当作空响应走 10 次空响应退避重试、掩盖真实原因。
+        const embeddedError = parseEmbeddedError(parsed);
+        if (embeddedError != null) {
+          this.logRequestError(payload, config, `LLM API returned error: ${embeddedError}`);
+          throw new Error(`LLM API returned error: ${embeddedError}`);
+        }
+        return parseChatResponse(parsed);
+      } catch (e) {
+        if (this.isCancelled(cancelFlag)) throw this.cancelledException();
+        if (e instanceof Error && e.message.startsWith('LLM API returned')) throw e;
+        if (!this.isRetryableNetworkFailure(e) || attempt > this.retry.rateLimitMaxRetries) {
+          this.logRequestError(payload, config, `LLM call failed: ${this.networkReason(e)}`);
+          throw new Error(`LLM call failed: ${this.networkReason(e)}`, { cause: e });
+        }
+        const delaySeconds = this.resolveRetryDelaySeconds(null, attempt);
+        const reason = this.networkReason(e);
+        this.logRetry(config.modelId, reason, null, attempt, delaySeconds, attemptStarted, totalStarted);
+        callback?.onRetry?.(reason, null, attempt, this.retry.rateLimitMaxRetries, delaySeconds);
+        if (!(await this.sleepSecondsRespectingCancel(delaySeconds, cancelFlag))) {
+          throw this.cancelledException();
+        }
+      }
+    }
+  }
+
+  async stream(
+    request: ChatRequest,
+    config: LlmModelConfig,
+    callback: StreamCallback,
+    cancelFlag?: { get(): boolean } | null,
+  ): Promise<void> {
+    let payload = await this.buildRequestBody(request, config, true);
+    const totalStarted = process.hrtime.bigint();
+    for (let attempt = 1; ; attempt++) {
+      if (this.isCancelled(cancelFlag)) {
+        callback.onError(this.cancelledException());
+        return;
+      }
+      const attemptStarted = process.hrtime.bigint();
+      let awaited: HttpResult;
+      try {
+        awaited = await this.awaitResponse(payload, config, true, cancelFlag, callback, config.modelId ?? '', attempt);
+      } catch (e) {
+        if (this.isCancelled(cancelFlag)) {
+          callback.onError(this.cancelledException());
+          return;
+        }
+        if (!this.isRetryableNetworkFailure(e) || attempt > this.retry.rateLimitMaxRetries) {
+          callback.onError(e);
+          return;
+        }
+        const delaySeconds = this.resolveRetryDelaySeconds(null, attempt);
+        if (!(await this.notifyAndWaitForRetry(callback, cancelFlag, config.modelId, this.networkReason(e), null, attempt, delaySeconds, attemptStarted, totalStarted))) {
+          callback.onError(this.cancelledException());
+          return;
+        }
+        continue;
+      }
+      try {
+        harnessLog('info', `LLM response headers model=${config.modelId} phase=response_headers attempt=${attempt}`);
+        if (this.isRetryableStatus(awaited.status)) {
+          if (attempt > this.retry.rateLimitMaxRetries) {
+            const detail = await this.readErrorBody(awaited.body);
+            this.logRequestError(payload, config, `LLM API returned ${awaited.status} after ${this.retry.rateLimitMaxRetries} retries: ${detail}`);
+            callback.onError(new Error(`LLM API returned ${awaited.status} after ${this.retry.rateLimitMaxRetries} retries: ${detail}`));
+            return;
+          }
+          const delaySeconds = this.resolveRetryDelaySeconds(awaited.headers, attempt);
+          await this.logRequestErrorOnStreamFailure(payload, config, 'http_status', awaited.status, attempt);
+          awaited.body.resume();
+          if (!(await this.notifyAndWaitForRetry(callback, cancelFlag, config.modelId, 'http_status', awaited.status, attempt, delaySeconds, attemptStarted, totalStarted))) {
+            callback.onError(this.cancelledException());
+            return;
+          }
+          continue;
+        }
+        if (awaited.status < 200 || awaited.status >= 300) {
+          const detail = await this.readErrorBody(awaited.body);
+          // 400 且错误体点名 prompt_cache_key：去掉字段重试（不消耗限流重试额度）
+          const degraded = await this.degradePromptCacheKeyOn400(payload, awaited.status, detail, config);
+          if (degraded != null) {
+            payload = degraded;
+            continue;
+          }
+          this.logRequestError(payload, config, `LLM API returned ${awaited.status}: ${detail}`);
+          callback.onError(new Error(`LLM API returned ${awaited.status}: ${detail}`));
+          return;
+        }
+        await this.processStreamBody(awaited.body, callback, cancelFlag);
+        return;
+      } catch (e) {
+        if (this.isCancelled(cancelFlag)) {
+          callback.onError(this.cancelledException());
+          return;
+        }
+        // 空响应重试耗尽是终态：原样透传给 onError，禁止包装、禁止整轮流重试
+        if (e instanceof EmptyResponseExhaustedException) {
+          callback.onError(e);
+          return;
+        }
+        const streamError = e instanceof StreamErrorEventException ? e : null;
+        const truncated = e instanceof StreamInterruptedAfterOutputException
+          || e instanceof StreamThinkingTruncatedException;
+        const retryable = streamError != null ? streamError.retryable : this.isRetryableNetworkFailure(e);
+        const terminalFailure = this.describeStreamFailure(e, streamError, truncated, retryable);
+        if (!retryable || attempt > this.retry.rateLimitMaxRetries) {
+          this.logRequestError(payload, config, this.failureMessage(terminalFailure));
+          callback.onError(terminalFailure);
+          return;
+        }
+        if (truncated || streamError != null) {
+          // 丢弃本轮残留输出（被截断的思考或中途失败前的片段），下一轮从干净状态重新生成
+          callback.onStreamReset?.();
+        }
+        const delaySeconds = this.resolveRetryDelaySeconds(null, attempt);
+        const reason = streamError != null ? 'stream_error_event' : this.networkReason(e);
+        if (!(await this.notifyAndWaitForRetry(callback, cancelFlag, config.modelId, reason, streamError?.statusCode ?? null, attempt, delaySeconds, attemptStarted, totalStarted))) {
+          callback.onError(this.cancelledException());
+          return;
+        }
+      }
+    }
+  }
+
+  /** 把流式失败翻译成给用户看的最终错误。 */
+  private describeStreamFailure(
+    failure: unknown,
+    streamError: StreamErrorEventException | null,
+    truncated: boolean,
+    retryable: boolean,
+  ): unknown {
+    if (streamError != null) {
+      const suffix = retryable ? '，自动重试已耗尽，请稍后重试' : '';
+      const prefix = streamError.statusCode === 429
+        ? '上游模型触发限流（流式响应中途返回 429）'
+        : '模型流式响应中途返回错误';
+      return new Error(`${prefix}${suffix}：${streamError.message}`, { cause: streamError });
+    }
+    if (truncated) {
+      return new Error(
+        failure instanceof StreamThinkingTruncatedException
+          ? '模型思考被输出上限截断，自动重试已耗尽，请重试'
+          : '模型流式响应已中断，自动重试已耗尽',
+        { cause: failure },
+      );
+    }
+    return failure;
+  }
+
+  private async processStreamBody(
+    body: http.IncomingMessage,
+    callback: StreamCallback,
+    cancelFlag?: { get(): boolean } | null,
+  ): Promise<void> {
+    const usage: ChatUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+    let usageObserved = false;
+    let emitted = false;
+    let done = false;
+    let buffer = '';
+    let finishReason: string | null = null;
+    let hasContentOutput = false;
+    let hasToolCallOutput = false;
+    // fatal：截断的 UTF-8 必须报错，静默降级为 U+FFFD 会让被截断的流看起来正常完成
+    const decoder = new TextDecoder('utf-8', { fatal: true });
+    let lastData = Date.now();
+    const idleMs = this.retry.streamIdleTimeoutSeconds * 1000;
+
+    let idleTimedOut: Error | null = null;
+
+    const waiting = setInterval(() => {
+      if (this.isCancelled(cancelFlag)) {
+        // 响应头已到：poll 早已随 res 回调停止，此处的轮询是取消的唯一出口。
+        // 裸 destroy() 足以让 for await 以 Premature close 退出，错误由 stream() 的
+        // isCancelled 收敛成 Cancelled by user。
+        body.destroy();
+        return;
+      }
+      callback.onWaiting?.('stream_data', Math.floor((Date.now() - lastData) / 1000));
+    }, 2000);
+
+    const idleTimer = setInterval(() => {
+      if (Date.now() - lastData > idleMs) {
+        idleTimedOut = Object.assign(new Error('timeout'), { code: 'ETIMEDOUT', name: 'TimeoutError' });
+        body.destroy(idleTimedOut);
+      }
+    }, 100);
+
+    /** 处理一整行 SSE；返回 true 表示读到了 [DONE]。 */
+    const handleLine = (line: string): boolean => {
+      if (!line.startsWith('data:')) return false;
+      lastData = Date.now();
+      const data = line.slice(5).replace(/^ /, '').trim();
+      if (data === '[DONE]') return true;
+      try {
+        const parsed = JSON.parse(data) as unknown;
+        // 中途错误（如限流）内嵌在 SSE 事件里，HTTP 状态码已发出无法反映，必须在此拦截，
+        // 否则该轮会被当成内容为空的正常响应，最终被上层误判为「LLM 返回空响应」。
+        const errorEvent = parseStreamErrorEvent(parsed);
+        if (errorEvent) {
+          throw new StreamErrorEventException(errorEvent.code, errorEvent.message);
+        }
+        const streamChunk = parseStreamChunk(parsed);
+        for (const choice of streamChunk.choices ?? []) {
+          if (choice.finishReason) finishReason = choice.finishReason;
+          const delta = choice.delta;
+          if (delta?.content) hasContentOutput = true;
+          if (delta?.toolCalls && delta.toolCalls.length > 0) hasToolCallOutput = true;
+        }
+        callback.onChunk(streamChunk);
+        if (hasAccumulatedOutput(streamChunk)) emitted = true;
+        const u = parseUsageFromSse(parsed);
+        if (u) {
+          usageObserved = true;
+          usage.promptTokens = u.promptTokens;
+          usage.completionTokens = u.completionTokens;
+          usage.totalTokens = u.totalTokens;
+          usage.promptTokensDetails = u.promptTokensDetails;
+        }
+      } catch (e) {
+        if (e instanceof StreamErrorEventException) throw e;
+        harnessLog('warn', `Failed to parse SSE chunk: ${data}`, e);
+      }
+      return false;
+    };
+
+    try {
+      for await (const chunk of body) {
+        if (idleTimedOut) throw idleTimedOut;
+        if (this.isCancelled(cancelFlag)) {
+          throw new Error('Cancelled by user');
+        }
+        buffer += decoder.decode(chunk as Uint8Array, { stream: true });
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          if (handleLine(line)) {
+            done = true;
+            break;
+          }
+        }
+        if (done) break;
+      }
+      buffer += decoder.decode();
+      // 上游可能不以换行结尾，残留在 buffer 里的最后一行同样是有效事件
+      if (!done && buffer.trim() !== '') {
+        if (handleLine(buffer)) done = true;
+        buffer = '';
+      }
+      if (idleTimedOut) throw idleTimedOut;
+      if (!done) {
+        const eof = Object.assign(new Error('stream ended before [DONE]'), { name: 'EOFException' });
+        if (emitted) throw new StreamInterruptedAfterOutputException(eof);
+        throw eof;
+      }
+      // 推理模型思考被输出上限截断：只有思考没有正式回答，丢弃该轮并按可重试异常处理
+      if (finishReason === 'length' && !hasContentOutput && !hasToolCallOutput) {
+        throw new StreamThinkingTruncatedException();
+      }
+      callback.onComplete(usage);
+    } catch (e) {
+      if (usageObserved) notifyPartialUsage(callback, usage);
+      if (idleTimedOut) throw idleTimedOut;
+      if (e instanceof EmptyResponseExhaustedException) throw e;
+      if (e instanceof StreamErrorEventException) throw e;
+      if (e instanceof StreamInterruptedAfterOutputException || e instanceof StreamThinkingTruncatedException) throw e;
+      if (emitted) throw new StreamInterruptedAfterOutputException(e);
+      throw e;
+    } finally {
+      clearInterval(waiting);
+      clearInterval(idleTimer);
+    }
+  }
+
+  private awaitResponse(
+    payload: string,
+    config: LlmModelConfig,
+    streaming: boolean,
+    cancelFlag: { get(): boolean } | null | undefined,
+    callback: Pick<StreamCallback, 'onWaiting'> | null,
+    model: string,
+    attempt: number,
+  ): Promise<HttpResult> {
+    return new Promise((resolve, reject) => {
+      const url = new URL((config.baseUrl ?? '').replace(/\/$/, '') + '/chat/completions');
+      const lib = url.protocol === 'https:' ? https : http;
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${config.apiKey ?? ''}`,
+        'Content-Type': 'application/json',
+      };
+      applyClientImpersonationHeaders(headers, config.clientImpersonation);
+      const started = Date.now();
+      const headerDeadline = started + this.retry.callTimeoutSeconds * 1000;
+      const callDeadline = streaming ? Number.POSITIVE_INFINITY : started + this.retry.httpCallTimeoutSeconds * 1000;
+      let settled = false;
+      let nextWaiting = started + 1000;
+
+      let connectTimer: NodeJS.Timeout | null = null;
+      const clearConnectTimer = () => {
+        if (connectTimer != null) {
+          clearTimeout(connectTimer);
+          connectTimer = null;
+        }
+      };
+      const req = lib.request({
+        hostname: url.hostname,
+        port: url.port || (url.protocol === 'https:' ? 443 : 80),
+        path: url.pathname + url.search,
+        method: 'POST',
+        headers: { ...headers, 'Content-Length': Buffer.byteLength(payload).toString() },
+      }, (res) => {
+        if (settled) return;
+        settled = true;
+        clearConnectTimer();
+        clearInterval(poll);
+        resolve({ status: res.statusCode ?? 0, headers: res.headers, body: res, started, req });
+      });
+
+      req.on('socket', (socket) => {
+        if (!socket.connecting) return;
+        connectTimer = setTimeout(() => {
+          abort(Object.assign(new Error('connect timeout'), { name: 'ConnectException' }));
+        }, 30_000);
+        socket.once(url.protocol === 'https:' ? 'secureConnect' : 'connect', clearConnectTimer);
+      });
+
+      const abort = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        clearConnectTimer();
+        clearInterval(poll);
+        req.destroy();
+        reject(err);
+      };
+
+      const poll = setInterval(() => {
+        if (this.isCancelled(cancelFlag)) {
+          abort(this.cancelledException());
+          return;
+        }
+        const now = Date.now();
+        if (now >= headerDeadline) {
+          harnessLog('warn', `LLM timeout model=${model} phase=response_headers attempt=${attempt}`);
+          abort(Object.assign(new Error(`response headers timed out after ${this.retry.callTimeoutSeconds}s`), { name: 'TimeoutException' }));
+          return;
+        }
+        if (now >= callDeadline) {
+          abort(Object.assign(new Error('timeout'), { name: 'InterruptedIOException', code: 'http_call_timeout' }));
+          return;
+        }
+        if (callback && now >= nextWaiting) {
+          callback.onWaiting?.('response_headers', Math.floor((now - started) / 1000));
+          nextWaiting = now + 2000;
+        }
+      }, 100);
+
+      req.on('error', (err) => abort(err));
+      req.write(payload);
+      req.end();
+    });
+  }
+
+  private async buildRequestBody(request: ChatRequest, config: LlmModelConfig, stream: boolean): Promise<string> {
+    const messages = request.messages != null ? [...request.messages] : null;
+    ensureContentPresent(messages);
+    const supportsVision = config.supportsVision === true;
+    if (!supportsVision && messages) {
+      this.replaceImagesWithPlaceholder(messages);
+    }
+    if (messages) {
+      for (const msg of messages) {
+        await this.convertImageUrlsToBase64(msg);
+      }
+    }
+    // 降级过的模型不再携带 prompt_cache_key：网关 400 拒绝过一次后，继续发只是每次多花一个失败请求
+    const body = serializeChatRequest(
+      { ...request, messages: messages ?? undefined }, config.modelId ?? '', stream,
+      isSupported(config, 'prompt_cache_key'),
+    );
+    return JSON.stringify(body);
+  }
+
+  /** 非 2xx（含 400）分支共用：错误体说明「不认 prompt_cache_key」时登记降级并重试一次去掉该字段的请求。 */
+  private async degradePromptCacheKeyOn400(
+    payload: string,
+    status: number,
+    detail: string,
+    config: LlmModelConfig,
+  ): Promise<string | null> {
+    if (!shouldDegrade(status, detail, 'prompt_cache_key')) return null;
+    if (!isSupported(config, 'prompt_cache_key')) return null;
+    markUnsupported(config, 'prompt_cache_key', detail);
+    const stripped = stripPromptCacheKey(payload);
+    harnessLog('info', `retrying without prompt_cache_key model=${config.modelId}`);
+    return stripped;
+  }
+
+  private replaceImagesWithPlaceholder(messages: ChatMessage[]): void {
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      if (!Array.isArray(msg.content)) continue;
+      const textParts: unknown[] = [];
+      let hasImage = false;
+      for (const part of msg.content) {
+        if (extractPartType(part) === 'image_url') hasImage = true;
+        else textParts.push(part);
+      }
+      if (!hasImage) continue;
+      let textContent = buildTextFromParts(textParts);
+      textContent = textContent ? `${textContent}\n${IMAGE_PLACEHOLDER}` : IMAGE_PLACEHOLDER;
+      messages[i] = {
+        role: msg.role,
+        content: textContent,
+        name: msg.name,
+        toolCallId: msg.toolCallId,
+        toolCalls: msg.toolCalls,
+        reasoningContent: msg.reasoningContent,
+      };
+    }
+  }
+
+  private async convertImageUrlsToBase64(msg: ChatMessage): Promise<void> {
+    if (!Array.isArray(msg.content)) return;
+    for (const part of msg.content) {
+      const url = extractImageUrl(part);
+      if (!url || url.trim() === '') continue;
+      try {
+        let base64Uri: string | undefined;
+        if (url.startsWith('data:')) {
+          base64Uri = await this.resizeDataUri(url);
+        } else {
+          base64Uri = await this.downloadAndEncode(url);
+        }
+        if (base64Uri) setImageUrl(part, base64Uri);
+      } catch (e) {
+        harnessLog('warn', `Failed to prepare image for prompt, keeping original URL: ${url.startsWith('data:') ? 'data-uri' : url}`, e);
+      }
+    }
+  }
+
+  private async resizeDataUri(dataUri: string): Promise<string> {
+    const comma = dataUri.indexOf(',');
+    if (comma < 0) throw new Error('Invalid data URI');
+    const meta = dataUri.slice(5, comma);
+    const payload = dataUri.slice(comma + 1);
+    let mimeHint: string | undefined;
+    const semi = meta.indexOf(';');
+    if (semi > 0) mimeHint = meta.slice(0, semi);
+    else if (meta.trim() !== '' && !meta.includes('base64')) mimeHint = meta;
+    if (!meta.includes('base64')) throw new Error('Only base64 data URIs are supported');
+    const bytes = Buffer.from(payload, 'base64');
+    const resized = await PromptImageResizer.tryResizeForPrompt(bytes, mimeHint);
+    return resized ? resized.toDataUri() : dataUri;
+  }
+
+  private async downloadAndEncode(imageUrl: string): Promise<string> {
+    // 远程图片走进程内 LRU：首轮下载并压到 ≤1.2MB，后续命中不再下载/重编码。
+    return remoteImageCache.resolve(imageUrl);
+  }
+
+  /** 请求异常告警日志：带上完整请求体（base64 图片等敏感数据脱敏），错误在适配器只会走到一个出口，无需去重。 */
+  private logRequestError(payload: string, config: LlmModelConfig, detail: string): void {
+    const url = (config.baseUrl ?? '').replace(/\/$/, '');
+    harnessLog('error', `LLM request failed model=${config.modelId} baseUrl=${url} error=${detail} payload=${redactRequestPayload(payload)}`);
+  }
+
+  /** 流式进入重试路径时的请求日志（终态失败已由 logRequestError 记录）。 */
+  private async logRequestErrorOnStreamFailure(
+    payload: string,
+    config: LlmModelConfig,
+    reason: string,
+    statusCode: number | null,
+    attempt: number,
+  ): Promise<void> {
+    const url = (config.baseUrl ?? '').replace(/\/$/, '');
+    harnessLog('warn', `LLM request failed model=${config.modelId} baseUrl=${url} attempt=${attempt} reason=${reason} statusCode=${statusCode} payload=${redactRequestPayload(payload)}`);
+    await Promise.resolve();
+  }
+
+  /** 统一错误对象 → 日志 message（Error 取 message，其余按字符串化）。 */
+  private failureMessage(failure: unknown): string {
+    return failure instanceof Error ? failure.message : String(failure);
+  }
+
+  private resolveRetryDelaySeconds(headers: http.IncomingHttpHeaders | null, attempt: number): number {
+    const maxDelay = this.retry.rateLimitMaxRetryDelaySeconds;
+    if (headers) {
+      const retryAfter = Array.isArray(headers['retry-after']) ? headers['retry-after'][0] : headers['retry-after'];
+      if (retryAfter && retryAfter.trim() !== '') {
+        const seconds = Number.parseInt(retryAfter.trim(), 10);
+        if (Number.isFinite(seconds) && seconds > 0) return Math.min(seconds, maxDelay);
+      }
+    }
+    const baseDelay = this.retry.rateLimitRetryDelaySeconds;
+    if (baseDelay <= 0 || maxDelay <= 0) return 0;
+    const shift = Math.min(Math.max(attempt - 1, 0), 30);
+    const backoff = Math.min(baseDelay * (2 ** shift), maxDelay);
+    const lower = Math.max(1, Math.floor((backoff + 1) / 2));
+    return lower + Math.floor(Math.random() * (backoff + 1 - lower));
+  }
+
+  private async sleepSecondsRespectingCancel(seconds: number, cancelFlag?: { get(): boolean } | null): Promise<boolean> {
+    const deadline = Date.now() + seconds * 1000;
+    while (Date.now() < deadline) {
+      if (this.isCancelled(cancelFlag)) return false;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return true;
+  }
+
+  private async notifyAndWaitForRetry(
+    callback: StreamCallback,
+    cancelFlag: { get(): boolean } | null | undefined,
+    model: string | undefined,
+    reason: string,
+    statusCode: number | null,
+    attempt: number,
+    delaySeconds: number,
+    attemptStarted: bigint,
+    totalStarted: bigint,
+  ): Promise<boolean> {
+    if (this.isCancelled(cancelFlag)) return false;
+    this.logRetry(model, reason, statusCode, attempt, delaySeconds, attemptStarted, totalStarted);
+    callback.onRetry?.(reason, statusCode, attempt, this.retry.rateLimitMaxRetries, delaySeconds);
+    return this.sleepSecondsRespectingCancel(delaySeconds, cancelFlag);
+  }
+
+  private logRetry(model: string | undefined, reason: string, statusCode: number | null, attempt: number, delaySeconds: number, _a: bigint, _t: bigint): void {
+    harnessLog('warn', `LLM retry model=${model} phase=retry reason=${reason} statusCode=${statusCode} attempt=${attempt} maxRetries=${this.retry.rateLimitMaxRetries} delaySeconds=${delaySeconds}`);
+  }
+
+  private isRetryableNetworkFailure(failure: unknown): boolean {
+    let cause: unknown = failure;
+    while (cause) {
+      if (cause instanceof Error) {
+        const name = cause.name;
+        const msg = cause.message ?? '';
+        if (cause instanceof EmptyResponseExhaustedException) return false;
+        if (name === 'TimeoutException' || name === 'TimeoutError' || name === 'EOFException'
+          || name === 'ConnectException' || name === 'InterruptedIOException'
+          || (cause as NodeJS.ErrnoException).code === 'ETIMEDOUT'
+          || (cause as NodeJS.ErrnoException).code === 'ECONNRESET'
+          || (cause as NodeJS.ErrnoException).code === 'ECONNREFUSED'
+          || (cause as NodeJS.ErrnoException).code === 'ENOTFOUND'
+          || (cause as NodeJS.ErrnoException).code === 'EAI_AGAIN'
+          || (cause as NodeJS.ErrnoException).code === 'http_call_timeout'
+          || cause instanceof StreamInterruptedAfterOutputException
+          || cause instanceof StreamThinkingTruncatedException
+          || msg.includes('stream ended before [DONE]')
+          || msg.includes('timeout')
+          || msg.includes('ECONNRESET')
+          || msg.includes('socket hang up')) {
+          return true;
+        }
+        cause = cause.cause;
+        continue;
+      }
+      break;
+    }
+    return false;
+  }
+
+  private networkReason(failure: unknown): string {
+    let cause: unknown = failure;
+    while (cause) {
+      if (cause instanceof Error) {
+        if (cause.name === 'TimeoutException') return 'response_header_timeout';
+        if (cause.name === 'TimeoutError' || (cause as NodeJS.ErrnoException).code === 'ETIMEDOUT') return 'stream_idle_timeout';
+        if (cause.name === 'InterruptedIOException' || (cause as NodeJS.ErrnoException).code === 'http_call_timeout') return 'http_call_timeout';
+        if (cause.name === 'ConnectException') return 'connect_failure';
+        if ((cause as NodeJS.ErrnoException).code === 'ENOTFOUND') return 'dns_lookup_failure';
+        if ((cause as NodeJS.ErrnoException).code === 'EAI_AGAIN') return 'dns_temporary_failure';
+        if (cause.name === 'EOFException' || cause.message.includes('stream ended before [DONE]')) return 'unexpected_eof';
+        if (cause instanceof StreamThinkingTruncatedException) return 'thinking_truncated';
+        if (cause.cause == null) break;
+        cause = cause.cause;
+        continue;
+      }
+      break;
+    }
+    const message = cause instanceof Error ? cause.message : String(cause);
+    if (message.toLowerCase().includes('reset')) return 'connection_reset';
+    return 'io_failure';
+  }
+
+  private cancelledException(): Error {
+    return new Error('Cancelled by user');
+  }
+
+  private isCancelled(cancelFlag?: { get(): boolean } | null): boolean {
+    return cancelFlag != null && cancelFlag.get();
+  }
+
+  private isRetryableStatus(code: number): boolean {
+    return code === 404 || code === 429 || (code >= 500 && code < 600);
+  }
+
+  private async readErrorBody(body: http.IncomingMessage): Promise<string> {
+    try {
+      const chunks: Buffer[] = [];
+      for await (const c of body) chunks.push(c as Buffer);
+      const text = Buffer.concat(chunks).toString('utf8');
+      return text.length > 500 ? text.slice(0, 500) : text;
+    } catch {
+      return '';
+    }
+  }
+
+  private async readBodyRespectingCancel(
+    body: http.IncomingMessage,
+    cancelFlag?: { get(): boolean } | null,
+    callDeadline?: number,
+    req?: http.ClientRequest,
+  ): Promise<string> {
+    const chunks: Buffer[] = [];
+    return await new Promise<string>((resolve, reject) => {
+      let settled = false;
+      const finish = (err?: Error, text?: string) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(poll);
+        if (err) reject(err);
+        else resolve(text ?? '');
+      };
+      const poll = setInterval(() => {
+        if (this.isCancelled(cancelFlag)) {
+          body.destroy();
+          req?.destroy();
+          finish(this.cancelledException());
+          return;
+        }
+        if (callDeadline != null && Date.now() >= callDeadline) {
+          body.destroy();
+          req?.destroy();
+          finish(Object.assign(new Error('timeout'), { name: 'InterruptedIOException', code: 'http_call_timeout' }));
+        }
+      }, 50);
+      body.on('data', (c: Buffer) => chunks.push(c));
+      body.on('end', () => finish(undefined, Buffer.concat(chunks).toString('utf8')));
+      body.on('error', (err) => finish(err));
+    });
+  }
+}
+
+/** 从已序列化的 chat-completions 请求体里删除顶层 prompt_cache_key，其余字段逐字节保留。 */
+function stripPromptCacheKey(payload: string): string {
+  try {
+    const body = JSON.parse(payload) as Record<string, unknown>;
+    delete body.prompt_cache_key;
+    return JSON.stringify(body);
+  } catch {
+    return payload;
+  }
+}
+
+function hasAccumulatedOutput(chunk: StreamChunk): boolean {
+  if (!chunk.choices) return false;
+  for (const choice of chunk.choices) {
+    const delta = choice.delta;
+    if (!delta) continue;
+    if (delta.content) return true;
+    if (delta.reasoningContent) return true;
+    if (delta.toolCalls && delta.toolCalls.length > 0) return true;
+  }
+  return false;
+}
+
+function extractImageUrl(part: unknown): string | null {
+  if (part && typeof part === 'object') {
+    const p = part as ContentPart & Record<string, unknown>;
+    if (p.type === 'image_url' && p.imageUrl?.url) return p.imageUrl.url;
+    if (p.type === 'image_url' && p.image_url && typeof p.image_url === 'object') {
+      return ((p.image_url as Record<string, unknown>).url as string) ?? null;
+    }
+  }
+  return null;
+}
+
+function setImageUrl(part: unknown, uri: string): void {
+  if (!part || typeof part !== 'object') return;
+  const p = part as ContentPart & Record<string, unknown>;
+  if (p.imageUrl) p.imageUrl.url = uri;
+  else if (p.image_url && typeof p.image_url === 'object') {
+    (p.image_url as Record<string, unknown>).url = uri;
+  }
+}
+
+function extractPartType(part: unknown): string | null {
+  if (part && typeof part === 'object') {
+    const t = (part as Record<string, unknown>).type;
+    return typeof t === 'string' ? t : null;
+  }
+  return null;
+}
+
+function buildTextFromParts(parts: unknown[]): string {
+  let sb = '';
+  for (const part of parts) {
+    if (part && typeof part === 'object') {
+      const t = (part as Record<string, unknown>).text;
+      if (typeof t === 'string') sb += t;
+    }
+  }
+  return sb.trim();
+}
+
+/** 解析 200 响应体内嵌的 { error: { message } } 结构（部分网关错误形态），无则返回 null。 */
+function parseEmbeddedError(parsed: unknown): string | null {
+  if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const root = parsed as Record<string, unknown>;
+  const error = root.error;
+  if (error == null) return null;
+  if (typeof error === 'string') return error;
+  if (error && typeof error === 'object' && !Array.isArray(error)) {
+    const detail = (error as Record<string, unknown>).message;
+    if (typeof detail === 'string' && detail !== '') return detail;
+  }
+  return null;
+}
+
+/** 日志脱敏：把请求体里的 base64 图片数据替换为占位符，其余内容原样保留。 */
+function redactRequestPayload(payload: string): string {
+  return payload.replace(/data:([^;,]+);base64,[A-Za-z0-9+/=]+/g, 'data:$1;base64,[REDACTED]');
+}

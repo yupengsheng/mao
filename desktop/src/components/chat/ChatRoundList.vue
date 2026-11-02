@@ -1,0 +1,326 @@
+<template>
+  <!-- 历史轮次：始终折叠 -->
+  <template v-for="round in historyRounds" :key="round.userMessage.id">
+    <MessageBubble
+      :message="round.userMessage"
+      :session-id="sessionId"
+      :dislike-enabled="dislikeEnabled"
+      :show-time="true"
+      :show-copy="showUserCopy"
+      :can-edit="canEditMessage?.(round.userMessage) ?? false"
+      :is-editing="editingMessageId === round.userMessage.id"
+      @edit="$emit('edit', round.userMessage)"
+      @cancel-edit="$emit('cancelEdit')"
+      @confirm-edit="$emit('confirmEdit', round.userMessage.id, $event)"
+      @add-to-command="$emit('addToCommand', $event)"
+    />
+    <CompactionMarker
+      v-for="ev in markersAfter(round.userMessage.id)"
+      :key="'c-' + ev.id"
+      :event="ev"
+    />
+
+    <template v-if="round.collapsedSteps.length > 0">
+      <div v-if="round.finalReply" class="final-reply-time">
+        {{ formatDateTime(round.finalReply.createdAt) }}
+      </div>
+
+      <div class="execution-steps-collapse">
+        <div class="steps-summary" @click="toggleRound(round.userMessage.id)">
+          <el-icon class="steps-expand-icon" :class="{ expanded: roundsExpanded[round.userMessage.id] }"><ArrowDown /></el-icon>
+          <span>已执行 {{ round.stepCount }} 个步骤，任务耗时 {{ round.durationText }}</span>
+        </div>
+        <div v-if="roundsExpanded[round.userMessage.id]" class="steps-detail">
+          <template v-for="step in round.displaySteps" :key="step.id">
+            <MessageBubble
+              :message="step"
+              :session-id="sessionId"
+              :dislike-enabled="dislikeEnabled"
+              :show-time="false"
+              :show-copy="false"
+              :hide-thinking="hideThinking"
+              :hide-file-changes="true"
+              :hide-subagent-process="hideSubagentProcess"
+            />
+            <CompactionMarker
+              v-for="ev in markersAfter(step.id)"
+              :key="'c-' + ev.id"
+              :event="ev"
+            />
+          </template>
+        </div>
+      </div>
+
+      <template v-if="!roundsExpanded[round.userMessage.id]">
+        <CompactionMarker
+          v-for="ev in markersInMessages(round.collapsedSteps)"
+          :key="'c-' + ev.id"
+          :event="ev"
+        />
+      </template>
+
+      <MessageBubble
+        v-if="round.finalReply"
+        :message="round.finalReply"
+        :session-id="sessionId"
+        :dislike-enabled="dislikeEnabled"
+        :fork-enabled="forkEnabled"
+        :share-enabled="shareEnabled"
+        @fork="handleFork"
+        @share="$emit('share')"
+        :hide-thinking="true"
+        :hide-file-changes="true"
+        :hide-subagent-process="hideSubagentProcess"
+      />
+      <FileChangePanel
+        v-if="showFileChangePanel && round.fileChanges.length > 0"
+        :changes="round.fileChanges"
+        mode="history"
+      />
+      <!-- 压缩分隔线标记轮次边界：必须排在本轮回复与它的文件变更之后，
+           插在中间会把一条回复和它自己的变更割开，读起来像分隔线属于下面那块面板。 -->
+      <CompactionMarker
+        v-for="ev in markersAfter(round.finalReply?.id)"
+        :key="'c-' + ev.id"
+        :event="ev"
+      />
+    </template>
+
+    <template v-else>
+      <MessageBubble
+        v-if="round.finalReply"
+        :message="round.finalReply"
+        :session-id="sessionId"
+        :dislike-enabled="dislikeEnabled"
+        :fork-enabled="forkEnabled"
+        :share-enabled="shareEnabled"
+        @fork="handleFork"
+        @share="$emit('share')"
+        :show-time="true"
+        :hide-thinking="hideThinking"
+        :hide-file-changes="true"
+        :hide-subagent-process="hideSubagentProcess"
+      />
+      <FileChangePanel
+        v-if="showFileChangePanel && round.fileChanges.length > 0"
+        :changes="round.fileChanges"
+        mode="history"
+      />
+      <CompactionMarker
+        v-for="ev in markersAfter(round.finalReply?.id)"
+        :key="'c-' + ev.id"
+        :event="ev"
+      />
+    </template>
+  </template>
+
+  <!-- 当前轮次：执行中平铺展示 -->
+  <template v-if="activeRound">
+    <MessageBubble
+      :message="activeRound.userMessage"
+      :session-id="sessionId"
+      :dislike-enabled="dislikeEnabled"
+      :show-time="true"
+      :show-copy="showUserCopy"
+      :can-edit="canEditMessage?.(activeRound.userMessage) ?? false"
+      :is-editing="editingMessageId === activeRound.userMessage.id"
+      @edit="$emit('edit', activeRound.userMessage)"
+      @cancel-edit="$emit('cancelEdit')"
+      @confirm-edit="$emit('confirmEdit', activeRound.userMessage.id, $event)"
+      @add-to-command="$emit('addToCommand', $event)"
+    />
+    <CompactionMarker
+      v-for="ev in markersAfter(activeRound.userMessage.id)"
+      :key="'c-' + ev.id"
+      :event="ev"
+    />
+    <template v-for="msg in activeRoundMsgs" :key="msg.id">
+      <MessageBubble
+        :message="msg"
+        :session-id="sessionId"
+        :dislike-enabled="dislikeEnabled"
+        :show-time="false"
+        :show-copy="false"
+        :hide-thinking="hideThinking"
+        :hide-file-changes="true"
+        :hide-subagent-process="hideSubagentProcess"
+        :is-last="msg === activeRoundMsgs[activeRoundMsgs.length - 1]"
+      />
+      <CompactionMarker
+        v-for="ev in markersAfter(msg.id)"
+        :key="'c-' + ev.id"
+        :event="ev"
+      />
+    </template>
+    <!-- 执行中不展示文件变更；刷新后 API 虽会带回已落库变更，也须等轮次完成后再展示 -->
+  </template>
+
+  <!-- 无轮次时：直接渲染所有消息 -->
+  <template v-if="historyRounds.length === 0 && !activeRound">
+    <template v-for="(msg, idx) in messages" :key="msg.id">
+      <MessageBubble
+        :message="msg"
+        :session-id="sessionId"
+        :dislike-enabled="dislikeEnabled"
+        :show-time="msg.role === 'user' || (msg.role === 'assistant' && idx < messages.length - 1)"
+        :show-copy="showUserCopy && msg.role === 'user'"
+        :hide-thinking="hideThinking"
+        :hide-subagent-process="hideSubagentProcess"
+        :is-last="idx === messages.length - 1"
+        :can-edit="canEditMessage?.(msg) ?? false"
+        :is-editing="editingMessageId === msg.id"
+        @edit="$emit('edit', msg)"
+        @cancel-edit="$emit('cancelEdit')"
+        @confirm-edit="$emit('confirmEdit', msg.id, $event)"
+        @add-to-command="$emit('addToCommand', $event)"
+      />
+      <CompactionMarker
+        v-for="ev in markersAfter(msg.id)"
+        :key="'c-' + ev.id"
+        :event="ev"
+      />
+    </template>
+  </template>
+</template>
+
+<script setup lang="ts">
+import { inject, toRef, watch, ref as vueRef } from 'vue'
+import { ArrowDown } from '@element-plus/icons-vue'
+import type { ChatMessage, CompactionEvent } from '../../types/chat'
+import { resolveForkCutPoint, useMessageRounds, expandRoundContainingMessage, type MessageRound } from '../../composables/useMessageRounds'
+import { LOCATE_FLASH_KEY } from '../../composables/useMessageLocate'
+import { formatDateTime } from '../../utils/datetime'
+import { userAskExcerpt } from '../../utils/selection-quote'
+import MessageBubble from './MessageBubble.vue'
+import FileChangePanel from './FileChangePanel.vue'
+import CompactionMarker from './CompactionMarker.vue'
+
+const props = withDefaults(defineProps<{
+  messages: ChatMessage[]
+  sending: boolean
+  editingMessageId?: string | null
+  canEditMessage?: (msg: ChatMessage) => boolean
+  compactionEvents?: CompactionEvent[]
+  /** 会话 ID，透传给 MessageBubble 以按会话读取重试状态 */
+  sessionId?: string
+  /** 是否显示点踩按钮（主聊天/边路会话 true；子代理面板不传） */
+  dislikeEnabled?: boolean
+  /** 是否显示「Fork 到边路任务」按钮（仅主聊天 true） */
+  forkEnabled?: boolean
+  /** 是否显示「分享会话」入口（仅主聊天 true） */
+  shareEnabled?: boolean
+  /** 只读分享页：折叠后的步骤也不展示思考，且无子代理过程入口 */
+  hideThinking?: boolean
+  hideSubagentProcess?: boolean
+  /** 主聊天在每轮末尾展示文件变更；分享页改为页面底部的汇总列表 */
+  showFileChangePanel?: boolean
+  /** 分享页只在最终回复上保留复制按钮 */
+  showUserCopy?: boolean
+}>(), {
+  hideThinking: false,
+  hideSubagentProcess: false,
+  showFileChangePanel: true,
+  showUserCopy: true,
+})
+
+const emit = defineEmits<{
+  edit: [msg: ChatMessage]
+  cancelEdit: []
+  confirmEdit: [messageId: string, content: string]
+  addToCommand: [content: string]
+  /** 分叉到边路任务：messageId 是被点击那一轮的助手最终回复 id，label 是该轮来源摘录 */
+  fork: [payload: { messageId: string; label: string }]
+  /** 打开「分享会话」弹窗 */
+  share: []
+}>()
+
+const messagesRef = toRef(props, 'messages')
+const sendingRef = toRef(props, 'sending')
+
+const {
+  roundsExpanded,
+  messageRounds,
+  historyRounds,
+  activeRound,
+  activeRoundMsgs,
+  toggleRound,
+} = useMessageRounds(messagesRef, sendingRef)
+
+const locateFlashId = inject(LOCATE_FLASH_KEY, vueRef<string | null>(null))
+watch(locateFlashId, (id) => {
+  if (!id) return
+  expandRoundContainingMessage(messageRounds.value, roundsExpanded.value, id)
+}, { flush: 'pre' })
+
+function markersAfter(messageId?: string | number | null): CompactionEvent[] {
+  if (messageId == null) return []
+  const id = String(messageId)
+  return (props.compactionEvents ?? []).filter(ev => String(ev.boundaryMsgId) === id)
+}
+
+function markersInMessages(messages: ChatMessage[]): CompactionEvent[] {
+  const ids = new Set(messages.map(m => String(m.id)))
+  return (props.compactionEvents ?? []).filter(ev => ids.has(String(ev.boundaryMsgId)))
+}
+
+/** 分叉来源标签：该轮用户消息的时间 + 真正问题的前 12 字（回复引用和行区间片段不占这 12 字）。 */
+function forkLabelOf(round: MessageRound): string {
+  const time = formatDateTime(round.userMessage.createdAt)
+  const excerpt = userAskExcerpt(round.userMessage.content ?? '').slice(0, 12)
+  return excerpt ? `${time} · ${excerpt}` : time
+}
+
+function handleFork(messageId: string) {
+  const cutPoint = resolveForkCutPoint(messageRounds.value, messageId)
+  if (cutPoint == null) return
+  const round = messageRounds.value.find(r => r.finalReply?.id === cutPoint)
+  if (!round) return
+  emit('fork', { messageId: cutPoint, label: forkLabelOf(round) })
+}
+</script>
+
+<style scoped>
+.final-reply-time {
+  font-size: var(--aw-text-fine);
+  color: var(--aw-ink-muted-48);
+  letter-spacing: -0.12px;
+  margin-bottom: 4px;
+}
+
+.execution-steps-collapse {
+  margin-bottom: 5px;
+}
+
+.execution-steps-collapse .steps-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: var(--aw-radius-xs);
+  background: var(--aw-canvas-parchment);
+  color: var(--aw-ink-muted-48);
+  font-size: var(--aw-text-fine);
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s, color 0.15s;
+}
+
+.execution-steps-collapse .steps-summary:hover {
+  background: var(--aw-divider-soft);
+  color: var(--aw-ink);
+}
+
+.execution-steps-collapse .steps-expand-icon {
+  font-size: 12px;
+  transition: transform 0.2s;
+  transform: rotate(-90deg);
+}
+
+.execution-steps-collapse .steps-expand-icon.expanded {
+  transform: rotate(0deg);
+}
+
+.steps-detail {
+  margin-top: 8px;
+}
+</style>
