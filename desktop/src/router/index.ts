@@ -44,6 +44,11 @@ const routes: RouteRecordRaw[] = [
         component: () => import('../views/settings/DingtalkBindRedirect.vue')
       },
       {
+        path: 'execution-records',
+        name: 'ExecutionRecords',
+        component: () => import('../views/task/ExecutionRecordsView.vue')
+      },
+      {
         path: 'tasks/:sessionId',
         name: 'Task',
         component: () => import('../views/task/TaskView.vue')

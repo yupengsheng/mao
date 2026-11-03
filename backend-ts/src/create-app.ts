@@ -207,6 +207,8 @@ import { assembleWeixinMcpServices } from './app-weixin-mcp-services.js';
 import { assembleHarnessEngine } from './app-harness-engine.js';
 import { assembleWsHandler } from './app-ws-handler.js';
 import { assembleSessionServices } from './app-session-services.js';
+import { TaskRepository } from './task/task.repository.js';
+import { TaskService } from './task/task.service.js';
 
 export interface MaoApp {
   app: FastifyInstance;
@@ -460,6 +462,7 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
   // 链接目标命中允许根才不会被沙箱当作路径逃逸拦截（容器严格模式同款放行见 container-tool-executor）。
   pathSandbox.addAllowedRoot(shareDir);
   const sessionRepo = new SessionRepository(db);
+  const taskService = new TaskService(new TaskRepository(db));
   const messageRepo = new MessageRepository(db);
   // run 轨迹读模型：零新表，读时聚合消息 / llm_call / session_activity / 压缩事件。
   const llmCallRepo = new LlmCallRepository(db);
@@ -762,6 +765,7 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     activityService, activityHeartbeat, todoMapper, modelRepo, llmCallRepo,
     fileChangeRepo, wsRegistry, treeSignalPublisher, inboxService, budgetService,
     deliveryService, memoryExtraction, messageCitationService, outboundSubscriptionService,
+    taskService,
     weixinWebhookFallback, weixinSend, weixinAccounts, weixinTokens, weixinInboundMessagesRef,
     definitionRegistry, subagentMapper, subagentInvocation, localToolSessions,
     scheduledStore, agentExecutor, holder,
@@ -915,6 +919,7 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     ossSts,
     skillBundleService, userSkillService, skillDocService,
     scheduledService,
+    taskService,
     openRunService, apiTokenService, webhookTriggerService, outboundSubscriptionService,
     openApiRateLimiter, callLogService,
     watcherService, signalWatcherRepo,

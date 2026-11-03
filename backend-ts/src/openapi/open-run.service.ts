@@ -49,6 +49,7 @@ export interface OpenRunDeps {
     executeFromEvent(sessionId: number, executionId: string, listener: unknown): Promise<void>;
   };
   taskTerminalService: {
+    beginExecution?(sessionId: number, executionId: string, source?: TaskNotifySource): Promise<void>;
     finishExecution(sessionId: number, userId: number, phase: string, executionId: string, reason?: string, notifySource?: TaskNotifySource): Promise<void>;
   };
   agentLookup: {
@@ -207,6 +208,7 @@ export class OpenRunService {
         terminalPhase = actual === 'FAILED' || actual === 'CANCELLED' ? actual : 'COMPLETED';
       } else {
         // 兜底路径（测试/装配缺失）：显式落 COMPLETED 终态并带来源
+        await this.deps.taskTerminalService.beginExecution?.(sessionId, executionId, input.source);
         await this.deps.harnessService.executeFromEvent(sessionId, executionId, noopListener());
         await this.deps.taskTerminalService.finishExecution(sessionId, input.userId, 'COMPLETED', executionId, undefined, input.source);
         terminalPhase = 'COMPLETED';

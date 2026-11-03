@@ -7,6 +7,7 @@ const auth = require('./commands/auth');
 const agent = require('./commands/agent');
 const model = require('./commands/model');
 const session = require('./commands/session');
+const task = require('./commands/task');
 const adminSession = require('./commands/admin-session');
 const skill = require('./commands/skill');
 const skillDocs = require('./commands/skill-docs');
@@ -51,6 +52,7 @@ const GLOBAL_HELP = `mao-cli — Mao 用户端与管理后台统一 CLI
   agent           Agent CRUD 与经验管理
   model           模型查询与管理端配置
   session         当前用户会话元数据（不含对话）
+  task            执行任务记录、阶段、来源与执行历史（只读）
   todo            会话待办
   skill           个人技能与同步包
   quick-command   快捷指令聚合列表
@@ -112,6 +114,7 @@ const MODULES = {
   agent,
   model,
   session,
+  task,
   'admin-session': adminSession,
   todo,
   skill,

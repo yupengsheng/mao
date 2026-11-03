@@ -194,6 +194,7 @@ const PREVIEW_MAX_COUNT = 10;
 const WEIXIN_ACTIVE_SEND_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 export interface ScheduleTaskTerminalService {
+  beginExecution?(sessionId: number, executionId: string, source?: TaskNotifySource): Promise<void>;
   finishExecution(sessionId: number, userId: number, phase: string, executionId: string, reason?: string, notifySource?: TaskNotifySource): Promise<void>;
 }
 
@@ -710,6 +711,7 @@ export class ScheduledTaskService {
                   return;
                 }
               } else {
+                await this.taskTerminalService.beginExecution?.(task.sessionId!, executionId, 'SCHEDULED');
                 await this.harnessService.executeFromEvent(task.sessionId!, executionId, {
                   onContentDelta() {},
                   onToolCallStart() {},

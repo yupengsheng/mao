@@ -57,6 +57,21 @@ export function openSideTaskTabFor(parentSessionId: string, sideSessionId: numbe
   notifyTabsChanged(sid)
 }
 
+export function openSubagentTabFor(parentSessionId: string, childSessionId: number, title: string) {
+  if (!parentSessionId || childSessionId <= 0) return
+  let state = sessionTabsMap.value.get(parentSessionId)
+  if (!state) {
+    state = { tabs: [], activeTabId: 'chat' }
+    sessionTabsMap.value.set(parentSessionId, state)
+  }
+  const id = 'subagent:' + childSessionId
+  const existing = state.tabs.find(tab => tab.id === id)
+  if (existing) existing.title = title || existing.title
+  else state.tabs.push({ id, type: 'subagent', title: title || '子代理', sideSessionId: childSessionId })
+  state.activeTabId = id
+  notifyTabsChanged(parentSessionId)
+}
+
 function findSideTaskTab(state: SessionTabState, sideSessionId: number) {
   const id = 'side:' + sideSessionId
   return state.tabs.find(t =>

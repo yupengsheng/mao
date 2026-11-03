@@ -28,6 +28,7 @@ import type { MysqlLlmModelRepository } from './model/model.repository.js';
 import type { LlmCallRepository } from './usage/llm-call.repository.js';
 import type { HarnessService } from './harness/core/harness-service.js';
 import type { AgentLoop } from './harness/core/agent-loop.js';
+import type { TaskService } from './task/task.service.js';
 import { createAgentExecutor } from './harness/core/agent-executor.js';
 
 import { TaskTerminalService } from './session/task-terminal.service.js';
@@ -73,6 +74,7 @@ export interface SessionServicesDeps {
   holder: { harness?: HarnessService; loop?: AgentLoop };
   /** waitForAll 阻塞期间的进度通知（飞书进度卡刷新）；未注入时等待期间不续更卡片。 */
   waitProgressNotifier?: ((parentSessionId: number) => void | Promise<void>) | null;
+  taskService?: TaskService | null;
 }
 
 export interface SessionServicesResult {
@@ -94,6 +96,7 @@ export function assembleSessionServices(deps: SessionServicesDeps): SessionServi
       settleWarn: (target: any, notifyUserId: any) => d.budgetService.settleWarn(target, notifyUserId),
     },
     d.messageCitationService,
+    d.taskService,
   );
   const visibility = new SubAgentVisibilityService({
     registry: d.wsRegistry,

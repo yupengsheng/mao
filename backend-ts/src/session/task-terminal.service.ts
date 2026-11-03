@@ -7,6 +7,8 @@ import type { SessionTreeSignalPublisher } from '../harness/approval/session-tre
 import type { TaskNotificationDeliveryService } from '../notification/task/delivery.service.js';
 import type { TaskNotificationDelivery } from '../notification/task/types.js';
 import type { ExtractionSessionInput } from '../memory/memory-extraction.service.js';
+import type { TaskService } from '../task/task.service.js';
+import type { TaskStage, TaskSource } from '../task/types.js';
 import { WEIXIN_PROJECT_KEY } from '../domain/types.js';
 import { isFeishuChannelSession } from '../harness/tool/feishu-channel-tool.js';
 import { isDingtalkChannelSession } from '../harness/tool/dingtalk-channel-tool.js';
@@ -85,7 +87,18 @@ export class TaskTerminalService {
     private readonly outboundEvents?: OutboundEventDispatcher | null,
     private readonly budgetWarner?: TaskTerminalBudgetWarner | null,
     private readonly citationRegistry?: CitationRegistryInvoker | null,
+    private readonly taskService?: TaskService | null,
   ) {}
+
+  async beginExecution(sessionId: number, executionId: string, source?: TaskSource): Promise<void> {
+    if (this.taskService == null) return;
+    try {
+      const session = await this.sessionService.getSession(sessionId);
+      await this.taskService.beginExecution(session, executionId, source);
+    } catch (error) {
+      console.warn(`[task] failed to begin execution: sessionId=${sessionId}, executionId=${executionId}`, error);
+    }
+  }
 
   async finishExecution(
     sessionId: number,
@@ -100,6 +113,7 @@ export class TaskTerminalService {
     }
     const previous = await this.sessionService.getSession(sessionId);
     if (isTerminalPhase(previous.phase)) {
+      await this.settleTask(previous, executionId, previous.phase as TaskStage, failureReason, notifySource);
       console.info(
         `Ignoring terminal transition for already-terminal session: sessionId=${sessionId}, from=${previous.phase}, to=${phase}`,
       );
@@ -117,6 +131,7 @@ export class TaskTerminalService {
     await this.sessionService.markLastMessageFinished(sessionId);
     const session = await this.sessionService.getSession(sessionId);
     const ownerId = userId ?? session.userId;
+    await this.settleTask(session, executionId, phase as TaskStage, failureReason, notifySource);
 
     // 引用溯源（技术方案 2026-10-12 §5.3）：citations 必须在下方终态 WS 事件之前
     // 落库。桌面端收到 session_status(COMPLETED) 即全量重拉消息，晚于事件的 UPDATE
@@ -170,6 +185,15 @@ export class TaskTerminalService {
     }
 
     this.dispatchMemoryExtraction(session, phase);
+  }
+
+  private async settleTask(session: Session, executionId: string, phase: TaskStage, failureReason: string | null | undefined, source: TaskNotifySource): Promise<void> {
+    if (this.taskService == null) return;
+    try {
+      await this.taskService.settleExecution(session, executionId, phase, failureReason, source);
+    } catch (error) {
+      console.warn(`[task] failed to settle execution: sessionId=${session.id}, executionId=${executionId}`, error);
+    }
   }
 
   /**

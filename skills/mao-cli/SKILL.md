@@ -21,6 +21,7 @@ Mao 的**产品文档唯一正文**（可独立分发）+ **REST 操作 CLI**。
 | 桌面 Web 端（任务、工作区、终端、通知、渠道绑定、我的用量抽屉等） | [reference/desktop.md](reference/desktop.md) |
 | 长期记忆（跨会话记忆的查看与维护） | [reference/memory.md](reference/memory.md) |
 | 任务收件箱（站内通知中心：未读数、七类事件、偏好开关） | [reference/inbox.md](reference/inbox.md) |
+| 执行记录页面 / 任务阶段、来源与执行历史（只读） | [reference/task.md](reference/task.md) |
 | 模型价格与用量成本核算（每百万 token 价格、llm_call 成本、分析看钱） | [reference/model.md](reference/model.md)、[reference/analytics.md](reference/analytics.md) |
 | 用量预算（全局 / 用户 / Agent 月度预算，超额提醒或拦截） | [reference/budget.md](reference/budget.md) |
 | 开放接口（API Token / 入站 Webhook 触发器 / 出站事件订阅） | [reference/open-api.md](reference/open-api.md) |
@@ -122,6 +123,7 @@ mao auth login --username <用户名> --password <密码>
 | 模型查询与管理端配置 | [reference/model.md](reference/model.md) |
 | MCP 全局/用户级配置与偏好 | [reference/mcp.md](reference/mcp.md) |
 | 当前用户会话元数据 | [reference/session.md](reference/session.md) |
+| 本人执行任务记录与执行历史 | [reference/task.md](reference/task.md) |
 | 管理端会话检索 | [reference/admin-session.md](reference/admin-session.md) |
 | 会话待办 | [reference/todo.md](reference/todo.md) |
 | 定时任务 | [reference/scheduled-task.md](reference/scheduled-task.md) |

@@ -104,6 +104,7 @@ export interface WsHandlerDeps {
   };
   taskTerminalService: {
     finishExecution(sessionId: number, userId: number, phase: string, executionId: string, reason?: string, notifySource?: TaskNotifySource): Promise<void>;
+    beginExecution?(sessionId: number, executionId: string, source?: TaskNotifySource): Promise<void>;
   };
   messageQueueService: {
     listPending(sessionId: number): Promise<MessageQueueItem[]>;
@@ -775,6 +776,7 @@ export class StreamingWsHandler {
           return;
         }
         await this.deps.sessionService.updatePhase(sessionId, 'RUNNING');
+        await this.deps.taskTerminalService.beginExecution?.(sessionId, executionId, executionSource ?? 'MANUAL');
         this.deps.registry.send(userId, wsEvent('session_status', sessionId, { phase: 'RUNNING', executionId }));
         this.deps.registry.send(userId, wsEvent('session_list_update', sessionId, { phase: 'RUNNING' }));
         if (session.sessionType === 'SIDE_TASK') this.deps.treeSignalPublisher.publishIfSideTask(sessionId);
@@ -1421,6 +1423,7 @@ export class StreamingWsHandler {
           return;
         }
         await this.deps.sessionService.updatePhase(sessionId, 'RUNNING');
+        await this.deps.taskTerminalService.beginExecution?.(sessionId, executionId);
         this.deps.registry.send(userId, wsEvent('session_status', sessionId, { phase: 'RUNNING', executionId }));
         this.deps.registry.send(userId, wsEvent('session_list_update', sessionId, { phase: 'RUNNING' }));
         if (session.sessionType === 'SIDE_TASK') this.deps.treeSignalPublisher.publishIfSideTask(sessionId);

@@ -7,7 +7,7 @@
             <el-icon :size="16"><FolderOpened /></el-icon>
           </div>
         </el-tooltip>
-        <el-tooltip v-if="isSettingsRoute" content="返回工作台" :show-after="100" placement="bottom" :disabled="isMobileDevice()">
+        <el-tooltip v-if="isSettingsRoute || route.name === 'ExecutionRecords'" content="返回工作台" :show-after="100" placement="bottom" :disabled="isMobileDevice()">
           <div class="theme-toggle" role="button" aria-label="返回工作台" @click="goBackFromSettings">
             <el-icon :size="16"><ArrowLeft /></el-icon>
           </div>
@@ -31,6 +31,12 @@
       </el-tooltip>
       <SessionSearchPopover ref="searchPopoverRef" />
       <UsageBell />
+      <el-tooltip v-if="authStore.user" content="执行记录" :show-after="100" placement="bottom" :disabled="isMobileDevice()">
+        <button type="button" class="theme-toggle records-toggle" aria-label="执行记录"
+          :class="{ active: route.name === 'ExecutionRecords' }" @click="router.push('/execution-records')">
+          <el-icon :size="16"><Clock /></el-icon>
+        </button>
+      </el-tooltip>
       <el-tooltip v-if="!isSettingsRoute" content="我的指令" :show-after="100" placement="bottom" :disabled="isMobileDevice()">
         <div
           class="theme-toggle commands-toggle"
@@ -120,7 +126,7 @@
     <InboxDrawer v-model="inboxDrawerVisible" />
   </nav>
 </template><script setup lang="ts">
-import { ArrowLeft, ChatLineSquare, FolderOpened, Reading, Refresh, Setting, SwitchButton, User } from '@element-plus/icons-vue'
+import { ArrowLeft, ChatLineSquare, Clock, FolderOpened, Reading, Refresh, Setting, SwitchButton, User } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -552,6 +558,11 @@ async function handleCommand(command: string) {
 .commands-toggle {
   text-decoration: none;
   color: var(--aw-nav-text-muted);
+}
+
+.records-toggle {
+  border: 0;
+  background: transparent;
 }
 
 .settings-toggle {

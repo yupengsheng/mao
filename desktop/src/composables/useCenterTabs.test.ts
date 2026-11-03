@@ -1,7 +1,7 @@
 import { nextTick, ref } from 'vue'
 import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { openSideTaskTabFor, removeSessionTabsFor, resetCenterTabs, resetNewTaskTabs, useCenterTabs } from './useCenterTabs'
+import { openSideTaskTabFor, openSubagentTabFor, removeSessionTabsFor, resetCenterTabs, resetNewTaskTabs, useCenterTabs } from './useCenterTabs'
 import { getClosedSideTaskIds } from '../utils/side-task-tabs'
 import { getPersistedActiveTab } from '../utils/center-active-tab'
 
@@ -26,6 +26,25 @@ vi.stubGlobal('localStorage', {
 })
 
 const SESSION_ID = '42'
+
+describe('openSubagentTabFor', () => {
+  it('opens and reselects one read-only child tab on the requested parent', async () => {
+    setActivePinia(createPinia())
+    resetCenterTabs()
+    localStorage.clear()
+    const current = ref<string | null>('99')
+    const tabs = useCenterTabs(current)
+    openSubagentTabFor('42', 7, '结果检查')
+    expect(tabs.tabs.value.some(tab => tab.sideSessionId === 7)).toBe(false)
+    current.value = '42'
+    await nextTick()
+    expect(tabs.activeTab.value).toMatchObject({ type: 'subagent', sideSessionId: 7, title: '结果检查' })
+    openSubagentTabFor('42', 7, '更新结果')
+    expect(tabs.tabs.value.filter(tab => tab.sideSessionId === 7)).toHaveLength(1)
+    expect(tabs.activeTab.value?.title).toBe('更新结果')
+    expect(getPersistedActiveTab('42')).toMatchObject({ type: 'subagent', sideSessionId: 7 })
+  })
+})
 
 function setup() {
   const sessionId = ref<string | null>(SESSION_ID)
