@@ -38,6 +38,23 @@ export class TaskService {
     });
   }
 
+  async setExecutionStage(session: Session, executionId: string, stage: 'WORKING' | 'BLOCKED'): Promise<void> {
+    this.validate(session, executionId);
+    await this.repo.transaction(async (repo) => {
+      const current = await repo.lockSession(session.userId, session.id!);
+      if (current == null) throw new BusinessException(ErrorCode.SESSION_NOT_FOUND);
+      if (!['RUNNING', 'RESUMING', 'WAITING_APPROVAL'].includes(current.phase ?? '')) return;
+      const task = await repo.findBySessionId(current.userId, current.id!);
+      if (task == null || task.lastExecutionId !== executionId) return;
+      const execution = await repo.executionById(executionId);
+      if (execution == null) return;
+      this.requireExecutionOwner(execution, task);
+      if (execution.status !== 'WORKING' && execution.status !== 'BLOCKED') return;
+      if (execution.status !== stage) await repo.updateExecution(execution.id!, { status: stage });
+      if (task.stage !== stage) await repo.updateById(task.id!, { stage });
+    });
+  }
+
   async settleExecution(session: Session, executionId: string, phase: TaskStage, failureReason?: string | null, source?: TaskSource): Promise<void> {
     this.validate(session, executionId);
     if (!TERMINAL.has(phase)) throw new BusinessException(ErrorCode.PARAM_INVALID, '只接受执行终态');

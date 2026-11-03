@@ -209,6 +209,7 @@ import { assembleWsHandler } from './app-ws-handler.js';
 import { assembleSessionServices } from './app-session-services.js';
 import { TaskRepository } from './task/task.repository.js';
 import { TaskService } from './task/task.service.js';
+import { TaskWaitService } from './task/task-wait.service.js';
 
 export interface MaoApp {
   app: FastifyInstance;
@@ -691,12 +692,13 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
   const subagentMapper = new SubagentExecutionMapper(db);
   const subagentInvocation = new SubagentInvocationService(db);
   const subagentResultDelivery = new SubagentResultDeliveryService(db, fileChangeRepo as never, inboxService);
-  const askUserQuestionsRegistry = new AskUserQuestionsRegistry();
+  const taskWaitService = new TaskWaitService(taskService, sessionService, wsRegistry);
+  const askUserQuestionsRegistry = new AskUserQuestionsRegistry(undefined, taskWaitService);
   const inFlightToolRegistry = new InFlightToolRegistry();
   const feishuAskFormStore = new FeishuAskFormStore();
   const feishuActiveProgress = new FeishuActiveProgressRegistry();
   const feishuAskMount = createFeishuAskMount(feishuAskFormStore, feishuActiveProgress);
-  const approvalRegistry = new ApprovalRegistry(sessionSvc, sessionMap, wsRegistry);
+  const approvalRegistry = new ApprovalRegistry(sessionSvc, sessionMap, wsRegistry, taskWaitService);
   const treeSignalPublisher = new SessionTreeSignalPublisher(
     sessionRepo, approvalRegistry, askUserQuestionsRegistry, wsRegistry,
   );

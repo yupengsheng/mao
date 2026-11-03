@@ -2,6 +2,7 @@ import type { SessionMapper, SessionService, StreamingWsRegistry } from '../deps
 import { wsEvent } from '../deps.js';
 import { harnessLog } from '../log.js';
 import type { ApprovalHint } from './approval-hint.js';
+import type { TaskWaitObserver } from '../core/task-wait-observer.js';
 
 export class ApprovalRegistry {
   private readonly pending = new Map<number, Set<string>>();
@@ -12,6 +13,7 @@ export class ApprovalRegistry {
     private readonly sessionService: SessionService,
     private readonly sessionMapper: SessionMapper,
     private readonly streamingWsRegistry: StreamingWsRegistry,
+    private readonly taskWaitObserver?: TaskWaitObserver,
   ) {}
 
   async register(sessionId: number | null, requestId: string | null, hint?: ApprovalHint | null): Promise<void> {
@@ -26,7 +28,9 @@ export class ApprovalRegistry {
       this.pending.set(sessionId, ids);
     }
     const first = ids.size === 0;
+    const added = !ids.has(requestId);
     ids.add(requestId);
+    if (added) this.taskWaitObserver?.started(sessionId, 'APPROVAL', requestId);
     if (first) {
       const entered = await this.sessionService.enterWaitingApproval(sessionId);
       if (entered) await this.publishPhase(sessionId, 'WAITING_APPROVAL');
@@ -40,8 +44,8 @@ export class ApprovalRegistry {
     // 否则超时/断连后陈旧帧仍可消费出规则
     this.hints.delete(`${sessionId}:${requestId}`);
     const ids = this.pending.get(sessionId);
-    if (!ids) return;
-    ids.delete(requestId);
+    if (!ids?.delete(requestId)) return;
+    this.taskWaitObserver?.finished(sessionId, 'APPROVAL', requestId);
     const empty = ids.size === 0;
     if (empty) this.pending.delete(sessionId);
     if (empty) {

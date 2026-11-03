@@ -8,10 +8,13 @@
 
 页面可见时每 10 秒刷新，恢复可见时立即刷新，也可手动刷新。加载失败可原地重试。「打开关联会话」回到对应会话；边路任务定位到根会话页签，子代理以只读页签打开。任务记录页只读，执行操作仍在原有会话中进行。
 
+状态筛选「等待处理」对应 BLOCKED：当前执行有待答提问或工具审批。打开关联会话回答或审批后，所有等待请求结束才恢复为执行中；拒绝审批、取消请求和超时也会释放对应等待，最终执行结果由原有运行链路决定。
+
 ## CLI
 
 ```bash
 mao task list --stage WORKING --page 1 --size 20
+mao task list --stage BLOCKED
 mao task list --source API --agent-id 1 --session-id 2
 mao task get --id 1
 ```
@@ -23,7 +26,7 @@ mao task get --id 1
 | --agent-id、--session-id | 可选正整数 |
 | --page、--size | 正整数，默认 1 / 20，size 最大 100 |
 
-QUEUED 为事务内初始化状态，BLOCKED 为预留；本期只记录 WORKING 和执行终态，不与待答提问/工具审批联动。
+QUEUED 为事务内初始化状态。WORKING 表示执行中，BLOCKED 表示等待提问回答或工具审批；仅对已登记开始且执行 ID 仍在途的执行投影等待状态。未接入开始登记的路径仍在终态补建，不会仅因提问/审批创建执行记录。等待请求在内存中管理，本期不提供后端重启后的等待恢复或自动修复。
 
 ## REST
 
