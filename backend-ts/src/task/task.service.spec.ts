@@ -3,6 +3,7 @@ import { TaskService } from './task.service.js';
 import { TaskWaitService } from './task-wait.service.js';
 import { ApprovalRegistry } from '../harness/approval/approval-registry.js';
 import { AskUserQuestionsRegistry } from '../harness/tool/ask-user-questions-registry.js';
+import { TaskTerminalService } from '../session/task-terminal.service.js';
 import type { TaskRepository } from './task.repository.js';
 import type { AgentTask, TaskExecution } from './types.js';
 import type { Session } from '../session/types.js';
@@ -129,6 +130,37 @@ describe('Task execution lifecycle', () => {
     expect(setup.task()?.stage).toBe('WORKING');
   });
 
+  it('resolves only the current owned unfinished execution for idle-loop cancellation', async () => {
+    const setup = fixture();
+    expect(await setup.service.getActiveExecutionId(setup.session)).toBeNull();
+    await setup.service.beginExecution(setup.session, 'current');
+    expect(await setup.service.getActiveExecutionId(setup.session)).toBe('current');
+    await setup.service.setExecutionStage(setup.session, 'current', 'BLOCKED');
+    expect(await setup.service.getActiveExecutionId(setup.session)).toBe('current');
+    expect(await setup.service.getActiveExecutionId({ ...setup.session, userId: 8 })).toBeNull();
+    await setup.service.settleExecution(setup.session, 'current', 'COMPLETED');
+    expect(await setup.service.getActiveExecutionId(setup.session)).toBeNull();
+  });
+
+  it('settles the original recorded execution when a channel cancels with no runtime id', async () => {
+    const setup = fixture();
+    await setup.service.beginExecution(setup.session, 'original', 'FEISHU');
+    await setup.service.setExecutionStage(setup.session, 'original', 'BLOCKED');
+    const terminal = new TaskTerminalService({
+      getSession: async () => ({ ...setup.session }),
+      updatePhase: async (_id: number, phase: string) => { setup.session.phase = phase; },
+      updateRuntimeStatus: async () => undefined,
+      markLastMessageFinished: async () => undefined,
+    } as never, { send: () => undefined, sendWithResult: async () => ({}) } as never,
+    { prepare: async () => null } as never, { publish: () => undefined } as never,
+    undefined, undefined, undefined, undefined, 'MANUAL', undefined, undefined, undefined, setup.service);
+    await terminal.cancelActiveExecution(11, 7);
+    expect(setup.executions).toHaveLength(1);
+    expect(setup.executions[0]).toMatchObject({ executionId: 'original', status: 'CANCELLED' });
+    expect(setup.task()).toMatchObject({ stage: 'CANCELLED', lastExecutionId: 'original', source: 'FEISHU' });
+    expect(setup.triggers).toHaveLength(1);
+  });
+
   it('numbers terminal-only attempts and preserves their actual source', async () => {
     const setup = fixture();
     await setup.service.settleExecution(setup.session, 'one', 'FAILED', 'sync failed', 'SIGNAL');
@@ -175,6 +207,42 @@ describe('Task waiting state projection', () => {
     const tracker = new TaskWaitService(setup.service, lookup, { getSessionExecution: () => execution.id });
     return { ...setup, tracker, execution, lookup };
   }
+
+  it('tracks headless event waits without creating duplicate attempts or changing the explicit source', async () => {
+    const setup = fixture();
+    let executionId: string | undefined;
+    const registry = {
+      getSessionExecution: () => executionId,
+      setSessionExecution: (_id: number, actualId: string) => { executionId = actualId; },
+      clearSessionExecution: () => { executionId = undefined; },
+      send: () => undefined, sendWithResult: async () => ({}),
+    };
+    const sessions = {
+      getSession: async () => ({ ...setup.session }),
+      updatePhase: async (_id: number, phase: string) => { setup.session.phase = phase; },
+      updateRuntimeStatus: async () => undefined, markLastMessageFinished: async () => undefined,
+    };
+    const terminal = new TaskTerminalService(sessions as never, registry as never,
+      { prepare: async () => null } as never, { publish: () => undefined } as never,
+      undefined, undefined, undefined, undefined, 'MANUAL', undefined, undefined, undefined, setup.service);
+    const tracker = new TaskWaitService(setup.service, sessions, registry);
+    const questions = new AskUserQuestionsRegistry(1_000, tracker);
+    await terminal.beginExecution(11, 'headless', 'API');
+    await terminal.beginExecution(11);
+    const requestId = questions.register(11, [{ question: '是否继续？' }], null);
+    const waiting = questions.waitForAnswer(11, requestId);
+    await vi.waitFor(() => expect(setup.task()?.stage).toBe('BLOCKED'));
+    expect(setup.executions).toHaveLength(1);
+    expect(setup.task()?.source).toBe('API');
+    expect(setup.triggers).toHaveLength(1);
+    expect(setup.triggers[0]!.source).toBe('API');
+    questions.complete(11, requestId, '{"answers":[]}');
+    await waiting;
+    await vi.waitFor(() => expect(setup.task()?.stage).toBe('WORKING'));
+    await terminal.finishExecution(11, 7, 'COMPLETED', 'headless');
+    expect(setup.executions[0]).toMatchObject({ executionId: 'headless', status: 'COMPLETED' });
+    expect(executionId).toBeUndefined();
+  });
 
   it('waits for both questions and approvals before resuming', async () => {
     const setup = waitingFixture();

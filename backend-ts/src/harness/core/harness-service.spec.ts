@@ -277,6 +277,7 @@ function makeHarness(overrides: Record<string, unknown> = {}) {
     deps.mcpLoadModeResolver ?? null,
     deps.httpToolService ?? null,
     deps.experienceMount ?? null,
+    deps.executionStarter ?? null,
   );
   return { service, ...deps };
 }
@@ -761,6 +762,60 @@ describe('HarnessService.buildContext and execute', () => {
       }),
     }, { promptTokens: 1, completionTokens: 2, totalTokens: 3 });
     await vi.waitFor(() => expect(fileChangeMapper.insert).toHaveBeenCalled());
+  });
+
+  it('registers an explicit event execution before assembling its context', async () => {
+    const order: string[] = [];
+    const executionStarter = vi.fn(async () => { order.push('start'); });
+    const { service, agentLoop } = makeHarness({ executionStarter });
+    const original = service.buildContext.bind(service);
+    vi.spyOn(service, 'buildContext').mockImplementation(async (...args) => {
+      order.push('context');
+      return original(...args);
+    });
+    await service.executeFromEvent(10, 'external-event', { onContentDelta: vi.fn() } as never);
+    expect(executionStarter).toHaveBeenCalledExactlyOnceWith(10, 'external-event');
+    expect(order).toEqual(['start', 'context']);
+    expect(agentLoop.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('registers channel executions through the ordinary execute entry', async () => {
+    const executionStarter = vi.fn(async () => undefined);
+    const { service } = makeHarness({ executionStarter });
+    await service.execute(10, null, { onContentDelta: vi.fn() } as never, null, 9);
+    expect(executionStarter).toHaveBeenCalledExactlyOnceWith(10, undefined);
+  });
+
+  it('registers a prepared subagent execution only when execution actually begins', async () => {
+    const executionStarter = vi.fn(async () => undefined);
+    const { service, agentLoop } = makeHarness({ executionStarter });
+    const context = await service.buildContext(10);
+    expect(executionStarter).not.toHaveBeenCalled();
+    await service.executePrepared(context, { onContentDelta: vi.fn() } as never);
+    expect(executionStarter).toHaveBeenCalledExactlyOnceWith(10, undefined);
+    expect(agentLoop.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('registers a side execution before its parent context is copied', async () => {
+    const order: string[] = [];
+    const executionStarter = vi.fn(async () => { order.push('start'); });
+    const { service } = makeHarness({ executionStarter });
+    vi.spyOn(service, 'forkParentMessages').mockImplementation(async () => { order.push('fork'); });
+    await service.executeSideFirstMessage(1, 10, 'fork', { onContentDelta: vi.fn() } as never);
+    expect(executionStarter).toHaveBeenCalledExactlyOnceWith(10, undefined);
+    expect(order).toEqual(['start', 'fork']);
+  });
+
+  it.each(['execute', 'event', 'prepared', 'side'])('keeps %s execution running when tracking fails', async (entry) => {
+    const executionStarter = vi.fn(async () => { throw new Error('task storage unavailable'); });
+    const { service, agentLoop } = makeHarness({ executionStarter });
+    const listener = { onContentDelta: vi.fn() } as never;
+    if (entry === 'execute') await service.execute(10, null, listener);
+    if (entry === 'event') await service.executeFromEvent(10, 'event', listener);
+    if (entry === 'prepared') await service.executePrepared(await service.buildContext(10), listener);
+    if (entry === 'side') await service.executeSideFirstMessage(1, 10, 'none', listener);
+    expect(executionStarter).toHaveBeenCalledTimes(1);
+    expect(agentLoop.execute).toHaveBeenCalledTimes(1);
   });
 
   it('executeSideFirstMessageAppendsParentSummary', async () => {

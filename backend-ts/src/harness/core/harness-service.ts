@@ -102,6 +102,7 @@ export class HarnessService {
      * 未注入时不补挂，行为与仅会话创建时挂载一致。
      */
     private readonly experienceMount?: { syncForSession(workspace: string, agentId: number, enabled: boolean, refreshIndex?: boolean): void } | null,
+    private readonly executionStarter?: ((sessionId: number, executionId?: string) => Promise<void>) | null,
   ) {}
 
   prepareMessage(_sessionId: number, _userContent: unknown): string {
@@ -109,15 +110,23 @@ export class HarnessService {
   }
 
   async executeFromEvent(
-    sessionId: number, _eventId: string, listener: AgentEventListener, cancelFlag?: AtomicBoolean | null,
+    sessionId: number, eventId: string, listener: AgentEventListener, cancelFlag?: AtomicBoolean | null,
   ): Promise<void> {
-    await this.execute(sessionId, null, listener, cancelFlag);
+    await this.executeInternal(sessionId, listener, cancelFlag, undefined, eventId);
   }
 
   async execute(
     sessionId: number, _userContent: string | null, listener: AgentEventListener, cancelFlag?: AtomicBoolean | null,
     executionUserId?: number | null,
   ): Promise<void> {
+    await this.executeInternal(sessionId, listener, cancelFlag, executionUserId);
+  }
+
+  private async executeInternal(
+    sessionId: number, listener: AgentEventListener, cancelFlag?: AtomicBoolean | null,
+    executionUserId?: number | null, executionId?: string,
+  ): Promise<void> {
+    await this.beginTrackedExecution(sessionId, executionId);
     const context = await this.buildContext(sessionId, listener, cancelFlag);
     if (executionUserId != null) context.executionUserId = executionUserId;
     const persistenceCallback = this.createPersistenceCallback(sessionId, context);
@@ -125,6 +134,14 @@ export class HarnessService {
       await this.agentLoop.execute(context, listener, persistenceCallback);
     } finally {
       if (cancelFlag != null) this.agentLoop.removeCancelFlag(sessionId);
+    }
+  }
+
+  private async beginTrackedExecution(sessionId: number, executionId?: string): Promise<void> {
+    try {
+      await this.executionStarter?.(sessionId, executionId);
+    } catch (error) {
+      harnessLog('warn', `Failed to register task execution for session ${sessionId}`, error);
     }
   }
 
@@ -291,6 +308,7 @@ export class HarnessService {
   }
 
   async executePrepared(context: AgentExecutionContext, listener: AgentEventListener): Promise<void> {
+    if (context.sessionId != null) await this.beginTrackedExecution(context.sessionId);
     const persistence = this.createPersistenceCallback(context.sessionId!, context);
     await this.agentLoop.execute(context, listener, persistence);
   }
@@ -777,6 +795,7 @@ export class HarnessService {
     listener: AgentEventListener,
     cancelFlag?: AtomicBoolean | null,
   ): Promise<void> {
+    await this.beginTrackedExecution(sideSessionId);
     if (contextMode === 'fork') {
       await this.forkParentMessages(parentSessionId, sideSessionId);
     }

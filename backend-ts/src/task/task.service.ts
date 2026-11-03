@@ -55,6 +55,17 @@ export class TaskService {
     });
   }
 
+  async getActiveExecutionId(session: Session): Promise<string | null> {
+    if (session.id == null) return null;
+    const task = await this.repo.findBySessionId(session.userId, session.id);
+    if (task == null || task.userId !== session.userId || task.sessionId !== session.id || task.lastExecutionId == null) return null;
+    if (task.stage !== 'WORKING' && task.stage !== 'BLOCKED') return null;
+    const execution = await this.repo.executionById(task.lastExecutionId);
+    if (execution == null || (execution.status !== 'WORKING' && execution.status !== 'BLOCKED')) return null;
+    this.requireExecutionOwner(execution, task);
+    return execution.executionId;
+  }
+
   async settleExecution(session: Session, executionId: string, phase: TaskStage, failureReason?: string | null, source?: TaskSource): Promise<void> {
     this.validate(session, executionId);
     if (!TERMINAL.has(phase)) throw new BusinessException(ErrorCode.PARAM_INVALID, '只接受执行终态');

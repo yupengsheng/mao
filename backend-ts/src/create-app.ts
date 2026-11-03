@@ -817,6 +817,7 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     inboxService, skillLoader, skillSync, localSkills, localAgentsMd, agentRepo,
     experienceService, modelRepo, fileChangeRepo, envInfo, db, mcpSync, mcpLoadModeResolver,
     activityHeartbeat, memoryService, wsRegistry,
+    taskExecutionStarter: (sessionId, executionId) => taskTerminal.beginExecution(sessionId, executionId),
     experienceIndexService,
     experienceMountService,
   });

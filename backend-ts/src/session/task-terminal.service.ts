@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { Session } from './types.js';
 import type { SessionService } from './session.service.js';
 import type { StreamingWsRegistry } from './ws/streaming-ws-registry.js';
@@ -90,14 +91,31 @@ export class TaskTerminalService {
     private readonly taskService?: TaskService | null,
   ) {}
 
-  async beginExecution(sessionId: number, executionId: string, source?: TaskSource): Promise<void> {
-    if (this.taskService == null) return;
+  async beginExecution(sessionId: number, executionId?: string, source?: TaskSource): Promise<void> {
+    const actualExecutionId = executionId ?? this.registry.getSessionExecution?.(sessionId);
+    if (actualExecutionId == null || actualExecutionId.trim() === '') return;
     try {
+      this.registry.setSessionExecution?.(sessionId, actualExecutionId);
+      if (this.taskService == null) return;
       const session = await this.sessionService.getSession(sessionId);
-      await this.taskService.beginExecution(session, executionId, source);
+      await this.taskService.beginExecution(session, actualExecutionId, source);
     } catch (error) {
-      console.warn(`[task] failed to begin execution: sessionId=${sessionId}, executionId=${executionId}`, error);
+      console.warn(`[task] failed to begin execution: sessionId=${sessionId}, executionId=${actualExecutionId}`, error);
     }
+  }
+
+  async cancelActiveExecution(sessionId: number, userId: number | null | undefined): Promise<void> {
+    const session = await this.sessionService.getSession(sessionId);
+    if (!['RUNNING', 'RESUMING', 'WAITING_APPROVAL', 'CANCELLING'].includes(session.phase ?? '')) return;
+    let executionId = this.registry.getSessionExecution?.(sessionId);
+    if (executionId == null && this.taskService != null) {
+      try {
+        executionId = await this.taskService.getActiveExecutionId(session) ?? undefined;
+      } catch (error) {
+        console.warn(`[task] failed to load active execution for cancellation: sessionId=${sessionId}`, error);
+      }
+    }
+    await this.finishExecution(sessionId, userId, 'CANCELLED', executionId ?? randomUUID());
   }
 
   async finishExecution(

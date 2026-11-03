@@ -1,6 +1,5 @@
 import { existsSync, rmSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
-import { randomUUID } from 'node:crypto';
 import fastifyStatic from '@fastify/static';
 import type { FastifyInstance } from 'fastify';
 import type { SpawnPtyOptions, PtyLike } from './harness/terminal/remote-terminal.js';
@@ -161,7 +160,7 @@ export function createPersistCancelledHelper(deps: PersistCancelledDeps) {
     if (session == null) return false;
     if (session.phase !== 'RUNNING' && session.phase !== 'RESUMING') return false;
     await sessionService.cleanupIncompleteTail(sessionId);
-    await taskTerminal.finishExecution(sessionId, session.userId, 'CANCELLED', randomUUID());
+    await taskTerminal.cancelActiveExecution(sessionId, session.userId);
     try { await feishuProgressCardRepo.deleteBySessionId(sessionId); } catch (error) {
       console.warn(`清理飞书进度卡片映射失败, sessionId=${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
     }

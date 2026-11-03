@@ -25,7 +25,7 @@ import { AgentDingtalkInboundHandler } from './agent-inbound-handler.js';
 import { MysqlDingtalkBindingRepository } from './binding.repository.js';
 import { registerDingtalkBindingRoutes } from './binding.routes.js';
 import { MysqlDingtalkBotRepository } from './bot.repository.js';
-import { persistDingtalkCancelIfIdle } from './cancel-running.js';
+import { persistDingtalkCancelIfIdle, persistDingtalkCancelIfActive } from './cancel-running.js';
 import { DingtalkCardActionService } from './card-action.service.js';
 import { progressCardParams, queueCardParams } from './card-body.js';
 import { createAndDeliverCard, updateCard } from './card-client.js';
@@ -85,7 +85,10 @@ export function createDingtalkRuntime(deps: {
   modelService: ModelService;
   userRepo: { findById(id: number): Promise<{ id?: number } | null> };
   settingService: { getSiteBaseUrl(): Promise<string | null> };
-  taskTerminal: { finishExecution(sessionId: number, userId: number, phase: string, executionId: string, failureReason?: string): Promise<void> };
+  taskTerminal: {
+    finishExecution(sessionId: number, userId: number, phase: string, executionId: string, failureReason?: string): Promise<void>;
+    cancelActiveExecution(sessionId: number, userId: number): Promise<void>;
+  };
   activityService: unknown;
   activityHeartbeat: unknown;
   todoMapper: unknown;
@@ -522,13 +525,9 @@ export function createDingtalkRuntime(deps: {
   }
 
   async function persistCancelledIfActive(sessionId: number): Promise<boolean> {
-    const session = await deps.sessionService.getSession(sessionId).catch(() => null);
-    if (session == null) return false;
-    if (session.phase !== 'RUNNING' && session.phase !== 'RESUMING') return false;
-    await deps.sessionService.cleanupIncompleteTail(sessionId);
-    await deps.taskTerminal.finishExecution(sessionId, session.userId, 'CANCELLED', `dingtalk-cancel-${sessionId}`);
-    await progressRepo.deleteBySessionId(sessionId).catch(() => undefined);
-    return true;
+    return persistDingtalkCancelIfActive(sessionId, {
+      sessionService: deps.sessionService, taskTerminal: deps.taskTerminal, progressRepo,
+    });
   }
 
   async function resolveSendTarget(sessionId: number | null): Promise<DingtalkSendTarget | null> {
