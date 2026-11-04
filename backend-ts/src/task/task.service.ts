@@ -7,6 +7,7 @@ import type { TaskRepository } from './task.repository.js';
 import type { AgentTask, TaskExecution, TaskPageFilter, TaskSource, TaskStage, TaskTrigger } from './types.js';
 
 const TERMINAL = new Set<TaskStage>(['COMPLETED', 'FAILED', 'CANCELLED']);
+const INTERRUPTED_EXECUTION_REASON = '执行因进程中断未完成，已自动恢复';
 
 function sourceOf(session: Session, source?: TaskSource): TaskSource {
   if (source != null && source !== 'MANUAL') return source;
@@ -34,6 +35,40 @@ export class TaskService {
       }
       const execution = await this.createExecution(repo, task, executionId, 'WORKING', actualSource);
       await repo.updateById(task.id!, { stage: 'WORKING', lastExecutionId: executionId, title: this.title(current), agentId: current.agentId ?? null });
+      return execution;
+    });
+  }
+
+  async beginRecoveryExecution(session: Session, executionId: string): Promise<TaskExecution> {
+    this.validate(session, executionId);
+    return this.repo.transaction(async (repo) => {
+      const current = await repo.lockSession(session.userId, session.id!);
+      if (current == null) throw new BusinessException(ErrorCode.SESSION_NOT_FOUND);
+      const fallbackSource = sourceOf(current);
+      const task = await this.ensureTask(repo, current, fallbackSource);
+      const existing = await repo.executionById(executionId);
+      if (existing != null) {
+        this.requireExecutionOwner(existing, task);
+        return existing;
+      }
+
+      const interrupted = await repo.unfinishedExecutions(task.id!);
+      let actualSource = fallbackSource;
+      if (interrupted.length > 0) {
+        const trigger = await repo.triggerByExecutionId(interrupted[0]!.executionId);
+        if (trigger != null) actualSource = trigger.source;
+        const finishedAt = nowSql();
+        for (const execution of interrupted) {
+          await repo.updateExecution(execution.id!, {
+            status: 'FAILED', finishedAt, failureReason: INTERRUPTED_EXECUTION_REASON,
+          });
+        }
+      }
+
+      const execution = await this.createExecution(repo, task, executionId, 'WORKING', actualSource);
+      await repo.updateById(task.id!, {
+        stage: 'WORKING', lastExecutionId: executionId, title: this.title(current), agentId: current.agentId ?? null,
+      });
       return execution;
     });
   }

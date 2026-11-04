@@ -71,6 +71,15 @@ export class TaskRepository {
     );
   }
 
+  unfinishedExecutions(taskId: number): Promise<TaskExecution[]> {
+    return this.db.query<TaskExecution>(
+      `SELECT * FROM agent_task_execution
+        WHERE task_id = ? AND status IN ('WORKING', 'BLOCKED')
+        ORDER BY attempt_no DESC, id DESC`,
+      [taskId],
+    );
+  }
+
   async insertExecution(execution: TaskExecution): Promise<number> {
     return this.db.insert('agent_task_execution', execution);
   }
@@ -81,6 +90,13 @@ export class TaskRepository {
 
   async insertTrigger(trigger: TaskTrigger): Promise<void> {
     await this.db.insert('agent_task_trigger', trigger);
+  }
+
+  async triggerByExecutionId(executionId: string): Promise<TaskTrigger | null> {
+    return this.db.queryOne<TaskTrigger>(
+      'SELECT * FROM agent_task_trigger WHERE source_event_id = ? LIMIT 1',
+      [executionId],
+    );
   }
 
   triggers(taskId: number): Promise<TaskTrigger[]> {

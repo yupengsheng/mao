@@ -10,7 +10,8 @@ function fixture(initialPhase = 'RUNNING') {
     updateRuntimeStatus: async () => undefined,
     markLastMessageFinished: async () => undefined,
   };
-  const task = { beginExecution: vi.fn(async () => undefined), settleExecution: vi.fn<TaskService['settleExecution']>(async () => undefined),
+  const task = { beginExecution: vi.fn(async () => undefined), beginRecoveryExecution: vi.fn(async () => undefined),
+    settleExecution: vi.fn<TaskService['settleExecution']>(async () => undefined),
     getActiveExecutionId: vi.fn(async (): Promise<string | null> => null) };
   const send = vi.fn();
   const active = new Map<number, string>();
@@ -54,6 +55,23 @@ describe('Task integration with session terminal', () => {
     expect(setup.active.get(11)).toBe('headless-event');
     await setup.terminal.finishExecution(11, 7, 'COMPLETED', 'headless-event');
     expect(setup.active.has(11)).toBe(false);
+  });
+
+  it('registers the recovery execution id before persisting the recovery attempt', async () => {
+    const setup = fixture();
+    await setup.terminal.beginRecoveryExecution(11, 'recovery-execution');
+    expect(setup.active.get(11)).toBe('recovery-execution');
+    expect(setup.task.beginRecoveryExecution).toHaveBeenCalledWith(expect.objectContaining({ id: 11 }), 'recovery-execution');
+  });
+
+  it('keeps the recovery execution id when task storage fails', async () => {
+    const setup = fixture();
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    setup.task.beginRecoveryExecution.mockRejectedValueOnce(new Error('storage unavailable'));
+    try {
+      await setup.terminal.beginRecoveryExecution(11, 'recovery-execution');
+      expect(setup.active.get(11)).toBe('recovery-execution');
+    } finally { warning.mockRestore(); }
   });
 
   it('does not invent a beginning when neither entry nor listener has an execution id', async () => {

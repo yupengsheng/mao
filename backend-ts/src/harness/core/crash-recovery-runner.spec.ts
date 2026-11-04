@@ -43,7 +43,10 @@ function makeRunner(
     getMessages: vi.fn().mockResolvedValue([]),
     extractVisibleText: (content: string | null) => content,
   };
-  const taskTerminalService = { finishExecution: vi.fn().mockResolvedValue(undefined) };
+  const taskTerminalService = {
+    beginRecoveryExecution: vi.fn().mockResolvedValue(undefined),
+    finishExecution: vi.fn().mockResolvedValue(undefined),
+  };
   const harnessService = {
     execute: options.executeError != null
       ? vi.fn().mockRejectedValue(options.executeError)
@@ -206,6 +209,25 @@ describe('CrashRecoveryRunner.createExtraListeners', () => {
     // 与终态收敛使用的是同一个 executionId
     expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(7, 42, 'COMPLETED', executionId);
   });
+
+  it('registers the recovery attempt with the same execution id before running the harness', async () => {
+    const { runner, taskTerminalService, harnessService, pending } = makeRunner();
+    await runner.run();
+    await Promise.all(pending);
+    const executionId = taskTerminalService.finishExecution.mock.calls[0]![3];
+    expect(taskTerminalService.beginRecoveryExecution).toHaveBeenCalledWith(7, executionId);
+    expect(taskTerminalService.beginRecoveryExecution.mock.invocationCallOrder[0])
+      .toBeLessThan(harnessService.execute.mock.invocationCallOrder[0]!);
+  });
+
+  it('continues recovery when task attempt registration fails', async () => {
+    const { runner, taskTerminalService, harnessService, pending } = makeRunner();
+    taskTerminalService.beginRecoveryExecution.mockRejectedValueOnce(new Error('task storage unavailable'));
+    await runner.run();
+    await Promise.all(pending);
+    expect(harnessService.execute).toHaveBeenCalledTimes(1);
+    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(7, 42, 'COMPLETED', expect.any(String));
+  });
 });
 
 describe('CrashRecoveryRunner deferred rescan', () => {
@@ -248,7 +270,7 @@ describe('CrashRecoveryRunner deferred rescan', () => {
     const runner = new CrashRecoveryRunner(
       sessionMapper as never,
       { cleanupIncompleteTail: vi.fn().mockResolvedValue(0), updatePhase: vi.fn().mockResolvedValue(undefined) } as never,
-      { finishExecution: vi.fn().mockResolvedValue(undefined) } as never,
+      { beginRecoveryExecution: vi.fn().mockResolvedValue(undefined), finishExecution: vi.fn().mockResolvedValue(undefined) } as never,
       { execute: vi.fn().mockResolvedValue(undefined) } as never,
       { registerCancelFlag: vi.fn().mockReturnValue({ get: () => false }), removeCancelFlag: vi.fn() } as never,
       { send: vi.fn() } as never,
@@ -366,7 +388,7 @@ describe('CrashRecoveryRunner deferred rescan', () => {
       const runner = new CrashRecoveryRunner(
         sessionMapper as never,
         { cleanupIncompleteTail: vi.fn().mockResolvedValue(0), updatePhase: vi.fn().mockResolvedValue(undefined) } as never,
-        { finishExecution: vi.fn().mockResolvedValue(undefined) } as never,
+        { beginRecoveryExecution: vi.fn().mockResolvedValue(undefined), finishExecution: vi.fn().mockResolvedValue(undefined) } as never,
         { execute: harnessExecute } as never,
         { registerCancelFlag: vi.fn().mockReturnValue({ get: () => false }), removeCancelFlag: vi.fn() } as never,
         { send: vi.fn() } as never,
@@ -416,7 +438,7 @@ describe('CrashRecoveryRunner deferred rescan', () => {
       const runner = new CrashRecoveryRunner(
         sessionMapper as never,
         { cleanupIncompleteTail: vi.fn().mockResolvedValue(0), updatePhase: vi.fn().mockResolvedValue(undefined) } as never,
-        { finishExecution: vi.fn().mockResolvedValue(undefined) } as never,
+        { beginRecoveryExecution: vi.fn().mockResolvedValue(undefined), finishExecution: vi.fn().mockResolvedValue(undefined) } as never,
         { execute: harnessExecute } as never,
         { registerCancelFlag: vi.fn().mockReturnValue({ get: () => false }), removeCancelFlag: vi.fn() } as never,
         { send: vi.fn() } as never,
@@ -464,7 +486,7 @@ describe('CrashRecoveryRunner deferred rescan', () => {
       const runner = new CrashRecoveryRunner(
         sessionMapper as never,
         { cleanupIncompleteTail: vi.fn().mockResolvedValue(0), updatePhase: vi.fn().mockResolvedValue(undefined) } as never,
-        { finishExecution: vi.fn().mockResolvedValue(undefined) } as never,
+        { beginRecoveryExecution: vi.fn().mockResolvedValue(undefined), finishExecution: vi.fn().mockResolvedValue(undefined) } as never,
         { execute: harnessExecute } as never,
         { registerCancelFlag: vi.fn().mockReturnValue({ get: () => false }), removeCancelFlag: vi.fn() } as never,
         { send: vi.fn() } as never,
@@ -549,7 +571,7 @@ describe('CrashRecoveryRunner orphan sweep', () => {
     const runner = new CrashRecoveryRunner(
       sessionMapper as never,
       { cleanupIncompleteTail: vi.fn().mockResolvedValue(0), updatePhase: vi.fn().mockResolvedValue(undefined) } as never,
-      { finishExecution: vi.fn().mockResolvedValue(undefined) } as never,
+      { beginRecoveryExecution: vi.fn().mockResolvedValue(undefined), finishExecution: vi.fn().mockResolvedValue(undefined) } as never,
       { execute: harnessExecute } as never,
       { registerCancelFlag: vi.fn().mockReturnValue({ get: () => false }), removeCancelFlag: vi.fn() } as never,
       { send: vi.fn() } as never,

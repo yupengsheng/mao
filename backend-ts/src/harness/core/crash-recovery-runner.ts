@@ -400,6 +400,12 @@ export class CrashRecoveryRunner {
       } catch (e) {
         harnessLog('warn', `Recovery extra listener failed for session ${sessionId}`, e);
       }
+      try {
+        await this.taskTerminalService.beginRecoveryExecution(sessionId, executionId);
+      } catch (e) {
+        // 任务记录不能阻断续跑；桥接层通常已吞掉存储异常，这里再兜住接口/装配异常。
+        harnessLog('warn', `Recovery execution registration failed for session ${sessionId}`, e);
+      }
       harnessLog('info', `Session ${sessionId}: starting recovery execution`);
       await this.sessionService.updatePhase(sessionId, 'RUNNING');
       this.notifyClient(userId, sessionId, 'RUNNING', executionId);

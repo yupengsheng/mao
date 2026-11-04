@@ -5,14 +5,14 @@ import { ApprovalRegistry } from '../harness/approval/approval-registry.js';
 import { AskUserQuestionsRegistry } from '../harness/tool/ask-user-questions-registry.js';
 import { TaskTerminalService } from '../session/task-terminal.service.js';
 import type { TaskRepository } from './task.repository.js';
-import type { AgentTask, TaskExecution } from './types.js';
+import type { AgentTask, TaskExecution, TaskTrigger } from './types.js';
 import type { Session } from '../session/types.js';
 
 function fixture() {
   const session: Session = { id: 11, userId: 7, agentId: 2, title: '修复问题', source: 'web', phase: 'RUNNING' };
   let task: AgentTask | null = null;
   const executions: TaskExecution[] = [];
-  const triggers: Array<Record<string, unknown>> = [];
+  const triggers: TaskTrigger[] = [];
   const repo = {
     transaction: async (work: (store: unknown) => Promise<unknown>) => work(repo),
     lockSession: async (userId: number, sessionId: number) => userId === session.userId && sessionId === session.id ? session : null,
@@ -22,9 +22,13 @@ function fixture() {
     updateById: async (_id: number, fields: Partial<AgentTask>) => { Object.assign(task!, fields); },
     latestExecution: async () => executions.at(-1) ?? null,
     executionById: async (id: string) => executions.find((item) => item.executionId === id) ?? null,
+    unfinishedExecutions: async (taskId: number) => executions
+      .filter((item) => item.taskId === taskId && (item.status === 'WORKING' || item.status === 'BLOCKED'))
+      .sort((a, b) => b.attemptNo - a.attemptNo || (b.id ?? 0) - (a.id ?? 0)),
     insertExecution: async (input: TaskExecution) => { executions.push({ ...input, id: executions.length + 1 }); return executions.length; },
     updateExecution: async (id: number, fields: Partial<TaskExecution>) => { Object.assign(executions.find((item) => item.id === id)!, fields); },
-    insertTrigger: async (input: Record<string, unknown>) => { triggers.push(input); },
+    insertTrigger: async (input: TaskTrigger) => { triggers.push(input); },
+    triggerByExecutionId: async (id: string) => triggers.find((item) => item.sourceEventId === id) ?? null,
     triggers: async () => triggers,
     executions: async () => executions,
   };
@@ -168,6 +172,61 @@ describe('Task execution lifecycle', () => {
     expect(setup.executions.map((item) => item.attemptNo)).toEqual([1, 2]);
     expect(setup.triggers.map((item) => item.source)).toEqual(['SIGNAL', 'SCHEDULED']);
     expect(setup.task()?.stage).toBe('CANCELLED');
+  });
+
+  it('closes interrupted attempts and starts a new numbered recovery attempt', async () => {
+    const setup = fixture();
+    await setup.service.beginExecution(setup.session, 'interrupted-blocked', 'FEISHU');
+    await setup.service.setExecutionStage(setup.session, 'interrupted-blocked', 'BLOCKED');
+    await setup.service.beginExecution(setup.session, 'interrupted-working', 'WEBHOOK');
+
+    const recovered = await setup.service.beginRecoveryExecution(setup.session, 'recovered');
+
+    expect(setup.executions.map((item) => item.status)).toEqual(['FAILED', 'FAILED', 'WORKING']);
+    expect(setup.executions.slice(0, 2).every((item) => item.finishedAt != null)).toBe(true);
+    expect(setup.executions.slice(0, 2).every((item) => item.failureReason === '执行因进程中断未完成，已自动恢复')).toBe(true);
+    expect(recovered).toMatchObject({ executionId: 'recovered', attemptNo: 3, status: 'WORKING' });
+    expect(recovered.startedAt).toBeTruthy();
+    expect(setup.task()).toMatchObject({ stage: 'WORKING', lastExecutionId: 'recovered' });
+  });
+
+  it('preserves the actual source of the interrupted attempt on recovery', async () => {
+    const setup = fixture();
+    await setup.service.beginExecution(setup.session, 'interrupted', 'SIGNAL');
+    await setup.service.beginRecoveryExecution(setup.session, 'recovered');
+    expect(setup.triggers.map((item) => item.source)).toEqual(['SIGNAL', 'SIGNAL']);
+  });
+
+  it('keeps recovery registration idempotent for the same execution id', async () => {
+    const setup = fixture();
+    await setup.service.beginExecution(setup.session, 'interrupted');
+    await setup.service.beginRecoveryExecution(setup.session, 'recovered');
+    const finishedAt = setup.executions[0]!.finishedAt;
+
+    await setup.service.beginRecoveryExecution(setup.session, 'recovered');
+
+    expect(setup.executions).toHaveLength(2);
+    expect(setup.executions[0]).toMatchObject({ status: 'FAILED', finishedAt });
+    expect(setup.triggers).toHaveLength(2);
+    expect(setup.task()?.lastExecutionId).toBe('recovered');
+  });
+
+  it('does not let an interrupted attempt overwrite the recovery attempt when it settles late', async () => {
+    const setup = fixture();
+    await setup.service.beginExecution(setup.session, 'interrupted');
+    await setup.service.beginRecoveryExecution(setup.session, 'recovered');
+    await setup.service.settleExecution(setup.session, 'interrupted', 'COMPLETED');
+    expect(setup.executions[0]).toMatchObject({ status: 'FAILED' });
+    expect(setup.task()).toMatchObject({ stage: 'WORKING', lastExecutionId: 'recovered' });
+  });
+
+  it('creates the first attempt when recovery finds no interrupted execution', async () => {
+    const setup = fixture();
+    setup.session.source = 'feishu';
+    const recovered = await setup.service.beginRecoveryExecution(setup.session, 'first-recovery');
+    expect(recovered).toMatchObject({ executionId: 'first-recovery', attemptNo: 1, status: 'WORKING' });
+    expect(recovered.startedAt).toBeTruthy();
+    expect(setup.triggers[0]!.source).toBe('FEISHU');
   });
 
   it('rejects execution ids that belong to another session', async () => {

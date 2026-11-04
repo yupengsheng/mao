@@ -104,6 +104,18 @@ export class TaskTerminalService {
     }
   }
 
+  async beginRecoveryExecution(sessionId: number, executionId: string): Promise<void> {
+    if (executionId.trim() === '') return;
+    try {
+      this.registry.setSessionExecution?.(sessionId, executionId);
+      if (this.taskService == null) return;
+      const session = await this.sessionService.getSession(sessionId);
+      await this.taskService.beginRecoveryExecution(session, executionId);
+    } catch (error) {
+      console.warn(`[task] failed to begin recovery execution: sessionId=${sessionId}, executionId=${executionId}`, error);
+    }
+  }
+
   async cancelActiveExecution(sessionId: number, userId: number | null | undefined): Promise<void> {
     const session = await this.sessionService.getSession(sessionId);
     if (!['RUNNING', 'RESUMING', 'WAITING_APPROVAL', 'CANCELLING'].includes(session.phase ?? '')) return;

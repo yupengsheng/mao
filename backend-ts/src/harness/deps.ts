@@ -292,6 +292,7 @@ export interface ActivityService {
 }
 
 export interface TaskTerminalService {
+  beginRecoveryExecution(sessionId: number, executionId: string): Promise<void>;
   finishExecution(sessionId: number, userId: number | null | undefined, phase: string, executionId: string, error?: string): Promise<void>;
 }
 

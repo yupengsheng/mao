@@ -28,7 +28,7 @@ describe('CrashRecoveryRunner', () => {
     };
     const registry = { send: vi.fn() };
     const activityHeartbeat = { clear: vi.fn() };
-    const taskTerminal = { finishExecution: vi.fn() };
+    const taskTerminal = { beginRecoveryExecution: vi.fn(), finishExecution: vi.fn() };
     const llm = { selectById: vi.fn(async () => ({ supportsVision: 1 })), selectDefault: vi.fn() };
     const runner = new CrashRecoveryRunner(
       {
@@ -72,7 +72,7 @@ describe('CrashRecoveryRunner', () => {
     const runner = new CrashRecoveryRunner(
       { selectByPhase, selectById: vi.fn(async () => ({ id: 9, userId: 3, modelId: 1, phase: 'RUNNING' })) } as never,
       sessionService as never,
-      { finishExecution: vi.fn() } as never,
+      { beginRecoveryExecution: vi.fn(), finishExecution: vi.fn() } as never,
       harness as never,
       agentLoop as never,
       { send: vi.fn() } as never,
@@ -112,7 +112,7 @@ describe('CrashRecoveryRunner', () => {
         selectById: vi.fn(async () => ({ id: 9, userId: 3, modelId: 1, phase: 'COMPLETED' })),
       } as never,
       sessionService as never,
-      { finishExecution: vi.fn() } as never,
+      { beginRecoveryExecution: vi.fn(), finishExecution: vi.fn() } as never,
       harness as never,
       { registerCancelFlag: vi.fn(), removeCancelFlag: vi.fn() } as never,
       { send: vi.fn() } as never,

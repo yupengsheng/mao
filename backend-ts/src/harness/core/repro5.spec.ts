@@ -27,7 +27,7 @@ describe('repro5', () => {
     const runner = new CrashRecoveryRunner(
       sessionMapper as never,
       { cleanupIncompleteTail: async () => 0, updatePhase: async () => {} } as never,
-      { finishExecution: async () => {} } as never,
+      { beginRecoveryExecution: async () => {}, finishExecution: async () => {} } as never,
       { execute: async () => {} } as never,
       { registerCancelFlag: () => ({ get: () => false }), removeCancelFlag: () => {} } as never,
       { send: () => {} } as never,
