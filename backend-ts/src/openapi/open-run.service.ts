@@ -7,6 +7,7 @@ import type { SessionSource } from '../session/session.repository.js';
 import { withSessionLock } from '../schedule/scheduled-task.service.js';
 import { isActivePhase } from '../session/session-vo.js';
 import type { MessageQueueSource } from '../session/types.js';
+import type { OpenRunAdmission, OpenRunAdmissionBinding } from './admission.js';
 
 /** 开放触发支持的消息长度上限（技术方案 §5.3）。 */
 export const OPEN_RUN_MESSAGE_MAX_LENGTH = 32000;
@@ -64,6 +65,11 @@ export interface OpenRunDeps {
   budgetCheck?: (target: { userId: number; agentId: number }) => Promise<{ message: string } | null>;
   /** 注入的 live WS 执行路径（createScheduledLiveExecution）；null 时走 no-op listener 兜底。 */
   liveExecution: ((session: Session, userId: number, executionId: string, savedMessage: Message, startedAt?: number, scheduledTaskId?: number | null, source?: 'SCHEDULED' | 'WEBHOOK' | 'API' | 'SIGNAL' | null) => Promise<void>) | null;
+  /**
+   * 触发来源准入（可选注入；生产装配必须注入）。
+   * 未注入时保持既有测试/装配兼容，注入后失败关闭：缺失或不匹配的绑定一律拒绝。
+   */
+  admission?: OpenRunAdmission;
 }
 
 export interface OpenRunInput {
@@ -77,6 +83,8 @@ export interface OpenRunInput {
   triggerId?: number | null;
   /** 入站调用流水 id，busy 入队后由消费侧回写终态。 */
   callLogId?: number | null;
+  /** 本次触发链的显式身份绑定；由各来源入口传入，不读取请求可写字段。 */
+  admissionBinding?: OpenRunAdmissionBinding | null;
 }
 
 export interface OpenRunResult {
@@ -115,6 +123,8 @@ export class OpenRunService {
     if (agent.enabled === 0) {
       throw new BusinessException(ErrorCode.PARAM_INVALID, '该 Agent 已停用，无法触发');
     }
+    // 准入必须在预算与会话创建/复用之前：拒绝时不得留下空会话、消息或排队项。
+    await this.assertAdmission(input);
     // 预算 BLOCK 在会话创建/复用与 withSessionLock 之前：拒绝时不留下孤儿空会话（技术方案 §5.7）
     if (this.deps.budgetCheck != null) {
       const blocked = await this.deps.budgetCheck({ userId: input.userId, agentId: input.agentId });
@@ -215,5 +225,28 @@ export class OpenRunService {
       }
       return { sessionId, messageId: savedMessage.id ?? null, queued: false, terminalPhase };
     });
+  }
+
+  private async assertAdmission(input: OpenRunInput): Promise<void> {
+    const admission = this.deps.admission;
+    if (admission == null) return;
+    try {
+      await admission.assertAllowed({
+        userId: input.userId,
+        agentId: input.agentId,
+        sessionId: input.sessionId ?? null,
+        source: input.source,
+        binding: input.admissionBinding ?? null,
+      });
+    } catch (e) {
+      // 已知拒绝/不可用原样透传；依赖抛出的未知异常统一失败关闭为 503。
+      if (
+        e instanceof BusinessException
+        && (e.code === ErrorCode.ADMISSION_REJECTED.code || e.code === ErrorCode.ADMISSION_UNAVAILABLE.code)
+      ) {
+        throw e;
+      }
+      throw new BusinessException(ErrorCode.ADMISSION_UNAVAILABLE);
+    }
   }
 }

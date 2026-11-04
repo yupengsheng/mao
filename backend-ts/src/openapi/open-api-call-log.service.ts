@@ -465,6 +465,7 @@ export class OpenApiCallLogService {
         sessionId: row.sessionId ?? null,
         source: 'API',
         callLogId: begun?.id ?? null,
+        admissionBinding: { kind: 'API_TOKEN', tokenId: row.tokenId },
       });
       await this.markAccepted(begun?.id ?? null, begun?.startedAt ?? this.now(), result);
       return result;

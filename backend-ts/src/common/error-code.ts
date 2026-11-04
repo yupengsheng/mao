@@ -75,6 +75,11 @@ export const ErrorCode = {
   HTTP_TOOL_NAME_DUPLICATE: { code: 3052, message: '同名工具已存在' },
   HTTP_TOOL_NAME_RESERVED: { code: 3053, message: '工具名与内置工具冲突或含保留前缀' },
 
+  /** 开放触发准入拒绝。HTTP 403；固定短语，不暴露 Token/触发器/哨兵状态。 */
+  ADMISSION_REJECTED: { code: 3054, message: '触发来源未通过准入' },
+  /** 准入依赖读取失败。HTTP 503；失败关闭，不降级放行。 */
+  ADMISSION_UNAVAILABLE: { code: 3055, message: '准入检查暂不可用，请稍后重试' },
+
   /** 用量预算 BLOCK 超线：message 动态携带 scope/当期消耗/上限（技术方案 §5.7）。 */
   BUDGET_EXCEEDED: { code: 3041, message: '用量预算已超限' },
 

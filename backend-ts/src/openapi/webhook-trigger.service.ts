@@ -265,17 +265,22 @@ export class WebhookTriggerService {
         source: 'WEBHOOK',
         triggerId: trigger.id ?? null,
         callLogId: begun?.id ?? null,
+        admissionBinding: { kind: 'WEBHOOK_TRIGGER', triggerId: trigger.id! },
         message: this.wrapPayload(trigger.name ?? '', rawBody),
       });
     } catch (e) {
       if (begun != null && !begun.duplicate) {
         await this.deps.callLog?.markRejected(begun.id, begun.startedAt, e);
       }
-      // 预算 BLOCK（决策 6）：任务未启动，无终态可投递；但计入连败与自动停用护栏正向联动，
-      // 否则超限触发器会以 4xx 信封无限重试刷量。其余异常原样上抛。
-      if (e instanceof BusinessException && e.code === ErrorCode.BUDGET_EXCEEDED.code && trigger.id != null) {
+      // 预算 BLOCK 与准入拒绝：任务未启动，无终态可投递；但计入连败与自动停用护栏正向联动，
+      // 否则这类确定性 4xx 会被外部无限重试刷量。准入暂不可用（503）是瞬时故障，不计连败。
+      if (
+        e instanceof BusinessException
+        && (e.code === ErrorCode.BUDGET_EXCEEDED.code || e.code === ErrorCode.ADMISSION_REJECTED.code)
+        && trigger.id != null
+      ) {
         await this.recordOutcome(trigger.id, 'FAILED').catch((err) =>
-          console.warn(`[openapi] failed to record budget-blocked outcome, triggerId=${trigger.id}: ${(err as Error).message}`));
+          console.warn(`[openapi] failed to record rejected outcome, triggerId=${trigger.id}: ${(err as Error).message}`));
       }
       throw e;
     }

@@ -190,6 +190,16 @@ mao open run --agent-id 12 --message "跑一遍 nightly 巡检" \
 - 幂等记录复用调用流水，只在流水保留期内有效（`openapi.callLogRetentionDays`，默认 90 天）。因此外部系统仍应使用足够稳定且长期不重复的事件 ID。
 - `pending` 与 `queued` 都是处理中；`pending` 若遇到进程崩溃可能长期停留，本期不做自动恢复，需要用新键重试。
 
+## 触发来源准入
+
+API Token、入站 Webhook 与 Signal 哨兵在创建/复用会话、落消息与入队之前统一做确定性准入：
+
+- **API**：Token 必须存在、归属当前用户、未吊销 / 未过期 / 未自动停用，且 scope 含 `open:run`。
+- **Webhook**：触发器必须存在、归属正确、Agent 一致、处于启用状态，且绑定的 Session 与本次请求一致。
+- **Signal**：哨兵必须存在、归属与 Agent 一致、状态为 `ACTIVE`；请求带 `sessionId` 时必须为 `REUSE_SESSION` 且等于复用指针。
+
+准入失败返回 `403` + `3054`（固定短语，不区分具体原因）；准入依赖读取失败返回 `503` + `3055`，本次执行未启动。Webhook 的 `3054` 计入连续失败与自动停用护栏，`3055` 不计；Signal 沿用既有失败计数。验签失败 / 触发器不存在仍按原语义返回 `404` + `3040`。
+
 ## 调用流水
 
 每次 API Token 触发和 Webhook 触发都会留下一条流水，包括参数错误、鉴权失败、限流和预算拒绝。桌面端 Token / 触发器卡片上的「调用记录」看自己的；管理后台「开放调用」看全量、统计和导出。
@@ -216,10 +226,13 @@ mao open calls get --id 100
 | hook 返回 404 + `not found` | 触发器不存在、已停用、或签名 / 时间戳不通过（统一措辞，不区分） |
 | hook 返回 429 | 该触发器限流；读 `Retry-After` 后重试 |
 | 收件箱出现「触发器停用」 | 连续 5 次执行失败，已自动停用；排除外部系统问题后重新启用 |
+| `run` 返回 403 + `3054` | Token 缺 scope、已吊销 / 过期 / 自动停用或归属不符；修正后重试 |
+| `hook` 返回 403 + `3054` | 触发器已停用、Agent 或绑定会话与请求不一致；检查触发器配置 |
+| 返回 503 + `3055` | 准入依赖暂不可用，执行未启动；稍后重试，不计入触发器连续失败 |
 | 重试返回 `deduplicated=true` | 幂等键命中了首次请求，未再次执行；用 `processing` / `queued` 判断是否仍在处理 |
 | 重试一直返回 `processing=true` | 首次流水仍是 `pending` / `queued`。先查调用记录；若进程崩溃导致 `pending` 长期不结束，本期没有自动恢复，需换新幂等键重试 |
 | 返回「幂等键已用于其他请求」 | 同键请求的 `agentId` / `sessionId` / `message` 或 Webhook 原始请求体已变化；修正后换新键 |
 | 返回「该幂等键对应的请求已被拒绝」 | 首次请求已失败，不能复用该键；修正原因后换新键重试 |
 | 订阅一直重试 | 目标 URL 非 2xx；用 `open subscription deliveries --id <id>` 看 `lastHttpStatus` / `lastError` |
 
-相关文档：桌面端「设置 → 开放接口」页面（含内嵌「接口文档」卡片的查阅 / 下载 / 复制）；设计细节见仓库 `docs/plan/2026-10-05-open-api-webhook-technical-design.md`。
+相关文档：桌面端「设置 → 开放接口」页面（含内嵌「接口文档」卡片的查阅 / 下载 / 复制）；设计细节见仓库 `docs/plan/2026-10-05-open-api-webhook-technical-design.md`、`docs/plan/2026-11-04-open-run-admission-design.md`。

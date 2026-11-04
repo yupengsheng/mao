@@ -140,6 +140,7 @@ export function registerOpenApiRoutes(app: FastifyInstance, deps: OpenApiRouteDe
         sessionId,
         source: 'API',
         callLogId: begun?.id ?? null,
+        admissionBinding: { kind: 'API_TOKEN', tokenId },
       });
       await deps.callLog?.markAccepted(begun?.id ?? null, begun?.startedAt ?? Date.now(), result);
       sendJson(reply, 202, ok({ sessionId: result.sessionId, messageId: result.messageId, queued: result.queued }));

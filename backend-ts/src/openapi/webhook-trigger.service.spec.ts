@@ -95,9 +95,12 @@ describe('WebhookTriggerService（P2）', () => {
     const outcome = await h.service.handleFire('a'.repeat(32), { ...signedHeaders(body), eventId: 'event-1' }, body);
     expect(outcome).toMatchObject({ ok: true, userId: 7, sessionId: 11, queued: false });
     expect(h.openRunRun).toHaveBeenCalledTimes(1);
-    const input = h.openRunRun.mock.calls[0][0] as { source: string; triggerId: number; message: string };
+    const input = h.openRunRun.mock.calls[0][0] as {
+      source: string; triggerId: number; message: string; admissionBinding: unknown;
+    };
     expect(input.source).toBe('WEBHOOK');
     expect(input.triggerId).toBe(1);
+    expect(input.admissionBinding).toEqual({ kind: 'WEBHOOK_TRIGGER', triggerId: 1 });
     expect(input.message).toContain('收到外部 Webhook 事件（触发器：CI 触发器）');
     expect(input.message).toContain(body);
     expect(h.callLog.begin).toHaveBeenCalledWith(expect.objectContaining({
@@ -296,6 +299,23 @@ describe('WebhookTriggerService（P2）', () => {
     h.repo.recordOutcome.mockRejectedValue(new Error('db down'));
     await expect(h.service.handleFire('a'.repeat(32), signedHeaders(body), body))
       .rejects.toMatchObject({ code: 3041 });
+  });
+
+  it('准入拒绝（3054）：计入 FAILED 连败并原样上抛，避免 4xx 无限重试', async () => {
+    const h = makeHarness();
+    h.repo.recordOutcome.mockResolvedValue({ consecutiveFailures: 2, disabled: false });
+    h.openRunRun.mockRejectedValue(new BusinessException(ErrorCode.ADMISSION_REJECTED));
+    await expect(h.service.handleFire('a'.repeat(32), signedHeaders(body), body))
+      .rejects.toMatchObject({ code: 3054 });
+    expect(h.repo.recordOutcome).toHaveBeenCalledWith(1, 'FAILED', TRIGGER_DISABLE_AFTER_FAILURES, expect.any(String));
+  });
+
+  it('准入暂不可用（3055）：瞬时故障不计连败，原样上抛', async () => {
+    const h = makeHarness();
+    h.openRunRun.mockRejectedValue(new BusinessException(ErrorCode.ADMISSION_UNAVAILABLE));
+    await expect(h.service.handleFire('a'.repeat(32), signedHeaders(body), body))
+      .rejects.toMatchObject({ code: 3055 });
+    expect(h.repo.recordOutcome).not.toHaveBeenCalled();
   });
 
   it('非预算异常：不入连败、原样上抛（原有语义不变）', async () => {

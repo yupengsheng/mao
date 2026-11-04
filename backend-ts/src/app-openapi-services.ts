@@ -16,6 +16,7 @@ import type { HarnessService } from './harness/core/harness-service.js';
 import { createAgentExecutor } from './harness/core/agent-executor.js';
 
 import { OpenRunService, type OpenRunDeps } from './openapi/open-run.service.js';
+import { OpenRunAdmissionService } from './openapi/admission.js';
 import { OpenApiCallLogRepository } from './openapi/open-api-call-log.repository.js';
 import { OpenApiCallLogService } from './openapi/open-api-call-log.service.js';
 import { OpenApiCallLogCleanup } from './openapi/open-api-call-log.cleanup.js';
@@ -69,6 +70,15 @@ export interface OpenApiServicesResult {
 export function assembleOpenApiServices(deps: OpenApiServicesDeps): OpenApiServicesResult {
   const { db, cfg, sessionService, messageQueueService, taskTerminal, agentRepo, wsHandler, budgetService, apiTokenService, inboxService, settingService, openApiRateLimiter, notifCipher, outboundSubscriptionService, holder, agentExecutor, openCallLogHolder, openTriggerSettle, openCallSettle } = deps;
 
+  // 准入与管理接口共用同一仓储实例：绑定校验读到的行与用户可见配置同源。
+  const webhookTriggerRepo = new MysqlWebhookTriggerRepository(db);
+  const signalWatcherRepo = new MysqlSignalWatcherRepository(db);
+  const admission = new OpenRunAdmissionService({
+    tokens: { findById: (id) => apiTokenService.findById(id) },
+    triggers: webhookTriggerRepo,
+    watchers: signalWatcherRepo,
+  });
+
   const openRunService = new OpenRunService({
     sessionService: sessionService as unknown as OpenRunDeps['sessionService'],
     messageQueueService,
@@ -81,6 +91,7 @@ export function assembleOpenApiServices(deps: OpenApiServicesDeps): OpenApiServi
       return block == null ? null : { message: budgetBlockMessage(block) };
     },
     liveExecution: createScheduledLiveExecution(wsHandler),
+    admission,
   });
   const callLogService = new OpenApiCallLogService({
     repo: new OpenApiCallLogRepository(db),
@@ -100,7 +111,7 @@ export function assembleOpenApiServices(deps: OpenApiServicesDeps): OpenApiServi
     () => settingService.getOpenApiCallLogRetentionDays(),
   );
   const webhookTriggerService = new WebhookTriggerService({
-    triggerRepo: new MysqlWebhookTriggerRepository(db),
+    triggerRepo: webhookTriggerRepo,
     sessionService: sessionService as unknown as WebhookTriggerDeps['sessionService'],
     agentLookup: { findById: (id: number) => agentRepo.findById(id) },
     cipher: notifCipher,
@@ -116,7 +127,6 @@ export function assembleOpenApiServices(deps: OpenApiServicesDeps): OpenApiServi
   openTriggerSettle.current = (triggerId, status) => webhookTriggerService.handleQueueSettled(triggerId, status);
 
   const signalCipher = new SignalSecretCipher(cfg.app.signal.secretKey);
-  const signalWatcherRepo = new MysqlSignalWatcherRepository(db);
   const signalCheckRepo = new MysqlSignalCheckRepository(db);
   const watcherService = new WatcherService({
     watcherRepo: signalWatcherRepo,

@@ -13,6 +13,7 @@ import {
   isTrafficSpike,
   logicalRejection,
   messageFromFullJson,
+  mapBusinessCode,
   percentile,
   queueWaitMsOf,
   apiRequestFingerprint,
@@ -413,7 +414,16 @@ describe('OpenApiCallLogService', () => {
       openRun: { run },
     });
     await expect(service.replay(5, undefined)).rejects.toMatchObject({ code: ErrorCode.SESSION_NOT_FOUND.code });
-    expect(run).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 99, userId: 7 }));
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 99,
+      userId: 7,
+      admissionBinding: { kind: 'API_TOKEN', tokenId: 3 },
+    }));
+  });
+
+  it('准入错误码映射为 403/503，流水展示固定错误码', () => {
+    expect(mapBusinessCode(ErrorCode.ADMISSION_REJECTED.code)).toEqual({ httpStatus: 403, errorCode: 'ADMISSION_REJECTED' });
+    expect(mapBusinessCode(ErrorCode.ADMISSION_UNAVAILABLE.code)).toEqual({ httpStatus: 503, errorCode: 'ADMISSION_UNAVAILABLE' });
   });
 });
 

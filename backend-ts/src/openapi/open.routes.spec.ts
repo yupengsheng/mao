@@ -78,6 +78,9 @@ describe('开放 API run 幂等路由', () => {
         requestFingerprint: apiRequestFingerprint(5, null, 'hi'),
       }));
       expect(h.openRunRun).toHaveBeenCalledTimes(1);
+      expect(h.openRunRun).toHaveBeenCalledWith(expect.objectContaining({
+        admissionBinding: { kind: 'API_TOKEN', tokenId: 3 },
+      }));
       expect(h.markAccepted).toHaveBeenCalledWith(9, 100, expect.objectContaining({ sessionId: 11 }));
     } finally {
       await h.app.close();
@@ -215,6 +218,32 @@ describe('开放 API run 幂等路由', () => {
       const res = await h.app.inject(runRequest({ headers: { 'idempotency-key': 'build-42' } }));
       expect(res.json().code).toBe(ErrorCode.INTERNAL_ERROR.code);
       expect(h.openRunRun).not.toHaveBeenCalled();
+    } finally {
+      await h.app.close();
+    }
+  });
+
+  it('准入拒绝返回 403 / 3054，且流水记为 rejected', async () => {
+    const h = await makeHarness();
+    h.openRunRun.mockRejectedValue(new BusinessException(ErrorCode.ADMISSION_REJECTED));
+    try {
+      const res = await h.app.inject(runRequest());
+      expect(res.statusCode).toBe(403);
+      expect(res.json()).toMatchObject({ code: 3054, message: '触发来源未通过准入' });
+      expect(h.markRejected).toHaveBeenCalledWith(9, 100, expect.objectContaining({ code: 3054 }));
+    } finally {
+      await h.app.close();
+    }
+  });
+
+  it('准入暂不可用返回 503 / 3055，且流水记为 rejected', async () => {
+    const h = await makeHarness();
+    h.openRunRun.mockRejectedValue(new BusinessException(ErrorCode.ADMISSION_UNAVAILABLE));
+    try {
+      const res = await h.app.inject(runRequest());
+      expect(res.statusCode).toBe(503);
+      expect(res.json()).toMatchObject({ code: 3055, message: '准入检查暂不可用，请稍后重试' });
+      expect(h.markRejected).toHaveBeenCalledWith(9, 100, expect.objectContaining({ code: 3055 }));
     } finally {
       await h.app.close();
     }

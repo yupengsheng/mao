@@ -67,6 +67,8 @@ export function logicalRejection(err: unknown): LogicalRejection {
 
 export function mapBusinessCode(code: number): { httpStatus: number; errorCode: string } {
   if (code === ErrorCode.BUDGET_EXCEEDED.code) return { httpStatus: 403, errorCode: 'BUDGET_EXCEEDED' };
+  if (code === ErrorCode.ADMISSION_REJECTED.code) return { httpStatus: 403, errorCode: 'ADMISSION_REJECTED' };
+  if (code === ErrorCode.ADMISSION_UNAVAILABLE.code) return { httpStatus: 503, errorCode: 'ADMISSION_UNAVAILABLE' };
   if (code === ErrorCode.FORBIDDEN.code) return { httpStatus: 403, errorCode: 'FORBIDDEN' };
   if (code === ErrorCode.TOKEN_AUTO_DISABLED.code) return { httpStatus: 403, errorCode: 'TOKEN_AUTO_DISABLED' };
   if (code === ErrorCode.PARAM_INVALID.code || code === ErrorCode.PARAM_MISSING.code) return { httpStatus: 400, errorCode: 'PARAM_INVALID' };

@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { OpenRunService, type OpenRunDeps } from './open-run.service.js';
 import type { Message, Session } from '../domain/types.js';
+import { BusinessException } from '../common/business-exception.js';
+import { ErrorCode } from '../common/error-code.js';
 
 function session(overrides: Partial<Session> = {}): Session {
   return {
@@ -27,9 +29,15 @@ interface Harness {
   liveExecution: ReturnType<typeof vi.fn>;
   isSessionBusy: ReturnType<typeof vi.fn>;
   budgetCheck: ReturnType<typeof vi.fn>;
+  admission: ReturnType<typeof vi.fn>;
 }
 
-function makeHarness(options: { agentEnabled?: number | null; agentFound?: boolean; budgetCheck?: () => Promise<{ message: string } | null> } = {}): Harness {
+function makeHarness(options: {
+  agentEnabled?: number | null;
+  agentFound?: boolean;
+  budgetCheck?: () => Promise<{ message: string } | null>;
+  admission?: () => Promise<void>;
+} = {}): Harness {
   const sessionService = {
     getSession: vi.fn(async () => session()),
     updatePhase: vi.fn(async () => undefined),
@@ -46,6 +54,7 @@ function makeHarness(options: { agentEnabled?: number | null; agentFound?: boole
   const finishExecution = vi.fn(async () => undefined);
   const liveExecution = vi.fn(async () => undefined);
   const budgetCheck = vi.fn(options.budgetCheck ?? (async () => null));
+  const admission = vi.fn(options.admission ?? (async () => undefined));
   const deps: OpenRunDeps = {
     sessionService: sessionService as unknown as OpenRunDeps['sessionService'],
     messageQueueService: { enqueue },
@@ -55,8 +64,12 @@ function makeHarness(options: { agentEnabled?: number | null; agentFound?: boole
     isSessionBusy: vi.fn(() => false),
     liveExecution,
     budgetCheck,
+    admission: options.admission === undefined ? undefined : { assertAllowed: admission },
   };
-  return { service: new OpenRunService(deps), sessionService, enqueue, finishExecution, liveExecution, isSessionBusy: deps.isSessionBusy as unknown as Harness['isSessionBusy'], budgetCheck };
+  return {
+    service: new OpenRunService(deps), sessionService, enqueue, finishExecution, liveExecution,
+    isSessionBusy: deps.isSessionBusy as unknown as Harness['isSessionBusy'], budgetCheck, admission,
+  };
 }
 
 describe('OpenRunService（P1/P2 共用执行流）', () => {
@@ -199,5 +212,46 @@ describe('OpenRunService（P1/P2 共用执行流）', () => {
     const result = await h.service.run({ userId: 7, agentId: 5, message: 'go', sessionId: 11, source: 'API' });
     expect(result.terminalPhase).toBe('COMPLETED');
     expect(h.budgetCheck).toHaveBeenCalledTimes(1);
+  });
+
+  it('准入拒绝：3054，且发生在预算、会话读取/创建、落消息、入队与执行之前', async () => {
+    const h = makeHarness({ admission: async () => { throw new BusinessException(ErrorCode.ADMISSION_REJECTED); } });
+    await expect(h.service.run({
+      userId: 7, agentId: 5, message: 'go', source: 'API',
+      admissionBinding: { kind: 'API_TOKEN', tokenId: 3 },
+    })).rejects.toMatchObject({ code: 3054 });
+    expect(h.admission).toHaveBeenCalledWith({
+      userId: 7, agentId: 5, sessionId: null, source: 'API',
+      binding: { kind: 'API_TOKEN', tokenId: 3 },
+    });
+    expect(h.budgetCheck).not.toHaveBeenCalled();
+    expect(h.sessionService.getSession).not.toHaveBeenCalled();
+    expect(h.sessionService.createSession).not.toHaveBeenCalled();
+    expect(h.sessionService.saveMessage).not.toHaveBeenCalled();
+    expect(h.enqueue).not.toHaveBeenCalled();
+    expect(h.liveExecution).not.toHaveBeenCalled();
+  });
+
+  it('准入拒绝：指定会话路径不读取会话，复用类绑定原样透传 sessionId', async () => {
+    const h = makeHarness({ admission: async () => { throw new BusinessException(ErrorCode.ADMISSION_REJECTED); } });
+    await expect(h.service.run({
+      userId: 7, agentId: 5, message: 'go', sessionId: 11, source: 'WEBHOOK',
+      admissionBinding: { kind: 'WEBHOOK_TRIGGER', triggerId: 5 },
+    })).rejects.toMatchObject({ code: 3054 });
+    expect(h.admission).toHaveBeenCalledWith({
+      userId: 7, agentId: 5, sessionId: 11, source: 'WEBHOOK',
+      binding: { kind: 'WEBHOOK_TRIGGER', triggerId: 5 },
+    });
+    expect(h.sessionService.getSession).not.toHaveBeenCalled();
+  });
+
+  it('准入依赖未知异常：失败关闭为 ADMISSION_UNAVAILABLE（3055）', async () => {
+    const h = makeHarness({ admission: async () => { throw new Error('db down'); } });
+    await expect(h.service.run({
+      userId: 7, agentId: 5, message: 'go', source: 'SIGNAL',
+      admissionBinding: { kind: 'SIGNAL_WATCHER', watcherId: 13 },
+    })).rejects.toMatchObject({ code: 3055, message: '准入检查暂不可用，请稍后重试' });
+    expect(h.budgetCheck).not.toHaveBeenCalled();
+    expect(h.sessionService.createSession).not.toHaveBeenCalled();
   });
 });

@@ -465,6 +465,7 @@ export class WatcherService {
         message: prompt,
         source: 'SIGNAL',
         sessionId: reuseId, // null = 新建（NEW_SESSION 或复用模式首触）
+        admissionBinding: { kind: 'SIGNAL_WATCHER', watcherId: watcher.id! },
       });
       sessionId = outcome.sessionId;
     } catch (e) {

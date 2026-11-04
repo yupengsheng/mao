@@ -346,6 +346,7 @@ describe('WatcherService.runCheck', () => {
     expect(arg.userId).toBe(7);
     expect(arg.agentId).toBe(3);
     expect(arg.sessionId).toBeNull();
+    expect(arg.admissionBinding).toEqual({ kind: 'SIGNAL_WATCHER', watcherId: 1 });
     expect(String(arg.message)).toContain('new-body');
     expect(String(arg.message)).toContain('old-body');
     expect(h.checks[0]!.changed).toBe(1);
