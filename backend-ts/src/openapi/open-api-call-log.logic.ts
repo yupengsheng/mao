@@ -1,5 +1,6 @@
 import { BusinessException } from '../common/business-exception.js';
 import { ErrorCode } from '../common/error-code.js';
+import { createHash } from 'node:crypto';
 
 /** 完整请求体 UTF-8 字节上限（MEDIUMTEXT 远大于此，避免单行过大）。 */
 export const FULL_BODY_MAX_BYTES = 64 * 1024;
@@ -8,11 +9,48 @@ const SENSITIVE_KEY = /pass(word)?|secret|token|api[_-]?key|credential/i;
 
 export type OpenCallOutcome = 'pending' | 'queued' | 'rejected' | 'completed' | 'failed' | 'cancelled';
 export type OpenCallSource = 'API' | 'WEBHOOK';
+export const MAX_IDEMPOTENCY_KEY_LENGTH = 128;
 
 export interface LogicalRejection {
   httpStatus: number;
   errorCode: string;
   errorSummary: string;
+}
+
+export function normalizeIdempotencyKey(value: unknown): string | null {
+  if (value == null) return null;
+  if (typeof value !== 'string' || value.length > MAX_IDEMPOTENCY_KEY_LENGTH || !/^[\x21-\x7e]+$/.test(value)) {
+    throw new BusinessException(ErrorCode.PARAM_INVALID, `幂等键需为 1~${MAX_IDEMPOTENCY_KEY_LENGTH} 个可打印 ASCII 字符`);
+  }
+  return value;
+}
+
+function fingerprint(value: unknown): string {
+  return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
+
+/** API 只绑定影响执行语义的字段，忽略请求体字段顺序与无关字段。 */
+export function apiRequestFingerprint(agentId: number | null, sessionId: number | null, message: unknown): string {
+  return fingerprint({ source: 'API', agentId, sessionId, message });
+}
+
+/** Webhook 使用验签原文，保证同一签名内容得到同一指纹。 */
+export function webhookRequestFingerprint(rawBody: string): string {
+  return fingerprint({ source: 'WEBHOOK', body: rawBody });
+}
+
+export function replayCallLog(row: {
+  outcome?: string | null;
+  sessionId?: number | null;
+  messageId?: number | null;
+}): { sessionId: number | null; messageId: number | null; queued: boolean; processing: boolean } {
+  const processing = row.outcome === 'pending' || row.outcome === 'queued';
+  return {
+    sessionId: row.sessionId ?? null,
+    messageId: row.messageId ?? null,
+    queued: row.outcome === 'queued',
+    processing,
+  };
 }
 
 /** 3041 在本路径只可能是预算拒绝（与 SHARE_NOT_FOUND 撞号，禁止按数字反查常量名）。 */

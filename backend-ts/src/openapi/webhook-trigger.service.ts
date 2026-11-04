@@ -6,6 +6,7 @@ import type { WebhookSecretCipher } from '../notification/task/webhook-secret-ci
 import type { FixedWindowRateLimiter } from './rate-limiter.js';
 import type { MysqlWebhookTriggerRepository } from './openapi.repository.js';
 import { generatePathToken, generateWebhookSecret, verifyHmacSignature } from './hmac.js';
+import { normalizeIdempotencyKey, replayCallLog, webhookRequestFingerprint } from './open-api-call-log.logic.js';
 import type { OpenRunResult, OpenRunService } from './open-run.service.js';
 import type { OpenApiCallLogService } from './open-api-call-log.service.js';
 
@@ -63,12 +64,13 @@ export interface CreatedTrigger {
 export interface HookFireHeaders {
   timestamp: string | undefined | null;
   signature: string | undefined | null;
+  eventId?: string | null;
 }
 
 export type HookFireOutcome =
   | { ok: false; reason: 'not_found' }
   | { ok: false; reason: 'rate_limited'; retryAfterSeconds: number }
-  | { ok: true; userId: number; sessionId: number; queued: boolean };
+  | { ok: true; userId: number; sessionId: number | null; queued: boolean; deduplicated?: boolean; processing?: boolean };
 
 /**
  * 入站 Webhook 触发器（P2）：签发/管理 + HMAC 验签 + 触发 + 连续失败自动停用。
@@ -207,6 +209,12 @@ export class WebhookTriggerService {
       });
       return { ok: false, reason: 'not_found' };
     }
+    // 幂等键只在验签通过后解析，保证验签失败始终是统一 404，不泄露参数校验差异。
+    const eventId = normalizeIdempotencyKey(headers.eventId);
+    const idempotent = eventId != null;
+    if (idempotent && (this.deps.callLog == null || trigger.id == null)) {
+      throw new BusinessException(ErrorCode.INTERNAL_ERROR, '幂等请求暂不可用，请稍后重试');
+    }
     const limit = trigger.sessionId != null ? TRIGGER_RATE_LIMIT_BOUND : TRIGGER_RATE_LIMIT_UNBOUND;
     const decision = this.deps.rateLimiter.allow(`trigger:${trigger.id}`, limit);
     if (!decision.allowed) {
@@ -232,7 +240,22 @@ export class WebhookTriggerService {
       sessionId: trigger.sessionId ?? null,
       sourceIp: sourceIp ?? null,
       body: rawBody,
+      idempotencyScope: idempotent ? `trigger:${trigger.id}` : null,
+      idempotencyKey: idempotent ? eventId : null,
+      requestFingerprint: idempotent ? webhookRequestFingerprint(rawBody) : null,
     }) ?? null;
+    if (begun?.duplicate) {
+      if (begun.row?.outcome === 'rejected') {
+        throw new BusinessException(ErrorCode.PARAM_INVALID, '该幂等键对应的请求已被拒绝，请使用新的事件 ID 重试');
+      }
+      const replay = replayCallLog(begun.row ?? {});
+      return {
+        ok: true,
+        userId: trigger.userId,
+        ...replay,
+        deduplicated: true,
+      };
+    }
     let result: OpenRunResult;
     try {
       result = await this.deps.openRun.run({
@@ -245,7 +268,9 @@ export class WebhookTriggerService {
         message: this.wrapPayload(trigger.name ?? '', rawBody),
       });
     } catch (e) {
-      await this.deps.callLog?.markRejected(begun?.id ?? null, begun?.startedAt ?? Date.now(), e);
+      if (begun != null && !begun.duplicate) {
+        await this.deps.callLog?.markRejected(begun.id, begun.startedAt, e);
+      }
       // 预算 BLOCK（决策 6）：任务未启动，无终态可投递；但计入连败与自动停用护栏正向联动，
       // 否则超限触发器会以 4xx 信封无限重试刷量。其余异常原样上抛。
       if (e instanceof BusinessException && e.code === ErrorCode.BUDGET_EXCEEDED.code && trigger.id != null) {

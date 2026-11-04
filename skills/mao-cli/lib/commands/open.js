@@ -31,13 +31,15 @@ const HELP = `用法:
   mao open subscription set-enabled --id <id> --enabled true|false
   mao open subscription deliveries --id <订阅id>
   mao open subscription delete --id <id>
-  mao open run --agent-id <id> --message <文本> [--session-id <id>] --api-token <mao_...>
+  mao open run --agent-id <id> --message <文本> [--session-id <id>] [--idempotency-key <键>] --api-token <mao_...>
 
 说明:
   管理子命令（token/trigger/subscription）走登录会话 JWT，只能管理本人资源；
   API Token 仅在 /v1/open/** 生效，不能调用其它 REST 接口。
   API Token 明文加密留存，token reveal --id 可随时再次打印；触发器/订阅 secret 仍只在 create 与 rotate-secret 时出现一次，请当场保存。
   run 需 --api-token 传 mao_ 前缀 API Token；会话忙时自动排队（响应 queued=true，202 异步语义）。
+  外部重试可传 --idempotency-key（1~128 个可打印 ASCII 字符）；同一 Token 下同键同请求只执行一次，
+  重复响应带 deduplicated=true；首次仍在处理时 processing=true。
   calls 查看本人 Token/触发器的入站调用流水。完整记录默认关闭，开启后请求体会进流水并留审计。
   连续失败达到阈值的 Token 会自动停用，恢复用 token re-enable。管理端重放与统计不在本 CLI。
 `;
@@ -246,12 +248,17 @@ async function runAction({ flags, globals }) {
   }
   const agentId = requireNumber(flags, 'agent-id', 'Agent ID');
   const message = requireString(flags, 'message', '触发消息');
+  const idempotencyKey = optionalString(flags, 'idempotency-key');
+  if (idempotencyKey != null && !/^[\x21-\x7e]{1,128}$/.test(idempotencyKey)) {
+    throw createCliError('--idempotency-key 需为 1~128 个可打印 ASCII 字符');
+  }
   const result = await request({
     baseUrl: globals.baseUrl,
     token: apiToken,
     timeoutMs: globals.timeoutMs,
     method: 'POST',
     path: `/open/agents/${agentId}/run`,
+    headers: idempotencyKey == null ? {} : { 'Idempotency-Key': idempotencyKey },
     body: { message, sessionId: optionalNumber(flags, 'session-id') },
   });
   outputResult(result, globals);

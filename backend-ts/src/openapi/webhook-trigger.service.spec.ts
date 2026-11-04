@@ -12,6 +12,7 @@ import { FixedWindowRateLimiter as RateLimiter } from './rate-limiter.js';
 import type { MysqlWebhookTriggerRepository } from './openapi.repository.js';
 import type { WebhookTrigger } from './types.js';
 import type { Session } from '../domain/types.js';
+import { webhookRequestFingerprint } from './open-api-call-log.logic.js';
 
 function triggerRow(overrides: Partial<WebhookTrigger> = {}, secret = 'row-secret'): WebhookTrigger {
   return {
@@ -38,9 +39,15 @@ interface Harness {
   rateAllow: ReturnType<typeof vi.fn>;
   notify: ReturnType<typeof vi.fn>;
   sessionGetSession: ReturnType<typeof vi.fn>;
+  callLog: {
+    begin: ReturnType<typeof vi.fn>;
+    markAccepted: ReturnType<typeof vi.fn>;
+    markRejected: ReturnType<typeof vi.fn>;
+    recordDirect: ReturnType<typeof vi.fn>;
+  };
 }
 
-function makeHarness(row: WebhookTrigger | null = triggerRow()): Harness {
+function makeHarness(row: WebhookTrigger | null = triggerRow(), callLogEnabled = true): Harness {
   const cipher = new WebhookSecretCipher();
   const repo = {
     insert: vi.fn(async (t: WebhookTrigger) => 42),
@@ -56,6 +63,12 @@ function makeHarness(row: WebhookTrigger | null = triggerRow()): Harness {
   const openRunRun = vi.fn(async () => ({ sessionId: 11, messageId: 1, queued: false, terminalPhase: 'COMPLETED' as const }));
   const rateAllow = vi.fn(() => ({ allowed: true, retryAfterSeconds: 0 }));
   const notify = vi.fn(async () => undefined);
+  const callLog = {
+    begin: vi.fn(async () => ({ id: 9, startedAt: 100, duplicate: false })),
+    markAccepted: vi.fn(async () => undefined),
+    markRejected: vi.fn(async () => undefined),
+    recordDirect: vi.fn(async () => undefined),
+  };
   const service = new WebhookTriggerService({
     triggerRepo: repo as unknown as MysqlWebhookTriggerRepository,
     sessionService: { getSession },
@@ -64,8 +77,9 @@ function makeHarness(row: WebhookTrigger | null = triggerRow()): Harness {
     openRun: { run: openRunRun } as never,
     rateLimiter: { allow: rateAllow } as unknown as FixedWindowRateLimiter,
     disableNotifier: { notifyTriggerDisabled: notify },
+    callLog: callLogEnabled ? callLog as never : null,
   });
-  return { service, repo, openRunRun, rateAllow, notify, sessionGetSession: getSession };
+  return { service, repo, openRunRun, rateAllow, notify, sessionGetSession: getSession, callLog };
 }
 
 function signedHeaders(body: string, secret = 'row-secret', timestamp = String(Math.floor(Date.now() / 1000))) {
@@ -78,7 +92,7 @@ describe('WebhookTriggerService（P2）', () => {
 
   it('验签通过且启用：触发 run，source=WEBHOOK 并绑定 triggerId，payload 包装带触发器名', async () => {
     const h = makeHarness();
-    const outcome = await h.service.handleFire('a'.repeat(32), signedHeaders(body), body);
+    const outcome = await h.service.handleFire('a'.repeat(32), { ...signedHeaders(body), eventId: 'event-1' }, body);
     expect(outcome).toMatchObject({ ok: true, userId: 7, sessionId: 11, queued: false });
     expect(h.openRunRun).toHaveBeenCalledTimes(1);
     const input = h.openRunRun.mock.calls[0][0] as { source: string; triggerId: number; message: string };
@@ -86,6 +100,104 @@ describe('WebhookTriggerService（P2）', () => {
     expect(input.triggerId).toBe(1);
     expect(input.message).toContain('收到外部 Webhook 事件（触发器：CI 触发器）');
     expect(input.message).toContain(body);
+    expect(h.callLog.begin).toHaveBeenCalledWith(expect.objectContaining({
+      idempotencyScope: 'trigger:1',
+      idempotencyKey: 'event-1',
+    }));
+  });
+
+  it('重复 Webhook 事件复用已有流水，不再次执行 Agent', async () => {
+    const h = makeHarness();
+    h.callLog.begin.mockResolvedValue({
+      id: 22,
+      startedAt: 100,
+      duplicate: true,
+      row: { id: 9, outcome: 'completed', sessionId: 11, messageId: 12 },
+    });
+    const outcome = await h.service.handleFire('a'.repeat(32), { ...signedHeaders(body), eventId: 'event-1' }, body);
+    expect(outcome).toMatchObject({ ok: true, userId: 7, sessionId: 11, queued: false, deduplicated: true, processing: false });
+    expect(h.openRunRun).not.toHaveBeenCalled();
+    expect(h.callLog.markAccepted).not.toHaveBeenCalled();
+    expect(h.callLog.markRejected).not.toHaveBeenCalled();
+    expect(h.repo.recordOutcome).not.toHaveBeenCalled();
+  });
+
+  it('重复 pending 事件返回 processing，不再次执行或回写触发器计数', async () => {
+    const h = makeHarness();
+    h.callLog.begin.mockResolvedValue({
+      id: 22,
+      startedAt: 100,
+      duplicate: true,
+      row: { id: 9, outcome: 'pending', sessionId: 11, messageId: null },
+    });
+    const outcome = await h.service.handleFire('a'.repeat(32), { ...signedHeaders(body), eventId: 'event-1' }, body);
+    expect(outcome).toEqual({
+      ok: true,
+      userId: 7,
+      sessionId: 11,
+      messageId: null,
+      queued: false,
+      processing: true,
+      deduplicated: true,
+    });
+    expect(h.openRunRun).not.toHaveBeenCalled();
+    expect(h.repo.recordOutcome).not.toHaveBeenCalled();
+  });
+
+  it('重复已拒绝事件返回参数错误，且不覆盖首次拒绝结果', async () => {
+    const h = makeHarness();
+    h.callLog.begin.mockResolvedValue({
+      id: 22,
+      startedAt: 100,
+      duplicate: true,
+      row: { id: 9, outcome: 'rejected', sessionId: null, messageId: null },
+    });
+    await expect(h.service.handleFire(
+      'a'.repeat(32),
+      { ...signedHeaders(body), eventId: 'event-1' },
+      body,
+    )).rejects.toMatchObject({ code: ErrorCode.PARAM_INVALID.code });
+    expect(h.openRunRun).not.toHaveBeenCalled();
+    expect(h.callLog.markRejected).not.toHaveBeenCalled();
+    expect(h.repo.recordOutcome).not.toHaveBeenCalled();
+  });
+
+  it('同事件 ID 不同原文由流水层拒绝，不执行 Agent 也不改写流水', async () => {
+    const h = makeHarness();
+    h.callLog.begin.mockRejectedValue(new BusinessException(ErrorCode.PARAM_INVALID, '幂等键已用于其他请求'));
+    await expect(h.service.handleFire(
+      'a'.repeat(32),
+      { ...signedHeaders(body), eventId: 'event-1' },
+      body,
+    )).rejects.toMatchObject({ code: ErrorCode.PARAM_INVALID.code });
+    expect(h.callLog.begin).toHaveBeenCalledWith(expect.objectContaining({
+      idempotencyScope: 'trigger:1',
+      idempotencyKey: 'event-1',
+      requestFingerprint: webhookRequestFingerprint(body),
+    }));
+    expect(h.openRunRun).not.toHaveBeenCalled();
+    expect(h.callLog.markRejected).not.toHaveBeenCalled();
+  });
+
+  it('带事件 ID 但流水服务不可用时 fail closed', async () => {
+    const h = makeHarness(triggerRow(), false);
+    await expect(h.service.handleFire(
+      'a'.repeat(32),
+      { ...signedHeaders(body), eventId: 'event-1' },
+      body,
+    )).rejects.toMatchObject({ code: ErrorCode.INTERNAL_ERROR.code });
+    expect(h.openRunRun).not.toHaveBeenCalled();
+  });
+
+  it('验签通过后仍拒绝空事件 ID，且不触发 Agent', async () => {
+    const h = makeHarness();
+    await expect(h.service.handleFire(
+      'a'.repeat(32),
+      { ...signedHeaders(body), eventId: '' },
+      body,
+    )).rejects.toMatchObject({ code: ErrorCode.PARAM_INVALID.code });
+    expect(h.callLog.begin).not.toHaveBeenCalled();
+    expect(h.openRunRun).not.toHaveBeenCalled();
   });
 
   it('不存在 / 停用 / 验签失败统一 not_found（统一 404 语义）', async () => {
@@ -98,6 +210,11 @@ describe('WebhookTriggerService（P2）', () => {
 
     const h2 = makeHarness();
     expect(await h2.service.handleFire('a'.repeat(32), { timestamp: signedHeaders(body).timestamp, signature: 'sha256=bad' }, body)).toEqual({ ok: false, reason: 'not_found' });
+    expect(await h2.service.handleFire('a'.repeat(32), {
+      timestamp: signedHeaders(body).timestamp,
+      signature: 'sha256=bad',
+      eventId: 'bad key with spaces',
+    }, body)).toEqual({ ok: false, reason: 'not_found' });
     expect(await h2.service.handleFire('a'.repeat(32), { timestamp: null, signature: null }, body)).toEqual({ ok: false, reason: 'not_found' });
   });
 

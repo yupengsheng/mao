@@ -11,6 +11,7 @@ import type { OpenRunService } from './open-run.service.js';
 import type { WebhookTriggerService } from './webhook-trigger.service.js';
 import type { OutboundSubscriptionService } from './outbound-subscription.service.js';
 import type { OpenApiCallLogService } from './open-api-call-log.service.js';
+import { apiRequestFingerprint, normalizeIdempotencyKey, replayCallLog } from './open-api-call-log.logic.js';
 
 /** 公开 hook 路径前缀（isPublicPath 与 preParsing rawBody 捕获共用同一前缀常量）。 */
 export const OPEN_HOOKS_PATH_PREFIX = '/v1/open/hooks/';
@@ -43,6 +44,14 @@ function tokenRateLimited(reply: FastifyReply, retryAfterSeconds: number): void 
   sendJson(reply, 429, failCode(ErrorCode.RATE_LIMITED));
 }
 
+function headerValue(value: string | string[] | undefined): string | null {
+  return Array.isArray(value) ? value[0] ?? null : value ?? null;
+}
+
+function rejectReusedIdempotencyKey(): never {
+  throw new BusinessException(ErrorCode.PARAM_INVALID, '该幂等键对应的请求已被拒绝，请使用新的幂等键重试');
+}
+
 function requireTokenIdentity(req: FastifyRequest): number {
   const tokenId = (req as ApiTokenAuthedRequest).apiTokenId;
   if (tokenId == null) {
@@ -71,25 +80,23 @@ function positiveIntOrNull(raw: unknown): number | null {
 export function registerOpenApiRoutes(app: FastifyInstance, deps: OpenApiRouteDeps): void {
   // ── P1：REST 触发端点（API Token 专属，scope: open:run）──────────────────
   app.post('/v1/open/agents/:agentId/run', async (req, reply) => {
-    const tokenId = (req as ApiTokenAuthedRequest).apiTokenId ?? null;
     const body = (req.body ?? {}) as { message?: unknown; sessionId?: unknown };
     const sessionId = positiveIntOrNull(body.sessionId);
     const agentId = positiveIntOrNull((req.params as { agentId: string }).agentId);
-    const begun = await deps.callLog?.begin({
-      source: 'API',
-      tokenId,
-      userId: req.userId ?? null,
-      agentId,
-      sessionId,
-      sourceIp: req.ip,
-      body,
-    }) ?? null;
+    let begun: Awaited<ReturnType<OpenApiCallLogService['begin']>> = null;
     try {
       requireTokenScope(req, 'open:run');
-      requireTokenIdentity(req);
+      const tokenId = requireTokenIdentity(req);
       const decision = deps.rateLimiter.allow(`token:${tokenId}`, TOKEN_RATE_LIMIT_PER_MINUTE);
       if (!decision.allowed) {
-        await deps.callLog?.markRejected(begun?.id ?? null, begun?.startedAt ?? Date.now(), {
+        await deps.callLog?.recordDirect({
+          source: 'API',
+          tokenId,
+          userId: req.userId ?? null,
+          agentId,
+          sessionId,
+          sourceIp: req.ip,
+          body,
           httpStatus: 429,
           errorCode: 'RATE_LIMITED',
           errorSummary: '请求过于频繁',
@@ -97,12 +104,34 @@ export function registerOpenApiRoutes(app: FastifyInstance, deps: OpenApiRouteDe
         tokenRateLimited(reply, decision.retryAfterSeconds);
         return;
       }
+      const idempotencyKey = normalizeIdempotencyKey(headerValue(req.headers['idempotency-key']));
+      if (idempotencyKey != null && deps.callLog == null) {
+        throw new BusinessException(ErrorCode.INTERNAL_ERROR, '幂等请求暂不可用，请稍后重试');
+      }
+      begun = await deps.callLog?.begin({
+        source: 'API',
+        tokenId,
+        userId: req.userId ?? null,
+        agentId,
+        sessionId,
+        sourceIp: req.ip,
+        body,
+        idempotencyScope: idempotencyKey == null ? null : `token:${tokenId}`,
+        idempotencyKey,
+        requestFingerprint: idempotencyKey == null ? null : apiRequestFingerprint(agentId, sessionId, body.message),
+      }) ?? null;
       if (agentId == null) throw new BusinessException(ErrorCode.PARAM_INVALID, '路径参数 id 必须为正整数');
       if (typeof body.message !== 'string') {
         throw new BusinessException(ErrorCode.PARAM_INVALID, 'message 必须为字符串');
       }
       if (body.sessionId != null && sessionId == null) {
         throw new BusinessException(ErrorCode.PARAM_INVALID, 'sessionId 必须为正整数');
+      }
+      if (begun?.duplicate) {
+        if (begun.row?.outcome === 'rejected') rejectReusedIdempotencyKey();
+        const replay = replayCallLog(begun.row ?? {});
+        sendJson(reply, 202, ok({ ...replay, deduplicated: true }));
+        return;
       }
       const result = await deps.openRun.run({
         userId: req.userId!,
@@ -115,7 +144,9 @@ export function registerOpenApiRoutes(app: FastifyInstance, deps: OpenApiRouteDe
       await deps.callLog?.markAccepted(begun?.id ?? null, begun?.startedAt ?? Date.now(), result);
       sendJson(reply, 202, ok({ sessionId: result.sessionId, messageId: result.messageId, queued: result.queued }));
     } catch (e) {
-      await deps.callLog?.markRejected(begun?.id ?? null, begun?.startedAt ?? Date.now(), e);
+      if (begun != null && !begun.duplicate) {
+        await deps.callLog?.markRejected(begun.id, begun.startedAt, e);
+      }
       throw e;
     }
   });
@@ -124,10 +155,10 @@ export function registerOpenApiRoutes(app: FastifyInstance, deps: OpenApiRouteDe
   app.post('/v1/open/hooks/:pathToken', async (req, reply) => {
     const pathToken = (req.params as { pathToken: string }).pathToken ?? '';
     const rawBody = (req as RawBodyRequest).rawBody?.toString('utf8') ?? '';
-    const headerValue = (v: string | string[] | undefined): string | null => (Array.isArray(v) ? v[0] ?? null : v ?? null);
     const outcome = await deps.triggerService.handleFire(pathToken, {
       timestamp: headerValue(req.headers['x-mao-timestamp']),
       signature: headerValue(req.headers['x-mao-signature']),
+      eventId: headerValue(req.headers['x-mao-event-id']),
     }, rawBody, req.ip);
     if (!outcome.ok) {
       if (outcome.reason === 'rate_limited') {
@@ -140,7 +171,12 @@ export function registerOpenApiRoutes(app: FastifyInstance, deps: OpenApiRouteDe
     }
     // 验签通过后回填属主：审计 onResponse 钩子晚于处理器读取 request.userId，回填即生效
     req.userId = outcome.userId;
-    sendJson(reply, 202, ok({ sessionId: outcome.sessionId, queued: outcome.queued }));
+    sendJson(reply, 202, ok({
+      sessionId: outcome.sessionId,
+      queued: outcome.queued,
+      ...(outcome.deduplicated ? { deduplicated: true } : {}),
+      ...(outcome.processing != null ? { processing: outcome.processing } : {}),
+    }));
   });
 
   // ── P1：API Token 管理（仅 JWT 会话身份，决策 12）────────────────────────

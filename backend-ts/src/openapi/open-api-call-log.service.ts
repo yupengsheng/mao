@@ -21,6 +21,7 @@ import {
 } from './open-api-call-log.logic.js';
 import {
   OpenApiCallLogRepository,
+  isDuplicateKey,
   type CallLogListFilter,
   type OpenApiCallLogRow,
 } from './open-api-call-log.repository.js';
@@ -48,6 +49,9 @@ export interface BeginCallInput {
   tokenPrefix?: string | null;
   body?: unknown;
   replayOfId?: number | null;
+  idempotencyScope?: string | null;
+  idempotencyKey?: string | null;
+  requestFingerprint?: string | null;
 }
 
 export interface DirectRejectInput {
@@ -184,8 +188,14 @@ export class OpenApiCallLogService {
     }
   }
 
-  async begin(input: BeginCallInput): Promise<{ id: number; startedAt: number } | null> {
+  async begin(input: BeginCallInput): Promise<{ id: number; startedAt: number; duplicate: boolean; row?: OpenApiCallLogRow } | null> {
     const startedAt = this.now();
+    const idempotencyScope = input.idempotencyScope ?? null;
+    const idempotencyKey = idempotencyScope == null ? null : input.idempotencyKey ?? null;
+    const idempotent = idempotencyScope != null && idempotencyKey != null;
+    if (idempotent && input.requestFingerprint == null) {
+      throw new BusinessException(ErrorCode.INTERNAL_ERROR, '幂等请求缺少请求指纹');
+    }
     try {
       const full = await this.fullBodyFor(input);
       const id = await this.deps.repo.insert({
@@ -201,11 +211,35 @@ export class OpenApiCallLogService {
         requestFullJson: full,
         outcome: 'pending',
         replayOfId: input.replayOfId ?? null,
+        idempotencyScope,
+        idempotencyKey,
+        requestFingerprint: input.requestFingerprint ?? null,
       });
-      return { id, startedAt };
+      return { id, startedAt, duplicate: false };
     } catch (e) {
-      console.warn(`[openapi] failed to begin call log: ${(e as Error).message}`);
-      return null;
+      if (!idempotent) {
+        console.warn(`[openapi] failed to begin call log: ${(e as Error).message}`);
+        return null;
+      }
+      if (!isDuplicateKey(e)) {
+        console.warn(`[openapi] idempotent begin failed: ${(e as Error).message}`);
+        throw new BusinessException(ErrorCode.INTERNAL_ERROR, '幂等请求登记失败，请稍后重试');
+      }
+      let existing: OpenApiCallLogRow | null;
+      try {
+        existing = await this.deps.repo.findByIdempotency(idempotencyScope, idempotencyKey);
+      } catch (readError) {
+        console.warn(`[openapi] failed to read existing idempotent call: ${(readError as Error).message}`);
+        throw new BusinessException(ErrorCode.INTERNAL_ERROR, '幂等请求读取失败，请稍后重试');
+      }
+      if (existing?.id == null) {
+        console.warn('[openapi] duplicate idempotency key without a readable call log row');
+        throw new BusinessException(ErrorCode.INTERNAL_ERROR, '幂等请求状态不可用，请稍后重试');
+      }
+      if (existing.requestFingerprint !== input.requestFingerprint) {
+        throw new BusinessException(ErrorCode.PARAM_INVALID, '幂等键已用于其他请求');
+      }
+      return { id: existing.id, startedAt, duplicate: true, row: existing };
     }
   }
 

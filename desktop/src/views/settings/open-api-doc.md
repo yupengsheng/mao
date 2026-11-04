@@ -24,6 +24,7 @@ Token 的签发、查看、吊销，以及触发器与订阅的管理只接受�
 
 - `Authorization: Bearer mao_xxx`
 - `Content-Type: application/json`
+- `Idempotency-Key: <可选，1~128 个可打印 ASCII 字符>`：抵御超时重投。按 Token 隔离，同键同请求只执行一次
 
 请求体：
 
@@ -39,12 +40,22 @@ Token 的签发、查看、吊销，以及触发器与订阅的管理只接受�
 | `sessionId` | integer | 执行所在会话 |
 | `messageId` | integer | 本轮消息 ID |
 | `queued` | boolean | `true` 表示目标会话正忙，消息已进入待发送队列 |
+| `deduplicated` | boolean | 仅在重复请求出现；`true` 表示未再次执行，回放首次受理结果 |
+| `processing` | boolean | 重复请求命中 `pending` / `queued` 时为 `true`，表示首次请求仍在处理 |
+
+幂等语义：
+
+- 指纹绑定 `agentId`、`sessionId` 与 `message`；同键但任一字段不同返回参数错误，不会启动执行。
+- 首次请求已被拒绝（参数错误、预算拦截等）时，该键不可复用，修正后需换新键。
+- 幂等记录复用调用流水，只在流水保留期内有效（默认 90 天，可配 `openapi.callLogRetentionDays`）。
+- 首次流水为 `pending` 时，若服务进程崩溃，状态可能长期停留；本期不做自动恢复，需换新键重试。
 
 curl 示例：
 
 ```bash
 curl -X POST 'https://mao.example.com/api/v1/open/agents/12/run' \
   -H 'Authorization: Bearer mao_xxxxxxxx' \
+  -H 'Idempotency-Key: nightly-2026-11-04' \
   -H 'Content-Type: application/json' \
   -d '{"message": "跑一遍 nightly 巡检"}'
 ```
@@ -59,10 +70,11 @@ curl -X POST 'https://mao.example.com/api/v1/open/agents/12/run' \
 
 | 头 | 说明 |
 |----|------|
+| `X-Mao-Event-Id` | 可选，1~128 个可打印 ASCII 字符；按触发器隔离，同一次外部事件重复投递只执行一次 |
 | `X-Mao-Timestamp` | Unix 秒级时间戳，容忍 ±300 秒 |
 | `X-Mao-Signature` | `sha256=<hex(HMAC-SHA256(secret, "<timestamp>.<原始请求体>"))>` |
 
-签名串为时间戳与请求体原文以英文句点连接，服务端按收到的原始字节校验。请求体原文会作为事件内容交给 Agent（超过 8000 字符截断）。
+签名串为时间戳与请求体原文以英文句点连接，服务端按收到的原始字节校验。请求体原文会作为事件内容交给 Agent（超过 8000 字符截断）。带 `X-Mao-Event-Id` 时，相同事件 ID 但请求体不同会返回参数错误；已拒绝的事件 ID 不能复用。
 
 Python 示例：
 
@@ -76,13 +88,14 @@ ts = str(int(time.time()))
 digest = hmac.new(secret.encode(), f"{ts}.".encode() + body, hashlib.sha256).hexdigest()
 req = urllib.request.Request(url, data=body, method="POST", headers={
     "Content-Type": "application/json",
+    "X-Mao-Event-Id": "disk-alert-20261104-001",
     "X-Mao-Timestamp": ts,
     "X-Mao-Signature": f"sha256={digest}",
 })
 print(urllib.request.urlopen(req).read())
 ```
 
-响应（202）`data`：`{ "sessionId": 12, "queued": false }`。
+响应（202）`data`：`{ "sessionId": 12, "queued": false }`。重复事件会带 `deduplicated: true`；首次仍在处理时还会带 `processing: true`，不会再启动一次执行。
 
 失败返回：
 
@@ -162,7 +175,7 @@ print(urllib.request.urlopen(req).read())
 | 1001 | 未登录 / Token 无效 | 检查 Token 是否过期或已吊销，或用在了 `/open` 之外的端点 |
 | 1002 | 无权限 | 用登录会话 JWT 调了 run 端点；run 只接受 `mao_` Token |
 | 1007 | 请求过于频繁 | 超过每 Token 60 次/分钟，读 `Retry-After` 后重试 |
-| 2001 | 参数校验失败 | 检查 `message` 为字符串、`sessionId` 为正整数且属于该 Agent |
+| 2001 | 参数校验失败 | 检查 `message` 为字符串、`sessionId` 为正整数且属于该 Agent；也可能是幂等键格式不合法、同键不同指纹、或复用了已拒绝的键 |
 | 3040 | 触发器不存在 | 不存在 / 已停用 / 验签失败，统一措辞不区分 |
 | 3043 | Token 已自动停用 | 一小时内连续失败达到阈值；在设置页「重新启用」后恢复 |
 
@@ -176,5 +189,9 @@ print(urllib.request.urlopen(req).read())
 | hook 返回 404 + `not found` | 触发器不存在、已停用，或签名 / 时间戳不通过 |
 | hook 返回 429 | 触发器限流；读 `Retry-After` 后重试 |
 | 收件箱出现「触发器停用」 | 连续 5 次执行失败已自动停用；排除外部系统问题后重新启用 |
+| 重试返回 `deduplicated: true` | 幂等键命中了首次请求，未再次执行；`processing: true` 表示首次仍在处理 |
+| 重试一直返回 `processing: true` | 首次流水仍是 `pending` / `queued`。查调用记录确认；若进程崩溃导致 `pending` 长期不结束，本期无自动恢复，需换新键 |
+| 返回「幂等键已用于其他请求」 | 同键的 `agentId` / `sessionId` / `message` 或 Webhook 原始请求体已变化；修正后换新键 |
+| 返回「该幂等键对应的请求已被拒绝」 | 首次请求已失败，不能复用该键；修正原因后换新键 |
 
-每次调用（含参数错误、鉴权失败、限流拒绝）都会留下流水：Token / 触发器卡片上的「调用记录」看自己的，管理后台「开放调用」看全量。默认只记录消息长度与字段名，不记正文；如需完整请求体，可在 Token 卡片上开启「完整记录」（可能含敏感信息，操作留审计）。
+每次调用（含参数错误、鉴权失败、限流拒绝）都会留下流水：Token / 触发器卡片上的「调用记录」看自己的，管理后台「开放调用」看全量。带幂等键的重复请求不新增流水，只回放首次受理结果。默认只记录消息长度与字段名，不记正文；如需完整请求体，可在 Token 卡片上开启「完整记录」（可能含敏感信息，操作留审计）。

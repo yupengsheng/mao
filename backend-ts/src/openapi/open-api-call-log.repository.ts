@@ -10,6 +10,9 @@ export interface OpenApiCallLogRow {
   sessionId?: number | null;
   messageId?: number | null;
   source?: string | null;
+  idempotencyScope?: string | null;
+  idempotencyKey?: string | null;
+  requestFingerprint?: string | null;
   sourceIp?: string | null;
   tokenPrefix?: string | null;
   requestSummaryJson?: string | null;
@@ -110,6 +113,9 @@ export class OpenApiCallLogRepository {
     durationMs?: number | null;
     executionMs?: number | null;
     finishedAt?: string | null;
+    idempotencyScope?: string | null;
+    idempotencyKey?: string | null;
+    requestFingerprint?: string | null;
   }): Promise<number> {
     return this.db.insert('open_api_call_log', {
       tokenId: row.tokenId ?? null,
@@ -118,6 +124,9 @@ export class OpenApiCallLogRepository {
       userId: row.userId ?? null,
       sessionId: row.sessionId ?? null,
       source: row.source,
+      idempotencyScope: row.idempotencyScope ?? null,
+      idempotencyKey: row.idempotencyKey ?? null,
+      requestFingerprint: row.requestFingerprint ?? null,
       sourceIp: row.sourceIp ?? null,
       tokenPrefix: row.tokenPrefix ?? null,
       requestSummaryJson: row.requestSummaryJson ?? null,
@@ -131,6 +140,13 @@ export class OpenApiCallLogRepository {
       executionMs: row.executionMs ?? null,
       finishedAt: row.finishedAt ?? null,
     });
+  }
+
+  findByIdempotency(scope: string, key: string): Promise<OpenApiCallLogRow | null> {
+    return this.db.queryOne<OpenApiCallLogRow>(
+      'SELECT * FROM open_api_call_log WHERE idempotency_scope = ? AND idempotency_key = ? LIMIT 1',
+      [scope, key],
+    );
   }
 
   async markFinished(id: number, patch: {
@@ -266,4 +282,10 @@ export class OpenApiCallLogRepository {
     );
     return result.affectedRows;
   }
+}
+
+export function isDuplicateKey(err: unknown): boolean {
+  if (typeof err !== 'object' || err == null) return false;
+  const value = err as { code?: string; errno?: number };
+  return value.code === 'ER_DUP_ENTRY' || value.errno === 1062;
 }

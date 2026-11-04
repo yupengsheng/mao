@@ -16,7 +16,7 @@
 
 - **API Token**：`mao_` 前缀 + 48 位随机字符，sha256 落库；明文另以 AES-GCM 密文加密留存（密钥 `APP_OPENAPI_TOKEN_SECRET`，未配置回退内置默认密钥），属主可随时用 `open token reveal` 或桌面端「复制 Token」再次获取，不再限于创建时一次。2026-10-10 之前签发、未留密文的旧 Token 无法再取回明文，需吊销重签。scope 首期仅 `open:run`，只能在 `/v1/open/**` 端点使用（调用其它 REST 接口一律 401）。每人最多 20 个未吊销 Token，默认 90 天过期，吊销即时生效。轮换加密密钥后旧 Token 不能再复制明文（sha256 鉴权不受影响）。
 - **Webhook 触发器**：`pathToken` 决定公开 URL，`secret` 用于 HMAC-SHA256 签名（创建 / 轮换时只展示一次）。时间戳容忍 ±300 秒，签名基于原始请求体原文。不存在 / 已停用 / 验签失败统一返回 404 + `{code:3040,message:"not found"}`，不探测资源是否存在。连续 5 次执行失败自动停用，并在收件箱推送「触发器停用」。
-- **run 端点**：恒返回 202 异步语义（`sessionId` / `messageId` / `queued`）；目标会话忙时消息自动进入待发送队列（`queued=true`）。指定 `sessionId` 时，会话必须属于路径上的同一个 Agent，不一致返回参数错误，不会改用会话里的另一个 Agent 执行。触发器绑定会话同样要求与触发器的 Agent 一致。限流：每 Token 60 次/分钟，超限 429 + `Retry-After`。
+- **run 端点**：恒返回 202 异步语义（`sessionId` / `messageId` / `queued`）；目标会话忙时消息自动进入待发送队列（`queued=true`）。可选 `Idempotency-Key` 请求头按 Token 隔离重试，重复请求不再启动执行。指定 `sessionId` 时，会话必须属于路径上的同一个 Agent，不一致返回参数错误，不会改用会话里的另一个 Agent 执行。触发器绑定会话同样要求与触发器的 Agent 一致。限流：每 Token 60 次/分钟，超限 429 + `Retry-After`。
 - **出站订阅**：目标 URL 必须 HTTPS（禁止 userinfo 与 hash 片段）；请求带 `X-Mao-Event` / `X-Mao-Timestamp` / `X-Mao-Signature`；失败按 1 / 5 / 25 分钟退避重试，3 次后置 FAILED 保留记录，不无限重投。`GET /v1/open/subscriptions/:id/deliveries` 可查最近投递。
 
 ## 明确不包含
@@ -109,6 +109,8 @@ signature = `sha256=${hex(hmac_sha256(secret, `${timestamp}.${rawBody}`))}`
 
 （时间戳与原始请求体原文以英文句点连接后签名；容忍 ±300 秒。）
 
+需要抵御超时重投时，再带 `X-Mao-Event-Id`（1~128 个可打印 ASCII 字符）。它按触发器隔离，同一次外部事件重复投递只执行第一次；相同事件 ID 配不同请求体会返回参数错误，已拒绝的事件 ID 不能复用。
+
 Python 示例：
 
 ```python
@@ -118,9 +120,11 @@ secret = "<trigger-secret>"
 url = "<trigger-url>"
 body = json.dumps({"issue": "disk almost full"}).encode()
 ts = str(int(time.time()))
+event_id = "disk-alert-20261104-001"
 digest = hmac.new(secret.encode(), f"{ts}.".encode() + body, hashlib.sha256).hexdigest()
 req = urllib.request.Request(url, data=body, method="POST", headers={
     "Content-Type": "application/json",
+    "X-Mao-Event-Id": event_id,
     "X-Mao-Timestamp": ts,
     "X-Mao-Signature": f"sha256={digest}",
 })
@@ -164,20 +168,34 @@ mao open subscription create --event task.failed --target-url https://ops.exampl
 | `--agent-id` | 是 | 目标 Agent ID |
 | `--message` | 是 | 触发消息全文 |
 | `--session-id` | 否 | 复用会话；缺省新建 |
+| `--idempotency-key` | 否 | 1~128 个可打印 ASCII 字符；同一 Token 下同键同请求只执行一次 |
 
 ### 示例
 
 ```bash
-mao open run --agent-id 12 --message "跑一遍 nightly 巡检" --api-token mao_xxxx
+mao open run --agent-id 12 --message "跑一遍 nightly 巡检" \
+  --idempotency-key nightly-2026-11-04 --api-token mao_xxxx
 ```
 
 `queued=true` 表示目标会话忙，消息已进待发送队列。
+
+### 幂等重试
+
+- 键按 API Token（`token:<id>`）隔离，不同 Token 可以使用相同键；Webhook 则按触发器（`trigger:<id>`）隔离。
+- 指纹只绑定 `agentId`、`sessionId` 与 `message`，请求体里的其他字段或 JSON 字段顺序不影响判定。
+- 首次已受理时，重复请求返回首次的 `sessionId` / `messageId`，并带 `deduplicated=true`；会话忙的首次受理还会回放 `queued=true`。
+- 首次仍在处理（流水 `pending`）时，重复请求返回 202、`processing=true` 且不会再启动一次执行；此时 `sessionId` / `messageId` 可能尚未写入，稍后重试即可拿到。
+- 首次已被拒绝（参数错误、预算拦截等）时，同键重试返回参数错误，不能复用该键；确认修正请求后换新键。
+- 同键但 `agentId` / `sessionId` / `message` 任一不同会返回参数错误，避免把两个业务请求误当成同一件。
+- 幂等记录复用调用流水，只在流水保留期内有效（`openapi.callLogRetentionDays`，默认 90 天）。因此外部系统仍应使用足够稳定且长期不重复的事件 ID。
+- `pending` 与 `queued` 都是处理中；`pending` 若遇到进程崩溃可能长期停留，本期不做自动恢复，需要用新键重试。
 
 ## 调用流水
 
 每次 API Token 触发和 Webhook 触发都会留下一条流水，包括参数错误、鉴权失败、限流和预算拒绝。桌面端 Token / 触发器卡片上的「调用记录」看自己的；管理后台「开放调用」看全量、统计和导出。
 
 - 默认只记消息长度和字段名，不记正文。`mao open token log-full-body --id <id> --enabled true` 才记录完整请求体（敏感字段名会被打码），操作留审计。
+- 带幂等键的重复请求不新增流水，只回放首次受理结果；原始流水进入 `rejected` 后，该键不可再用。调用方可用「调用记录」查看首次请求的最终状态。
 - 排队中的调用在执行结束后回写成功、失败或取消。长时间没有终态、而且队列里也已经没有这条消息的，统计里算「结果未知」。
 - Token 一小时内连续失败达到阈值（默认 10，系统设置可关）会自动停用，之后调用返回 403。属主用 `mao open token re-enable --id <id>` 恢复。限流和取消不计入次数。
 - 管理端「重发」只对 API 调用开放，用量记在 Token 属主头上。没开完整记录时需要手工粘贴 message。Webhook 不能从服务端重发。
@@ -198,6 +216,10 @@ mao open calls get --id 100
 | hook 返回 404 + `not found` | 触发器不存在、已停用、或签名 / 时间戳不通过（统一措辞，不区分） |
 | hook 返回 429 | 该触发器限流；读 `Retry-After` 后重试 |
 | 收件箱出现「触发器停用」 | 连续 5 次执行失败，已自动停用；排除外部系统问题后重新启用 |
+| 重试返回 `deduplicated=true` | 幂等键命中了首次请求，未再次执行；用 `processing` / `queued` 判断是否仍在处理 |
+| 重试一直返回 `processing=true` | 首次流水仍是 `pending` / `queued`。先查调用记录；若进程崩溃导致 `pending` 长期不结束，本期没有自动恢复，需换新幂等键重试 |
+| 返回「幂等键已用于其他请求」 | 同键请求的 `agentId` / `sessionId` / `message` 或 Webhook 原始请求体已变化；修正后换新键 |
+| 返回「该幂等键对应的请求已被拒绝」 | 首次请求已失败，不能复用该键；修正原因后换新键重试 |
 | 订阅一直重试 | 目标 URL 非 2xx；用 `open subscription deliveries --id <id>` 看 `lastHttpStatus` / `lastError` |
 
 相关文档：桌面端「设置 → 开放接口」页面（含内嵌「接口文档」卡片的查阅 / 下载 / 复制）；设计细节见仓库 `docs/plan/2026-10-05-open-api-webhook-technical-design.md`。

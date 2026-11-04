@@ -16,6 +16,8 @@ describe('开放接口内嵌文档', () => {
 
   it('覆盖鉴权与 HMAC 签名契约', () => {
     expect(doc).toContain('Authorization: Bearer mao_xxx')
+    expect(doc).toContain('Idempotency-Key')
+    expect(doc).toContain('X-Mao-Event-Id')
     expect(doc).toContain('X-Mao-Timestamp')
     expect(doc).toContain('X-Mao-Signature')
     expect(doc).toContain('sha256=<hex(HMAC-SHA256(secret, "<timestamp>.<原始请求体>"))>')

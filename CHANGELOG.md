@@ -1,3 +1,16 @@
+## 0.0.406 (2026-11-04)
+
+### 后端
+- **开放 API 与入站 Webhook 支持持久化幂等重试**：API 可带 `Idempotency-Key`（按 Token 隔离），Webhook 可带 `X-Mao-Event-Id`（按触发器隔离）。同一作用域内的同键同请求只执行一次，重复请求返回首次的 `sessionId` / `messageId` 并带 `deduplicated: true`；首次仍在 `pending` / `queued` 时返回 `processing: true`，不会创建第二次执行。幂等键要求 1~128 个可打印 ASCII 字符，同键但请求语义不同返回参数错误，已拒绝的键不可复用。幂等记录复用开放调用流水，未带键的请求保持原行为。
+- 新增 V180 迁移，为 `open_api_call_log` 增加幂等作用域、幂等键、请求指纹及唯一索引。带键请求在流水不可用或数据库异常时失败关闭；限流等入口拒绝不占用幂等键。幂等有效期跟随调用流水保留期（`openapi.callLogRetentionDays`，默认 90 天）；进程崩溃导致 `pending` 长期停留时本期不自动恢复。
+
+### 前端
+- 桌面端「设置 → 开放接口」内置接口文档补充 `Idempotency-Key`、`X-Mao-Event-Id`、重复响应字段、幂等冲突与保留期边界。
+
+### 终端 CLI（mao-cli）
+- `mao open run` 新增 `--idempotency-key`，透传 `Idempotency-Key` 请求头并在本地校验 1~128 个可打印 ASCII 字符。
+- 同步开放接口文档中的幂等语义、Webhook 事件 ID、调用流水行为与排障说明。
+
 ## 0.0.405 (2026-11-03)
 
 ### 后端

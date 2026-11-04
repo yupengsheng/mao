@@ -15,7 +15,12 @@ import {
   messageFromFullJson,
   percentile,
   queueWaitMsOf,
+  apiRequestFingerprint,
+  MAX_IDEMPOTENCY_KEY_LENGTH,
+  normalizeIdempotencyKey,
   redactSensitive,
+  replayCallLog,
+  webhookRequestFingerprint,
 } from './open-api-call-log.logic.js';
 import { OpenApiCallLogService } from './open-api-call-log.service.js';
 import type { OpenApiCallLogRepository, OpenApiCallLogRow } from './open-api-call-log.repository.js';
@@ -112,9 +117,25 @@ function memoryRepo() {
   let next = 1;
   const repo = {
     insert: vi.fn(async (row: OpenApiCallLogRow) => {
+      for (const existing of rows.values()) {
+        if (row.idempotencyScope != null && row.idempotencyKey != null
+          && existing.idempotencyScope === row.idempotencyScope
+          && existing.idempotencyKey === row.idempotencyKey) {
+          const error = new Error('Duplicate entry') as Error & { code: string; errno: number };
+          error.code = 'ER_DUP_ENTRY';
+          error.errno = 1062;
+          throw error;
+        }
+      }
       const id = next++;
       rows.set(id, { ...row, id, outcome: row.outcome, createdAt: '2026-10-09 10:00:00' });
       return id;
+    }),
+    findByIdempotency: vi.fn(async (scope: string, key: string) => {
+      for (const row of rows.values()) {
+        if (row.idempotencyScope === scope && row.idempotencyKey === key) return row;
+      }
+      return null;
     }),
     markFinished: vi.fn(async (id: number, patch: Partial<OpenApiCallLogRow> & { outcome: string }) => {
       const row = rows.get(id);
@@ -186,6 +207,115 @@ describe('OpenApiCallLogService', () => {
     expect(recordTokenOutcome).toHaveBeenCalledWith(3, 'completed');
     await service.settleQueued(begun!.id, 'FAILED', 10, 99);
     expect(repo.rows.get(begun!.id)?.outcome).toBe('completed');
+  });
+
+  it('相同幂等键复用首次流水，不重复创建流水', async () => {
+    const repo = memoryRepo();
+    const service = new OpenApiCallLogService({ repo: repo as unknown as OpenApiCallLogRepository });
+    const first = await service.begin({
+      source: 'API', tokenId: 3, userId: 7, agentId: 1, body: { message: 'hi' },
+      idempotencyScope: 'token:3', idempotencyKey: 'build-42', requestFingerprint: 'fingerprint-a',
+    });
+    const duplicate = await service.begin({
+      source: 'API', tokenId: 3, userId: 7, agentId: 1, body: { message: 'hi' },
+      idempotencyScope: 'token:3', idempotencyKey: 'build-42', requestFingerprint: 'fingerprint-a',
+    });
+
+    expect(first).toMatchObject({ id: 1, duplicate: false });
+    expect(duplicate).toMatchObject({ id: first!.id, duplicate: true });
+    expect(repo.insert).toHaveBeenCalledTimes(2);
+    expect(repo.rows.size).toBe(1);
+  });
+
+  it('相同幂等键但请求指纹不同直接拒绝', async () => {
+    const repo = memoryRepo();
+    const service = new OpenApiCallLogService({ repo: repo as unknown as OpenApiCallLogRepository });
+    await service.begin({
+      source: 'WEBHOOK', triggerId: 9, userId: 7, body: '{}',
+      idempotencyScope: 'trigger:9', idempotencyKey: 'event-1', requestFingerprint: 'fingerprint-a',
+    });
+
+    await expect(service.begin({
+      source: 'WEBHOOK', triggerId: 9, userId: 7, body: '{"changed":true}',
+      idempotencyScope: 'trigger:9', idempotencyKey: 'event-1', requestFingerprint: 'fingerprint-b',
+    })).rejects.toMatchObject({ code: ErrorCode.PARAM_INVALID.code });
+    expect(repo.insert).toHaveBeenCalledTimes(2);
+    expect(repo.rows.size).toBe(1);
+  });
+
+  it('幂等键只接受 1~128 个可打印 ASCII 字符，缺失保持无键行为', () => {
+    expect(normalizeIdempotencyKey(null)).toBeNull();
+    expect(normalizeIdempotencyKey(undefined)).toBeNull();
+    expect(normalizeIdempotencyKey('build-42')).toBe('build-42');
+    expect(normalizeIdempotencyKey('x'.repeat(MAX_IDEMPOTENCY_KEY_LENGTH))).toHaveLength(MAX_IDEMPOTENCY_KEY_LENGTH);
+    for (const invalid of ['', ' ', '  key', 'key ', '中文', 'x'.repeat(MAX_IDEMPOTENCY_KEY_LENGTH + 1)]) {
+      expect(() => normalizeIdempotencyKey(invalid)).toThrow();
+    }
+  });
+
+  it('API 指纹忽略请求体字段顺序，Webhook 指纹绑定验签原文', () => {
+    expect(apiRequestFingerprint(5, 11, 'hi')).toBe(apiRequestFingerprint(5, 11, 'hi'));
+    expect(apiRequestFingerprint(5, 11, 'hi')).not.toBe(apiRequestFingerprint(5, 11, 'changed'));
+    expect(apiRequestFingerprint(5, 11, 'hi')).not.toBe(apiRequestFingerprint(6, 11, 'hi'));
+    expect(webhookRequestFingerprint('{"a":1,"b":2}')).toBe(webhookRequestFingerprint('{"a":1,"b":2}'));
+    expect(webhookRequestFingerprint('{"a":1,"b":2}')).not.toBe(webhookRequestFingerprint('{"b":2,"a":1}'));
+  });
+
+  it('不同 Token / 触发器作用域可以使用相同幂等键', async () => {
+    const repo = memoryRepo();
+    const service = new OpenApiCallLogService({ repo: repo as unknown as OpenApiCallLogRepository });
+    const tokenA = await service.begin({
+      source: 'API', tokenId: 3, userId: 7, body: { message: 'a' },
+      idempotencyScope: 'token:3', idempotencyKey: 'same-key', requestFingerprint: 'a',
+    });
+    const tokenB = await service.begin({
+      source: 'API', tokenId: 4, userId: 8, body: { message: 'a' },
+      idempotencyScope: 'token:4', idempotencyKey: 'same-key', requestFingerprint: 'a',
+    });
+    const trigger = await service.begin({
+      source: 'WEBHOOK', triggerId: 9, userId: 7, body: '{}',
+      idempotencyScope: 'trigger:9', idempotencyKey: 'same-key', requestFingerprint: 'a',
+    });
+    expect([tokenA?.duplicate, tokenB?.duplicate, trigger?.duplicate]).toEqual([false, false, false]);
+    expect(repo.rows.size).toBe(3);
+  });
+
+  it('并发提交相同幂等键只保留一行，后到请求读取首个流水', async () => {
+    const repo = memoryRepo();
+    const service = new OpenApiCallLogService({ repo: repo as unknown as OpenApiCallLogRepository });
+    const input = {
+      source: 'API' as const, tokenId: 3, userId: 7, body: { message: 'same' },
+      idempotencyScope: 'token:3', idempotencyKey: 'concurrent', requestFingerprint: 'fingerprint-a',
+    };
+    const [first, second] = await Promise.all([service.begin(input), service.begin(input)]);
+    expect([first?.duplicate, second?.duplicate].sort()).toEqual([false, true]);
+    expect(first?.id).toBe(second?.id);
+    expect(repo.rows.size).toBe(1);
+  });
+
+  it('带键登记遇到非唯一键数据库故障 fail closed，无键仍 fail open', async () => {
+    const repo = memoryRepo();
+    const service = new OpenApiCallLogService({ repo: repo as unknown as OpenApiCallLogRepository });
+    repo.insert.mockRejectedValueOnce(new Error('db unavailable'));
+    await expect(service.begin({
+      source: 'API', tokenId: 3, userId: 7, body: { message: 'a' },
+      idempotencyScope: 'token:3', idempotencyKey: 'key-1', requestFingerprint: 'fingerprint-a',
+    })).rejects.toMatchObject({ code: ErrorCode.INTERNAL_ERROR.code });
+
+    repo.insert.mockRejectedValueOnce(new Error('db unavailable'));
+    await expect(service.begin({ source: 'API', tokenId: 3, userId: 7, body: { message: 'b' } })).resolves.toBeNull();
+  });
+
+  it('重复流水状态投影为处理中或已受理结果', () => {
+    expect(replayCallLog({ outcome: 'pending', sessionId: 11, messageId: null })).toEqual({
+      sessionId: 11, messageId: null, queued: false, processing: true,
+    });
+    expect(replayCallLog({ outcome: 'queued', sessionId: 11, messageId: null })).toEqual({
+      sessionId: 11, messageId: null, queued: true, processing: true,
+    });
+    expect(replayCallLog({ outcome: 'completed', sessionId: 11, messageId: 12 })).toEqual({
+      sessionId: 11, messageId: 12, queued: false, processing: false,
+    });
   });
 
   it('排队回写失败会计入自动停用；重放行不计', async () => {
