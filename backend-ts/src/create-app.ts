@@ -70,6 +70,7 @@ import { SessionCompactionService } from './session/session-compaction.service.j
 import { SessionCompactionEventService } from './session/session-compaction-event.service.js';
 import { GitOperationService } from './session/git-operation.service.js';
 import { SessionService } from './session/session.service.js';
+import { SessionChannelMappingRepository } from './session/session-channel-mapping.repository.js';
 import { SessionTitleService } from './session/session-title.service.js';
 import { ActivityService } from './session/activity.service.js';
 import { RunTraceService } from './session/run-trace.service.js';
@@ -512,6 +513,9 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
   // onSessionDeleted 钩子在下面就要直接引用它（技术方案 §4.6 评审补充）。
   const workspaceRulesSnapshotRepo = new WorkspaceRulesSnapshotRepository(db);
   const workspaceRulesSnapshotService = new WorkspaceRulesSnapshotService(workspaceRulesSnapshotRepo);
+  // 通道会话映射（微信对端 / 飞书话题 / 飞书通道绑定）随会话删除回收。仓库无状态，
+  // 与按小时孤儿修复共用同一套 SQL 语义。
+  const sessionChannelMappingRepo = new SessionChannelMappingRepository(db);
   // 团队经验库（技术方案 2026-10-24）：索引/挂载服务，纯文件系统无 DB 依赖。
   const experienceIndexService = new ExperienceIndexService(join(shareDir, EXPERIENCE_ROOT_SUBDIR));
   const experienceMountService = new ExperienceMountService(experienceIndexService);
@@ -533,6 +537,8 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
       ctx.mcpSyncRef?.clearCloudSnapshot(sessionId);
       // 工作区规则快照同理会话级资源，物理删行（技术方案 §4.6）
       await workspaceRulesSnapshotService.deleteBySessionId(sessionId);
+      // 通道映射是会话级资源：会话已逻辑删除，映射不可再被合法使用。
+      await sessionChannelMappingRepo.deleteBySessionId(sessionId);
     },
     (sessionId) => approvalRuleRepo.deleteBySessionId(sessionId),
     experienceMountService,

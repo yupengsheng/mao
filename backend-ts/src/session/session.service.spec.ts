@@ -273,6 +273,30 @@ describe('SessionService archive', () => {
     );
   });
 
+  it('promotesSideTaskAndDeletesItsChannelMappings', async () => {
+    // 边路会话提升不走 onSessionDeleted：通道映射也须在同一事务内回收。
+    const { service, sessionRepo, txDb } = makeService();
+    vi.mocked(sessionRepo.findById).mockResolvedValue({
+      id: 20,
+      userId: 7,
+      title: '边路任务',
+      sessionType: 'SIDE_TASK',
+      phase: 'COMPLETED',
+      executionMode: 'CLOUD',
+      workspace: '/tmp/w',
+    });
+    vi.mocked(sessionRepo.list).mockResolvedValue([]);
+
+    await service.promoteSideTaskToMainSession(20, 7);
+
+    for (const table of ['weixin_session_peer', 'feishu_thread_session', 'feishu_session_channel']) {
+      expect(txDb.execute).toHaveBeenCalledWith(
+        expect.stringContaining(`DELETE FROM ${table} WHERE session_id = ?`),
+        [20],
+      );
+    }
+  });
+
   it('rejectsDeleteWhenSessionRunning', async () => {
     const { service, sessionRepo } = makeService();
     vi.mocked(sessionRepo.findById).mockResolvedValue({ id: 11, userId: 7, phase: 'RUNNING' });
