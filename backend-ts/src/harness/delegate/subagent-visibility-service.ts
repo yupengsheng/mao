@@ -8,10 +8,12 @@ import { wsEvent } from '../../session/ws/ws-event.js';
 import type { StreamingWsRegistry } from '../../session/ws/streaming-ws-registry.js';
 import { ToolCallContext } from '../tool/tool-call-context.js';
 import { WsStreamingEventListener, type WsListenerDeps } from '../../session/ws/ws-streaming-event-listener.js';
+import type { LeaseHandle } from '../../task/execution-lease.service.js';
 
 export interface VisibleRunResult {
   collector: SubAgentResultCollector;
   executionId: string;
+  lease: LeaseHandle | null;
 }
 
 export interface SubAgentVisibilityDeps {
@@ -23,16 +25,26 @@ export interface SubAgentVisibilityDeps {
     updatePhase(sessionId: number, phase: string): Promise<void>;
   };
   taskTerminalService: {
+    beginExecution?(
+      sessionId: number,
+      executionId: string,
+      source?: string,
+      externalEvent?: null,
+    ): Promise<{ duplicate: boolean; lease: LeaseHandle | null }>;
     finishExecution(
       sessionId: number,
       userId: number | null | undefined,
       phase: string,
       executionId: string,
       reason?: string,
-    ): Promise<void>;
+      notifySource?: string,
+      lease?: LeaseHandle | null,
+    ): Promise<{ settled: boolean }>;
   };
   llmModelLookup: { findById(id: number): Promise<{ supportsVision?: number | null } | null> };
   harnessService: Pick<HarnessService, 'executePrepared'>;
+  /** 与主执行共用同一开关；关闭时不获取租约，保持既有子代理行为。 */
+  executionLeaseEnabled?: boolean;
 }
 
 export class SubAgentVisibilityService {
@@ -112,15 +124,34 @@ export class SubAgentVisibilityService {
     const executionId = crypto.randomUUID();
     if (skip) {
       collector.completed = true;
-      return { collector, executionId };
+      return { collector, executionId, lease: null };
     }
 
+    let lease: LeaseHandle | null = null;
+    const childSessionId = childSession.id;
+    if (this.deps.executionLeaseEnabled === true && this.deps.taskTerminalService.beginExecution != null) {
+      if (childSessionId == null) {
+        collector.onError(new Error('子会话缺少 id'));
+        return { collector, executionId, lease: null };
+      }
+      try {
+        const begun = await this.deps.taskTerminalService.beginExecution(childSessionId, executionId);
+        if (begun.duplicate) {
+          collector.completed = true;
+          return { collector, executionId, lease: null };
+        }
+        lease = begun.lease;
+      } catch (error) {
+        collector.onError(error);
+        return { collector, executionId, lease: null };
+      }
+    }
     try {
-      await this.runVisible(childSession, subContext, collector, executionId);
+      await this.runVisible(childSession, subContext, collector, executionId, lease);
     } catch (error) {
       collector.onError(error);
     }
-    return { collector, executionId };
+    return { collector, executionId, lease };
   }
 
   /**
@@ -133,9 +164,11 @@ export class SubAgentVisibilityService {
     phase: string,
     executionId: string,
     reason?: string,
+    lease?: LeaseHandle | null,
   ): Promise<void> {
     try {
-      await this.deps.taskTerminalService.finishExecution(childSessionId, userId, phase, executionId, reason);
+      if (lease == null) await this.deps.taskTerminalService.finishExecution(childSessionId, userId, phase, executionId, reason);
+      else await this.deps.taskTerminalService.finishExecution(childSessionId, userId, phase, executionId, reason, undefined, lease);
     } catch (e) {
       harnessLog('warn', `Failed to finish subagent session ${childSessionId}: ${(e as Error).message}`);
       try {
@@ -156,6 +189,7 @@ export class SubAgentVisibilityService {
     subContext: AgentExecutionContext,
     collector: SubAgentResultCollector,
     executionId: string,
+    lease?: LeaseHandle | null,
   ): Promise<void> {
     const userId = childSession.userId;
     const childSessionId = childSession.id;
@@ -176,7 +210,7 @@ export class SubAgentVisibilityService {
     );
     const composite = CompositeAgentEventListener.of(wsListener, collector);
     try {
-      await this.deps.harnessService.executePrepared(subContext, composite);
+      await this.deps.harnessService.executePrepared(subContext, composite, lease);
     } catch (e) {
       // 执行异常（如 LLM 重试耗尽）必须让 WS 端也收到 error 事件，
       // 前端子代理面板据此显示异常提示与重试按钮；collector 同时记录错误供上层判定 FAILED。

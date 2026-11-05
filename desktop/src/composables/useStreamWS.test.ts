@@ -289,6 +289,67 @@ describe('useStreamWS user_message_saved', () => {
   })
 })
 
+describe('useStreamWS recovered execution waits', () => {
+  async function setupSession() {
+    const { connect, subscribe } = useStreamWS()
+    const pending = connect()
+    sockets[0].open()
+    await pending
+    await subscribe('9')
+    const sessionStore = useSessionStore()
+    sessionStore.updateSession('9', { executionMode: 'CLOUD', phase: 'WAITING_APPROVAL', running: true })
+    return sessionStore
+  }
+
+  function pushRecoveredWait() {
+    sockets[0].message({
+      type: 'execution_wait_recovered',
+      sessionId: 9,
+      data: {
+        requestId: 'wait-1',
+        requestType: 'APPROVAL',
+        summary: JSON.stringify({ toolName: 'shell', target: 'npm test' }),
+        expiresAt: '2026-11-05 12:15:00',
+        recovered: true,
+        actionable: false,
+      },
+    })
+  }
+
+  it('stores only the read-only projection and keeps it while waiting for approval', async () => {
+    const sessionStore = await setupSession()
+    pushRecoveredWait()
+
+    expect(sessionStore.getSessionEntity('9')?.pendingWait).toEqual({
+      kind: 'APPROVAL',
+      requestId: 'wait-1',
+      summary: JSON.stringify({ toolName: 'shell', target: 'npm test' }),
+      expiresAt: '2026-11-05 12:15:00',
+      recovered: true,
+      actionable: false,
+    })
+
+    sockets[0].message({ type: 'session_status', sessionId: 9, data: { phase: 'WAITING_APPROVAL', executionId: 'run-1' } })
+    expect(sessionStore.getSessionEntity('9')?.pendingWait?.requestId).toBe('wait-1')
+  })
+
+  it('drops the stale recovered notice when execution starts again', async () => {
+    const sessionStore = await setupSession()
+    pushRecoveredWait()
+
+    sockets[0].message({ type: 'session_status', sessionId: 9, data: { phase: 'RUNNING', executionId: 'run-1' } })
+    expect(sessionStore.getSessionEntity('9')?.pendingWait).toBeNull()
+  })
+
+  it('drops the stale recovered notice on a terminal phase', async () => {
+    const sessionStore = await setupSession()
+    pushRecoveredWait()
+
+    sockets[0].message({ type: 'session_status', sessionId: 9, data: { phase: 'FAILED', executionId: 'run-1' } })
+    expect(sessionStore.getSessionEntity('9')?.pendingWait).toBeNull()
+  })
+})
+
 describe('useStreamWS side session creation', () => {
   it('createSideSession 带切点时才下发 forkFromMessageId', async () => {
     const { connect, createSideSession } = useStreamWS()

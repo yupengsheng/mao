@@ -248,7 +248,7 @@ describe('AgentFeishuInboundHandler', () => {
     expect(reply).toBeNull();
     expect(sessionService.saveUserMessage).toHaveBeenCalledWith(7, '【用户消息】\n未知用户：hello', null);
     expect(harness.execute).toHaveBeenCalledWith(7, 'exec-1', expect.anything(), expect.anything(), 42);
-    expect(onExecutionFinished).toHaveBeenCalledWith(7, expect.anything(), 'exec-1', 'COMPLETED');
+    expect(onExecutionFinished).toHaveBeenCalledWith(7, expect.anything(), 'exec-1', 'COMPLETED', undefined, null);
     expect(onReply).toHaveBeenCalledWith(expect.objectContaining({ text: 'hello' }), 'assistant text', 7);
   });
 
@@ -492,7 +492,7 @@ describe('AgentFeishuInboundHandler', () => {
     const reply = await handler.onMessage(makeContext());
     expect(reply).toBeNull();
     expect(onReply).toHaveBeenCalledWith(expect.objectContaining({ text: 'hello' }), '任务已取消。', 7);
-    expect(onExecutionFinished).toHaveBeenCalledWith(7, expect.anything(), 'e', 'CANCELLED');
+    expect(onExecutionFinished).toHaveBeenCalledWith(7, expect.anything(), 'e', 'CANCELLED', undefined, null);
   });
 
   it('progress cancel shows 任务已取消 not 被下一条指令中断', async () => {
@@ -598,12 +598,13 @@ describe('AgentFeishuInboundHandler', () => {
         updates.push({ status, content, messageId });
       },
     }));
-    // 回调只等「起跑」，execute 在后台跑完
+    // 回调只等「起跑」，execute 在后台跑完。重试必须生成执行身份并通过门禁，
+    // 但不得重新落一条 user message（历史保持原样）。
     expect(result).toEqual({ ok: true });
-    expect(harness.prepareMessage).not.toHaveBeenCalled();
+    expect(harness.prepareMessage).toHaveBeenCalledWith(7, '');
     expect(saveUserMessage).not.toHaveBeenCalled();
     await vi.waitFor(() => {
-      expect(onExecutionFinished).toHaveBeenCalledWith(7, expect.anything(), expect.any(String), 'COMPLETED');
+      expect(onExecutionFinished).toHaveBeenCalledWith(7, expect.anything(), expect.any(String), 'COMPLETED', undefined, null);
     });
     expect(harness.execute).toHaveBeenCalledTimes(1);
     expect(registry.send).toHaveBeenCalledWith(9, expect.objectContaining({

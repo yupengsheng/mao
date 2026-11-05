@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import type { Session } from './types.js';
 import type { SessionService } from './session.service.js';
 import type { StreamingWsRegistry } from './ws/streaming-ws-registry.js';
@@ -8,13 +7,38 @@ import type { SessionTreeSignalPublisher } from '../harness/approval/session-tre
 import type { TaskNotificationDeliveryService } from '../notification/task/delivery.service.js';
 import type { TaskNotificationDelivery } from '../notification/task/types.js';
 import type { ExtractionSessionInput } from '../memory/memory-extraction.service.js';
-import type { TaskService } from '../task/task.service.js';
+import { LostExecutionLeaseError, type TaskService } from '../task/task.service.js';
 import type { ExternalEventRef, TaskStage, TaskSource } from '../task/types.js';
+import type { TaskWaitReleaseReason } from '@mao/contracts';
+import { LeaseRequiredError, type ExecutionLeaseService, type LeaseHandle } from '../task/execution-lease.service.js';
 import { WEIXIN_PROJECT_KEY } from '../domain/types.js';
 import { isFeishuChannelSession } from '../harness/tool/feishu-channel-tool.js';
 import { isDingtalkChannelSession } from '../harness/tool/dingtalk-channel-tool.js';
 
 const TERMINAL = new Set(['COMPLETED', 'FAILED', 'CANCELLED']);
+
+/** 等待中的执行不允许被新的普通触发绕过；入口应按 busy 收敛。 */
+export class ExecutionWaitPendingError extends Error {
+  constructor(readonly sessionId: number) {
+    super(`session ${sessionId} still has a pending execution wait`);
+    this.name = 'ExecutionWaitPendingError';
+  }
+}
+
+/** 同一 Session 已有其他执行持有租约，或租约数据库不可用。 */
+export class LeaseConflictError extends Error {
+  constructor(readonly sessionId: number, readonly executionId: string) {
+    super(`execution lease is held by another execution: sessionId=${sessionId}, executionId=${executionId}`);
+    this.name = 'LeaseConflictError';
+  }
+}
+
+export class LeaseUnavailableError extends Error {
+  constructor(readonly sessionId: number, readonly cause: unknown) {
+    super(`execution lease unavailable for session ${sessionId}`);
+    this.name = 'LeaseUnavailableError';
+  }
+}
 
 /**
  * 任务终态通知来源：MANUAL=手工触发（默认）、SCHEDULED=定时任务、
@@ -89,6 +113,17 @@ export class TaskTerminalService {
     private readonly budgetWarner?: TaskTerminalBudgetWarner | null,
     private readonly citationRegistry?: CitationRegistryInvoker | null,
     private readonly taskService?: TaskService | null,
+    private readonly executionLeaseService?: ExecutionLeaseService | null,
+    private readonly executionLeaseEnabled: boolean = false,
+    private readonly executionWaitLookup?: {
+      hasPending(sessionId: number, executionId?: string): Promise<boolean>;
+      releaseAllPending?(
+        sessionId: number,
+        reason: TaskWaitReleaseReason,
+        maxFencingToken?: bigint,
+      ): Promise<number>;
+    } | null,
+    private readonly ownerInstance: string = '',
   ) {}
 
   async beginExecution(
@@ -96,29 +131,109 @@ export class TaskTerminalService {
     executionId?: string,
     source?: TaskSource,
     externalEvent?: ExternalEventRef | null,
-  ): Promise<{ duplicate: boolean }> {
+  ): Promise<{ duplicate: boolean; lease: LeaseHandle | null }> {
     const actualExecutionId = executionId ?? this.registry.getSessionExecution?.(sessionId);
-    if (actualExecutionId == null || actualExecutionId.trim() === '') return { duplicate: false };
+    if (actualExecutionId == null || actualExecutionId.trim() === '') {
+      if (this.executionLeaseEnabled) throw new LeaseRequiredError(sessionId);
+      return { duplicate: false, lease: null };
+    }
+    if (this.executionLeaseEnabled) {
+      return this.beginLeasedExecution(sessionId, actualExecutionId, source, externalEvent);
+    }
     try {
       this.registry.setSessionExecution?.(sessionId, actualExecutionId);
-      if (this.taskService == null) return { duplicate: false };
+      if (this.taskService == null) return { duplicate: false, lease: null };
       const session = await this.sessionService.getSession(sessionId);
       const result = await this.taskService.beginExecution(session, actualExecutionId, source, externalEvent);
-      return { duplicate: result.duplicate };
+      return { duplicate: result.duplicate, lease: null };
     } catch (error) {
       console.warn(`[task] failed to begin execution: sessionId=${sessionId}, executionId=${actualExecutionId}`, error);
-      return { duplicate: false };
+      return { duplicate: false, lease: null };
     }
   }
 
-  async beginRecoveryExecution(sessionId: number, executionId: string): Promise<void> {
-    if (executionId.trim() === '') return;
+  private async beginLeasedExecution(
+    sessionId: number,
+    executionId: string,
+    source?: TaskSource,
+    externalEvent?: ExternalEventRef | null,
+  ): Promise<{ duplicate: boolean; lease: LeaseHandle | null }> {
+    const leases = this.executionLeaseService;
+    if (leases == null || this.ownerInstance.trim() === '') {
+      throw new LeaseUnavailableError(sessionId, new Error('execution lease service is not configured'));
+    }
+
+    if (externalEvent != null && this.taskService != null) {
+      const duplicate = await this.taskService.findExternalEvent(externalEvent.scope, externalEvent.id);
+      if (duplicate != null) return { duplicate: true, lease: null };
+    }
+    if (this.executionWaitLookup != null && await this.executionWaitLookup.hasPending(sessionId)) {
+      throw new ExecutionWaitPendingError(sessionId);
+    }
+
+    let lease: LeaseHandle | null;
+    try {
+      lease = await leases.acquire(sessionId, executionId, this.ownerInstance);
+    } catch (error) {
+      throw new LeaseUnavailableError(sessionId, error);
+    }
+    if (lease == null) throw new LeaseConflictError(sessionId, executionId);
+
+    this.registry.setSessionExecution?.(sessionId, executionId);
+    if (this.taskService == null) {
+      console.warn(`[task] task projection skipped: sessionId=${sessionId}, executionId=${executionId}, reason=task_service_unavailable`);
+      return { duplicate: false, lease };
+    }
+    try {
+      const session = await this.sessionService.getSession(sessionId);
+      const result = await this.taskService.beginExecution(session, executionId, source, externalEvent);
+      if (result.duplicate) {
+        await this.releaseLease(lease);
+        return { duplicate: true, lease: null };
+      }
+      return { duplicate: false, lease };
+    } catch (error) {
+      console.warn(
+        `[task] task_projection_failed: sessionId=${sessionId}, executionId=${executionId}`,
+        error,
+      );
+      return { duplicate: false, lease };
+    }
+  }
+
+  async beginRecoveryExecution(sessionId: number, executionId: string, lease?: LeaseHandle | null): Promise<void> {
+    if (executionId.trim() === '') {
+      if (this.executionLeaseEnabled) throw new LeaseRequiredError(sessionId);
+      return;
+    }
+    if (this.executionLeaseEnabled && lease == null) throw new LeaseRequiredError(sessionId);
+    if (this.executionLeaseEnabled) {
+      if (lease!.sessionId !== sessionId || lease!.executionId !== executionId) {
+        throw new LostExecutionLeaseError(executionId);
+      }
+      let fenced = false;
+      try {
+        fenced = await this.executionLeaseService!.assertFenced(lease!);
+      } catch {
+        throw new LostExecutionLeaseError(executionId);
+      }
+      if (!fenced) throw new LostExecutionLeaseError(executionId);
+    }
     try {
       this.registry.setSessionExecution?.(sessionId, executionId);
       if (this.taskService == null) return;
       const session = await this.sessionService.getSession(sessionId);
-      await this.taskService.beginRecoveryExecution(session, executionId);
+      if (lease == null) await this.taskService.beginRecoveryExecution(session, executionId);
+      else await this.taskService.beginRecoveryExecution(session, executionId, lease);
     } catch (error) {
+      if (error instanceof LostExecutionLeaseError) throw error;
+      if (this.executionLeaseEnabled) {
+        console.warn(
+          `[task] task_projection_failed: sessionId=${sessionId}, executionId=${executionId}, recovery=true`,
+          error,
+        );
+        return;
+      }
       console.warn(`[task] failed to begin recovery execution: sessionId=${sessionId}, executionId=${executionId}`, error);
     }
   }
@@ -127,6 +242,16 @@ export class TaskTerminalService {
     const session = await this.sessionService.getSession(sessionId);
     if (!['RUNNING', 'RESUMING', 'WAITING_APPROVAL', 'CANCELLING'].includes(session.phase ?? '')) return;
     let executionId = this.registry.getSessionExecution?.(sessionId);
+    let lease: LeaseHandle | null = null;
+    if (this.executionLeaseEnabled && this.executionLeaseService != null) {
+      try {
+        lease = await this.executionLeaseService.getActive(sessionId);
+      } catch (error) {
+        console.warn(`[task] failed to load active execution lease for cancellation: sessionId=${sessionId}`, error);
+      }
+      if (lease != null) executionId ??= lease.executionId;
+      if (executionId != null && lease?.executionId !== executionId) lease = null;
+    }
     if (executionId == null && this.taskService != null) {
       try {
         executionId = await this.taskService.getActiveExecutionId(session) ?? undefined;
@@ -134,7 +259,35 @@ export class TaskTerminalService {
         console.warn(`[task] failed to load active execution for cancellation: sessionId=${sessionId}`, error);
       }
     }
-    await this.finishExecution(sessionId, userId, 'CANCELLED', executionId ?? randomUUID());
+    if (executionId == null) {
+      await this.sessionService.updatePhase(sessionId, 'CANCELLED');
+      this.registry.clearSessionExecution?.(sessionId);
+      return;
+    }
+    if (this.executionLeaseEnabled && lease == null) {
+      // 执行归属已被其他实例接管（或尚未建立）：只收敛本实例可见的 Session，
+      // 不写 Task 终态，避免取消请求串写新执行。
+      await this.sessionService.updatePhase(sessionId, 'CANCELLED');
+      this.registry.clearSessionExecution?.(sessionId);
+      return;
+    }
+    await this.finishExecution(sessionId, userId, 'CANCELLED', executionId, undefined, 'MANUAL', lease);
+  }
+
+  /** 入口在拿到租约后若未能启动执行，必须显式释放，避免空占 TTL。 */
+  async releaseExecutionLease(lease: LeaseHandle | null | undefined): Promise<void> {
+    await this.releaseLease(lease);
+  }
+
+  /** 取消路径只读查询当前执行归属；查询失败按无租约处理，不阻断 Session 收敛。 */
+  async getActiveExecutionLease(sessionId: number): Promise<LeaseHandle | null> {
+    if (!this.executionLeaseEnabled || this.executionLeaseService == null) return null;
+    try {
+      return await this.executionLeaseService.getActive(sessionId);
+    } catch (error) {
+      console.warn(`[task] failed to load active execution lease: sessionId=${sessionId}`, error);
+      return null;
+    }
   }
 
   async finishExecution(
@@ -144,17 +297,22 @@ export class TaskTerminalService {
     executionId: string,
     failureReason?: string | null,
     notifySource: TaskNotifySource = 'MANUAL',
-  ): Promise<void> {
+    lease?: LeaseHandle | null,
+  ): Promise<{ settled: boolean }> {
     if (!TERMINAL.has(phase)) {
       throw new Error(`Unsupported terminal phase: ${phase}`);
     }
     const previous = await this.sessionService.getSession(sessionId);
+    if (!await this.assertCurrentLease(sessionId, executionId, lease)) {
+      return { settled: false };
+    }
     if (isTerminalPhase(previous.phase)) {
-      await this.settleTask(previous, executionId, previous.phase as TaskStage, failureReason, notifySource);
+      const settled = await this.settleTask(previous, executionId, previous.phase as TaskStage, failureReason, notifySource, lease);
+      if (this.taskService == null || settled) await this.releaseLease(lease);
       console.info(
         `Ignoring terminal transition for already-terminal session: sessionId=${sessionId}, from=${previous.phase}, to=${phase}`,
       );
-      return;
+      return { settled };
     }
     // FAILED 时将错误信息持久化到 runtimeStatusJson，刷新后前端可恢复
     if (phase === 'FAILED' && failureReason != null && failureReason.trim().length > 0) {
@@ -168,7 +326,8 @@ export class TaskTerminalService {
     await this.sessionService.markLastMessageFinished(sessionId);
     const session = await this.sessionService.getSession(sessionId);
     const ownerId = userId ?? session.userId;
-    await this.settleTask(session, executionId, phase as TaskStage, failureReason, notifySource);
+    const settled = await this.settleTask(session, executionId, phase as TaskStage, failureReason, notifySource, lease);
+    if (this.taskService == null || settled) await this.releaseLease(lease);
 
     // 引用溯源（技术方案 2026-10-12 §5.3）：citations 必须在下方终态 WS 事件之前
     // 落库。桌面端收到 session_status(COMPLETED) 即全量重拉消息，晚于事件的 UPDATE
@@ -222,14 +381,78 @@ export class TaskTerminalService {
     }
 
     this.dispatchMemoryExtraction(session, phase);
+    return { settled };
   }
 
-  private async settleTask(session: Session, executionId: string, phase: TaskStage, failureReason: string | null | undefined, source: TaskNotifySource): Promise<void> {
-    if (this.taskService == null) return;
+  private async settleTask(
+    session: Session,
+    executionId: string,
+    phase: TaskStage,
+    failureReason: string | null | undefined,
+    source: TaskNotifySource,
+    lease?: LeaseHandle | null,
+  ): Promise<boolean> {
+    if (this.taskService == null) return false;
     try {
-      await this.taskService.settleExecution(session, executionId, phase, failureReason, source);
+      const settled = lease == null
+        ? await this.taskService.settleExecution(session, executionId, phase, failureReason, source)
+        : await this.taskService.settleExecution(session, executionId, phase, failureReason, source, lease);
+      if (settled === false) return false;
+      // 终态已写入后清理残留等待；任何异常都只影响后续启动门禁，不回滚终态。
+      await this.releasePendingWaits(session.id!, lease);
+      return true;
     } catch (error) {
       console.warn(`[task] failed to settle execution: sessionId=${session.id}, executionId=${executionId}`, error);
+      return false;
+    }
+  }
+
+  private async releasePendingWaits(sessionId: number, lease?: LeaseHandle | null): Promise<void> {
+    if (this.executionWaitLookup?.releaseAllPending == null) return;
+    try {
+      await this.executionWaitLookup.releaseAllPending(sessionId, 'CANCELLED', lease?.fencingToken);
+    } catch (error) {
+      console.warn(
+        `[task] failed to release pending waits after terminal settlement: sessionId=${sessionId}`,
+        error,
+      );
+    }
+  }
+
+  /**
+   * 终态写入前先确认租约仍属于本次执行。开关关闭时保持旧行为；
+   * 开关开启但 handle 缺失 / 不匹配 / 已失效时，一律不得覆盖 Session 终态。
+   */
+  private async assertCurrentLease(
+    sessionId: number,
+    executionId: string,
+    lease?: LeaseHandle | null,
+  ): Promise<boolean> {
+    if (!this.executionLeaseEnabled) return true;
+    if (lease == null || this.executionLeaseService == null) {
+      console.warn(`[task] lease_lost: skip terminal write without lease: sessionId=${sessionId}, executionId=${executionId}`);
+      return false;
+    }
+    if (lease.sessionId !== sessionId || lease.executionId !== executionId) {
+      console.warn(`[task] lease_mismatch: skip terminal write: sessionId=${sessionId}, executionId=${executionId}, leaseExecutionId=${lease.executionId}`);
+      return false;
+    }
+    try {
+      if (await this.executionLeaseService.assertFenced(lease)) return true;
+    } catch (error) {
+      console.warn(`[task] lease_lost: failed to verify lease: sessionId=${sessionId}, executionId=${executionId}`, error);
+      return false;
+    }
+    console.warn(`[task] lease_lost: skip terminal write: sessionId=${sessionId}, executionId=${executionId}`);
+    return false;
+  }
+
+  private async releaseLease(lease?: LeaseHandle | null): Promise<void> {
+    if (lease == null || this.executionLeaseService == null) return;
+    try {
+      await this.executionLeaseService.release(lease);
+    } catch (error) {
+      console.warn(`[task] failed to release execution lease: sessionId=${lease.sessionId}, executionId=${lease.executionId}`, error);
     }
   }
 

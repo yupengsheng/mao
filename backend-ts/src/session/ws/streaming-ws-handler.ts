@@ -72,6 +72,7 @@ import type { AgentExecutionContext } from '../../harness/core/agent-execution-c
 import type { EmbedPageToolRegistry } from '../../harness/embed-page-tool-registry.js';
 import type { McpConnectionError } from '../../harness/mcp/entity/mcp-server.js';
 import type { ApprovalHint } from '../../harness/approval/approval-hint.js';
+import type { LeaseHandle } from '../../task/execution-lease.service.js';
 
 export interface WsHandlerDeps {
   registry: StreamingWsRegistry;
@@ -80,10 +81,10 @@ export interface WsHandlerDeps {
   };
   harnessService: {
     prepareMessage(sessionId: number, content: unknown): Promise<string> | string;
-    executeFromEvent(sessionId: number, eventId: string, listener: AgentEventListener, cancelFlag: { get(): boolean; set(v: boolean): void }): Promise<void>;
+    executeFromEvent(sessionId: number, eventId: string, listener: AgentEventListener, cancelFlag?: { get(): boolean; set(v: boolean): void } | null, lease?: LeaseHandle | null): Promise<void>;
     /** 以预构建上下文执行（子代理重试走 buildSubContext 裁剪后的上下文）。 */
-    executePrepared(context: AgentExecutionContext, listener: AgentEventListener): Promise<void>;
-    executeSideFirstMessage(parentId: number, sideId: number, contextMode: 'fork' | 'summary' | 'none', listener: AgentEventListener, cancelFlag: { get(): boolean; set(v: boolean): void }): Promise<void>;
+    executePrepared(context: AgentExecutionContext, listener: AgentEventListener, lease?: LeaseHandle | null): Promise<void>;
+    executeSideFirstMessage(parentId: number, sideId: number, contextMode: 'fork' | 'summary' | 'none', listener: AgentEventListener, cancelFlag?: { get(): boolean; set(v: boolean): void } | null, lease?: LeaseHandle | null): Promise<void>;
     forkParentMessages(parentId: number, sideId: number, forkFromMessageId?: number | null): Promise<void>;
     /** 空闲手动压缩（技术方案 5.4）：调用方已持有 executionClaims，force 越阈值/越 enabled 门，triggerMode='manual'。 */
     requestCompaction(sessionId: number, listener: AgentEventListener | null): Promise<boolean>;
@@ -93,6 +94,7 @@ export interface WsHandlerDeps {
     findOwnedMessage(sessionId: number, messageId: number): Promise<Message | null>;
     saveMessage(sessionId: number, role: string, content: unknown, a: null, b: null, c: null, d: number, e: null): Promise<Message>;
     updatePhase(sessionId: number, phase: string): Promise<void>;
+    markLastMessageFinished?(sessionId: number): Promise<void>;
     updateField(sessionId: number, field: string, value: unknown): Promise<void>;
     updateModelId(sessionId: number, modelId: number): Promise<void>;
     getMessages(sessionId: number): Promise<Message[]>;
@@ -105,8 +107,17 @@ export interface WsHandlerDeps {
     updateContextTokens(sessionId: number, tokens: number): Promise<void>;
   };
   taskTerminalService: {
-    finishExecution(sessionId: number, userId: number, phase: string, executionId: string, reason?: string, notifySource?: TaskNotifySource): Promise<void>;
-    beginExecution?(sessionId: number, executionId: string, source?: TaskNotifySource, externalEvent?: ExternalEventRef | null): Promise<{ duplicate: boolean }>;
+    finishExecution(
+      sessionId: number,
+      userId: number,
+      phase: string,
+      executionId: string,
+      reason?: string,
+      notifySource?: TaskNotifySource,
+      lease?: LeaseHandle | null,
+    ): Promise<{ settled: boolean }>;
+    beginExecution?(sessionId: number, executionId: string, source?: TaskNotifySource, externalEvent?: ExternalEventRef | null): Promise<{ duplicate: boolean; lease: LeaseHandle | null }>;
+    getActiveExecutionLease?(sessionId: number): Promise<LeaseHandle | null>;
   };
   messageQueueService: {
     listPending(sessionId: number): Promise<MessageQueueItem[]>;
@@ -332,8 +343,9 @@ export function createScheduledLiveExecution(handler: StreamingWsHandler) {
     scheduledTaskId?: number | null,
     source?: 'SCHEDULED' | 'WEBHOOK' | 'API' | 'SIGNAL' | null,
     externalEvent?: ExternalEventRef | null,
+    lease?: LeaseHandle | null,
   ): Promise<void> =>
-    handler.executePersistedUserPrompt(session, userId, executionId, savedMessage, startedAt, scheduledTaskId, source, externalEvent);
+    handler.executePersistedUserPrompt(session, userId, executionId, savedMessage, startedAt, scheduledTaskId, source, externalEvent, lease);
 }
 
 export class StreamingWsHandler {
@@ -341,6 +353,8 @@ export class StreamingWsHandler {
   private readonly runningTasks = new Map<number, unknown>();
   private readonly runningExecutionIds = new Map<number, string>();
   private readonly executionClaims = new Set<number>();
+  /** 本进程已通过执行门禁的租约；取消路径据此取得与执行体相同的 handle。 */
+  private readonly sessionLeases = new Map<number, LeaseHandle>();
   private readonly sessionLocks = new Map<number, Promise<void>>();
   private readonly pendingSkillSyncs = new Map<number, { syncId: string; resolve: () => void; reject: (e: Error) => void }>();
   private readonly pendingMcpSyncs = new Map<number, { syncId: string; resolve: () => void; reject: (e: Error) => void }>();
@@ -764,6 +778,7 @@ export class StreamingWsHandler {
   private async runExecution(
     session: Session, userId: number, sessionId: number, executionId: string,
     cancelFlag: { get(): boolean; set(v: boolean): void }, clearTodos: boolean, futureRef: { current: unknown },
+    providedLease: LeaseHandle | null = null,
   ): Promise<void> {
     await this.withLock(this.sessionLocks, sessionId, async () => {
       // 本执行绑定的队列回写绑定（定时任务 lastExecutionStatus / Webhook 触发器失败计数）：
@@ -779,6 +794,7 @@ export class StreamingWsHandler {
       // 任何遗漏赋值的分支都倾向「不消费」，宁可暂停也不错误消耗用户消息。
       let terminalPhase: 'COMPLETED' | 'CANCELLED' | 'FAILED' = 'FAILED';
       const listenerRef: { current: WsStreamingEventListener | null } = { current: null };
+      let lease = providedLease;
       try {
         // 入口取消复查：取消发生在提交后、池真正开跑前的排队窗口时，不得覆盖 CANCELLED
         // 并白做同步/MCP 连接。与 runRetryExecution 一致放在 try 内提前退出：finally 的
@@ -787,21 +803,42 @@ export class StreamingWsHandler {
         // 下一次执行 stale 回写。簿记归属已由 cancelFlags 对象身份判定（可能已被
         // handleCancel 释放并归下一次执行所有），此处进入 finally 不会误删新执行簿记。
         if (cancelFlag.get()) {
-          await this.finishCancelledSession(sessionId, userId, executionId, executionSource);
+          await this.finishCancelledSession(sessionId, userId, executionId, executionSource, lease);
           terminalPhase = 'CANCELLED';
           return;
         }
+        try {
+          if (lease != null && (lease.sessionId !== sessionId || lease.executionId !== executionId)) {
+            throw new Error(`执行租约与当前任务不匹配: sessionId=${sessionId}, executionId=${executionId}`);
+          }
+          if (lease == null) {
+            const begun = await this.deps.taskTerminalService.beginExecution?.(
+              sessionId, executionId, executionSource ?? 'MANUAL', executionExternalEvent,
+            );
+            if (begun?.duplicate) {
+              // 外部事件已被其他执行认领：本次不进入 Harness，会话恢复空闲；
+              // 按 CANCELLED 收敛队列绑定（不计触发器连续失败）。
+              const current = await this.deps.sessionService.getSession(sessionId);
+              if (!this.isTerminalPhase(current?.phase)) {
+                await this.deps.sessionService.updatePhase(sessionId, 'IDLE');
+              }
+              terminalPhase = 'CANCELLED';
+              return;
+            }
+            lease = begun?.lease ?? null;
+          }
+        } catch (e) {
+          const message = e instanceof Error ? e.message : '任务正在其他实例执行';
+          terminalPhase = 'FAILED';
+          this.deps.registry.send(userId, wsEvent('error', sessionId, {
+            message: `执行门禁拒绝：${message}`,
+            code: 'execution_lease_rejected',
+            executionId,
+          }));
+          return;
+        }
+        if (lease != null) this.sessionLeases.set(sessionId, lease);
         await this.deps.sessionService.updatePhase(sessionId, 'RUNNING');
-        const begun = await this.deps.taskTerminalService.beginExecution?.(
-          sessionId, executionId, executionSource ?? 'MANUAL', executionExternalEvent,
-        );
-        if (begun?.duplicate) {
-          // 外部事件已被其他执行认领：本次不进入 Harness，会话恢复空闲；
-          // 按 CANCELLED 收敛队列绑定（不计触发器连续失败）。
-          await this.deps.sessionService.updatePhase(sessionId, 'IDLE');
-          terminalPhase = 'CANCELLED';
-          return;
-        }
         this.deps.registry.send(userId, wsEvent('session_status', sessionId, { phase: 'RUNNING', executionId }));
         this.deps.registry.send(userId, wsEvent('session_list_update', sessionId, { phase: 'RUNNING' }));
         if (session.sessionType === 'SIDE_TASK') this.deps.treeSignalPublisher.publishIfSideTask(sessionId);
@@ -810,7 +847,7 @@ export class StreamingWsHandler {
           const syncFailure = await this.syncSkillsToClient(userId, sessionId, session, agent);
           if (syncFailure) {
             const message = `技能同步失败：${syncFailure}`;
-            terminalPhase = await this.finishFailedSession(sessionId, userId, executionId, message, executionSource);
+            terminalPhase = await this.finishFailedSession(sessionId, userId, executionId, message, executionSource, lease);
             this.deps.registry.send(userId, wsEvent('error', sessionId, { message, executionId }));
             return;
           }
@@ -828,17 +865,17 @@ export class StreamingWsHandler {
           sessionId, userId, executionId, await this.resolveSupportsVision(session),
         );
         listenerRef.current = listener;
-        await this.deps.harnessService.executeFromEvent(sessionId, executionId, listener, cancelFlag);
+        await this.deps.harnessService.executeFromEvent(sessionId, executionId, listener, cancelFlag, lease);
         if (cancelFlag.get()) {
-          await this.finishCancelledSession(sessionId, userId, executionId, executionSource);
+          await this.finishCancelledSession(sessionId, userId, executionId, executionSource, lease);
           terminalPhase = 'CANCELLED';
         } else {
-          terminalPhase = await this.finishCompletedSession(sessionId, userId, executionId, executionSource);
+          terminalPhase = await this.finishCompletedSession(sessionId, userId, executionId, executionSource, lease);
         }
       } catch (e) {
         const message = e instanceof Error ? e.message : 'Agent 执行异常';
         this.deps.registry.send(userId, wsEvent('error', sessionId, { message, executionId }));
-        terminalPhase = await this.finishFailedSession(sessionId, userId, executionId, message, executionSource);
+        terminalPhase = await this.finishFailedSession(sessionId, userId, executionId, message, executionSource, lease);
       } finally {
         listenerRef.current?.dispose();
         try {
@@ -850,6 +887,7 @@ export class StreamingWsHandler {
         this.deps.registry.setSessionThinking(sessionId, false);
         if (this.runningTasks.get(sessionId) === futureRef.current) this.runningTasks.delete(sessionId);
         if (this.runningExecutionIds.get(sessionId) === executionId) this.runningExecutionIds.delete(sessionId);
+        if (lease != null && this.sessionLeases.get(sessionId) === lease) this.sessionLeases.delete(sessionId);
         // 簿记按归属回收：executionClaims 无对象身份，而它与 cancelFlags 始终成对增删，
         // 用 flag 的对象身份判定整套簿记是否仍属于本次执行。取消排队中的执行后立即重发时，
         // 迟到的旧执行体若无条件回收，会删掉新执行的 claim/cancelFlag 并把停止标记一并清掉。
@@ -894,6 +932,7 @@ export class StreamingWsHandler {
     scheduledTaskId?: number | null,
     source?: 'SCHEDULED' | 'WEBHOOK' | 'API' | 'SIGNAL' | null,
     externalEvent?: ExternalEventRef | null,
+    lease?: LeaseHandle | null,
   ): Promise<void> {
     const sessionId = session.id!;
     this.deps.titleService.scheduleForFirstUserMessage(sessionId, savedMessage.id, savedMessage.content ?? '');
@@ -925,7 +964,7 @@ export class StreamingWsHandler {
     // startedAt 由定时任务在 updatePhase(RUNNING) 之前记下。窗口内的停止早于本方法入口，
     // 用入口时间会把标记当成陈旧清掉，随后 runExecution 又把 CANCELLED 盖回 RUNNING。
     if (this.takePendingCancel(sessionId, startedAt ?? Date.now(), flag)) {
-      await this.finishCancelledSession(sessionId, userId, executionId);
+      await this.finishCancelledSession(sessionId, userId, executionId, null, lease);
       if (sourceBinding != null && this.liveSourceBindings.get(sessionId) === sourceBinding) {
         this.liveSourceBindings.delete(sessionId);
       }
@@ -938,7 +977,7 @@ export class StreamingWsHandler {
     this.runningExecutionIds.set(sessionId, executionId);
     if (!this.executionClaims.has(sessionId)) this.executionClaims.add(sessionId);
     const futureRef = { current: null as unknown };
-    const run = this.runExecution(session, userId, sessionId, executionId, flag, false, futureRef);
+    const run = this.runExecution(session, userId, sessionId, executionId, flag, false, futureRef, lease ?? null);
     futureRef.current = run;
     this.runningTasks.set(sessionId, run);
     await run;
@@ -1220,14 +1259,15 @@ export class StreamingWsHandler {
     }));
     this.executionClaims.add(sideSessionId);
     const flag = this.deps.agentLoop.registerCancelFlag(sideSessionId);
+    const sideExecutionId = randomUUID();
     if (this.takePendingCancel(sideSessionId, sideStartedAt, flag)) {
-      await this.finishCancelledSession(sideSessionId, userId, randomUUID());
+      await this.finishCancelledSession(sideSessionId, userId, '');
       return;
     }
     this.cancelFlags.set(sideSessionId, flag);
-    const sideExecutionId = randomUUID();
     this.runningExecutionIds.set(sideSessionId, sideExecutionId);
     let sideListener: WsStreamingEventListener | null = null;
+    let sideLease: LeaseHandle | null = null;
     const futureRef = { current: null as unknown };
     try {
       const future = this.deps.agentExecutor(async () => {
@@ -1235,10 +1275,29 @@ export class StreamingWsHandler {
         let terminalPhase: 'COMPLETED' | 'CANCELLED' | 'FAILED' = 'FAILED';
         try {
           if (flag.get()) {
-            await this.deps.taskTerminalService.finishExecution(sideSessionId, userId, 'CANCELLED', sideExecutionId);
+            await this.finishCancelledSession(sideSessionId, userId, sideExecutionId, null, sideLease);
             terminalPhase = 'CANCELLED';
             return;
           }
+          try {
+            const begun = await this.deps.taskTerminalService.beginExecution?.(sideSessionId, sideExecutionId, 'MANUAL');
+            if (begun?.duplicate) {
+              await this.deps.sessionService.updatePhase(sideSessionId, 'IDLE');
+              terminalPhase = 'CANCELLED';
+              return;
+            }
+            sideLease = begun?.lease ?? null;
+          } catch (e) {
+            await this.deps.sessionService.updatePhase(sideSessionId, 'IDLE');
+            terminalPhase = 'FAILED';
+            this.deps.registry.send(userId, wsEvent('error', sideSessionId, {
+              message: `执行门禁拒绝：${e instanceof Error ? e.message : '边路任务无法启动'}`,
+              code: 'execution_lease_rejected',
+              executionId: sideExecutionId,
+            }));
+            return;
+          }
+          if (sideLease != null) this.sessionLeases.set(sideSessionId, sideLease);
           await this.deps.sessionService.updatePhase(sideSessionId, 'RUNNING');
           this.deps.registry.send(userId, wsEvent('session_status', sideSessionId, { phase: 'RUNNING', executionId: sideExecutionId }));
           this.deps.treeSignalPublisher.publishIfSideTask(sideSessionId);
@@ -1248,7 +1307,7 @@ export class StreamingWsHandler {
               const syncFailure = await this.syncSkillsToClient(userId, sideSessionId, sideSession, sideAgent);
               if (syncFailure) {
                 const message = `技能同步失败：${syncFailure}`;
-                terminalPhase = await this.finishFailedSession(sideSessionId, userId, sideExecutionId, message);
+                terminalPhase = await this.finishFailedSession(sideSessionId, userId, sideExecutionId, message, null, sideLease);
                 this.deps.registry.send(userId, wsEvent('error', sideSessionId, { message, executionId: sideExecutionId }));
                 return;
               }
@@ -1260,16 +1319,16 @@ export class StreamingWsHandler {
             sideSessionId, userId, sideExecutionId, await this.resolveSupportsVision(sideSession),
           );
           sideListener = listener;
-          await this.deps.harnessService.executeSideFirstMessage(parentSessionId, sideSessionId, sideRunMode, listener, flag);
+          await this.deps.harnessService.executeSideFirstMessage(parentSessionId, sideSessionId, sideRunMode, listener, flag, sideLease);
           if (flag.get()) {
-            await this.deps.taskTerminalService.finishExecution(sideSessionId, userId, 'CANCELLED', sideExecutionId);
+            await this.finishCancelledSession(sideSessionId, userId, sideExecutionId, null, sideLease);
             terminalPhase = 'CANCELLED';
           } else {
-            terminalPhase = await this.finishCompletedSession(sideSessionId, userId, sideExecutionId);
+            terminalPhase = await this.finishCompletedSession(sideSessionId, userId, sideExecutionId, null, sideLease);
           }
         } catch (e) {
           const message = e instanceof Error ? e.message : '未知错误';
-          terminalPhase = await this.finishFailedSession(sideSessionId, userId, sideExecutionId, message);
+          terminalPhase = await this.finishFailedSession(sideSessionId, userId, sideExecutionId, message, null, sideLease);
           this.deps.registry.send(userId, wsEvent('error', sideSessionId, { message }));
         } finally {
           sideListener?.dispose();
@@ -1282,6 +1341,9 @@ export class StreamingWsHandler {
           this.deps.registry.setSessionThinking(sideSessionId, false);
           if (this.runningTasks.get(sideSessionId) === futureRef.current) this.runningTasks.delete(sideSessionId);
           if (this.runningExecutionIds.get(sideSessionId) === sideExecutionId) this.runningExecutionIds.delete(sideSessionId);
+          if (sideLease != null && this.sessionLeases.get(sideSessionId) === sideLease) {
+            this.sessionLeases.delete(sideSessionId);
+          }
           // 簿记按归属回收（同 runExecution finally）：flag 身份不匹配说明簿记已易主
           if (this.cancelFlags.get(sideSessionId) === flag) {
             this.executionClaims.delete(sideSessionId);
@@ -1299,8 +1361,10 @@ export class StreamingWsHandler {
       this.executionClaims.delete(sideSessionId);
       this.cancelFlags.delete(sideSessionId);
       this.runningExecutionIds.delete(sideSessionId);
+      this.sessionLeases.delete(sideSessionId);
       this.deps.agentLoop.removeCancelFlag(sideSessionId);
-      await this.finishFailedSession(sideSessionId, userId, sideExecutionId, '服务器繁忙，请稍后重试');
+      // 线程池拒绝发生在执行门禁之前：无租约、无任务投影，只收敛 Session。
+      await this.deps.sessionService.updatePhase(sideSessionId, 'FAILED');
       this.deps.registry.send(userId, wsEvent('error', sideSessionId, { message: '服务器繁忙，请稍后重试' }));
       this.deps.registry.send(userId, wsEvent('error', parentSessionId, { message: '服务器繁忙，请稍后重试' }));
     }
@@ -1310,9 +1374,11 @@ export class StreamingWsHandler {
     const sideSessionId = this.getLong(root, 'sideSessionId');
     if (sideSessionId == null) return;
     if (!(await this.requireOwnedSession(userId, sideSessionId))) return;
-    const executionId = this.currentExecutionId(sideSessionId) ?? '';
+    let lease = this.sessionLeases.get(sideSessionId) ?? null;
+    const executionId = this.currentExecutionId(sideSessionId) ?? lease?.executionId ?? '';
+    if (lease != null && executionId !== '' && lease.executionId !== executionId) lease = null;
     this.abortRunningExecution(sideSessionId, userId);
-    await this.finishCancelledSession(sideSessionId, userId, executionId);
+    await this.finishCancelledSession(sideSessionId, userId, executionId, null, lease);
     // 与 handleCancel 一致：DB 终态之外必须回收内存簿记，否则边路会话的「继续」按钮
     // 会被 already_running 永久拒绝。
     this.releaseExecutionBookkeeping(sideSessionId, { future: this.runningTasks.get(sideSessionId) });
@@ -1404,7 +1470,7 @@ export class StreamingWsHandler {
       this.deps.registry.setSessionThinking(sessionId, false);
       this.deps.askUserQuestionsRegistry.failAllForSession(sessionId);
       const submitted = this.submitExecution(sessionId, userId, executionId, (futureRef) =>
-        this.runRetryExecution(session, userId, sessionId, executionId, cancelFlag, futureRef, retryTaskId));
+        this.runRetryExecution(session, userId, sessionId, executionId, cancelFlag, futureRef, retryTaskId, entryPhase));
       if (!submitted) {
         // 线程池拒绝：submitExecution 已回滚簿记并发「服务器繁忙」事件，
         // 这里把相位收敛回进入时的终态（入口已校验 isTerminalPhase），
@@ -1440,21 +1506,40 @@ export class StreamingWsHandler {
   private async runRetryExecution(
     session: Session, userId: number, sessionId: number, executionId: string,
     cancelFlag: { get(): boolean; set(v: boolean): void }, futureRef: { current: unknown },
-    retryTaskId: number | null,
+    retryTaskId: number | null, entryPhase: string,
   ): Promise<void> {
     await this.withLock(this.sessionLocks, sessionId, async () => {
       let terminalPhase: 'COMPLETED' | 'CANCELLED' | 'FAILED' = 'FAILED';
       const listenerRef: { current: WsStreamingEventListener | null } = { current: null };
+      let lease: LeaseHandle | null = null;
       try {
         // 入口取消复查：取消发生在提交后、池真正开跑前的排队窗口时，不得覆盖 CANCELLED
         // 并白做执行。finishExecution 对已终态会话是 no-op；finally 仍收敛子代理重试簿记。
         if (cancelFlag.get()) {
-          await this.finishCancelledSession(sessionId, userId, executionId);
+          await this.finishCancelledSession(sessionId, userId, executionId, null, lease);
           terminalPhase = 'CANCELLED';
           return;
         }
+        try {
+          const begun = await this.deps.taskTerminalService.beginExecution?.(sessionId, executionId, 'MANUAL');
+          if (begun?.duplicate) {
+            await this.deps.sessionService.updatePhase(sessionId, entryPhase);
+            terminalPhase = 'FAILED';
+            return;
+          }
+          lease = begun?.lease ?? null;
+        } catch (e) {
+          await this.deps.sessionService.updatePhase(sessionId, entryPhase);
+          terminalPhase = 'FAILED';
+          this.deps.registry.send(userId, wsEvent('error', sessionId, {
+            message: `执行门禁拒绝：${e instanceof Error ? e.message : '任务无法重试'}`,
+            code: 'execution_lease_rejected',
+            executionId,
+          }));
+          return;
+        }
+        if (lease != null) this.sessionLeases.set(sessionId, lease);
         await this.deps.sessionService.updatePhase(sessionId, 'RUNNING');
-        await this.deps.taskTerminalService.beginExecution?.(sessionId, executionId);
         this.deps.registry.send(userId, wsEvent('session_status', sessionId, { phase: 'RUNNING', executionId }));
         this.deps.registry.send(userId, wsEvent('session_list_update', sessionId, { phase: 'RUNNING' }));
         if (session.sessionType === 'SIDE_TASK') this.deps.treeSignalPublisher.publishIfSideTask(sessionId);
@@ -1471,20 +1556,20 @@ export class StreamingWsHandler {
           const manager = this.deps.backgroundSubagentManager;
           if (!manager?.buildRetryContext) throw new Error('子代理重试上下文构建能力不可用');
           const context = await manager.buildRetryContext(sessionId);
-          await this.deps.harnessService.executePrepared(context, listener);
+          await this.deps.harnessService.executePrepared(context, listener, lease);
         } else {
-          await this.deps.harnessService.executeFromEvent(sessionId, executionId, listener, cancelFlag);
+          await this.deps.harnessService.executeFromEvent(sessionId, executionId, listener, cancelFlag, lease);
         }
         if (cancelFlag.get()) {
-          await this.finishCancelledSession(sessionId, userId, executionId);
+          await this.finishCancelledSession(sessionId, userId, executionId, null, lease);
           terminalPhase = 'CANCELLED';
         } else {
-          terminalPhase = await this.finishCompletedSession(sessionId, userId, executionId);
+          terminalPhase = await this.finishCompletedSession(sessionId, userId, executionId, null, lease);
         }
       } catch (e) {
         const message = e instanceof Error ? e.message : 'Agent 重试执行异常';
         this.deps.registry.send(userId, wsEvent('error', sessionId, { message, executionId }));
-        terminalPhase = await this.finishFailedSession(sessionId, userId, executionId, message);
+        terminalPhase = await this.finishFailedSession(sessionId, userId, executionId, message, null, lease);
       } finally {
         listenerRef.current?.dispose();
         try {
@@ -1496,6 +1581,7 @@ export class StreamingWsHandler {
         this.deps.registry.setSessionThinking(sessionId, false);
         if (this.runningTasks.get(sessionId) === futureRef.current) this.runningTasks.delete(sessionId);
         if (this.runningExecutionIds.get(sessionId) === executionId) this.runningExecutionIds.delete(sessionId);
+        if (lease != null && this.sessionLeases.get(sessionId) === lease) this.sessionLeases.delete(sessionId);
         // 簿记按归属回收（同 runExecution finally 的说明）：取消排队中的重试后立即重发时，
         // 迟到的旧执行体不得删掉新执行的 claim/cancelFlag。
         if (this.cancelFlags.get(sessionId) === cancelFlag) {
@@ -1630,15 +1716,22 @@ export class StreamingWsHandler {
         || this.runningTasks.has(sessionId)
         || this.isSessionActive(session.phase);
       if (inFlight) {
-        await this.finishCancelledSession(sessionId, userId, this.currentExecutionId(sessionId) ?? randomUUID());
+        const lease = this.sessionLeases.get(sessionId)
+          ?? await this.deps.taskTerminalService.getActiveExecutionLease?.(sessionId)
+          ?? null;
+        await this.finishCancelledSession(sessionId, userId, this.currentExecutionId(sessionId) ?? '', null, lease);
       }
       // 注意：此处不能回收簿记。pendingCancels 正是用来让「尚未注册取消标志」的在途提交
       // 在恢复后自行收敛的（见 takePendingCancel），提前删掉会让取消被静默丢弃。
       return;
     }
-    const executionId = this.currentExecutionId(sessionId) ?? '';
+    let lease = this.sessionLeases.get(sessionId)
+      ?? await this.deps.taskTerminalService.getActiveExecutionLease?.(sessionId)
+      ?? null;
+    const executionId = this.currentExecutionId(sessionId) ?? lease?.executionId ?? '';
+    if (lease != null && executionId !== '' && lease.executionId !== executionId) lease = null;
     this.abortRunningExecution(sessionId, userId);
-    await this.finishCancelledSession(sessionId, userId, executionId);
+    await this.finishCancelledSession(sessionId, userId, executionId, null, lease);
     // 取消标志已注册，执行体理论上会靠自己的 finally 回收簿记；但它可能因 LLM 流卡死
     // 永远走不到 finally。若不在此主动回收，claim/future 会永久残留，该会话后续的发送与
     // 重试全被 session_already_running 拒绝（只能重启服务恢复）。
@@ -2286,13 +2379,14 @@ export class StreamingWsHandler {
    */
   private async finishCompletedSession(
     sessionId: number, userId: number, executionId: string, source: TaskNotifySource | null = null,
+    lease?: LeaseHandle | null,
   ): Promise<'COMPLETED' | 'CANCELLED'> {
     const session = await this.deps.sessionService.getSession(sessionId);
     if (session?.phase === 'CANCELLED') return 'CANCELLED';
     if (source != null) {
-      await this.deps.taskTerminalService.finishExecution(sessionId, userId, 'COMPLETED', executionId, undefined, source);
+      await this.deps.taskTerminalService.finishExecution(sessionId, userId, 'COMPLETED', executionId, undefined, source, lease);
     } else {
-      await this.deps.taskTerminalService.finishExecution(sessionId, userId, 'COMPLETED', executionId);
+      await this.deps.taskTerminalService.finishExecution(sessionId, userId, 'COMPLETED', executionId, undefined, 'MANUAL', lease);
     }
     return 'COMPLETED';
   }
@@ -2303,26 +2397,36 @@ export class StreamingWsHandler {
    */
   private async finishFailedSession(
     sessionId: number, userId: number, executionId: string, reason: string, source: TaskNotifySource | null = null,
+    lease?: LeaseHandle | null,
   ): Promise<'FAILED' | 'CANCELLED'> {
     const session = await this.deps.sessionService.getSession(sessionId);
     if (session?.phase === 'CANCELLED') return 'CANCELLED';
     if (source != null) {
-      await this.deps.taskTerminalService.finishExecution(sessionId, userId, 'FAILED', executionId, reason, source);
+      await this.deps.taskTerminalService.finishExecution(sessionId, userId, 'FAILED', executionId, reason, source, lease);
     } else {
-      await this.deps.taskTerminalService.finishExecution(sessionId, userId, 'FAILED', executionId, reason);
+      await this.deps.taskTerminalService.finishExecution(sessionId, userId, 'FAILED', executionId, reason, 'MANUAL', lease);
     }
     return 'FAILED';
   }
 
   private async finishCancelledSession(
     sessionId: number, userId: number, executionId: string, _source: TaskNotifySource | null = null,
+    lease?: LeaseHandle | null,
   ): Promise<'CANCELLED'> {
     const session = await this.deps.sessionService.getSession(sessionId);
     if (session && this.isTerminalPhase(session.phase)) return 'CANCELLED';
     await this.deps.sessionService.cleanupIncompleteTail(sessionId);
-    // CANCELLED 不写收件箱，notifySource 对本终态无意义：保持 5 参调用，
-    // 不因签名扩展给这一路塞无意义的 SCHEDULED
-    await this.deps.taskTerminalService.finishExecution(sessionId, userId, 'CANCELLED', executionId);
+    const resolvedExecutionId = executionId.trim() !== '' ? executionId : lease?.executionId ?? '';
+    if (resolvedExecutionId === '') {
+      // 尚未拿到执行归属的预启动取消：只收敛 Session，不伪造 executionId 写任务终态。
+      await this.deps.sessionService.updatePhase(sessionId, 'CANCELLED');
+      this.deps.registry.clearSessionExecution?.(sessionId);
+      await this.deps.sessionService.markLastMessageFinished?.(sessionId);
+      return 'CANCELLED';
+    }
+    await this.deps.taskTerminalService.finishExecution(
+      sessionId, userId, 'CANCELLED', resolvedExecutionId, undefined, 'MANUAL', lease,
+    );
     return 'CANCELLED';
   }
 

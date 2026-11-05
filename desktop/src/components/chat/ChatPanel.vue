@@ -150,6 +150,8 @@
         @submit="handleSubmitQuestion"
       />
 
+      <RecoveredWaitNotice v-if="recoveredWait" :wait="recoveredWait" />
+
       <div v-if="sessionId && !isNewTaskMode" class="side-task-entry">
         <button type="button" class="side-task-btn" @click="openSideTask?.()">
           + 边路任务
@@ -236,6 +238,7 @@ import ApprovalStack from './ApprovalStack.vue'
 import CommandEditDialog from '../command/CommandEditDialog.vue'
 import ShareDialog from '../task/ShareDialog.vue'
 import QuestionPanel from './QuestionPanel.vue'
+import RecoveredWaitNotice from './RecoveredWaitNotice.vue'
 import ExecutionErrorBanner from './ExecutionErrorBanner.vue'
 import StarterPrompts from './StarterPrompts.vue'
 import RoundDirectory from './RoundDirectory.vue'
@@ -453,6 +456,12 @@ watch(isNewTaskMode, (enabled) => {
 })
 
 const currentSession = computed(() => sessionStore.activeSession)
+
+/** 崩溃恢复后的等待只读提示；正常进程内等待仍走 ApprovalStack / QuestionPanel。 */
+const recoveredWait = computed(() => {
+  const wait = currentSession.value?.pendingWait
+  return wait?.recovered === true ? wait : null
+})
 
 /**
  * 当前草稿绑定键：新建任务共用 'new'，已有会话按会话 ID 隔离。

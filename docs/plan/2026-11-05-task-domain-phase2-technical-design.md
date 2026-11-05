@@ -1,6 +1,6 @@
 # Super-agent 任务域技术方案（第二期）
 
-> 状态：实施中（2026-11-05）。共享契约、`V200` 基础表与第 3 步等待态持久化双写已落地；双写由 `EXECUTION_WAIT_PERSISTENCE_ENABLED` 控制且默认关闭。执行租约与恢复扫描尚未启用，默认运行时行为不变。
+> 状态：核心开发完成（2026-11-05）。第 1–9 步已落地：等待态双写、执行租约门禁、启动前 `PENDING` 检查、终态 fencing、崩溃恢复、Session / Task `pendingWait` 查询与桌面只读展示。`EXECUTION_WAIT_PERSISTENCE_ENABLED` / `EXECUTION_LEASE_ENABLED` 仍默认关闭，开启顺序与回滚见 §12；第 10 步的真实进程重启 / 多实例演练待发布环境执行。
 
 ## 1. 目标
 
@@ -424,10 +424,12 @@ export interface TaskDetailVO {
 - Task 详情：`TaskDetailVO.pendingWait` 由 `TaskService.get()` 按 `agent_task.lastExecutionId` 查询 `execution_wait`（`status='PENDING'`，多条时取 `expires_at` 最早的一条）填充；Task 列表继续用 `stage = BLOCKED` 筛选，不新增接口。
 - `mao task get` 在执行详情中透出 `pendingWait`，字段映射同步到 `skills/mao-cli/reference/task.md`；不输出原始参数、答案或审批意见。
 - `execution_wait_recovered` 通知与 `pendingWait` 使用同一 `TaskWaitVO` 字段集，避免前后端两套结构。
+- 桌面端 `useStreamWS` 把通知写入对应 Session 的 `pendingWait`（固定 `recovered=true`、`actionable=false`）；会话进入 `RUNNING` 或终态时清除旧恢复提示，`WAITING_APPROVAL` 保留。聊天页显示只读提示，执行记录详情显示类型、脱敏摘要、到期时间与恢复状态，均不提供审批 / 回答按钮。
+- 恢复提示与正常进程内等待分离：`ApprovalStack` / `QuestionPanel` 只消费内存 Registry；`RecoveredWaitNotice` 只消费 `pendingWait.recovered=true`，避免重启后的旧 `requestId` 被误当成可应答请求。
 
 ## 10. 开发顺序
 
-> 实施进度（2026-11-05）：第 1–3 步已完成；第 3 步默认关闭，开启后只旁路写库，不改变原有审批 / 提问语义。下一步为第 4 步执行租约。
+> 实施进度（2026-11-05）：第 1–9 步已完成；等待持久化与执行租约仍由开关控制且默认关闭，开启后按 §12 顺序灰度。第 10 步的真实重启 / 多实例演练待发布环境执行；第 11 步的文档与 CHANGELOG 已同步。
 
 1. 契约：`shared/contracts/src/task.ts` 增加 `TaskWaitKind` / `TaskWaitStatus` / `TaskWaitReleaseReason` / `TaskWaitVO` 与 `TaskDetailVO.pendingWait`；导出到 index；三端 tsc 先绿。
 2. 迁移 `V200`：两张表、`execution_wait.fencing_token`、唯一键与查询索引；补 SQL 结构测试。

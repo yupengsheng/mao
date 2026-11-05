@@ -11,6 +11,7 @@ import type { AgentExecutionContext } from '../core/agent-execution-context.js';
 import type { AgentDefinition, AgentDefinitionRegistry } from './agent-definition-registry.js';
 import type { SubagentExecutionMapper } from './subagent-execution.mapper.js';
 import type { SubAgentVisibilityService } from './subagent-visibility-service.js';
+import type { LeaseHandle } from '../../task/execution-lease.service.js';
 
 export class SubagentExecutionRecoveryService {
   constructor(
@@ -56,6 +57,7 @@ export class SubagentExecutionRecoveryService {
       return;
     }
     harnessLog('info', `subagent_recovery_start executionId=${execution.id} parent=${execution.parentSessionId} child=${child.id} invocation=${execution.invocationType ?? 'legacy'}`);
+    let recoveredLease: LeaseHandle | null = null;
     try {
       const existingFinal = await this.findPersistedFinal(execution);
       if (existingFinal) {
@@ -83,6 +85,7 @@ export class SubagentExecutionRecoveryService {
         if (!connected) throw new Error('LOCAL 客户端未在恢复等待期内连接');
       }
       const run = await this.visibilityService.executeVisible(child, context, false);
+      recoveredLease = run.lease;
       const collector = run.collector;
       const cancelled = cancel.get();
       let status = cancelled ? 'CANCELLED' : collector.error ? 'FAILED' : 'COMPLETED';
@@ -109,10 +112,13 @@ export class SubagentExecutionRecoveryService {
       await this.visibilityService.finishSubagent(
         child.id!, parent.userId, status, run.executionId,
         status === 'FAILED' ? result : undefined,
+        run.lease,
       );
     } catch (error) {
       await this.fail(execution, `子代理恢复失败：${(error as Error).message}`);
-      await this.visibilityService.finishSubagent(child.id!, parent.userId, 'FAILED', '', (error as Error).message);
+      await this.visibilityService.finishSubagent(
+        child.id!, parent.userId, 'FAILED', '', (error as Error).message, recoveredLease,
+      );
     } finally {
       this.agentLoop.removeCancelFlag(child.id!);
       this.localRegistry.removeSession?.(child.id!);

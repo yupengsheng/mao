@@ -75,6 +75,7 @@ import { CompactionSignalBus } from './harness/core/compaction-signal-bus.js';
 import { AgentLoop } from './harness/core/agent-loop.js';
 import { HarnessService } from './harness/core/harness-service.js';
 import type { ExperienceIndexService } from './harness/experience/experience-index.service.js';
+import type { ExecutionLeaseService } from './task/execution-lease.service.js';
 import { downloadFeishuMediaBuffer } from './feishu-media.js';
 import { fetchFeishuMessageDetail } from './feishu/message-detail.js';
 import { feishuSendTargetOf, sendFeishuFile, sendFeishuImage } from './feishu/media-sender.js';
@@ -159,7 +160,8 @@ export interface HarnessEngineDeps {
   activityHeartbeat: SessionActivityHeartbeat;
   memoryService: MemoryService;
   wsRegistry: any;
-  taskExecutionStarter?: (sessionId: number, executionId?: string) => Promise<unknown>;
+  executionLeaseService?: Pick<ExecutionLeaseService, 'heartbeat'> | null;
+  executionLeaseEnabled?: boolean;
   /** 团队经验库索引服务（技术方案 2026-10-24）：write_file/edit_file 落盘回调刷新索引。可选注入。 */
   experienceIndexService?: ExperienceIndexService | null;
   /** 团队经验库挂载服务：buildContext 每轮幂等补挂（存量会话兜底）。可选注入。 */
@@ -323,7 +325,8 @@ export function assembleHarnessEngine(deps: HarnessEngineDeps): HarnessEngineRes
     d.mcpLoadModeResolver,
     d.httpToolService,
     d.experienceMountService ?? null,
-    d.taskExecutionStarter ?? null,
+    d.executionLeaseService ?? null,
+    d.executionLeaseEnabled === true,
   );
   d.holder.harness = harness;
 

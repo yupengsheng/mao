@@ -99,7 +99,7 @@ describe('StreamingWsHandler source 透传（开放接口）', () => {
     const session = { id: 11, userId: 7, agentId: 5, executionMode: 'CLOUD', phase: 'IDLE', permissionLevel: 'READ_ONLY', status: 'ACTIVE' } as Session;
     await h.handler.executePersistedUserPrompt(session, 7, 'exec-open-1', { id: 300, sessionId: 11, role: 'USER', content: 'go' } as Message, Date.now(), null, 'API');
     await h.executor.runAll();
-    expect(h.taskTerminalService.finishExecution).toHaveBeenCalledWith(11, 7, 'COMPLETED', 'exec-open-1', undefined, 'API');
+    expect(h.taskTerminalService.finishExecution).toHaveBeenCalledWith(11, 7, 'COMPLETED', 'exec-open-1', undefined, 'API', null);
   });
 
   it('队列行 source_type=WEBHOOK + open_trigger_id：终态后触发器回写 + 收件箱来源 WEBHOOK', async () => {
@@ -119,7 +119,7 @@ describe('StreamingWsHandler source 透传（开放接口）', () => {
     expect(h.onOpenTriggerQueueConsumed).toHaveBeenCalledWith(3, 'COMPLETED');
     expect(h.onScheduledTaskQueueConsumed).not.toHaveBeenCalled();
     expect(h.taskTerminalService.finishExecution).toHaveBeenCalledWith(
-      11, 7, 'COMPLETED', expect.any(String), undefined, 'WEBHOOK',
+      11, 7, 'COMPLETED', expect.any(String), undefined, 'WEBHOOK', null,
     );
   });
 
@@ -139,7 +139,7 @@ describe('StreamingWsHandler source 透传（开放接口）', () => {
     expect(h.onScheduledTaskQueueConsumed).toHaveBeenCalledWith(77, 'COMPLETED');
     expect(h.onOpenTriggerQueueConsumed).not.toHaveBeenCalled();
     expect(h.taskTerminalService.finishExecution).toHaveBeenCalledWith(
-      11, 7, 'COMPLETED', expect.any(String), undefined, 'SCHEDULED',
+      11, 7, 'COMPLETED', expect.any(String), undefined, 'SCHEDULED', null,
     );
   });
 

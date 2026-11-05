@@ -7,6 +7,8 @@ import { AgentExecutionContext } from './agent-execution-context.js';
 import { CompactionConfig } from './compaction-config.js';
 import { HarnessService } from './harness-service.js';
 import { AtomicBoolean } from '../atomic-boolean.js';
+import { LeaseRequiredError, type LeaseHandle } from '../../task/execution-lease.service.js';
+import { LostExecutionLeaseError } from '../../task/task.service.js';
 import type { Tool } from '../tool/tool.js';
 import type { AgentLoop } from './agent-loop.js';
 import type { ToolRegistry } from '../tool/tool-registry.js';
@@ -277,9 +279,21 @@ function makeHarness(overrides: Record<string, unknown> = {}) {
     deps.mcpLoadModeResolver ?? null,
     deps.httpToolService ?? null,
     deps.experienceMount ?? null,
-    deps.executionStarter ?? null,
+    deps.executionLeaseService ?? null,
+    deps.executionLeaseEnabled === true,
   );
   return { service, ...deps };
+}
+
+function lease(overrides: Partial<LeaseHandle> = {}): LeaseHandle {
+  return {
+    sessionId: 10,
+    executionId: 'exec-1',
+    ownerInstance: 'instance-a',
+    fencingToken: 3n,
+    expiresAt: new Date(Date.now() + 60_000),
+    ...overrides,
+  };
 }
 
 /** forkParentMessages 用的假事务：按 SQL 关键字返回行，并记录全部 insert。 */
@@ -764,57 +778,92 @@ describe('HarnessService.buildContext and execute', () => {
     await vi.waitFor(() => expect(fileChangeMapper.insert).toHaveBeenCalled());
   });
 
-  it('registers an explicit event execution before assembling its context', async () => {
-    const order: string[] = [];
-    const executionStarter = vi.fn(async () => { order.push('start'); });
-    const { service, agentLoop } = makeHarness({ executionStarter });
-    const original = service.buildContext.bind(service);
-    vi.spyOn(service, 'buildContext').mockImplementation(async (...args) => {
-      order.push('context');
-      return original(...args);
-    });
-    await service.executeFromEvent(10, 'external-event', { onContentDelta: vi.fn() } as never);
-    expect(executionStarter).toHaveBeenCalledExactlyOnceWith(10, 'external-event');
-    expect(order).toEqual(['start', 'context']);
+  it('requires a lease when the execution lease gate is enabled', async () => {
+    const { service, agentLoop } = makeHarness({ executionLeaseEnabled: true });
+    await expect(service.execute(10, null, { onContentDelta: vi.fn() } as never))
+      .rejects.toBeInstanceOf(LeaseRequiredError);
+    expect(agentLoop.execute).not.toHaveBeenCalled();
+  });
+
+  it('executes with a matching lease when the gate is enabled', async () => {
+    const leaseService = { heartbeat: vi.fn(async () => true) };
+    const { service, agentLoop } = makeHarness({ executionLeaseEnabled: true, executionLeaseService: leaseService });
+    await service.execute(10, null, { onContentDelta: vi.fn() } as never, null, 7, lease());
     expect(agentLoop.execute).toHaveBeenCalledTimes(1);
+    expect(leaseService.heartbeat).not.toHaveBeenCalled();
   });
 
-  it('registers channel executions through the ordinary execute entry', async () => {
-    const executionStarter = vi.fn(async () => undefined);
-    const { service } = makeHarness({ executionStarter });
-    await service.execute(10, null, { onContentDelta: vi.fn() } as never, null, 9);
-    expect(executionStarter).toHaveBeenCalledExactlyOnceWith(10, undefined);
+  it('rejects an event whose execution id does not match the lease', async () => {
+    const { service, agentLoop } = makeHarness({ executionLeaseEnabled: true });
+    await expect(service.executeFromEvent(
+      10, 'external-event', { onContentDelta: vi.fn() } as never, null, lease({ executionId: 'other' }),
+    )).rejects.toBeInstanceOf(LostExecutionLeaseError);
+    expect(agentLoop.execute).not.toHaveBeenCalled();
   });
 
-  it('registers a prepared subagent execution only when execution actually begins', async () => {
-    const executionStarter = vi.fn(async () => undefined);
-    const { service, agentLoop } = makeHarness({ executionStarter });
+  it('cancels immediately when a heartbeat reports a lost lease', async () => {
+    vi.useFakeTimers();
+    try {
+      const heartbeat = vi.fn(async () => false);
+      let finishLoop!: () => void;
+      const { service, agentLoop } = makeHarness({
+        executionLeaseEnabled: true,
+        executionLeaseService: { heartbeat },
+      });
+      agentLoop.execute.mockImplementation(() => new Promise<void>((resolve) => { finishLoop = resolve; }));
+      const cancelFlag = new AtomicBoolean(false);
+      const running = service.execute(10, null, { onContentDelta: vi.fn() } as never, cancelFlag, 7, lease());
+      await vi.advanceTimersByTimeAsync(0);
+      expect(cancelFlag.get()).toBe(false);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(heartbeat).toHaveBeenCalledTimes(1);
+      expect(cancelFlag.get()).toBe(true);
+      finishLoop();
+      await running;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels after two consecutive heartbeat errors', async () => {
+    vi.useFakeTimers();
+    try {
+      const heartbeat = vi.fn(async () => { throw new Error('db unavailable'); });
+      let finishLoop!: () => void;
+      const { service, agentLoop } = makeHarness({
+        executionLeaseEnabled: true,
+        executionLeaseService: { heartbeat },
+      });
+      agentLoop.execute.mockImplementation(() => new Promise<void>((resolve) => { finishLoop = resolve; }));
+      const cancelFlag = new AtomicBoolean(false);
+      const running = service.execute(10, null, { onContentDelta: vi.fn() } as never, cancelFlag, 7, lease());
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(cancelFlag.get()).toBe(false);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(heartbeat).toHaveBeenCalledTimes(2);
+      expect(cancelFlag.get()).toBe(true);
+      finishLoop();
+      await running;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps prepared and side executions lease-gated', async () => {
+    const { service, agentLoop } = makeHarness({ executionLeaseEnabled: true });
     const context = await service.buildContext(10);
-    expect(executionStarter).not.toHaveBeenCalled();
-    await service.executePrepared(context, { onContentDelta: vi.fn() } as never);
-    expect(executionStarter).toHaveBeenCalledExactlyOnceWith(10, undefined);
-    expect(agentLoop.execute).toHaveBeenCalledTimes(1);
+    await expect(service.executePrepared(context, { onContentDelta: vi.fn() } as never))
+      .rejects.toBeInstanceOf(LeaseRequiredError);
+    await expect(service.executeSideFirstMessage(1, 10, 'none', { onContentDelta: vi.fn() } as never))
+      .rejects.toBeInstanceOf(LeaseRequiredError);
+    expect(agentLoop.execute).not.toHaveBeenCalled();
   });
 
-  it('registers a side execution before its parent context is copied', async () => {
-    const order: string[] = [];
-    const executionStarter = vi.fn(async () => { order.push('start'); });
-    const { service } = makeHarness({ executionStarter });
-    vi.spyOn(service, 'forkParentMessages').mockImplementation(async () => { order.push('fork'); });
-    await service.executeSideFirstMessage(1, 10, 'fork', { onContentDelta: vi.fn() } as never);
-    expect(executionStarter).toHaveBeenCalledExactlyOnceWith(10, undefined);
-    expect(order).toEqual(['start', 'fork']);
-  });
-
-  it.each(['execute', 'event', 'prepared', 'side'])('keeps %s execution running when tracking fails', async (entry) => {
-    const executionStarter = vi.fn(async () => { throw new Error('task storage unavailable'); });
-    const { service, agentLoop } = makeHarness({ executionStarter });
+  it('allows legacy executions without a lease when the gate is disabled', async () => {
+    const { service, agentLoop } = makeHarness();
     const listener = { onContentDelta: vi.fn() } as never;
-    if (entry === 'execute') await service.execute(10, null, listener);
-    if (entry === 'event') await service.executeFromEvent(10, 'event', listener);
-    if (entry === 'prepared') await service.executePrepared(await service.buildContext(10), listener);
-    if (entry === 'side') await service.executeSideFirstMessage(1, 10, 'none', listener);
-    expect(executionStarter).toHaveBeenCalledTimes(1);
+    await service.execute(10, null, listener);
     expect(agentLoop.execute).toHaveBeenCalledTimes(1);
   });
 

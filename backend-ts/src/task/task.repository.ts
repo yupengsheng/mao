@@ -141,6 +141,22 @@ export class TaskRepository {
   }
 
   /**
+   * 事务内校验当前执行仍持有有效租约。与 session 行锁同一事务，避免
+   * 校验通过后、写入前被其他实例抢占。
+   */
+  async assertLease(sessionId: number, executionId: string, fencingToken: bigint): Promise<boolean> {
+    const row = await this.db.queryOne<{ matched: number | string }>(
+      `SELECT 1 AS matched
+         FROM agent_execution_lease
+        WHERE session_id = ? AND execution_id = ? AND fencing_token = ?
+          AND status = 'ACTIVE' AND expires_at >= CURRENT_TIMESTAMP
+        LIMIT 1`,
+      [sessionId, executionId, fencingToken.toString()],
+    );
+    return row != null;
+  }
+
+  /**
    * 清理超过保留期且不属于任务最近 keepPerTask 次尝试的终态执行，并删除对应入口记录。
    * 只处理 COMPLETED / FAILED / CANCELLED，绝不触碰 WORKING / BLOCKED；单批使用
    * ORDER BY id LIMIT，避免长事务，多实例重复执行幂等。

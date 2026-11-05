@@ -1,9 +1,13 @@
 import { BusinessException } from '../common/business-exception.js';
 import { ErrorCode } from '../common/error-code.js';
 import { nowSql } from '../common/datetime.js';
-import type { AgentTaskVO, TaskDetailVO, TaskExecutionVO, TaskPageVO, TaskTriggerVO } from '@mao/contracts';
+import type {
+  AgentTaskVO, TaskDetailVO, TaskExecutionVO, TaskPageVO, TaskTriggerVO, TaskWaitVO,
+} from '@mao/contracts';
 import { OPEN_RUN_ADMISSION_POLICY_VERSION } from '../openapi/admission.js';
 import type { Session } from '../session/types.js';
+import type { LeaseHandle } from './execution-lease.service.js';
+import type { ExecutionWaitQueryStore, ExecutionWaitRecord } from './execution-wait.repository.js';
 import type { TaskRepository } from './task.repository.js';
 import type {
   AgentTask, BeginExecutionResult, ExternalEventRef, ExternalEventTrace, TaskExecution,
@@ -45,7 +49,10 @@ class ExternalEventClaimedError extends Error {
 }
 
 export class TaskService {
-  constructor(private readonly repo: TaskRepository) {}
+  constructor(
+    private readonly repo: TaskRepository,
+    private readonly executionWaits?: Pick<ExecutionWaitQueryStore, 'findEarliestPending'> | null,
+  ) {}
 
   async beginExecution(
     session: Session,
@@ -95,11 +102,14 @@ export class TaskService {
     });
   }
 
-  async beginRecoveryExecution(session: Session, executionId: string): Promise<TaskExecution> {
+  async beginRecoveryExecution(session: Session, executionId: string, lease?: LeaseHandle | null): Promise<TaskExecution> {
     this.validate(session, executionId);
     return this.repo.transaction(async (repo) => {
       const current = await repo.lockSession(session.userId, session.id!);
       if (current == null) throw new BusinessException(ErrorCode.SESSION_NOT_FOUND);
+      if (!await this.isLeaseValid(repo, current, executionId, lease)) {
+        throw new LostExecutionLeaseError(executionId);
+      }
       const fallbackSource = sourceOf(current);
       const task = await this.ensureTask(repo, current, fallbackSource);
       const existing = await repo.executionById(executionId);
@@ -128,11 +138,17 @@ export class TaskService {
     });
   }
 
-  async setExecutionStage(session: Session, executionId: string, stage: 'WORKING' | 'BLOCKED'): Promise<void> {
+  async setExecutionStage(
+    session: Session,
+    executionId: string,
+    stage: 'WORKING' | 'BLOCKED',
+    lease?: LeaseHandle | null,
+  ): Promise<void> {
     this.validate(session, executionId);
     await this.repo.transaction(async (repo) => {
       const current = await repo.lockSession(session.userId, session.id!);
       if (current == null) throw new BusinessException(ErrorCode.SESSION_NOT_FOUND);
+      if (!await this.isLeaseValid(repo, current, executionId, lease)) return;
       if (!['RUNNING', 'RESUMING', 'WAITING_APPROVAL'].includes(current.phase ?? '')) return;
       const task = await repo.findBySessionId(current.userId, current.id!);
       if (task == null || task.lastExecutionId !== executionId) return;
@@ -162,18 +178,26 @@ export class TaskService {
     await this.repo.transaction((repo) => repo.deleteBySessionId(sessionId));
   }
 
-  async settleExecution(session: Session, executionId: string, phase: TaskStage, failureReason?: string | null, source?: TaskSource): Promise<void> {
+  async settleExecution(
+    session: Session,
+    executionId: string,
+    phase: TaskStage,
+    failureReason?: string | null,
+    source?: TaskSource,
+    lease?: LeaseHandle | null,
+  ): Promise<boolean> {
     this.validate(session, executionId);
     if (!TERMINAL.has(phase)) throw new BusinessException(ErrorCode.PARAM_INVALID, '只接受执行终态');
-    await this.repo.transaction(async (repo) => {
+    return this.repo.transaction(async (repo) => {
       const current = await repo.lockSession(session.userId, session.id!);
       if (current == null) throw new BusinessException(ErrorCode.SESSION_NOT_FOUND);
+      if (!await this.isLeaseValid(repo, current, executionId, lease)) return false;
       const actualSource = sourceOf(current, source);
       const task = await this.ensureTask(repo, current, actualSource);
       let execution = await repo.executionById(executionId);
       if (execution != null) {
         this.requireExecutionOwner(execution, task);
-        if (TERMINAL.has(execution.status)) return;
+        if (TERMINAL.has(execution.status)) return true;
       } else {
         const created = await this.createExecution(repo, task, executionId, phase, actualSource);
         execution = created.execution!;
@@ -183,6 +207,7 @@ export class TaskService {
       if (currentExecution == null || execution.attemptNo >= currentExecution.attemptNo) {
         await repo.updateById(task.id!, this.taskFields(current, phase, executionId, actualSource));
       }
+      return true;
     });
   }
 
@@ -211,7 +236,35 @@ export class TaskService {
       latestExecution: latest == null ? null : this.executionVO(latest),
       executions: executions.map((execution) => this.executionVO(execution)),
       triggers: triggers.map((trigger) => this.triggerVO(trigger)),
-      pendingWait: null,
+      pendingWait: await this.pendingWait(task),
+    };
+  }
+
+  /**
+   * 只查 Task 当前执行的未过期等待；等待表不可用或数据异常时返回 null，
+   * 不让详情接口因辅助信息失败。原始参数 / 答案 / 审批意见不会出现在这里。
+   */
+  private async pendingWait(task: AgentTask): Promise<TaskWaitVO | null> {
+    const executionId = task.lastExecutionId;
+    if (this.executionWaits == null || executionId == null || executionId.trim() === '') return null;
+    let wait: ExecutionWaitRecord | null;
+    try {
+      wait = await this.executionWaits.findEarliestPending(task.sessionId, executionId);
+    } catch (error) {
+      console.warn(
+        `[task] failed to load pending wait: sessionId=${task.sessionId}, executionId=${executionId}`,
+        error,
+      );
+      return null;
+    }
+    if (wait == null) return null;
+    return {
+      kind: wait.requestType,
+      requestId: wait.requestId,
+      summary: wait.payloadSummary,
+      expiresAt: wait.expiresAt,
+      recovered: wait.recovered,
+      actionable: !wait.recovered,
     };
   }
 
@@ -311,7 +364,30 @@ export class TaskService {
     }
   }
 
+  /**
+   * lease 为空时保持旧行为，兼容开关关闭与历史调用方；非空时必须同时匹配
+   * Session / executionId / fencing token，任何不一致都视为已失去租约。
+   */
+  private async isLeaseValid(
+    repo: TaskRepository,
+    session: Session,
+    executionId: string,
+    lease?: LeaseHandle | null,
+  ): Promise<boolean> {
+    if (lease == null) return true;
+    if (lease.sessionId !== session.id || lease.executionId !== executionId) return false;
+    return repo.assertLease(session.id!, executionId, lease.fencingToken);
+  }
+
   private title(session: Session): string {
     return (session.title?.trim() || '未命名任务').slice(0, 512);
+  }
+}
+
+/** 恢复写入时发现租约已被其他实例接管；调用方必须放弃本轮恢复。 */
+export class LostExecutionLeaseError extends Error {
+  constructor(readonly executionId: string) {
+    super(`execution lease lost: ${executionId}`);
+    this.name = 'LostExecutionLeaseError';
   }
 }

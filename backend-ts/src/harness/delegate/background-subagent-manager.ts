@@ -14,6 +14,7 @@ import { SubAgentResultCollector } from './subagent-result-collector.js';
 import type { SubagentExecutionMapper } from './subagent-execution.mapper.js';
 import type { SubagentInvocationService } from './subagent-invocation.service.js';
 import type { SubAgentVisibilityService } from './subagent-visibility-service.js';
+import type { LeaseHandle } from '../../task/execution-lease.service.js';
 
 export const BACKGROUND_SUBAGENT_TOOLS = [
   'spawn_subagent',
@@ -698,6 +699,7 @@ export class BackgroundSubagentManager {
     const childSessionId = childSession.id!;
     const parentSessionId = execution.parentSessionId!;
     let runExecutionId = '';
+    let runLease: LeaseHandle | null = null;
     try {
       // 排队期间可能已被取消或父会话已终结：启动前二次校验，避免无谓执行产生副作用
       if (execution.id != null) {
@@ -741,6 +743,7 @@ export class BackgroundSubagentManager {
       }
 
       runExecutionId = runResult.executionId;
+      runLease = runResult.lease;
       const cancelled = childCancel.get() || parentCancel?.get() === true;
       let resultText: string;
       let status: string;
@@ -782,11 +785,12 @@ export class BackgroundSubagentManager {
       await this.deps.visibilityService.finishSubagent(
         childSessionId, childSession.userId, status, runExecutionId,
         status === 'FAILED' ? resultText : undefined,
+        runLease,
       );
       await this.onCompleted(execution, childSession, status, resultText, subContext, collector);
     } catch (e) {
       const message = '后台子代理执行失败: ' + ((e as Error)?.message ?? '子代理执行异常');
-      await this.failExecution(execution, childSession, message, runExecutionId);
+      await this.failExecution(execution, childSession, message, runExecutionId, runLease);
     } finally {
       if (execution.id != null) this.runningRefsByTask.delete(execution.id);
       this.untrackRunning(parentSessionId, execution.id ?? -1);
@@ -977,6 +981,7 @@ export class BackgroundSubagentManager {
     childSession: Session,
     message: string,
     runExecutionId: string,
+    lease?: LeaseHandle | null,
   ): Promise<void> {
     const parentId = execution.parentSessionId!;
     try {
@@ -992,7 +997,9 @@ export class BackgroundSubagentManager {
         });
         if (!applied) return;
       }
-      await this.deps.visibilityService.finishSubagent(childSession.id!, childSession.userId, 'FAILED', runExecutionId, message);
+      await this.deps.visibilityService.finishSubagent(
+        childSession.id!, childSession.userId, 'FAILED', runExecutionId, message, lease,
+      );
 
       const parent = await this.deps.sessionMapper.selectById(parentId);
       if (!parent || isTerminal(parent.phase)) {

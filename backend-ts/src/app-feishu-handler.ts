@@ -322,9 +322,16 @@ export function assembleFeishuHandler(deps: FeishuHandlerDeps): FeishuHandlerRes
         sessionService: d.sessionService as never,
       }, sessionId, ownerUserId, executionId, session.modelId != null && (await d.modelService.getModel(session.modelId))?.supportsVision === 1);
     },
-    onExecutionFinished: async (sessionId: number, _context: any, executionId: any, phase: any, failureReason: any) => {
+    taskTerminalService: {
+      beginExecution: (sessionId: number, executionId: string, source?: string, externalEvent?: null) =>
+        d.taskTerminal.beginExecution(sessionId, executionId, source, externalEvent),
+      releaseExecutionLease: (lease: any) => d.taskTerminal.releaseExecutionLease(lease),
+    },
+    executionLeaseEnabled: cfg.app.task?.executionLeaseEnabled === true,
+    onExecutionFinished: async (sessionId: number, _context: any, executionId: any, phase: any, failureReason: any, lease?: any) => {
       const session = await d.sessionService.getSession(sessionId);
-      await d.taskTerminal.finishExecution(sessionId, session.userId!, phase, executionId, failureReason);
+      if (lease == null) await d.taskTerminal.finishExecution(sessionId, session.userId!, phase, executionId, failureReason);
+      else await d.taskTerminal.finishExecution(sessionId, session.userId!, phase, executionId, failureReason, undefined, lease);
       if (phase === 'FAILED') return;
       try { await feishuProgressCardRepo.deleteBySessionId(sessionId); } catch (error) {
         console.warn(`清理飞书进度卡片映射失败, sessionId=${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
@@ -510,6 +517,7 @@ export function assembleFeishuHandler(deps: FeishuHandlerDeps): FeishuHandlerRes
       groupContextMaxItems: cfg.dingtalk.groupContext.maxItems,
       groupContextMaxMinutes: cfg.dingtalk.groupContext.maxMinutes,
       mergeWindowMs: cfg.dingtalk.mergeWindowMs,
+      executionLeaseEnabled: cfg.app.task?.executionLeaseEnabled === true,
     },
     workspaceRoot: cfg.app.harness.workspaceRoot,
     jwt: d.jwt,

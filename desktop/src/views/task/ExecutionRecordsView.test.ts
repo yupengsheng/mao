@@ -74,6 +74,30 @@ describe('execution records page', () => {
     expect(host.querySelector('.execution-list')?.textContent).toContain('trigger:7')
   })
 
+  it('shows a recovered pending wait as read-only with no approval actions', async () => {
+    deps.getTask.mockResolvedValue({
+      ...record,
+      pendingWait: {
+        kind: 'APPROVAL',
+        requestId: 'wait-1',
+        summary: JSON.stringify({ toolName: 'shell', target: 'npm test' }),
+        expiresAt: '2026-11-05 12:15:00',
+        recovered: true,
+        actionable: false,
+      },
+    })
+    const { host } = mount()
+    await settle()
+    host.querySelector<HTMLButtonElement>('.record-row')!.click()
+    await settle()
+    const card = host.querySelector('.pending-wait-card')
+    expect(card?.textContent).toContain('已恢复（只读）')
+    expect(card?.textContent).toContain('工具审批')
+    expect(card?.textContent).toContain('shell · npm test')
+    expect(card?.textContent).toContain('无法在此审批或回答')
+    expect(card?.querySelector('button')).toBeNull()
+  })
+
   it('renders failed requests as an error with a working retry action', async () => {
     deps.listTasks.mockRejectedValueOnce(new Error('暂时无法查询'))
     const { host } = mount()

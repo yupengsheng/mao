@@ -165,6 +165,7 @@ import { registerFeishuBindingRoutes } from './feishu/binding.routes.js';
 import { registerTaskNotificationPreferenceRoutes } from './notification/task/preference.routes.js';
 import { attachWebSocket } from './session/ws/attach-websocket.js';
 import type { TaskService } from './task/task.service.js';
+import type { ExecutionWaitQueryStore } from './task/execution-wait.repository.js';
 import { registerTaskRoutes } from './task/task.routes.js';
 
 export interface RouteDeps {
@@ -333,6 +334,7 @@ export interface RouteDeps {
   wsHandler: StreamingWsHandler;
   terminalWsHandler: TerminalWsHandler;
   taskService: TaskService;
+  executionWaitRepository: ExecutionWaitQueryStore;
 }
 
 export async function registerAllRoutes(deps: RouteDeps): Promise<void> {
@@ -376,6 +378,7 @@ export async function registerAllRoutes(deps: RouteDeps): Promise<void> {
     notifPref,
     wsHandler, terminalWsHandler,
     taskService,
+    executionWaitRepository,
   } = deps;
 
   await app.register(async (api) => {
@@ -506,6 +509,7 @@ export async function registerAllRoutes(deps: RouteDeps): Promise<void> {
       askUserQuestionsRegistry,
       treeSignalPublisher,
       existsSessionUnderWorkspace: (userId: number, path: string) => sessionRepo.existsSessionUnderWorkspace(userId, path),
+      executionWaitRepository,
     });
     registerTaskRoutes(api, taskService);
     const sessionShareService = new SessionShareService(

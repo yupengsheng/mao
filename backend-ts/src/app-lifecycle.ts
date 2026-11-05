@@ -304,6 +304,13 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
     },
     (sessionId: number) => d.agentLoop.getCancelFlag(sessionId) != null,
     cfg.server.port,
+    {
+      taskService: d.taskService ?? null,
+      executionWaitRepository: d.executionWaitRepository ?? null,
+      executionLeaseService: d.executionLeaseService ?? null,
+      ownerInstance: d.executionOwnerInstance ?? '',
+      executionLeaseEnabled: d.executionLeaseEnabled === true,
+    },
   );
   void crash.run().catch((e: unknown) => console.error('Crash recovery failed', e)).then(async () => {
     await d.dingtalk.hydrate().catch((error: unknown) => console.error('钉钉入站队列启动恢复失败', error));

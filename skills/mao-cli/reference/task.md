@@ -28,12 +28,12 @@ mao task get --id 1
 | --agent-id、--session-id | 可选正整数 |
 | --page、--size | 正整数，默认 1 / 20，size 最大 100 |
 
-QUEUED 为事务内初始化状态。WORKING 表示执行中，BLOCKED 表示等待提问回答或工具审批；仅对已登记开始且执行 ID 仍在途的执行投影等待状态。无 WS Listener 的直接事件执行也登记在途 ID。缺少开始记录时仍在终态补建，不会仅因提问/审批创建执行记录。等待请求目前仍由内存 Registry 管理，后端重启后不可恢复；`V200` 已建立等待态与执行租约基础表，但持久化写入、租约与恢复扫描尚未启用。自动崩溃续跑仍仅覆盖尚未结束的 RUNNING / RESUMING 会话，WAITING_APPROVAL / CANCELLING 不在自动续跑范围。
+QUEUED 为事务内初始化状态。WORKING 表示执行中，BLOCKED 表示等待提问回答或工具审批；仅对已登记开始且执行 ID 仍在途的执行投影等待状态。无 WS Listener 的直接事件执行也登记在途 ID。缺少开始记录时仍在终态补建，不会仅因提问/审批创建执行记录。开启 `EXECUTION_WAIT_PERSISTENCE_ENABLED` 后，等待请求会旁路写入 `execution_wait`，进程重启后可通过崩溃恢复重新投影为 `BLOCKED` 并推送只读恢复通知；恢复后的旧 Promise 已丢失，只能查看，不能继续审批或回答。自动崩溃续跑仍仅覆盖尚未结束的 RUNNING / RESUMING 会话，WAITING_APPROVAL / CANCELLING 不在自动续跑范围；执行租约由 `EXECUTION_LEASE_ENABLED` 单独控制。
 
 ## REST
 
 - `GET /api/v1/tasks?stage=WORKING&page=1&size=20`，返回 Result.data：`{ items, total, page, size }`。参数与 CLI 相同，Agent/Session 参数名为 agentId、sessionId。按更新时间、ID 倒序。
-- `GET /api/v1/tasks/:id`，返回 Result.data：`{ task, latestExecution, executions, triggers, pendingWait }`。执行和入口各最多最近 50 条。`pendingWait` 为当前执行最早过期的 `PENDING` 等待摘要，包含 `kind`、`requestId`、`summary`、`expiresAt`、`recovered`、`actionable`；没有等待时为 `null`。等待持久化启用前该字段固定为 `null`。不输出原始参数、答案或审批意见。
+- `GET /api/v1/tasks/:id`，返回 Result.data：`{ task, latestExecution, executions, triggers, pendingWait }`。执行和入口各最多最近 50 条。`pendingWait` 为当前执行最早过期的 `PENDING` 等待摘要，包含 `kind`、`requestId`、`summary`、`expiresAt`、`recovered`、`actionable`；没有等待时为 `null`。`summary` 是脱敏 JSON 投影，不包含原始参数、答案或审批意见。`recovered=true` 且 `actionable=false` 表示重启后恢复的只读投影；桌面 / Web 聊天页与执行记录详情只展示摘要和到期时间，不提供审批、拒绝、回答或提交入口。`GET /api/v1/sessions/:id` 同样返回可选的 `pendingWait`，会话列表 / dashboard / search 不返回。
 - 不存在/他人任务按既有 Result 业务错误返回 code=404。查询不接受用 userId 切换所有者。关联 Session 删除或转交后旧任务不可见。删除会话时会回收该会话的任务主档、执行与入口记录；边路任务提升为普通会话时，在同一事务内回收旧边路会话的任务记录。清理失败只记录日志，不阻断会话删除；任务历史不会迁移到提升后的新会话。
 
 Task.source 是首次来源；triggers 中的 source 是对应执行实际来源。sourceEventId 等于 executionId，仍只用于同一次执行登记去重。上游重新投递的同一外部事件改由 `externalEventId` + `externalEventScope` 识别：API 按 `token:<TokenID>` 绑定 `Idempotency-Key`，Webhook 按 `trigger:<触发器ID>` 绑定 `X-Mao-Event-Id`，同一作用域内只认领一次执行。未携带事件 ID 的手工 / 定时 / Signal 执行这两列为 null。
@@ -46,4 +46,4 @@ Task.source 是首次来源；triggers 中的 source 是对应执行实际来源
 
 飞书、钉钉在无内存循环但会话仍执行中时补写取消，优先使用在途 ID，再查询本人 Task 最新未结算的执行 ID，以取消原尝试。只有没有可用记录或查询失败时才使用新的随机 ID，已结束会话不生成取消尝试。崩溃恢复登记新一次执行时，会在同一事务内把该任务尚处于 WORKING / BLOCKED 的旧尝试标为 FAILED，结束时间取恢复登记时间，原因固定为「执行因进程中断未完成，已自动恢复」；相同恢复 executionId 幂等。恢复来源优先沿用最高编号旧尝试的 Trigger，取不到时按 Session 推断。多实例并发仍依赖部署排空与静默阈值，不是数据库租约。
 
-部署需应用 V179 / V195 / V198 / V200 迁移；V198 新增 `agent_task_trigger` 外部事件列与唯一键，并给 `message_queue` 增加透传列；V200 新增 `execution_wait` 与 `agent_execution_lease` 基础表，暂不启用运行时逻辑。正常使用现有 `FLYWAY_ENABLED` 迁移流程即可。
+部署需应用 V179 / V195 / V198 / V200 / V201 迁移；V198 新增 `agent_task_trigger` 外部事件列与唯一键，并给 `message_queue` 增加透传列；V200 新增 `execution_wait` 与 `agent_execution_lease` 基础表；V201 给 `execution_wait` 增加 `recovered_at`。运行时写入 / 租约 / 恢复分别受 `EXECUTION_WAIT_PERSISTENCE_ENABLED` 与 `EXECUTION_LEASE_ENABLED` 控制，默认关闭。正常使用现有 `FLYWAY_ENABLED` 迁移流程即可。

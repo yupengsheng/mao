@@ -213,6 +213,8 @@ import { TaskRepository } from './task/task.repository.js';
 import { TaskService } from './task/task.service.js';
 import { TaskWaitService } from './task/task-wait.service.js';
 import { ExecutionWaitRepository } from './task/execution-wait.repository.js';
+import { ExecutionLeaseService } from './task/execution-lease.service.js';
+import { createOwnerInstance } from './task/owner-instance.js';
 
 export interface MaoApp {
   app: FastifyInstance;
@@ -472,7 +474,10 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
   // 链接目标命中允许根才不会被沙箱当作路径逃逸拦截（容器严格模式同款放行见 container-tool-executor）。
   pathSandbox.addAllowedRoot(shareDir);
   const sessionRepo = new SessionRepository(db);
-  const taskService = new TaskService(new TaskRepository(db));
+  const executionWaitRepository = new ExecutionWaitRepository(db);
+  const executionLeaseService = new ExecutionLeaseService(db);
+  const executionOwnerInstance = createOwnerInstance();
+  const taskService = new TaskService(new TaskRepository(db), executionWaitRepository);
   const messageRepo = new MessageRepository(db);
   // run 轨迹读模型：零新表，读时聚合消息 / llm_call / session_activity / 压缩事件。
   const llmCallRepo = new LlmCallRepository(db);
@@ -737,7 +742,8 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
   const subagentResultDelivery = new SubagentResultDeliveryService(db, fileChangeRepo as never, inboxService);
   const taskWaitService = new TaskWaitService(taskService, sessionService, wsRegistry, {
     enabled: cfg.app.task.waitPersistenceEnabled,
-    store: new ExecutionWaitRepository(db),
+    store: executionWaitRepository,
+    leaseLookup: executionLeaseService,
   });
   const askUserQuestionsRegistry = new AskUserQuestionsRegistry(undefined, taskWaitService);
   const inFlightToolRegistry = new InFlightToolRegistry();
@@ -813,7 +819,10 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     activityService, activityHeartbeat, todoMapper, modelRepo, llmCallRepo,
     fileChangeRepo, wsRegistry, treeSignalPublisher, inboxService, budgetService,
     deliveryService, memoryExtraction, messageCitationService, outboundSubscriptionService,
-    taskService,
+    taskService, executionWaitRepository,
+    executionLeaseService,
+    executionLeaseEnabled: cfg.app.task.executionLeaseEnabled,
+    executionOwnerInstance,
     weixinWebhookFallback, weixinSend, weixinAccounts, weixinTokens, weixinInboundMessagesRef,
     definitionRegistry, subagentMapper, subagentInvocation, localToolSessions,
     scheduledStore, agentExecutor, holder,
@@ -863,7 +872,8 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     inboxService, skillLoader, skillSync, localSkills, localAgentsMd, agentRepo,
     experienceService, modelRepo, fileChangeRepo, envInfo, db, mcpSync, mcpLoadModeResolver,
     activityHeartbeat, memoryService, wsRegistry,
-    taskExecutionStarter: (sessionId, executionId) => taskTerminal.beginExecution(sessionId, executionId),
+    executionLeaseService,
+    executionLeaseEnabled: cfg.app.task.executionLeaseEnabled,
     experienceIndexService,
     experienceMountService,
   });
@@ -969,7 +979,7 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     ossSts,
     skillBundleService, userSkillService, skillDocService,
     scheduledService,
-    taskService,
+    taskService, executionWaitRepository,
     openRunService, apiTokenService, webhookTriggerService, outboundSubscriptionService,
     openApiRateLimiter, callLogService,
     watcherService, signalWatcherRepo,
@@ -1001,6 +1011,8 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     feishuInboundHandler, feishuTaskQueue, createFeishuRecoveryProgress,
     weixinInboundHandler, feishuInboundProcessor, watcherScheduler, signalCheckCleanup,
     ptyChannelHubs, ptyHubGeneration, containerRegistry, channelServer,
+    taskService, executionWaitRepository, executionLeaseService, executionOwnerInstance,
+    executionLeaseEnabled: cfg.app.task.executionLeaseEnabled,
   });
 
   return {

@@ -9,6 +9,7 @@ import { isInboundFileMessage, isNewSessionCommand } from './event-normalizer.js
 import { toWorkspaceRelative } from '../common/workspace-path.js';
 import { mapWithConcurrency } from '../common/concurrency.js';
 import { INBOUND_IMAGE_COMPRESS_CONCURRENCY, PromptImageResizer } from '../harness/tool/prompt-image-resizer.js';
+import type { LeaseHandle } from '../task/execution-lease.service.js';
 import type {
   CancelFlag, DingtalkHarnessService, DingtalkInboundContext, DingtalkInboundHandler,
   DingtalkInboundQueueRow, DingtalkQueuePayload, DingtalkQueueStoredContext, DingtalkReply, DingtalkTaskQueuePort,
@@ -84,7 +85,14 @@ export class AgentDingtalkInboundHandler implements DingtalkInboundHandler {
     settleCancel?: (sessionId: number) => Promise<void>;
     downloadMedia?: (context: DingtalkInboundContext, workspace: string | null) => Promise<DingtalkMediaDownload | null>;
     listenerFactory?: (sessionId: number, context: DingtalkInboundContext, executionId: string) => Promise<Parameters<DingtalkHarnessService['execute']>[2]>;
-    onExecutionFinished?: (sessionId: number, context: DingtalkInboundContext, executionId: string, phase: 'COMPLETED' | 'FAILED' | 'CANCELLED', failureReason?: string) => Promise<void>;
+    onExecutionFinished?: (sessionId: number, context: DingtalkInboundContext, executionId: string, phase: 'COMPLETED' | 'FAILED' | 'CANCELLED', failureReason?: string, lease?: LeaseHandle | null) => Promise<void>;
+    /** 任务执行门禁：begin 必须先于阶段写入与消息落库；未真正启动时只释放，不写终态。 */
+    taskTerminalService?: {
+      beginExecution?(sessionId: number, executionId: string, source?: string, externalEvent?: null): Promise<{ duplicate: boolean; lease: LeaseHandle | null }>;
+      releaseExecutionLease?(lease: LeaseHandle | null | undefined): Promise<void>;
+    };
+    /** 开启后，没有租约的执行不得写任务终态（关闭时保持改造前行为）。 */
+    executionLeaseEnabled?: boolean;
     /** 回复发出之后再清进度卡映射，便于发送失败时把原因写回卡片。 */
     afterDelivery?: (sessionId: number, phase: 'COMPLETED' | 'FAILED' | 'CANCELLED') => Promise<void>;
     /** 失败重试没有入站上下文，按进度卡映射还原发送目标。 */
@@ -264,11 +272,20 @@ export class AgentDingtalkInboundHandler implements DingtalkInboundHandler {
     }
   }
 
+  /** 只有真正进入 Harness 执行后才允许写终态；开启租约时还要求拿到 handle。 */
+  private canSettle(started: boolean, lease: LeaseHandle | null): boolean {
+    return started && (lease != null || this.options.executionLeaseEnabled !== true);
+  }
+
   private async runExecution(
     sessionId: number, context: DingtalkInboundContext, built: BuiltMessage,
     executionUserId: number | null, cancelFlag: CancelFlag, queueRow?: DingtalkInboundQueueRow | null,
   ): Promise<{ text: string | null; phase: 'COMPLETED' | 'CANCELLED' | 'FAILED' }> {
     let executionId = '';
+    let lease: LeaseHandle | null = null;
+    let started = false;
+    let phaseStarted = false;
+    let previousPhase = 'IDLE';
     let cardListener: FeishuCardProgressListener | null = null;
     let savedId: number | null = null;
     const swap = built.persisted !== built.forModel;
@@ -279,30 +296,59 @@ export class AgentDingtalkInboundHandler implements DingtalkInboundHandler {
       } catch (error) {
         console.warn(`钉钉进度卡片创建失败，继续执行: ${error instanceof Error ? error.message : String(error)}`);
       }
+      // executionId 必须来自正式入口；门禁先于 phase 写入与消息落库。
+      const eventId = await this.options.harnessService.prepareMessage(sessionId, built.forModel);
+      executionId = eventId || '';
+      try {
+        previousPhase = (await this.options.sessionService.getPhase?.(sessionId)) ?? 'IDLE';
+      } catch {
+        previousPhase = 'IDLE';
+      }
+      let begun: { duplicate: boolean; lease: LeaseHandle | null };
+      try {
+        begun = await this.options.taskTerminalService?.beginExecution?.(sessionId, executionId)
+          ?? { duplicate: false, lease: null };
+      } catch (error) {
+        console.warn(`钉钉消息执行门禁失败, sessionId=${sessionId}`, error);
+        return { text: '当前会话不可执行，请稍后再试。', phase: 'CANCELLED' };
+      }
+      if (begun.duplicate) {
+        return { text: null, phase: 'COMPLETED' };
+      }
+      lease = begun.lease;
       await this.options.sessionService.updatePhase?.(sessionId, 'RUNNING');
+      phaseStarted = true;
       const metadata = queueRow != null ? JSON.stringify({ dingtalkQueueId: queueRow.id }) : null;
-      const saved = await this.options.sessionService.saveUserMessage(sessionId, built.persisted, metadata);
+      let saved: number | void;
+      try {
+        saved = await this.options.sessionService.saveUserMessage(sessionId, built.persisted, metadata);
+      } catch (error) {
+        await this.options.sessionService.updatePhase?.(sessionId, previousPhase).catch(() => undefined);
+        await this.options.taskTerminalService?.releaseExecutionLease?.(lease).catch(() => undefined);
+        throw error;
+      }
       savedId = typeof saved === 'number' ? saved : null;
       this.echoUserMessageSaved(sessionId, executionUserId, built.persisted);
       if (swap && savedId != null) await this.options.sessionService.replaceMessageContent?.(savedId, built.forModel);
-      const eventId = await this.options.harnessService.prepareMessage(sessionId, built.forModel);
-      executionId = eventId || '';
       await this.broadcastRunning(sessionId, executionId, executionUserId);
       const listener = await this.options.listenerFactory?.(sessionId, context, executionId);
       if (listener == null) throw new Error('Dingtalk listenerFactory is required to execute a harness session');
-      await this.options.harnessService.execute(
-        sessionId, eventId || null,
-        cardListener == null ? listener : CompositeAgentEventListener.of(listener, cardListener),
-        cancelFlag, executionUserId,
-      );
+      started = true;
+      const executeListener = cardListener == null ? listener : CompositeAgentEventListener.of(listener, cardListener);
+      if (lease == null) await this.options.harnessService.execute(sessionId, eventId || null, executeListener, cancelFlag, executionUserId);
+      else await this.options.harnessService.execute(sessionId, eventId || null, executeListener, cancelFlag, executionUserId, lease);
       if (cancelFlag.get()) {
         const wasInterrupted = this.interrupted.has(sessionId);
         await this.options.sessionService.cleanupIncompleteTail?.(sessionId);
         await cardListener?.cancel(wasInterrupted);
-        await this.options.onExecutionFinished?.(sessionId, context, executionId, 'CANCELLED');
+        if (this.canSettle(started, lease)) {
+          await this.options.onExecutionFinished?.(sessionId, context, executionId, 'CANCELLED', undefined, lease);
+        }
         return { text: cardListener == null ? (wasInterrupted ? '任务已被下一条消息中断。' : '任务已取消。') : null, phase: 'CANCELLED' };
       }
-      await this.options.onExecutionFinished?.(sessionId, context, executionId, 'COMPLETED');
+      if (this.canSettle(started, lease)) {
+        await this.options.onExecutionFinished?.(sessionId, context, executionId, 'COMPLETED', undefined, lease);
+      }
       const text = await this.options.sessionService.getLatestAssistantReply(sessionId);
       await cardListener?.complete(text);
       return { text, phase: 'COMPLETED' };
@@ -311,7 +357,14 @@ export class AgentDingtalkInboundHandler implements DingtalkInboundHandler {
       await this.options.sessionService.cleanupIncompleteTail?.(sessionId);
       const failText = error instanceof Error ? error.message : 'Agent 执行异常';
       await cardListener?.fail(failText);
-      await this.options.onExecutionFinished?.(sessionId, context, executionId, 'FAILED', failText);
+      if (this.canSettle(started, lease)) {
+        await this.options.onExecutionFinished?.(sessionId, context, executionId, 'FAILED', failText, lease);
+      } else {
+        if (phaseStarted) {
+          await this.options.sessionService.updatePhase?.(sessionId, previousPhase).catch(() => undefined);
+        }
+        await this.options.taskTerminalService?.releaseExecutionLease?.(lease).catch(() => undefined);
+      }
       return { text: failText, phase: 'FAILED' };
     } finally {
       if (swap && savedId != null) {
@@ -325,27 +378,53 @@ export class AgentDingtalkInboundHandler implements DingtalkInboundHandler {
   private async runRetry(sessionId: number, progress: FeishuCardProgress): Promise<'COMPLETED' | 'CANCELLED' | 'FAILED'> {
     const cancelFlag = this.options.createCancelFlag?.(sessionId) ?? NOOP_CANCEL_FLAG;
     this.cancelFlags.set(sessionId, cancelFlag);
+    let executionId = '';
+    let lease: LeaseHandle | null = null;
+    let started = false;
+    let previousPhase = 'IDLE';
     let cardListener: FeishuCardProgressListener | null = null;
     const stub = { accountId: '0', chatType: 'p2p', conversationId: '', messageId: '', senderUserid: null, senderUnionId: null, senderName: '', msgtype: 'text', text: '', downloadCodes: [], fileName: null, quotedText: null, isInAtList: true } as DingtalkInboundContext;
     try {
       await this.options.sessionService.cleanupIncompleteTail?.(sessionId);
+      executionId = await this.options.harnessService.prepareMessage(sessionId, '');
+      try {
+        previousPhase = (await this.options.sessionService.getPhase?.(sessionId)) ?? 'IDLE';
+      } catch {
+        previousPhase = 'IDLE';
+      }
+      let begun: { duplicate: boolean; lease: LeaseHandle | null };
+      try {
+        begun = await this.options.taskTerminalService?.beginExecution?.(sessionId, executionId)
+          ?? { duplicate: false, lease: null };
+      } catch (error) {
+        console.warn(`钉钉重试执行门禁失败, sessionId=${sessionId}`, error);
+        return 'CANCELLED';
+      }
+      if (begun.duplicate) return 'COMPLETED';
+      lease = begun.lease;
       await this.options.sessionService.updatePhase?.(sessionId, 'RUNNING');
       let roundOffset = 0;
       try { roundOffset = countCompletedAgentRounds(await this.options.sessionService.getMessages?.(sessionId)); } catch { roundOffset = 0; }
       cardListener = new FeishuCardProgressListener(progress, roundOffset);
       await progress.update('RUNNING', roundOffset, '正在重试，请稍候…', []).catch(() => undefined);
-      const executionId = randomUUID();
       await this.broadcastRunning(sessionId, executionId, null);
       const listener = await this.options.listenerFactory?.(sessionId, stub, executionId) ?? new NoopAgentEventListener();
-      await this.options.harnessService.execute(sessionId, null, CompositeAgentEventListener.of(listener, cardListener), cancelFlag);
+      started = true;
+      const executeListener = CompositeAgentEventListener.of(listener, cardListener);
+      if (lease == null) await this.options.harnessService.execute(sessionId, null, executeListener, cancelFlag, null);
+      else await this.options.harnessService.execute(sessionId, null, executeListener, cancelFlag, null, lease);
       if (cancelFlag.get()) {
         await this.options.sessionService.cleanupIncompleteTail?.(sessionId);
         await cardListener.cancel(this.interrupted.has(sessionId));
-        await this.options.onExecutionFinished?.(sessionId, stub, executionId, 'CANCELLED');
+        if (this.canSettle(started, lease)) {
+          await this.options.onExecutionFinished?.(sessionId, stub, executionId, 'CANCELLED', undefined, lease);
+        }
         await this.options.afterDelivery?.(sessionId, 'CANCELLED');
         return 'CANCELLED';
       }
-      await this.options.onExecutionFinished?.(sessionId, stub, executionId, 'COMPLETED');
+      if (this.canSettle(started, lease)) {
+        await this.options.onExecutionFinished?.(sessionId, stub, executionId, 'COMPLETED', undefined, lease);
+      }
       const text = await this.options.sessionService.getLatestAssistantReply(sessionId);
       await cardListener.complete(text);
       if (text) await this.reply(await this.replyContext(sessionId, stub), text, sessionId);
@@ -354,7 +433,12 @@ export class AgentDingtalkInboundHandler implements DingtalkInboundHandler {
     } catch (error) {
       const failText = error instanceof Error ? error.message : 'Agent 执行异常';
       await cardListener?.fail(failText);
-      await this.options.onExecutionFinished?.(sessionId, stub, '', 'FAILED', failText);
+      if (this.canSettle(started, lease)) {
+        await this.options.onExecutionFinished?.(sessionId, stub, executionId, 'FAILED', failText, lease);
+      } else {
+        await this.options.sessionService.updatePhase?.(sessionId, previousPhase).catch(() => undefined);
+        await this.options.taskTerminalService?.releaseExecutionLease?.(lease).catch(() => undefined);
+      }
       if (failText) await this.reply(await this.replyContext(sessionId, stub), failText, sessionId);
       await this.options.afterDelivery?.(sessionId, 'FAILED');
       return 'FAILED';

@@ -63,6 +63,9 @@ const CRITICAL_EVENT_TYPES = new Set([
   'queue_updated',
   'queue_message_consumed',
   'session_already_running',
+  // 崩溃恢复后重建的等待通知：丢失会让客户端只看到 BLOCKED，却看不到具体的
+  // 审批 / 提问摘要与“只读、不可操作”的提示，直到重新打开会话详情。
+  'execution_wait_recovered',
   // 收件箱未读数：普通帧队列满时是直接丢弃，弱网/高频会话下未读数会静默停在旧值
   // 且无主动重拉入口；事件日均为个位数到数十条，不会挤占关键通道。
   'inbox_updated',

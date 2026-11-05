@@ -19,11 +19,19 @@ vi.mock('../../session/ws/ws-streaming-event-listener.js', () => {
 
 import type { AgentEventListener } from './agent-event-listener.js';
 import { CompositeAgentEventListener } from './composite-agent-event-listener.js';
-import { CrashRecoveryRunner, type RecoveryExtraListener } from './crash-recovery-runner.js';
+import {
+  CrashRecoveryRunner,
+  EXECUTION_WAIT_EXPIRED_REASON,
+  type CrashRecoveryDeps,
+  type RecoveryExtraListener,
+} from './crash-recovery-runner.js';
+import type { LeaseHandle } from '../../task/execution-lease.service.js';
+import type { ExecutionWaitRecord } from '../../task/execution-wait.repository.js';
 
 interface RunnerOptions {
   cancelled?: boolean;
   executeError?: Error;
+  recoveryDeps?: CrashRecoveryDeps;
 }
 
 function makeRunner(
@@ -76,6 +84,9 @@ function makeRunner(
     onExecutionFinished,
     undefined,
     extra,
+    undefined,
+    undefined,
+    options.recoveryDeps,
   );
   return { runner, registry, taskTerminalService, harnessService, pending, onExecutionFinished, sessionService };
 }
@@ -107,7 +118,7 @@ describe('CrashRecoveryRunner.createExtraListeners', () => {
     await runner.run();
     await Promise.all(pending);
     expect((harnessService.execute.mock.calls[0][2] as { marker?: string }).marker).toBe('ws-listener');
-    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(7, 42, 'COMPLETED', expect.any(String));
+    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(7, 42, 'COMPLETED', expect.any(String), undefined, 'MANUAL', null);
   });
 
   it('successfulRecoveryNotifiesExtraCompleteWithLatestAssistantReply', async () => {
@@ -121,7 +132,7 @@ describe('CrashRecoveryRunner.createExtraListeners', () => {
     await runner.run();
     await Promise.all(pending);
     expect(complete).toHaveBeenCalledWith('最终回复');
-    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(7, 42, 'COMPLETED', expect.any(String));
+    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(7, 42, 'COMPLETED', expect.any(String), undefined, 'MANUAL', null);
   });
 
   it('successfulRecoveryCompleteFallsBackWhenNoAssistantReply', async () => {
@@ -156,7 +167,7 @@ describe('CrashRecoveryRunner.createExtraListeners', () => {
     await Promise.all(pending);
     expect(fail).toHaveBeenCalledWith('llm down');
     expect(onError).not.toHaveBeenCalled();
-    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(7, 42, 'FAILED', expect.any(String), 'llm down');
+    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(7, 42, 'FAILED', expect.any(String), 'llm down', 'MANUAL', null);
   });
 
   it('executionFailureFallsBackToOnErrorWhenFailIsAbsent', async () => {
@@ -166,7 +177,7 @@ describe('CrashRecoveryRunner.createExtraListeners', () => {
     await runner.run();
     await Promise.all(pending);
     expect(onError).toHaveBeenCalledWith(expect.any(Error));
-    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(7, 42, 'FAILED', expect.any(String), 'llm down');
+    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(7, 42, 'FAILED', expect.any(String), 'llm down', 'MANUAL', null);
   });
 
   it('cancelledRecoveryNotifiesExtraCancelAndMarksCancelled', async () => {
@@ -176,7 +187,7 @@ describe('CrashRecoveryRunner.createExtraListeners', () => {
     await runner.run();
     await Promise.all(pending);
     expect(cancel).toHaveBeenCalled();
-    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(7, 42, 'CANCELLED', expect.any(String));
+    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(7, 42, 'CANCELLED', expect.any(String), undefined, 'MANUAL', null);
   });
 
   it('onExecutionFinishedReceivesPhaseFailedWhenRecoveryFails', async () => {
@@ -207,7 +218,7 @@ describe('CrashRecoveryRunner.createExtraListeners', () => {
     expect(executionId).not.toBe('');
     for (const e of runningEvents) expect(e.data?.executionId).toBe(executionId);
     // 与终态收敛使用的是同一个 executionId
-    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(7, 42, 'COMPLETED', executionId);
+    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(7, 42, 'COMPLETED', executionId, undefined, 'MANUAL', null);
   });
 
   it('registers the recovery attempt with the same execution id before running the harness', async () => {
@@ -215,7 +226,7 @@ describe('CrashRecoveryRunner.createExtraListeners', () => {
     await runner.run();
     await Promise.all(pending);
     const executionId = taskTerminalService.finishExecution.mock.calls[0]![3];
-    expect(taskTerminalService.beginRecoveryExecution).toHaveBeenCalledWith(7, executionId);
+    expect(taskTerminalService.beginRecoveryExecution).toHaveBeenCalledWith(7, executionId, null);
     expect(taskTerminalService.beginRecoveryExecution.mock.invocationCallOrder[0])
       .toBeLessThan(harnessService.execute.mock.invocationCallOrder[0]!);
   });
@@ -226,7 +237,214 @@ describe('CrashRecoveryRunner.createExtraListeners', () => {
     await runner.run();
     await Promise.all(pending);
     expect(harnessService.execute).toHaveBeenCalledTimes(1);
-    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(7, 42, 'COMPLETED', expect.any(String));
+    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(7, 42, 'COMPLETED', expect.any(String), undefined, 'MANUAL', null);
+  });
+});
+
+describe('CrashRecoveryRunner lease-aware recovery', () => {
+  const expiresAt = new Date('2026-11-05T08:00:00.000Z');
+
+  function waitRow(overrides: Partial<ExecutionWaitRecord> = {}): ExecutionWaitRecord {
+    return {
+      id: 1,
+      sessionId: 7,
+      executionId: 'exec-old',
+      requestType: 'APPROVAL',
+      requestId: 'req-1',
+      payloadSummary: '等待工具 read_file 的审批（参数已隐藏）',
+      expiresAt: '2026-11-05 12:00:00',
+      fencingToken: 7n,
+      expired: false,
+      recovered: false,
+      ...overrides,
+    };
+  }
+
+  function makeLeaseAwareRunner(options: {
+    waits: ExecutionWaitRecord[];
+    active?: LeaseHandle | null;
+    enabled?: boolean;
+    priorExecutionId?: string | null;
+  }) {
+    const leaseService = {
+      getActive: vi.fn().mockResolvedValue(options.active ?? null),
+      getRecord: vi.fn().mockResolvedValue({
+        sessionId: 7, executionId: 'exec-old', ownerInstance: 'node-a', fencingToken: 7n,
+        expiresAt, status: 'RELEASED' as const,
+      }),
+      acquire: vi.fn().mockImplementation(async (sessionId: number, executionId: string) => ({
+        sessionId, executionId, ownerInstance: 'node-a', fencingToken: 8n, expiresAt,
+      })),
+      release: vi.fn().mockResolvedValue(undefined),
+    };
+    const recoveredIds = new Set<number>();
+    const waitRepository = {
+      listPending: vi.fn().mockResolvedValue(options.waits),
+      expire: vi.fn().mockResolvedValue(true),
+      markRecovered: vi.fn().mockImplementation(async (ids: number[]) => {
+        const newly = ids.filter((id) => !recoveredIds.has(id));
+        for (const id of newly) recoveredIds.add(id);
+        return newly;
+      }),
+    };
+    const taskService = {
+      getActiveExecutionId: vi.fn().mockResolvedValue(
+        options.priorExecutionId === undefined ? 'exec-old' : options.priorExecutionId),
+      setExecutionStage: vi.fn().mockResolvedValue(undefined),
+    };
+    const built = makeRunner(undefined, {
+      recoveryDeps: {
+        executionLeaseService: leaseService as never,
+        executionWaitRepository: waitRepository as never,
+        taskService: taskService as never,
+        ownerInstance: 'node-a',
+        executionLeaseEnabled: options.enabled ?? true,
+      } satisfies CrashRecoveryDeps,
+    });
+    return { ...built, leaseService, waitRepository, taskService, recoveredIds };
+  }
+
+  it('claims a fresh lease before resuming a session without pending waits', async () => {
+    const fixture = makeLeaseAwareRunner({ waits: [] });
+    await fixture.runner.run();
+    await Promise.all(fixture.pending);
+
+    expect(fixture.leaseService.acquire).toHaveBeenCalledWith(7, expect.any(String), 'node-a');
+    const executionId = fixture.taskTerminalService.beginRecoveryExecution.mock.calls[0]![1] as string;
+    const lease = fixture.leaseService.acquire.mock.results[0]!.value;
+    expect(fixture.taskTerminalService.beginRecoveryExecution).toHaveBeenCalledWith(7, executionId, await lease);
+    expect(fixture.harnessService.execute).toHaveBeenCalledWith(
+      7, null, expect.anything(), expect.anything(), null, await lease);
+    expect(fixture.taskTerminalService.finishExecution).toHaveBeenCalledWith(
+      7, 42, 'COMPLETED', executionId, undefined, 'MANUAL', await lease);
+    expect(fixture.leaseService.release).toHaveBeenCalledWith(await lease);
+  });
+
+  it('projects an unexpired approval as a read-only BLOCKED wait', async () => {
+    const fixture = makeLeaseAwareRunner({ waits: [waitRow()] });
+    await fixture.runner.run();
+    await Promise.all(fixture.pending);
+
+    const lease = await fixture.leaseService.acquire.mock.results[0]!.value;
+    expect(fixture.waitRepository.listPending).toHaveBeenNthCalledWith(1, 7, 'exec-old');
+    expect(fixture.waitRepository.listPending).toHaveBeenNthCalledWith(2, 7, 'exec-old', 8n);
+    expect(fixture.taskService.setExecutionStage).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 7 }), 'exec-old', 'BLOCKED', lease);
+    expect(fixture.sessionService.updatePhase).toHaveBeenCalledWith(7, 'WAITING_APPROVAL');
+    expect(fixture.harnessService.execute).not.toHaveBeenCalled();
+    expect(fixture.taskTerminalService.finishExecution).not.toHaveBeenCalled();
+    expect(fixture.leaseService.release).toHaveBeenCalledWith(lease);
+    expect(fixture.registry.send).toHaveBeenCalledWith(42, expect.objectContaining({
+      type: 'execution_wait_recovered',
+      data: expect.objectContaining({
+        requestId: 'req-1', requestType: 'APPROVAL', recovered: true, actionable: false,
+      }),
+    }));
+  });
+
+  it('projects an unexpired question while keeping the session RUNNING', async () => {
+    const fixture = makeLeaseAwareRunner({
+      waits: [waitRow({ requestType: 'QUESTION', requestId: 'req-q' })],
+    });
+    await fixture.runner.run();
+    await Promise.all(fixture.pending);
+
+    expect(fixture.sessionService.updatePhase).toHaveBeenCalledWith(7, 'RUNNING');
+    expect(fixture.harnessService.execute).not.toHaveBeenCalled();
+    expect(fixture.registry.send).toHaveBeenCalledWith(42, expect.objectContaining({
+      type: 'execution_wait_recovered',
+      data: expect.objectContaining({ requestType: 'QUESTION', actionable: false }),
+    }));
+  });
+
+  it('expires an overdue wait and settles the old execution as FAILED', async () => {
+    const fixture = makeLeaseAwareRunner({ waits: [waitRow({ expired: true })] });
+    await fixture.runner.run();
+    await Promise.all(fixture.pending);
+
+    const lease = await fixture.leaseService.acquire.mock.results[0]!.value;
+    expect(fixture.waitRepository.expire).toHaveBeenCalledWith(1, 8n);
+    expect(fixture.waitRepository.markRecovered).not.toHaveBeenCalled();
+    expect(fixture.taskTerminalService.finishExecution).toHaveBeenCalledWith(
+      7, 42, 'FAILED', 'exec-old', EXECUTION_WAIT_EXPIRED_REASON, 'MANUAL', lease);
+    expect(fixture.onExecutionFinished).toHaveBeenCalledWith(7, 42, 'FAILED');
+    expect(fixture.harnessService.execute).not.toHaveBeenCalled();
+    expect(fixture.registry.send).not.toHaveBeenCalledWith(
+      42, expect.objectContaining({ type: 'execution_wait_recovered' }));
+  });
+
+  it('expires stale rows but keeps a mixed wait actionable when one request is still live', async () => {
+    const fixture = makeLeaseAwareRunner({
+      waits: [
+        waitRow({ id: 1, requestId: 'req-expired', expired: true }),
+        waitRow({ id: 2, requestId: 'req-live' }),
+      ],
+    });
+    await fixture.runner.run();
+    await Promise.all(fixture.pending);
+
+    expect(fixture.waitRepository.expire).toHaveBeenCalledTimes(1);
+    expect(fixture.waitRepository.expire).toHaveBeenCalledWith(1, 8n);
+    expect(fixture.taskTerminalService.finishExecution).not.toHaveBeenCalled();
+    expect(fixture.sessionService.updatePhase).toHaveBeenCalledWith(7, 'WAITING_APPROVAL');
+    const recovered = vi.mocked(fixture.registry.send).mock.calls
+      .map((call) => call[1] as { type: string; data?: { requestId?: string } })
+      .filter((event) => event.type === 'execution_wait_recovered');
+    expect(recovered.map((event) => event.data?.requestId)).toEqual(['req-live']);
+    expect(fixture.waitRepository.markRecovered).toHaveBeenCalledWith([2], 8n);
+  });
+
+  it('skips recovery while another instance still owns an active lease', async () => {
+    const fixture = makeLeaseAwareRunner({
+      waits: [waitRow()],
+      active: {
+        sessionId: 7, executionId: 'exec-other', ownerInstance: 'node-b', fencingToken: 5n, expiresAt,
+      },
+    });
+    await fixture.runner.run();
+    await Promise.all(fixture.pending);
+
+    expect(fixture.waitRepository.listPending).not.toHaveBeenCalled();
+    expect(fixture.leaseService.acquire).not.toHaveBeenCalled();
+    expect(fixture.harnessService.execute).not.toHaveBeenCalled();
+  });
+
+  it('keeps the legacy recovery path when the lease flag is off', async () => {
+    const fixture = makeLeaseAwareRunner({ waits: [waitRow()], enabled: false });
+    await fixture.runner.run();
+    await Promise.all(fixture.pending);
+
+    expect(fixture.leaseService.getActive).not.toHaveBeenCalled();
+    expect(fixture.waitRepository.listPending).not.toHaveBeenCalled();
+    expect(fixture.harnessService.execute).toHaveBeenCalledTimes(1);
+    expect(fixture.taskTerminalService.finishExecution).toHaveBeenCalledWith(
+      7, 42, 'COMPLETED', expect.any(String), undefined, 'MANUAL', null);
+  });
+
+  it('pushes the same recovered wait only once across repeated scans', async () => {
+    const fixture = makeLeaseAwareRunner({ waits: [waitRow()] });
+    await fixture.runner.run();
+    await Promise.all(fixture.pending);
+    await fixture.runner.run();
+    await Promise.all(fixture.pending);
+
+    const recovered = vi.mocked(fixture.registry.send).mock.calls
+      .filter((call) => (call[1] as { type: string }).type === 'execution_wait_recovered');
+    expect(recovered).toHaveLength(1);
+    expect(fixture.waitRepository.markRecovered).toHaveBeenCalledTimes(2);
+    await expect(fixture.waitRepository.markRecovered.mock.results[1]!.value).resolves.toEqual([]);
+  });
+
+  it('does not push a recovered wait when the persistence marker fails', async () => {
+    const fixture = makeLeaseAwareRunner({ waits: [waitRow()] });
+    fixture.waitRepository.markRecovered.mockRejectedValueOnce(new Error('db down'));
+
+    await fixture.runner.run();
+    await Promise.all(fixture.pending);
+
+    expect(fixture.taskService.setExecutionStage).toHaveBeenCalled();
+    expect(fixture.registry.send).not.toHaveBeenCalledWith(
+      42, expect.objectContaining({ type: 'execution_wait_recovered' }));
   });
 });
 
@@ -253,13 +471,13 @@ describe('CrashRecoveryRunner deferred rescan', () => {
     // 本实例承接流量（active-backend-port = 自身端口），否则延迟恢复会被部署闸门推迟。
     mkdirSync(runtimeDir, { recursive: true });
     writeFileSync(join(runtimeDir, 'active-backend-port'), String(selfPort));
-    // collectCandidates 每轮扫描调用 selectByPhase 两次（RUNNING + RESUMING），
-    // 这里按「轮」推进序列：每轮两次调用消费同一个 ids 元素。
+    // collectCandidates 每轮会查询 RUNNING / RESUMING / WAITING_APPROVAL；
+    // 本组用例只关心 RUNNING，序列按每个 pass 的 RUNNING 查询推进一次。
     let round = 0;
     const sessionMapper = {
       selectByPhase: vi.fn()
         .mockImplementation(async (phase: string) => {
-          if (phase === 'RESUMING') return [];
+          if (phase !== 'RUNNING') return [];
           const ids = scanSequence[Math.min(round, scanSequence.length - 1)] ?? [];
           round++;
           return ids.map((id) => ({ id, userId: 42, sessionType: 'DEFAULT', phase, modelId: null }));

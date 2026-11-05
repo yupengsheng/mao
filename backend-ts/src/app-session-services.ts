@@ -29,6 +29,8 @@ import type { LlmCallRepository } from './usage/llm-call.repository.js';
 import type { HarnessService } from './harness/core/harness-service.js';
 import type { AgentLoop } from './harness/core/agent-loop.js';
 import type { TaskService } from './task/task.service.js';
+import type { ExecutionWaitRepository } from './task/execution-wait.repository.js';
+import type { ExecutionLeaseService } from './task/execution-lease.service.js';
 import { createAgentExecutor } from './harness/core/agent-executor.js';
 
 import { TaskTerminalService } from './session/task-terminal.service.js';
@@ -75,6 +77,10 @@ export interface SessionServicesDeps {
   /** waitForAll 阻塞期间的进度通知（飞书进度卡刷新）；未注入时等待期间不续更卡片。 */
   waitProgressNotifier?: ((parentSessionId: number) => void | Promise<void>) | null;
   taskService?: TaskService | null;
+  executionWaitRepository?: ExecutionWaitRepository | null;
+  executionLeaseService?: ExecutionLeaseService | null;
+  executionLeaseEnabled?: boolean;
+  executionOwnerInstance?: string;
 }
 
 export interface SessionServicesResult {
@@ -97,6 +103,10 @@ export function assembleSessionServices(deps: SessionServicesDeps): SessionServi
     },
     d.messageCitationService,
     d.taskService,
+    d.executionLeaseService ?? null,
+    d.executionLeaseEnabled === true,
+    d.executionWaitRepository ?? null,
+    d.executionOwnerInstance ?? '',
   );
   const visibility = new SubAgentVisibilityService({
     registry: d.wsRegistry,
@@ -107,6 +117,7 @@ export function assembleSessionServices(deps: SessionServicesDeps): SessionServi
     taskTerminalService: taskTerminal,
     llmModelLookup: d.modelRepo,
     harnessService: lazyRef(() => d.holder.harness!),
+    executionLeaseEnabled: d.executionLeaseEnabled === true,
   });
 
   const backgroundSubagentManager = new BackgroundSubagentManager({

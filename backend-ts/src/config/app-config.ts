@@ -106,6 +106,8 @@ export interface AppConfig {
     task: {
       /** 等待态双写开关；关闭时保持纯内存投影，不写 execution_wait。 */
       waitPersistenceEnabled: boolean;
+      /** 执行租约门禁开关；关闭时保留改造前的无租约执行路径。 */
+      executionLeaseEnabled: boolean;
     };
     harness: {
       workspaceRoot: string;
@@ -243,7 +245,7 @@ const DEFAULTS: AppConfig = {
     taskNotification: {
       secretKey: 'mao-task-notification-default-key-v1-20260713',
     },
-    task: { waitPersistenceEnabled: false },
+    task: { waitPersistenceEnabled: false, executionLeaseEnabled: false },
     harness: {
       workspaceRoot: './workspace',
       runtimeDir: '/opt/mao-data/runtime',
@@ -451,9 +453,13 @@ function coerceTypes(cfg: AppConfig): AppConfig {
   cfg.spring.flyway.enabled = b(process.env.FLYWAY_ENABLED ?? cfg.spring.flyway.enabled, true);
   cfg.app.search = cfg.app.search ?? { fulltextEnabled: true };
   cfg.app.search.fulltextEnabled = b(process.env.SEARCH_FULLTEXT_ENABLED ?? cfg.app.search.fulltextEnabled, true);
-  cfg.app.task = cfg.app.task ?? { waitPersistenceEnabled: false };
+  cfg.app.task = cfg.app.task ?? { waitPersistenceEnabled: false, executionLeaseEnabled: false };
   cfg.app.task.waitPersistenceEnabled = b(
     process.env.EXECUTION_WAIT_PERSISTENCE_ENABLED ?? cfg.app.task.waitPersistenceEnabled,
+    false,
+  );
+  cfg.app.task.executionLeaseEnabled = b(
+    process.env.EXECUTION_LEASE_ENABLED ?? cfg.app.task.executionLeaseEnabled,
     false,
   );
   cfg.app.cloudRuntime = cfg.app.cloudRuntime ?? {

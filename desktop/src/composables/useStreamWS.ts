@@ -120,7 +120,7 @@ const STREAM_EVENT_TYPES = new Set([
   'thinking_start', 'thinking_end', 'thinking_delta', 'message_end',
   'file_change', 'activity', 'compaction_start', 'compaction_end', 'compaction_marker',
   'context_window', 'llm_waiting', 'llm_stream_reset', 'llm_retry', 'session_already_running', 'error',
-  'round_start', 'round_end'
+  'round_start', 'round_end', 'execution_wait_recovered'
 ])
 
 function refreshQueue(sessionId: string) {
@@ -728,10 +728,33 @@ export function useStreamWS() {
         }
         break
 
+      case 'execution_wait_recovered':
+        // 崩溃恢复后的等待只做只读投影：旧 Promise 已随进程丢失，前端不得渲染
+        // 审批 / 回答入口，也不能把 recovered=false 的正常等待塞进这条通道。
+        if (sessionId && typeof data?.requestId === 'string' && data.requestId) {
+          sessionStore.updateSession(sessionId, {
+            pendingWait: {
+              kind: data.requestType === 'APPROVAL' ? 'APPROVAL' : 'QUESTION',
+              requestId: data.requestId,
+              summary: typeof data.summary === 'string' ? data.summary : '',
+              expiresAt: typeof data.expiresAt === 'string' ? data.expiresAt : '',
+              recovered: true,
+              actionable: false,
+            }
+          })
+        }
+        break
+
       case 'session_status':
         if (sessionId) {
           const phase = data.phase as TaskPhase
           const terminalPhases = ['COMPLETED', 'FAILED', 'CANCELLED', 'IDLE']
+
+          // 恢复提示只服务于“重启后等待仍挂着”的会话：一旦重新执行或进入终态，
+          // 旧只读投影立即失效；WAITING_APPROVAL 必须保留（恢复事件随后才到或已在）。
+          if (phase === 'RUNNING' || terminalPhases.includes(phase)) {
+            sessionStore.updateSession(sessionId, { pendingWait: null })
+          }
 
           if (phase === 'RUNNING' && data.executionId) {
             setActiveExecution(sessionId, data.executionId)

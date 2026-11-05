@@ -61,7 +61,7 @@ function makeHarness(options: {
   };
   const enqueue = vi.fn(async () => undefined);
   const finishExecution = vi.fn(async () => undefined);
-  const beginExecution = vi.fn(async () => ({ duplicate: options.beginDuplicate === true }));
+  const beginExecution = vi.fn(async () => ({ duplicate: options.beginDuplicate === true, lease: null }));
   const findExternalEvent = vi.fn(options.externalEventTrace ?? (async () => null));
   const liveExecution = vi.fn(async () => undefined);
   const budgetCheck = vi.fn(options.budgetCheck ?? (async () => null));
@@ -188,7 +188,8 @@ describe('OpenRunService（P1/P2 共用执行流）', () => {
     expect(result).toMatchObject({ sessionId: 11, deduplicated: true, terminalPhase: 'COMPLETED' });
     expect(h.beginExecution).toHaveBeenCalledWith(99, expect.any(String), 'WEBHOOK', { scope: 'trigger:3', id: 'evt-9' });
     expect(h.sessionService.updatePhase).toHaveBeenCalledWith(99, 'IDLE');
-    expect(h.sessionService.deleteMessageById).toHaveBeenCalledWith(99, 101);
+    // 门禁在落消息之前就拒绝重复事件：本次没有消息可删，只回滚新建会话。
+    expect(h.sessionService.deleteMessageById).not.toHaveBeenCalled();
     expect(h.sessionService.deleteSession).toHaveBeenCalledWith(99);
   });
 
@@ -205,7 +206,7 @@ describe('OpenRunService（P1/P2 共用执行流）', () => {
     expect(h.sessionService.deleteSession).toHaveBeenCalledWith(99);
     expect(h.liveExecution).toHaveBeenCalledWith(
       expect.objectContaining({ id: 99 }), 7, expect.any(String), expect.objectContaining({ id: 101 }),
-      expect.any(Number), null, 'API', { scope: 'token:4', id: 'evt-9' },
+      expect.any(Number), null, 'API', { scope: 'token:4', id: 'evt-9' }, null,
     );
   });
 

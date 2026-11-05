@@ -10,7 +10,7 @@ function fixture(initialPhase = 'RUNNING') {
     updateRuntimeStatus: async () => undefined,
     markLastMessageFinished: async () => undefined,
   };
-  const task = { beginExecution: vi.fn(async () => undefined), beginRecoveryExecution: vi.fn(async () => undefined),
+  const task = { beginExecution: vi.fn(async () => ({ duplicate: false })), beginRecoveryExecution: vi.fn(async () => ({ duplicate: false })),
     settleExecution: vi.fn<TaskService['settleExecution']>(async () => undefined),
     getActiveExecutionId: vi.fn(async (): Promise<string | null> => null) };
   const send = vi.fn();
@@ -116,19 +116,20 @@ describe('Task integration with session terminal', () => {
     try {
       await setup.terminal.cancelActiveExecution(11, 7);
       expect(setup.session.phase).toBe('CANCELLED');
-      expect(setup.task.settleExecution.mock.calls[0]![1]).toMatch(/^[0-9a-f-]{36}$/);
+      expect(setup.task.settleExecution).not.toHaveBeenCalled();
+      expect(setup.active.size).toBe(0);
     } finally { warning.mockRestore(); }
   });
 
-  it('uses a fresh fallback cancellation identity for each unrecorded run', async () => {
+  it('does not fabricate an execution identity for unrecorded runs', async () => {
     const first = fixture();
     const second = fixture();
     await first.terminal.cancelActiveExecution(11, 7);
     await second.terminal.cancelActiveExecution(11, 7);
-    const firstId = first.task.settleExecution.mock.calls[0]![1];
-    const secondId = second.task.settleExecution.mock.calls[0]![1];
-    expect(firstId).toMatch(/^[0-9a-f-]{36}$/);
-    expect(secondId).not.toBe(firstId);
+    expect(first.session.phase).toBe('CANCELLED');
+    expect(second.session.phase).toBe('CANCELLED');
+    expect(first.task.settleExecution).not.toHaveBeenCalled();
+    expect(second.task.settleExecution).not.toHaveBeenCalled();
   });
 
   it.each(['COMPLETED', 'FAILED', 'CANCELLED'])('does not create a cancellation attempt for a %s session', async (phase) => {

@@ -74,6 +74,22 @@
             <button type="button" class="primary-button" data-action="open-session" :disabled="opening" @click="openSession">{{ opening ? '正在打开…' : '打开关联会话' }}</button>
             <p v-if="navigationError" class="navigation-error" role="alert">{{ navigationError }}</p>
           </header>
+          <section v-if="detail.pendingWait" class="pending-wait-card" aria-label="待处理等待">
+            <div class="pending-wait-heading">
+              <h3>待处理等待</h3>
+              <span class="wait-status" :data-recovered="detail.pendingWait.recovered">
+                {{ detail.pendingWait.recovered ? '已恢复（只读）' : '等待处理' }}
+              </span>
+            </div>
+            <div class="wait-meta">
+              <span>类型：{{ taskWaitKindLabel(detail.pendingWait.kind) }}</span>
+              <span>到期：{{ formatDateTime(detail.pendingWait.expiresAt) || '未记录' }}</span>
+            </div>
+            <p class="wait-summary">{{ formatTaskWaitSummary(detail.pendingWait.summary, detail.pendingWait.kind) }}</p>
+            <p v-if="detail.pendingWait.recovered" class="history-note">
+              执行已中断，等待通知已恢复；只能查看，无法在此审批或回答。
+            </p>
+          </section>
           <div class="history-header">
             <h3>执行历史</h3>
             <span class="muted">最近 {{ detail.executions.length }} 次</span>
@@ -113,6 +129,7 @@ import { useSessionStore } from '../../stores/session'
 import { formatDateTime } from '../../utils/datetime'
 import { goBackToWorkbench } from '../../utils/workbench-nav'
 import { TASK_STAGE_LABELS, TASK_SOURCE_LABELS, taskSourceLabel, taskStageLabel } from '../../utils/taskRecordLabels'
+import { formatTaskWaitSummary, taskWaitKindLabel } from '../../utils/taskWait'
 
 const router = useRouter()
 const sessionStore = useSessionStore()
@@ -224,6 +241,12 @@ button:focus-visible, select:focus-visible { outline: 2px solid var(--aw-primary
 .detail-header { padding-bottom: 22px; border-bottom: 1px solid var(--aw-divider-soft); }
 .detail-meta { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 18px; }
 .primary-button { color: var(--aw-primary); border-color: var(--aw-primary-line); background: var(--aw-primary-soft); }
+.pending-wait-card { margin-top: 18px; padding: 14px 16px; border: 1px solid color-mix(in srgb, var(--aw-warning) 40%, var(--aw-divider)); border-radius: 8px; background: color-mix(in srgb, var(--aw-warning) 6%, var(--aw-canvas)); }
+.pending-wait-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.wait-status { padding: 2px 7px; border-radius: 4px; background: var(--aw-canvas-parchment); color: var(--aw-warning); font-size: 12px; }
+.wait-status[data-recovered="false"] { color: var(--aw-primary); }
+.wait-meta { display: flex; flex-wrap: wrap; gap: 8px 20px; margin-top: 10px; font-size: 12px; color: var(--aw-ink-muted); }
+.wait-summary { margin: 10px 0 0; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
 .history-header { margin: 22px 0 16px; }
 .execution-attempt { border: 1px solid var(--aw-divider); border-radius: 8px; padding: 16px; margin-bottom: 12px; }
 .attempt-heading strong { font-size: 13px; }

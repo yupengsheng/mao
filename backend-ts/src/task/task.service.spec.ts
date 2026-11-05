@@ -10,7 +10,9 @@ import type { TaskRepository } from './task.repository.js';
 import type { AgentTask, TaskExecution, TaskTrigger } from './types.js';
 import type { Session } from '../session/types.js';
 
-function fixture() {
+function fixture(
+  executionWaits?: { findEarliestPending: (sessionId: number, executionId?: string) => Promise<unknown> } | null,
+) {
   const session: Session = { id: 11, userId: 7, agentId: 2, title: '修复问题', source: 'web', phase: 'RUNNING' };
   let task: AgentTask | null = null;
   const executions: TaskExecution[] = [];
@@ -65,7 +67,7 @@ function fixture() {
     executions: async () => executions,
     deleteBySessionId: vi.fn(async () => undefined),
   };
-  const service = new TaskService(repo as unknown as TaskRepository);
+  const service = new TaskService(repo as unknown as TaskRepository, executionWaits as never);
   return { service, session, repo, executions, triggers, task: () => task };
 }
 
@@ -585,5 +587,73 @@ describe('Task waiting state projection', () => {
       expect.objectContaining({ cancelled: true }), expect.objectContaining({ cancelled: true }),
     ]);
     await vi.waitFor(() => expect(setup.task()?.stage).toBe('WORKING'));
+  });
+});
+
+describe('Task detail pending wait projection', () => {
+  it('returns the earliest live wait for the current execution', async () => {
+    const findEarliestPending = vi.fn().mockResolvedValue({
+      id: 9,
+      sessionId: 11,
+      executionId: 'current',
+      requestType: 'APPROVAL',
+      requestId: 'req-1',
+      payloadSummary: '等待工具 read_file 的审批（参数已隐藏）',
+      expiresAt: '2026-11-05 12:00:00',
+      fencingToken: 3n,
+      expired: false,
+      recovered: false,
+    });
+    const setup = fixture({ findEarliestPending });
+    await setup.service.beginExecution(setup.session, 'current');
+
+    const detail = await setup.service.get(7, 1);
+
+    expect(findEarliestPending).toHaveBeenCalledWith(11, 'current');
+    expect(detail?.pendingWait).toEqual({
+      kind: 'APPROVAL',
+      requestId: 'req-1',
+      summary: '等待工具 read_file 的审批（参数已隐藏）',
+      expiresAt: '2026-11-05 12:00:00',
+      recovered: false,
+      actionable: true,
+    });
+  });
+
+  it('marks a recovered wait read-only in task detail', async () => {
+    const setup = fixture({
+      findEarliestPending: vi.fn().mockResolvedValue({
+        id: 9, sessionId: 11, executionId: 'current', requestType: 'QUESTION', requestId: 'req-q',
+        payloadSummary: '确认继续', expiresAt: '2026-11-05 12:00:00', fencingToken: 3n,
+        expired: false, recovered: true,
+      }),
+    });
+    await setup.service.beginExecution(setup.session, 'current');
+
+    const detail = await setup.service.get(7, 1);
+
+    expect(detail?.pendingWait).toMatchObject({ recovered: true, actionable: false });
+  });
+
+  it('returns null without querying when the task has no current execution', async () => {
+    const findEarliestPending = vi.fn();
+    const setup = fixture({ findEarliestPending });
+    await setup.service.beginExecution(setup.session, 'current');
+    setup.executions.splice(0, setup.executions.length);
+    const task = setup.task();
+    if (task != null) task.lastExecutionId = null;
+
+    const detail = await setup.service.get(7, 1);
+
+    expect(detail?.pendingWait).toBeNull();
+    expect(findEarliestPending).not.toHaveBeenCalled();
+  });
+
+  it('degrades to null when the wait lookup fails', async () => {
+    const findEarliestPending = vi.fn().mockRejectedValue(new Error('db down'));
+    const setup = fixture({ findEarliestPending });
+    await setup.service.beginExecution(setup.session, 'current');
+
+    await expect(setup.service.get(7, 1)).resolves.toMatchObject({ pendingWait: null });
   });
 });

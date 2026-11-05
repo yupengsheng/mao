@@ -2,13 +2,19 @@ import { randomUUID } from 'node:crypto';
 import { BusinessException } from '../common/business-exception.js';
 import { ErrorCode } from '../common/error-code.js';
 import type { Message, Session } from '../domain/types.js';
-import type { TaskNotifySource } from '../session/task-terminal.service.js';
+import {
+  ExecutionWaitPendingError,
+  LeaseConflictError,
+  LeaseUnavailableError,
+  type TaskNotifySource,
+} from '../session/task-terminal.service.js';
 import type { SessionSource } from '../session/session.repository.js';
 import { withSessionLock } from '../schedule/scheduled-task.service.js';
 import { isActivePhase } from '../session/session-vo.js';
 import type { MessageQueueSource } from '../session/types.js';
 import type { OpenRunAdmission, OpenRunAdmissionBinding } from './admission.js';
 import type { ExternalEventRef, ExternalEventTrace } from '../task/types.js';
+import type { LeaseHandle } from '../task/execution-lease.service.js';
 
 /** 开放触发支持的消息长度上限（技术方案 §5.3）。 */
 export const OPEN_RUN_MESSAGE_MAX_LENGTH = 32000;
@@ -50,11 +56,20 @@ export interface OpenRunDeps {
     enqueue(sessionId: number, userId: number, content: string, images: string | null, scheduledTaskId?: number | null, source?: MessageQueueSource | null, openTriggerId?: number | null, openCallLogId?: number | null, externalEventId?: string | null, externalEventScope?: string | null): Promise<unknown>;
   };
   harnessService: {
-    executeFromEvent(sessionId: number, executionId: string, listener: unknown): Promise<void>;
+    executeFromEvent(sessionId: number, executionId: string, listener: unknown, cancelFlag?: unknown, lease?: LeaseHandle | null): Promise<void>;
   };
   taskTerminalService: {
-    beginExecution?(sessionId: number, executionId: string, source?: TaskNotifySource, externalEvent?: ExternalEventRef | null): Promise<{ duplicate: boolean }>;
-    finishExecution(sessionId: number, userId: number, phase: string, executionId: string, reason?: string, notifySource?: TaskNotifySource): Promise<void>;
+    beginExecution?(sessionId: number, executionId: string, source?: TaskNotifySource, externalEvent?: ExternalEventRef | null): Promise<{ duplicate: boolean; lease: LeaseHandle | null }>;
+    finishExecution(
+      sessionId: number,
+      userId: number,
+      phase: string,
+      executionId: string,
+      reason?: string,
+      notifySource?: TaskNotifySource,
+      lease?: LeaseHandle | null,
+    ): Promise<{ settled: boolean }>;
+    releaseExecutionLease?(lease: LeaseHandle | null | undefined): Promise<void>;
   };
   agentLookup: {
     findById(id: number): Promise<{ id?: number; name?: string | null; enabled?: number | null } | null>;
@@ -67,7 +82,7 @@ export interface OpenRunDeps {
    */
   budgetCheck?: (target: { userId: number; agentId: number }) => Promise<{ message: string } | null>;
   /** 注入的 live WS 执行路径（createScheduledLiveExecution）；null 时走 no-op listener 兜底。 */
-  liveExecution: ((session: Session, userId: number, executionId: string, savedMessage: Message, startedAt?: number, scheduledTaskId?: number | null, source?: 'SCHEDULED' | 'WEBHOOK' | 'API' | 'SIGNAL' | null, externalEvent?: ExternalEventRef | null) => Promise<void>) | null;
+  liveExecution: ((session: Session, userId: number, executionId: string, savedMessage: Message, startedAt?: number, scheduledTaskId?: number | null, source?: 'SCHEDULED' | 'WEBHOOK' | 'API' | 'SIGNAL' | null, externalEvent?: ExternalEventRef | null, lease?: LeaseHandle | null) => Promise<void>) | null;
   /** 任务域外部事件查询：入口预检查，命中直接返回 deduplicated。 */
   findExternalEvent?: (scope: string, id: string) => Promise<ExternalEventTrace | null>;
   /**
@@ -226,12 +241,27 @@ export class OpenRunService {
 
       const executionId = randomUUID();
       const startedAt = Date.now();
+      const previousPhase = latest.phase ?? 'IDLE';
+      const begun = await this.beginExecution(sessionId, executionId, input);
+      if (begun.duplicate) {
+        await this.deps.sessionService.updatePhase(sessionId, previousPhase).catch(() => undefined);
+        await this.rollbackDuplicateAttempt(input, sessionId, null);
+        const duplicate = await this.externalEventTrace(input);
+        return {
+          sessionId: duplicate?.sessionId ?? sessionId,
+          messageId: null,
+          queued: false,
+          terminalPhase: duplicate == null ? 'CANCELLED' as const : terminalPhaseOf(duplicate.status),
+          deduplicated: true,
+        };
+      }
       await this.deps.sessionService.updatePhase(sessionId, 'RUNNING');
       let savedMessage: Message;
       try {
         savedMessage = await this.deps.sessionService.saveMessage(sessionId, 'USER', message, null, null, null, 0, null);
       } catch (e) {
-        await this.deps.sessionService.updatePhase(sessionId, 'IDLE').catch(() => undefined);
+        await this.deps.sessionService.updatePhase(sessionId, previousPhase).catch(() => undefined);
+        await this.deps.taskTerminalService.releaseExecutionLease?.(begun.lease).catch(() => undefined);
         throw e;
       }
 
@@ -239,7 +269,10 @@ export class OpenRunService {
       if (this.deps.liveExecution != null) {
         // liveExecution（runExecution）内部吞掉失败/取消并落终态后正常返回，
         // 必须回读会话真实终态（照抄 executeTask 的回读逻辑）
-        await this.deps.liveExecution(session, input.userId, executionId, savedMessage, startedAt, null, input.source, input.externalEvent ?? null);
+        await this.deps.liveExecution(
+          session, input.userId, executionId, savedMessage, startedAt, null,
+          input.source, input.externalEvent ?? null, begun.lease,
+        );
         const after = await this.deps.sessionService.getSession(sessionId);
         const actual = after?.phase;
         terminalPhase = actual === 'FAILED' || actual === 'CANCELLED' ? actual : 'COMPLETED';
@@ -253,21 +286,10 @@ export class OpenRunService {
         }
       } else {
         // 兜底路径（测试/装配缺失）：显式落 COMPLETED 终态并带来源
-        const begun = await this.deps.taskTerminalService.beginExecution?.(
-          sessionId, executionId, input.source, input.externalEvent ?? null,
+        await this.deps.harnessService.executeFromEvent(sessionId, executionId, noopListener(), null, begun.lease);
+        await this.deps.taskTerminalService.finishExecution(
+          sessionId, input.userId, 'COMPLETED', executionId, undefined, input.source, begun.lease,
         );
-        if (begun?.duplicate) {
-          await this.deps.sessionService.updatePhase(sessionId, 'IDLE');
-          await this.rollbackDuplicateAttempt(input, sessionId, savedMessage.id ?? null);
-          const duplicate = await this.externalEventTrace(input);
-          return {
-            sessionId: duplicate?.sessionId ?? sessionId, messageId: null, queued: false,
-            terminalPhase: duplicate == null ? 'CANCELLED' as const : terminalPhaseOf(duplicate.status),
-            deduplicated: true,
-          };
-        }
-        await this.deps.harnessService.executeFromEvent(sessionId, executionId, noopListener());
-        await this.deps.taskTerminalService.finishExecution(sessionId, input.userId, 'COMPLETED', executionId, undefined, input.source);
         terminalPhase = 'COMPLETED';
       }
       return { sessionId, messageId: savedMessage.id ?? null, queued: false, terminalPhase };
@@ -277,6 +299,29 @@ export class OpenRunService {
   private async externalEventTrace(input: OpenRunInput): Promise<ExternalEventTrace | null> {
     if (input.externalEvent == null || this.deps.findExternalEvent == null) return null;
     return this.deps.findExternalEvent(input.externalEvent.scope, input.externalEvent.id);
+  }
+
+  /**
+   * 租约门禁必须先于阶段写入与消息落库。等待态/租约冲突都属于“当前不可执行”，
+   * 统一收敛为业务错误，避免开放接口把 500 暴露给调用方。
+   */
+  private async beginExecution(sessionId: number, executionId: string, input: OpenRunInput) {
+    if (this.deps.taskTerminalService.beginExecution == null) {
+      return { duplicate: false, lease: null };
+    }
+    try {
+      return await this.deps.taskTerminalService.beginExecution(
+        sessionId, executionId, input.source, input.externalEvent ?? null,
+      );
+    } catch (error) {
+      if (error instanceof ExecutionWaitPendingError || error instanceof LeaseConflictError) {
+        throw new BusinessException(ErrorCode.PARAM_INVALID, '会话当前不可执行，请稍后重试');
+      }
+      if (error instanceof LeaseUnavailableError) {
+        throw new BusinessException(ErrorCode.INTERNAL_ERROR, '执行租约不可用，请稍后重试');
+      }
+      throw error;
+    }
   }
 
   private async rollbackDuplicateAttempt(input: OpenRunInput, sessionId: number, messageId: number | null): Promise<void> {

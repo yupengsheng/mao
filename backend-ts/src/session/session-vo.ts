@@ -1,5 +1,6 @@
 import { javaLocalDateTimeString } from '../common/datetime.js';
 import { isMultimodalContentParts } from '../common/multimodal-content.js';
+import type { TaskWaitVO } from '@mao/contracts';
 import type { ContextManifest } from '../harness/core/context-manifest.js';
 import type { InFlightToolCall } from '../harness/core/in-flight-tool-registry.js';
 import { idMapGet } from '../common/request.js';
@@ -59,6 +60,8 @@ export interface SessionVO {
   treeUnread?: boolean;
   treeRunning?: boolean;
   treeFailed?: boolean;
+  /** 仅 Session 详情返回：当前执行仍未处理的等待；列表 / dashboard / search 不返回。 */
+  pendingWait?: TaskWaitVO | null;
   runtimeStatus?: unknown;
 }
 
@@ -689,6 +692,7 @@ export function applySessionListSignals(
   sidesByParent: Map<number, Session[]>,
   approvalRegistry: ApprovalRegistry,
   questionRegistry: AskUserQuestionsRegistry,
+  persistedCounts?: Map<number, { approval: number; question: number }> | null,
 ): void {
   if (sessions.length === 0) {
     return;
@@ -702,7 +706,10 @@ export function applySessionListSignals(
   const approvalCounts = approvalRegistry.countForSessionIds([...allIds]);
   const questionCounts = questionRegistry.countPendingBySessionIds([...allIds]);
   for (let i = 0; i < sessions.length; i++) {
-    fillTreeSignals(vos[i], sessions[i], sidesByParent.get(sessions[i].id!) ?? [], approvalCounts, questionCounts);
+    fillTreeSignals(
+      vos[i], sessions[i], sidesByParent.get(sessions[i].id!) ?? [],
+      approvalCounts, questionCounts, persistedCounts,
+    );
   }
 }
 
@@ -712,23 +719,28 @@ function fillTreeSignals(
   sides: Session[],
   approvalCounts: Map<number, number>,
   questionCounts: Map<number, number>,
+  persistedCounts?: Map<number, { approval: number; question: number }> | null,
 ): void {
   let approval = approvalCounts.get(main.id!) ?? 0;
   let question = questionCounts.get(main.id!) ?? 0;
+  let persistedApproval = persistedCounts?.get(main.id!)?.approval ?? 0;
+  let persistedQuestion = persistedCounts?.get(main.id!)?.question ?? 0;
   let unread = main.unread === 1;
   let running = isActivePhase(main.phase);
   let failed = main.phase === 'FAILED';
   for (const st of sides) {
     approval += approvalCounts.get(st.id!) ?? 0;
     question += questionCounts.get(st.id!) ?? 0;
+    persistedApproval += persistedCounts?.get(st.id!)?.approval ?? 0;
+    persistedQuestion += persistedCounts?.get(st.id!)?.question ?? 0;
     unread = unread || st.unread === 1;
     running = running || isActivePhase(st.phase);
     failed = failed || st.phase === 'FAILED';
   }
-  vo.pendingApprovalCount = approvalCounts.get(main.id!) ?? 0;
-  vo.pendingQuestionCount = questionCounts.get(main.id!) ?? 0;
-  vo.treePendingApprovalCount = approval;
-  vo.treePendingQuestionCount = question;
+  vo.pendingApprovalCount = Math.max(approvalCounts.get(main.id!) ?? 0, persistedCounts?.get(main.id!)?.approval ?? 0);
+  vo.pendingQuestionCount = Math.max(questionCounts.get(main.id!) ?? 0, persistedCounts?.get(main.id!)?.question ?? 0);
+  vo.treePendingApprovalCount = Math.max(approval, persistedApproval);
+  vo.treePendingQuestionCount = Math.max(question, persistedQuestion);
   vo.treeUnread = unread;
   vo.treeRunning = running;
   vo.treeFailed = failed;

@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import type { FastifyInstance } from 'fastify';
+import type { TaskWaitVO } from '@mao/contracts';
 import { BusinessException } from '../common/business-exception.js';
 import { ErrorCode } from '../common/error-code.js';
 import { requireUserId, sendOk } from '../common/http-error.js';
@@ -22,6 +23,7 @@ import {
   DEFAULT_EXPENSIVE_COST, EXPENSIVE_COST_MAX, EXPENSIVE_COST_MIN, expensiveCostToMicros,
 } from './run-trace.service.js';
 import type { SessionTodoRepository, SubagentExecutionRepository } from './activity.repository.js';
+import type { ExecutionWaitQueryStore, ExecutionWaitRecord } from '../task/execution-wait.repository.js';
 import type {
   AgentLookup,
   AgentRef,
@@ -66,6 +68,8 @@ export interface SessionRouteDeps {
    * 用户自建会话允许落在参与过的飞书/钉钉群工作区；缺省时群工作区一律拒绝（fail-closed）。
    */
   existsSessionUnderWorkspace?: (userId: number, path: string) => Promise<boolean>;
+  /** 任务域二期的等待查询；缺失或数据库异常时只回退内存 Registry 计数。 */
+  executionWaitRepository?: ExecutionWaitQueryStore | null;
 }
 
 interface CreateSessionRequest {
@@ -135,7 +139,10 @@ export function registerSessionRoutes(app: FastifyInstance, deps: SessionRouteDe
     return map;
   }
 
-  async function enrichSessions(sessions: Session[]): Promise<SessionVO[]> {
+  async function enrichSessions(
+    sessions: Session[],
+    options: { includePendingWait?: boolean } = {},
+  ): Promise<SessionVO[]> {
     const agentMap = await batchLoadAgents(sessions);
     const modelMap = await batchLoadModels(sessions, agentMap);
     const vos = sessions.map((s) => toSessionVO(s, agentMap, modelMap));
@@ -144,11 +151,48 @@ export function registerSessionRoutes(app: FastifyInstance, deps: SessionRouteDe
     // 列表 / dashboard 查询本就排除 SIDE_TASK / SUBAGENT，这里的主会话集合全部是树根。
     const descendantsByRoot = await sessionService.listDescendantSideTaskSessionsByRoots(mainIds);
     const sidesByParent = new Map<number, Session[]>();
+    const allIds = new Set(mainIds);
     for (const [rootId, list] of descendantsByRoot) {
-      if (list.length > 0) sidesByParent.set(rootId, list);
+      if (list.length > 0) {
+        sidesByParent.set(rootId, list);
+        for (const side of list) {
+          if (side.id != null) allIds.add(side.id);
+        }
+      }
     }
-    applySessionListSignals(sessions, vos, sidesByParent, approvalRegistry, questionRegistry);
+    let persistedCounts: Map<number, { approval: number; question: number }> | null = null;
+    if (deps.executionWaitRepository != null) {
+      try {
+        persistedCounts = await deps.executionWaitRepository.countPendingBySessionIds([...allIds]);
+      } catch (error) {
+        console.warn('[session] failed to load persisted pending wait counts; falling back to registry', error);
+      }
+    }
+    applySessionListSignals(
+      sessions, vos, sidesByParent, approvalRegistry, questionRegistry, persistedCounts);
+    if (options.includePendingWait === true) {
+      await attachPendingWait(sessions, vos);
+    }
     return vos;
+  }
+
+  /** 详情页兜底：用户离线错过恢复推送时，打开会话仍能看到同一条只读等待。 */
+  async function attachPendingWait(sessions: Session[], vos: SessionVO[]): Promise<void> {
+    await Promise.all(sessions.map(async (session, index) => {
+      const vo = vos[index];
+      if (vo == null) return;
+      if (session.id == null || deps.executionWaitRepository == null) {
+        vo.pendingWait = null;
+        return;
+      }
+      try {
+        const wait = await deps.executionWaitRepository.findEarliestPending(session.id);
+        vo.pendingWait = wait == null ? null : toPendingWaitVO(wait);
+      } catch (error) {
+        console.warn(`[session] failed to load pending wait: sessionId=${session.id}`, error);
+        vo.pendingWait = null;
+      }
+    }));
   }
 
   app.post('/v1/sessions', async (request, reply) => {
@@ -299,7 +343,7 @@ export function registerSessionRoutes(app: FastifyInstance, deps: SessionRouteDe
   app.get('/v1/sessions/:id', async (request, reply) => {
     const userId = requireUserId(request);
     const session = await requireSessionOwner(userId, pathId(request));
-    const vos = await enrichSessions([session]);
+    const vos = await enrichSessions([session], { includePendingWait: true });
     return sendOk(reply, vos[0]);
   });
 
@@ -630,6 +674,17 @@ export function registerSessionRoutes(app: FastifyInstance, deps: SessionRouteDe
     const queue = await deps.messageQueueService.listPending(id);
     return sendOk(reply, queue.map(toQueueMessageVO));
   });
+}
+
+function toPendingWaitVO(wait: ExecutionWaitRecord): TaskWaitVO {
+  return {
+    kind: wait.requestType,
+    requestId: wait.requestId,
+    summary: wait.payloadSummary,
+    expiresAt: wait.expiresAt,
+    recovered: wait.recovered,
+    actionable: !wait.recovered,
+  };
 }
 
 /** 轨迹阈值钳制：非法 query 回落默认区间，避免越界值把整个会话都标成慢 / 贵。 */

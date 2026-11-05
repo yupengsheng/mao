@@ -56,7 +56,10 @@ describe('StreamingWsHandler', () => {
     getLastUserMessage: vi.fn(async () => message(3, 'USER')),
     deleteMessageById: vi.fn(async () => undefined),
   };
-  const taskTerminalService = { finishExecution: vi.fn(), beginExecution: vi.fn(async () => ({ duplicate: false })) };
+  const taskTerminalService = {
+    finishExecution: vi.fn(),
+    beginExecution: vi.fn(async () => ({ duplicate: false, lease: null })),
+  };
   const onScheduledTaskQueueConsumed = vi.fn(async () => undefined);
   const messageQueueService = {
     listPending: vi.fn(async () => []), enqueue: vi.fn(), dequeue: vi.fn(), getById: vi.fn(),
@@ -133,7 +136,7 @@ describe('StreamingWsHandler', () => {
     expect(skillSyncService.syncToSession).toHaveBeenCalled();
     expect(harnessService.executeFromEvent).toHaveBeenCalled();
     expect(sessionService.updatePhase).toHaveBeenCalledWith(11, 'RUNNING');
-    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(11, 7, 'COMPLETED', 'event-1');
+    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(11, 7, 'COMPLETED', 'event-1', undefined, 'MANUAL', null);
     expect(activityHeartbeat.clear).toHaveBeenCalledWith(11);
     expect(agentLoop.removeCancelFlag).toHaveBeenCalledWith(11);
     // CLOUD MCP 快照是会话级记忆（技术方案 §4.5）：执行结束只回收桌面上报的 LOCAL 工具，
@@ -150,7 +153,7 @@ describe('StreamingWsHandler', () => {
     sessionService.saveMessage.mockResolvedValue(message(99, 'USER'));
     harnessService.prepareMessage.mockResolvedValue('event-dup');
     messageQueueService.listPending.mockResolvedValue([]);
-    taskTerminalService.beginExecution.mockResolvedValueOnce({ duplicate: true });
+    taskTerminalService.beginExecution.mockResolvedValueOnce({ duplicate: true, lease: null });
 
     await handler.handleTextMessage(ws, JSON.stringify({
       type: 'send_message', sessionId: 11, data: { content: 'retry', eventId: 'event-dup' },
@@ -331,7 +334,7 @@ describe('StreamingWsHandler', () => {
       taskHandler.afterConnectionClosed(socket);
       await taskExecutor.runAll();
       expect(harnessService.executeFromEvent).toHaveBeenCalled();
-      expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(11, 7, 'COMPLETED', 'accepted-event');
+      expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(11, 7, 'COMPLETED', 'accepted-event', undefined, 'MANUAL', null);
       expect(agentLoop.requestCancel).not.toHaveBeenCalled();
     } finally {
       realRegistry.shutdown();
@@ -380,7 +383,7 @@ describe('StreamingWsHandler', () => {
     // 恢复执行不在 handler.cancelFlags 簿记里，但 flag 已注册在 agentLoop：必须真正中止执行，
     // 不能落进 pendingCancels（无人消费，执行照跑）。
     expect(agentLoop.requestCancel).toHaveBeenCalledWith(11);
-    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(11, 7, 'CANCELLED', 'exec-recovered');
+    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(11, 7, 'CANCELLED', 'exec-recovered', undefined, 'MANUAL', null);
   });
 
   it('sendMessageRejectsDuplicateWhileSessionIsRunningWithoutPersistingOrSubmitting', async () => {
@@ -449,9 +452,9 @@ describe('StreamingWsHandler', () => {
       type: 'create_side_session', sessionId: 11, data: { content: 'side work', contextMode: 'summary' },
     }));
 
-    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(
-      13, 7, 'FAILED', expect.any(String), '服务器繁忙，请稍后重试',
-    );
+    // 线程池拒绝发生在执行门禁之前：无租约、无任务投影，只收敛 Session。
+    expect(sessionService.updatePhase).toHaveBeenCalledWith(13, 'FAILED');
+    expect(taskTerminalService.finishExecution).not.toHaveBeenCalled();
     expect(registry.send).toHaveBeenCalledWith(7, expect.objectContaining({
       type: 'error',
       sessionId: 13,
@@ -479,7 +482,9 @@ describe('StreamingWsHandler', () => {
     await executor.runAll();
 
     expect(harnessService.executeSideFirstMessage).not.toHaveBeenCalled();
-    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(13, 7, 'CANCELLED', expect.any(String));
+    // 分叉窗口取消时尚无执行身份：只把 Session 收敛为 CANCELLED，不伪造 executionId。
+    expect(sessionService.updatePhase).toHaveBeenCalledWith(13, 'CANCELLED');
+    expect(taskTerminalService.finishExecution).not.toHaveBeenCalled();
   });
 
   it('rejects a side fork whose cut point no longer belongs to the parent', async () => {
@@ -581,7 +586,7 @@ describe('StreamingWsHandler', () => {
     }));
     expect(registry.subscribe).toHaveBeenCalledWith(7, 11);
     expect(harnessService.forkParentMessages).not.toHaveBeenCalled();
-    expect(harnessService.executeSideFirstMessage).toHaveBeenCalledWith(11, 13, 'none', expect.anything(), expect.anything());
+    expect(harnessService.executeSideFirstMessage).toHaveBeenCalledWith(11, 13, 'none', expect.anything(), expect.anything(), null);
   });
 
   it('forks a side task under a side-task parent honoring the cut point', async () => {
@@ -700,7 +705,7 @@ describe('StreamingWsHandler', () => {
     await executor.runAll();
     expect(sessionService.editMessageAndTruncate).toHaveBeenCalledWith(11, 3, 'edited', []);
     expect(harnessService.executeFromEvent).toHaveBeenCalled();
-    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(11, 7, 'COMPLETED', 'edit-event');
+    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(11, 7, 'COMPLETED', 'edit-event', undefined, 'MANUAL', null);
   });
 
   it('editAndResendWithImagesPassesTheEditedBodyThroughUnchanged', async () => {
@@ -1033,7 +1038,7 @@ describe('StreamingWsHandler', () => {
     // FAILED 后不应自动出队/消费队列下一条
     expect(messageQueueService.dequeue).not.toHaveBeenCalled();
     expect(messageQueueService.listPending).not.toHaveBeenCalled();
-    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(11, 7, 'FAILED', 'event-1', expect.any(String));
+    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(11, 7, 'FAILED', 'event-1', expect.any(String), 'MANUAL', null);
     vi.useRealTimers();
   });
 
@@ -1138,7 +1143,8 @@ describe('StreamingWsHandler', () => {
     registry.getUserId.mockReturnValue(7);
     sessionService.getSession.mockResolvedValue(session('CLOUD', 'RUNNING'));
     await handler.handleTextMessage(ws, JSON.stringify({ type: 'cancel', sessionId: 11 }));
-    expect(taskTerminalService.finishExecution).toHaveBeenCalled();
+    expect(sessionService.updatePhase).toHaveBeenCalledWith(11, 'CANCELLED');
+    expect(taskTerminalService.finishExecution).not.toHaveBeenCalled();
 
     sessionService.getSession.mockResolvedValue(session('CLOUD', 'IDLE'));
     messageQueueService.getById.mockResolvedValue({ id: 4, sessionId: 11, content: 'inserted', images: null });
@@ -1222,7 +1228,7 @@ describe('StreamingWsHandler', () => {
     expect(titleService.scheduleForFirstUserMessage).toHaveBeenCalledWith(11, 88, '定时检查');
     expect(registry.subscribe).toHaveBeenCalledWith(7, 11);
     expect(harnessService.executeFromEvent).toHaveBeenCalled();
-    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(11, 7, 'COMPLETED', 'sched-1');
+    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(11, 7, 'COMPLETED', 'sched-1', undefined, 'MANUAL', null);
   });
 
   it('executePersistedUserPromptPushesScheduledUserMessageAndStreamsWithoutSource', async () => {
@@ -1234,7 +1240,7 @@ describe('StreamingWsHandler', () => {
     await handler.executePersistedUserPrompt(
       session('CLOUD', 'IDLE'), 7, 'sched-plain', { id: 89, content: '手工触发' }, undefined, null,
     );
-    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(11, 7, 'COMPLETED', 'sched-plain');
+    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(11, 7, 'COMPLETED', 'sched-plain', undefined, 'MANUAL', null);
   });
 
   it('scheduledLiveExecutionPassesScheduledSourceToFinishExecution (收件箱来源透传)', async () => {
@@ -1250,7 +1256,7 @@ describe('StreamingWsHandler', () => {
     );
     await executor.runAll();
     expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(
-      11, 7, 'COMPLETED', 'sched-2', undefined, 'SCHEDULED',
+      11, 7, 'COMPLETED', 'sched-2', undefined, 'SCHEDULED', null,
     );
   });
 
@@ -1265,7 +1271,7 @@ describe('StreamingWsHandler', () => {
     );
     await executor.runAll();
     expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(
-      11, 7, 'FAILED', 'sched-3', expect.any(String), 'SCHEDULED',
+      11, 7, 'FAILED', 'sched-3', expect.any(String), 'SCHEDULED', null,
     );
   });
 
@@ -1286,7 +1292,7 @@ describe('StreamingWsHandler', () => {
     await executor.runAll();
     const calls = taskTerminalService.finishExecution.mock.calls;
     expect(calls).toHaveLength(2);
-    expect(calls[0][5]).toBeUndefined();
+    expect(calls[0][5]).toBe('MANUAL');
     expect(calls[1][5]).toBe('SCHEDULED');
   });
 
@@ -1302,16 +1308,16 @@ describe('StreamingWsHandler', () => {
 
     const spy = vi.spyOn(handler, 'executePersistedUserPrompt');
     const live = createScheduledLiveExecution(handler);
-    expect(live.length).toBe(8); // 形参表与 ScheduledLiveExecution 对齐，防止回归成漏参 lambda
+    expect(live.length).toBe(9); // 形参表与 ScheduledLiveExecution 对齐，防止回归成漏参 lambda
 
     await live(session('CLOUD', 'IDLE'), 7, 'sched-5', { id: 94, content: '定时任务' }, undefined, 55);
     expect(spy).toHaveBeenCalledWith(
-      session('CLOUD', 'IDLE'), 7, 'sched-5', { id: 94, content: '定时任务' }, undefined, 55, undefined, undefined,
+      session('CLOUD', 'IDLE'), 7, 'sched-5', { id: 94, content: '定时任务' }, undefined, 55, undefined, undefined, undefined,
     );
 
     await executor.runAll();
     expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(
-      11, 7, 'COMPLETED', 'sched-5', undefined, 'SCHEDULED',
+      11, 7, 'COMPLETED', 'sched-5', undefined, 'SCHEDULED', null,
     );
   });
 
@@ -1336,7 +1342,7 @@ describe('StreamingWsHandler', () => {
 
     expect(harnessService.executeFromEvent).not.toHaveBeenCalled();
     expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(
-      11, 7, 'FAILED', 'local-event', expect.stringContaining('syncId'),
+      11, 7, 'FAILED', 'local-event', expect.stringContaining('syncId'), 'MANUAL', null,
     );
     expect(registry.send).toHaveBeenCalledWith(7, expect.objectContaining({
       type: 'error', sessionId: 11,
@@ -1363,7 +1369,7 @@ describe('StreamingWsHandler', () => {
 
     expect(registry.sendToLocalClients).not.toHaveBeenCalled();
     expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(
-      11, 7, 'FAILED', 'local-event-2', expect.stringContaining('客户端连接'),
+      11, 7, 'FAILED', 'local-event-2', expect.stringContaining('客户端连接'), 'MANUAL', null,
     );
     registry.hasLocalClientConnection.mockReset();
     localToolSessionRegistry.isConnected.mockReset();
@@ -1637,7 +1643,7 @@ describe('StreamingWsHandler', () => {
 
       // 取消后簿记必须清零，否则该会话后续发送/重试全被 session_already_running 拒绝。
       expect(handler.hasExecutionClaim(11)).toBe(false);
-      expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(11, 7, 'CANCELLED', 'e-1');
+      expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(11, 7, 'CANCELLED', 'e-1', undefined, 'MANUAL', null);
       expect(agentLoop.removeCancelFlag).toHaveBeenCalledWith(11);
     });
 
@@ -1648,7 +1654,7 @@ describe('StreamingWsHandler', () => {
 
       sessionService.getSession.mockResolvedValue(session('CLOUD', 'IDLE'));
       await handler.handleTextMessage(ws, JSON.stringify({ type: 'cancel', sessionId: 11 }));
-      expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(11, 7, 'CANCELLED', 'e-1');
+      expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(11, 7, 'CANCELLED', 'e-1', undefined, 'MANUAL', null);
 
       // 重发 B：正常执行到完成
       harnessService.executeFromEvent.mockResolvedValue(undefined);
@@ -1695,7 +1701,7 @@ describe('StreamingWsHandler', () => {
 
       sessionService.getSession.mockResolvedValue(own('IDLE'));
       await handler.handleTextMessage(ws, JSON.stringify({ type: 'cancel', sessionId: 15 }));
-      expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(15, 7, 'CANCELLED', 'e-own-1');
+      expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(15, 7, 'CANCELLED', 'e-own-1', undefined, 'MANUAL', null);
 
       // 队列里还有一条 busy 入队的定时任务消息（A 在途时用户继续入队）
       harnessService.executeFromEvent.mockResolvedValue(undefined);
@@ -1763,7 +1769,7 @@ describe('StreamingWsHandler', () => {
       );
       await executor.runAll();
 
-      expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(16, 7, 'CANCELLED', 'e-live-1');
+      expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(16, 7, 'CANCELLED', 'e-live-1', undefined, 'MANUAL', undefined);
       // busy 簿记必须被收敛：映射清空 + 回写 CANCELLED，不得永久停在 QUEUED
       expect(queued.has(16)).toBe(false);
       expect(onScheduledTaskQueueConsumed).toHaveBeenCalledWith(9, 'CANCELLED');

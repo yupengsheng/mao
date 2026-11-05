@@ -10,6 +10,7 @@ import { isInboundFileMessage } from './event-normalizer.js';
 import { toWorkspaceRelative } from '../common/workspace-path.js';
 import { mapWithConcurrency } from '../common/concurrency.js';
 import { INBOUND_IMAGE_COMPRESS_CONCURRENCY, PromptImageResizer } from '../harness/tool/prompt-image-resizer.js';
+import type { LeaseHandle } from '../task/execution-lease.service.js';
 
 export interface FeishuSessionAdapter {
   getOrCreateSession(accountId: string, context: FeishuInboundContext): Promise<{ id: number; workspace?: string | null; executionUserId?: number | null }>;
@@ -165,7 +166,14 @@ export class AgentFeishuInboundHandler implements FeishuInboundHandler {
     /** 图片/文件下载：返回 data URI 与落盘路径；返回 null 表示无媒体或未处理。 */
     downloadMedia?: (context: FeishuInboundContext, workspace: string | null) => Promise<FeishuMediaDownload | null>;
     listenerFactory?: (sessionId: number, context: FeishuInboundContext, executionId: string) => Parameters<FeishuHarnessService['execute']>[2] | Promise<Parameters<FeishuHarnessService['execute']>[2]>;
-    onExecutionFinished?: (sessionId: number, context: FeishuInboundContext, executionId: string, phase: 'COMPLETED' | 'FAILED' | 'CANCELLED', failureReason?: string) => Promise<void>;
+    onExecutionFinished?: (sessionId: number, context: FeishuInboundContext, executionId: string, phase: 'COMPLETED' | 'FAILED' | 'CANCELLED', failureReason?: string, lease?: LeaseHandle | null) => Promise<void>;
+    /** 任务执行门禁：begin 必须先于阶段写入与消息落库；未真正启动时只释放，不写终态。 */
+    taskTerminalService?: {
+      beginExecution?(sessionId: number, executionId: string, source?: string, externalEvent?: null): Promise<{ duplicate: boolean; lease: LeaseHandle | null }>;
+      releaseExecutionLease?(lease: LeaseHandle | null | undefined): Promise<void>;
+    };
+    /** 开启后，没有租约的执行不得写任务终态（关闭时保持改造前行为）。 */
+    executionLeaseEnabled?: boolean;
     createProgressCard?: (context: FeishuInboundContext, sessionId: number) => Promise<FeishuCardProgress | null>;
     // 队列支持
     queueService?: FeishuTaskQueuePort;
@@ -254,11 +262,13 @@ export class AgentFeishuInboundHandler implements FeishuInboundHandler {
     return outcome;
   }
 
-  /** 重试执行主体：不 saveUserMessage / prepareMessage，直接 execute 续跑历史。 */
+  /** 重试执行主体：不 saveUserMessage，但必须先取正式 executionId 与执行门禁。 */
   private async runRetry(sessionId: number, progress: FeishuCardProgress): Promise<'COMPLETED' | 'CANCELLED' | 'FAILED'> {
     const cancelFlag = this.options.createCancelFlag?.(sessionId) ?? NOOP_CANCEL_FLAG;
     this.cancelFlags.set(sessionId, cancelFlag);
     let executionId = '';
+    let lease: LeaseHandle | null = null;
+    let started = false;
     let cardListener: FeishuCardProgressListener | null = null;
     let outcome: 'COMPLETED' | 'CANCELLED' | 'FAILED' = 'FAILED';
     const stubContext = {
@@ -268,6 +278,13 @@ export class AgentFeishuInboundHandler implements FeishuInboundHandler {
     } as unknown as FeishuInboundContext;
     try {
       await this.options.sessionService.cleanupIncompleteTail?.(sessionId);
+      executionId = await this.options.harnessService.prepareMessage(sessionId, '');
+      const begun = await this.options.taskTerminalService?.beginExecution?.(sessionId, executionId);
+      if (begun?.duplicate) {
+        outcome = 'COMPLETED';
+        return outcome;
+      }
+      lease = begun?.lease ?? null;
       await this.options.sessionService.updatePhase?.(sessionId, 'RUNNING');
       let roundOffset = 0;
       try {
@@ -282,24 +299,29 @@ export class AgentFeishuInboundHandler implements FeishuInboundHandler {
       } catch (error) {
         console.warn(`飞书重试进度卡片首次 PATCH 失败, sessionId=${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
       }
-      executionId = randomUUID();
       await this.broadcastRunning(sessionId, executionId, null);
       const listener = await this.options.listenerFactory?.(sessionId, stubContext, executionId)
         ?? new NoopAgentEventListener();
-      await this.options.harnessService.execute(
-        sessionId, null,
-        CompositeAgentEventListener.of(listener, cardListener),
-        cancelFlag,
-      );
+      started = true;
+      const executeListener = CompositeAgentEventListener.of(listener, cardListener);
+      if (lease == null) {
+        await this.options.harnessService.execute(sessionId, null, executeListener, cancelFlag, null);
+      } else {
+        await this.options.harnessService.execute(sessionId, null, executeListener, cancelFlag, null, lease);
+      }
       if (cancelFlag.get()) {
         const wasInterrupted = this.interrupted.has(sessionId);
         await this.options.sessionService.cleanupIncompleteTail?.(sessionId);
         await cardListener.cancel(wasInterrupted);
-        await this.options.onExecutionFinished?.(sessionId, stubContext, executionId, 'CANCELLED');
+        if (this.canSettle(started, lease)) {
+          await this.options.onExecutionFinished?.(sessionId, stubContext, executionId, 'CANCELLED', undefined, lease);
+        }
         outcome = 'CANCELLED';
         return outcome;
       }
-      await this.options.onExecutionFinished?.(sessionId, stubContext, executionId, 'COMPLETED');
+      if (this.canSettle(started, lease)) {
+        await this.options.onExecutionFinished?.(sessionId, stubContext, executionId, 'COMPLETED', undefined, lease);
+      }
       const reply = await this.options.sessionService.getLatestAssistantReplyWithId(sessionId);
       const cardUpdated = await cardListener.complete(reply.text, reply.messageId ?? undefined);
       if (cardUpdated === false && reply.text != null && reply.text !== '') {
@@ -312,7 +334,11 @@ export class AgentFeishuInboundHandler implements FeishuInboundHandler {
       await this.options.sessionService.cleanupIncompleteTail?.(sessionId);
       const failText = feishuFailureText(error);
       const cardUpdated = await cardListener?.fail(failText);
-      await this.options.onExecutionFinished?.(sessionId, stubContext, executionId, 'FAILED', failText);
+      if (this.canSettle(started, lease)) {
+        await this.options.onExecutionFinished?.(sessionId, stubContext, executionId, 'FAILED', failText, lease);
+      } else {
+        await this.options.taskTerminalService?.releaseExecutionLease?.(lease).catch(() => undefined);
+      }
       if ((cardListener == null || cardUpdated === false) && failText !== '') {
         await this.reply(stubContext, failText, sessionId).catch(() => undefined);
       }
@@ -642,6 +668,11 @@ export class AgentFeishuInboundHandler implements FeishuInboundHandler {
   /** 标记「消息已由某条队列行消费」的 metadata 键（写入 message.metadata JSON）。 */
   private static readonly QUEUE_METADATA_KEY = 'feishuQueueId';
 
+  /** 只有真正进入 Harness 执行后才允许写终态；开启租约时还要求拿到 handle。 */
+  private canSettle(started: boolean, lease: LeaseHandle | null): boolean {
+    return started && (lease != null || this.options.executionLeaseEnabled !== true);
+  }
+
   /** 共享执行逻辑：进度卡片 → phase 重置 → 保存消息 → prepare → execute → 结果处理。
    *  返回 `{ text, phase }`：text = 待发送的文本回复（null 表示已通过进度卡片呈现，无需再发文本）；
    *  phase = 本次执行的终态，供调用方决定队列是否接力消费（FAILED 时不消费下一条）。
@@ -652,6 +683,10 @@ export class AgentFeishuInboundHandler implements FeishuInboundHandler {
     executionUserId: number | null, cancelFlag: CancelFlag, queueRow?: FeishuInboundQueueRow | null,
   ): Promise<{ text: string | null; phase: 'COMPLETED' | 'CANCELLED' | 'FAILED' }> {
     let executionId = '';
+    let lease: LeaseHandle | null = null;
+    let started = false;
+    let phaseStarted = false;
+    let previousPhase = 'IDLE';
     let cardListener: FeishuCardProgressListener | null = null;
     try {
       try {
@@ -660,32 +695,62 @@ export class AgentFeishuInboundHandler implements FeishuInboundHandler {
       } catch (error) {
         console.warn(`飞书进度卡片创建失败，继续执行 Agent: ${error instanceof Error ? error.message : String(error)}`);
       }
-      await this.options.sessionService.updatePhase?.(sessionId, 'RUNNING');
-      const metadata = queueRow != null ? JSON.stringify({ [AgentFeishuInboundHandler.QUEUE_METADATA_KEY]: queueRow.id }) : null;
-      const messageForEcho = message;
-      await this.options.sessionService.saveUserMessage(sessionId, message, metadata);
-      this.echoUserMessageSaved(sessionId, executionUserId, messageForEcho);
+      // executionId 必须来自正式入口；门禁先于 phase 写入与消息落库。
       const eventId = await this.options.harnessService.prepareMessage(sessionId, message);
       executionId = eventId || '';
+      try {
+        previousPhase = (await this.options.sessionService.getPhase?.(sessionId)) ?? 'IDLE';
+      } catch {
+        previousPhase = 'IDLE';
+      }
+      let begun: { duplicate: boolean; lease: LeaseHandle | null };
+      try {
+        begun = await this.options.taskTerminalService?.beginExecution?.(sessionId, executionId)
+          ?? { duplicate: false, lease: null };
+      } catch (error) {
+        console.warn(`飞书消息执行门禁失败, sessionId=${sessionId}`, error);
+        return { text: '当前会话不可执行，请稍后再试。', phase: 'CANCELLED' };
+      }
+      if (begun.duplicate) {
+        return { text: null, phase: 'COMPLETED' };
+      }
+      lease = begun.lease;
+      await this.options.sessionService.updatePhase?.(sessionId, 'RUNNING');
+      phaseStarted = true;
+      const metadata = queueRow != null ? JSON.stringify({ [AgentFeishuInboundHandler.QUEUE_METADATA_KEY]: queueRow.id }) : null;
+      const messageForEcho = message;
+      try {
+        await this.options.sessionService.saveUserMessage(sessionId, message, metadata);
+      } catch (error) {
+        await this.options.sessionService.updatePhase?.(sessionId, previousPhase).catch(() => undefined);
+        await this.options.taskTerminalService?.releaseExecutionLease?.(lease).catch(() => undefined);
+        throw error;
+      }
+      this.echoUserMessageSaved(sessionId, executionUserId, messageForEcho);
       // 先于 execute：已打开的网页在上一轮 COMPLETED 后会丢弃流式事件，直到这条 RUNNING。
       await this.broadcastRunning(sessionId, executionId, executionUserId);
       const listener = await this.options.listenerFactory?.(sessionId, context, executionId);
       if (listener == null) throw new Error('Feishu listenerFactory is required to execute a harness session');
-      await this.options.harnessService.execute(
-        sessionId, eventId || null,
-        cardListener == null ? listener : CompositeAgentEventListener.of(listener, cardListener),
-        cancelFlag,
-        executionUserId,
-      );
+      started = true;
+      const executeListener = cardListener == null ? listener : CompositeAgentEventListener.of(listener, cardListener);
+      if (lease == null) {
+        await this.options.harnessService.execute(sessionId, eventId || null, executeListener, cancelFlag, executionUserId);
+      } else {
+        await this.options.harnessService.execute(sessionId, eventId || null, executeListener, cancelFlag, executionUserId, lease);
+      }
       if (cancelFlag.get()) {
         const wasInterrupted = this.interrupted.has(sessionId);
         await this.options.sessionService.cleanupIncompleteTail?.(sessionId);
         await cardListener?.cancel(wasInterrupted);
-        await this.options.onExecutionFinished?.(sessionId, context, executionId, 'CANCELLED');
+        if (this.canSettle(started, lease)) {
+          await this.options.onExecutionFinished?.(sessionId, context, executionId, 'CANCELLED', undefined, lease);
+        }
         const text = cardListener == null ? (wasInterrupted ? '任务已被下一条消息中断。' : '任务已取消。') : null;
         return { text, phase: 'CANCELLED' };
       }
-      await this.options.onExecutionFinished?.(sessionId, context, executionId, 'COMPLETED');
+      if (this.canSettle(started, lease)) {
+        await this.options.onExecutionFinished?.(sessionId, context, executionId, 'COMPLETED', undefined, lease);
+      }
       const reply = await this.options.sessionService.getLatestAssistantReplyWithId(sessionId);
       const cardUpdated = await cardListener?.complete(reply.text, reply.messageId ?? undefined);
       const replyText = cardListener == null || cardUpdated === false ? reply.text : null;
@@ -696,7 +761,14 @@ export class AgentFeishuInboundHandler implements FeishuInboundHandler {
       // 与客户端 ExecutionErrorBanner 一致：透传具体 error.message，便于在会话详情里定位根因。
       const failText = feishuFailureText(error);
       const cardUpdated = await cardListener?.fail(failText);
-      await this.options.onExecutionFinished?.(sessionId, context, executionId, 'FAILED', failText);
+      if (this.canSettle(started, lease)) {
+        await this.options.onExecutionFinished?.(sessionId, context, executionId, 'FAILED', failText, lease);
+      } else {
+        if (phaseStarted) {
+          await this.options.sessionService.updatePhase?.(sessionId, previousPhase).catch(() => undefined);
+        }
+        await this.options.taskTerminalService?.releaseExecutionLease?.(lease).catch(() => undefined);
+      }
       const replyText = cardListener == null || cardUpdated === false ? failText : null;
       return { text: replyText, phase: 'FAILED' };
     }

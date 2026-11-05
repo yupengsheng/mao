@@ -13,6 +13,7 @@ import { toWorkspaceRelative } from '../common/workspace-path.js';
 import { mapWithConcurrency } from '../common/concurrency.js';
 import { INBOUND_IMAGE_COMPRESS_CONCURRENCY, PromptImageResizer } from '../harness/tool/prompt-image-resizer.js';
 import type { InboundFile, WeixinInboundHandler, WeixinInboundMessageContext, WeixinReply } from './types.js';
+import type { LeaseHandle } from '../task/execution-lease.service.js';
 
 const DEFAULT_IMAGE_PROMPT = '请查看这张图片';
 
@@ -23,6 +24,8 @@ export interface WeixinHarnessService {
     eventId: string | null,
     listener: AgentEventListener,
     cancelFlag: { get(): boolean; set(v: boolean): void },
+    executionUserId?: number | null,
+    lease?: LeaseHandle | null,
   ): Promise<void>;
 }
 
@@ -59,7 +62,24 @@ export interface AgentWeixinInboundHandlerDeps {
   };
   shellSessionManager: { closeByConversation(sessionId: number): void };
   registry: StreamingWsRegistry;
-  taskTerminalService: { finishExecution(sessionId: number, userId: number, phase: string, executionId: string, reason?: string): Promise<void> };
+  taskTerminalService: {
+    beginExecution(
+      sessionId: number,
+      executionId: string,
+      source?: string,
+      externalEvent?: null,
+    ): Promise<{ duplicate: boolean; lease: LeaseHandle | null }>;
+    finishExecution(
+      sessionId: number,
+      userId: number,
+      phase: string,
+      executionId: string,
+      reason?: string,
+      notifySource?: string,
+      lease?: LeaseHandle | null,
+    ): Promise<{ settled: boolean }>;
+    releaseExecutionLease?(lease: LeaseHandle | null | undefined): Promise<void>;
+  };
   activityService: WsListenerDeps['activityService'];
   activityHeartbeat: { touch(sessionId: number): void };
   sessionTodoMapper: {
@@ -184,6 +204,25 @@ export class AgentWeixinInboundHandler implements WeixinInboundHandler {
         resolve({ text: '当前会话仍在执行，请稍后再发。' });
         return;
       }
+      // 门禁先于阶段写入与 AgentLoop 启动：拿不到归属就不能进入 RUNNING。
+      let lease: LeaseHandle | null = null;
+      try {
+        const taskTerminal = this.deps.taskTerminalService;
+        const begun = taskTerminal?.beginExecution != null
+          ? await taskTerminal.beginExecution(sessionId, executionId)
+          : { duplicate: false, lease: null };
+        if (begun.duplicate) {
+          await this.rollbackSupersededUserMessage(sessionId, savedMessageId);
+          resolve(null);
+          return;
+        }
+        lease = begun.lease;
+      } catch (e) {
+        console.warn(`微信消息执行门禁失败, sessionId=${sessionId}`, e);
+        await this.rollbackSupersededUserMessage(sessionId, savedMessageId);
+        resolve({ text: '当前会话不可执行，请稍后再试。' });
+        return;
+      }
       const cancelFlag = this.deps.agentLoop!.registerCancelFlag(sessionId);
       this.cancelFlags.set(sessionId, cancelFlag);
       try {
@@ -205,20 +244,27 @@ export class AgentWeixinInboundHandler implements WeixinInboundHandler {
           executionId,
           await this.resolveSupportsVision(session),
         );
-        await this.deps.harnessService!.execute(sessionId, null, listener, cancelFlag);
+        if (lease == null) await this.deps.harnessService!.execute(sessionId, null, listener, cancelFlag, null);
+        else await this.deps.harnessService!.execute(sessionId, null, listener, cancelFlag, null, lease);
         if (cancelFlag.get() || !this.isCurrentGeneration(sessionId, generation)) {
           console.info(`微信 Agent 执行已取消, sessionId=${sessionId}, gen=${generation}`);
-          await this.finishCancelledSession(sessionId, userId, executionId);
+          await this.finishCancelledSession(sessionId, userId, executionId, lease);
           resolve(null);
           return;
         }
-        await this.deps.taskTerminalService!.finishExecution(sessionId, userId, 'COMPLETED', executionId);
+        await this.deps.taskTerminalService!.finishExecution(
+          sessionId, userId, 'COMPLETED', executionId, undefined, undefined, lease,
+        );
         const messages = await this.deps.sessionService!.getMessages(sessionId);
         resolve({ text: this.getLatestAssistantReply(messages) });
       } catch (e) {
         if (cancelFlag.get() || !this.isCurrentGeneration(sessionId, generation)) {
           console.info(`微信 Agent 执行异常但已取消, sessionId=${sessionId}, gen=${generation}`);
-          try { await this.finishCancelledSession(sessionId, userId, executionId); } catch { /* ignore */ }
+          try {
+            await this.finishCancelledSession(sessionId, userId, executionId, lease);
+          } catch {
+            await this.deps.taskTerminalService?.releaseExecutionLease?.(lease).catch(() => undefined);
+          }
           resolve(null);
           return;
         }
@@ -232,9 +278,11 @@ export class AgentWeixinInboundHandler implements WeixinInboundHandler {
         try {
           await this.deps.taskTerminalService?.finishExecution(
             sessionId, userId, 'FAILED', executionId,
-            e instanceof Error ? e.message : 'Agent 执行异常',
+            e instanceof Error ? e.message : 'Agent 执行异常', undefined, lease,
           );
-        } catch { /* ignore */ }
+        } catch {
+          await this.deps.taskTerminalService?.releaseExecutionLease?.(lease).catch(() => undefined);
+        }
         resolve({ text: '抱歉，处理您的消息时出现了错误，请稍后再试。' });
       } finally {
         if (this.cancelFlags.get(sessionId) === cancelFlag) {
@@ -339,12 +387,19 @@ export class AgentWeixinInboundHandler implements WeixinInboundHandler {
     }
   }
 
-  private async finishCancelledSession(sessionId: number, userId: number, executionId: string): Promise<void> {
+  private async finishCancelledSession(
+    sessionId: number,
+    userId: number,
+    executionId: string,
+    lease?: LeaseHandle | null,
+  ): Promise<void> {
     const deleted = await this.deps.sessionService!.cleanupIncompleteTail(sessionId);
     if (deleted > 0) {
       console.info(`微信会话 ${sessionId}: 取消后清理 ${deleted} 条不完整消息`);
     }
-    await this.deps.taskTerminalService!.finishExecution(sessionId, userId, 'CANCELLED', executionId);
+    await this.deps.taskTerminalService!.finishExecution(
+      sessionId, userId, 'CANCELLED', executionId, undefined, undefined, lease,
+    );
   }
 
   private async resolveSupportsVision(session: Session): Promise<boolean> {

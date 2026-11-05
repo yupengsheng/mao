@@ -3,6 +3,8 @@ import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const sql = readFileSync(resolve(process.cwd(), 'db/migration/V200__execution_wait_and_lease.sql'), 'utf8');
+const recoveredSql = readFileSync(
+  resolve(process.cwd(), 'db/migration/V201__execution_wait_recovered_at.sql'), 'utf8');
 
 function expectColumn(table: string, column: string) {
   expect(sql, `${table}.${column}`).toContain(`\`${column}\``);
@@ -32,5 +34,14 @@ describe('V200 execution wait and lease migration', () => {
     expect(sql).toContain('UNIQUE KEY `uk_agent_execution_lease_session` (`session_id`)');
     expect(sql).toContain('KEY `idx_agent_execution_lease_expiry` (`status`, `expires_at`)');
     expect(sql).toContain('KEY `idx_agent_execution_lease_execution` (`execution_id`)');
+  });
+});
+
+describe('V201 execution wait recovered_at migration', () => {
+  it('adds the read-only recovery marker without rewriting existing waits', () => {
+    expect(recoveredSql).toContain('ALTER TABLE `execution_wait`');
+    expect(recoveredSql).toContain('`recovered_at` DATETIME NULL');
+    expect(recoveredSql).not.toContain('UPDATE `execution_wait`');
+    expect(recoveredSql).not.toContain('DELETE FROM `execution_wait`');
   });
 });

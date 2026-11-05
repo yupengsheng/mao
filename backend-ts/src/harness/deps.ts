@@ -2,6 +2,7 @@ import type { ChatRequest, ChatUsage, LlmModelConfig } from './llm/chat-request.
 import type { Db } from '../db/db.js';
 import type { ClientImpersonation } from '@mao/contracts';
 import { parsePriceColumn } from '../usage/cost-micros.js';
+import type { LeaseHandle } from '../task/execution-lease.service.js';
 
 export interface Session {
   id?: number;
@@ -292,8 +293,16 @@ export interface ActivityService {
 }
 
 export interface TaskTerminalService {
-  beginRecoveryExecution(sessionId: number, executionId: string): Promise<void>;
-  finishExecution(sessionId: number, userId: number | null | undefined, phase: string, executionId: string, error?: string): Promise<void>;
+  beginRecoveryExecution(sessionId: number, executionId: string, lease?: LeaseHandle | null): Promise<void>;
+  finishExecution(
+    sessionId: number,
+    userId: number | null | undefined,
+    phase: string,
+    executionId: string,
+    error?: string,
+    notifySource?: string,
+    lease?: LeaseHandle | null,
+  ): Promise<{ settled: boolean }>;
 }
 
 export interface MessageMapper {

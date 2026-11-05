@@ -7,10 +7,13 @@ import type {
 import type { Session } from '../session/types.js';
 import type { TaskService } from './task.service.js';
 import type { ExecutionWaitStore } from './execution-wait.repository.js';
+import type { LeaseHandle } from './execution-lease.service.js';
 
 export interface TaskWaitPersistenceOptions {
   enabled: boolean;
   store?: ExecutionWaitStore;
+  /** 读取当前执行租约，把真实 fencing token 写入等待行。 */
+  leaseLookup?: { getActive(sessionId: number): Promise<LeaseHandle | null> } | null;
 }
 
 export class TaskWaitService implements TaskWaitObserver {
@@ -95,6 +98,15 @@ export class TaskWaitService implements TaskWaitObserver {
   private async persistStarted(input: TaskWaitStartedInput, executionId: string): Promise<void> {
     if (!this.persistence.enabled || this.persistence.store == null) return;
     try {
+      let fencingToken: bigint | undefined;
+      if (this.persistence.leaseLookup != null) {
+        try {
+          const lease = await this.persistence.leaseLookup.getActive(input.sessionId);
+          if (lease != null && lease.executionId === executionId) fencingToken = lease.fencingToken;
+        } catch (error) {
+          console.warn(`[task] failed to read execution lease for waiting state: sessionId=${input.sessionId}`, error);
+        }
+      }
       await this.persistence.store.insertPending({
         sessionId: input.sessionId,
         executionId,
@@ -102,6 +114,7 @@ export class TaskWaitService implements TaskWaitObserver {
         requestId: input.requestId,
         payloadSummary: input.payloadSummary,
         payloadDigest: input.payloadDigest,
+        ...(fencingToken == null ? {} : { fencingToken }),
       });
     } catch (error) {
       console.warn(

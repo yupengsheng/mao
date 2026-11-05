@@ -56,7 +56,7 @@ describe('CrashRecoveryRunner', () => {
     expect(submitted).toHaveLength(1);
     await submitted[0]();
     expect(harness.execute).toHaveBeenCalled();
-    expect(taskTerminal.finishExecution).toHaveBeenCalledWith(4, 7, 'COMPLETED', expect.any(String));
+    expect(taskTerminal.finishExecution).toHaveBeenCalledWith(4, 7, 'COMPLETED', expect.any(String), undefined, 'MANUAL', null);
     expect(activityHeartbeat.clear).toHaveBeenCalledWith(4);
   });
 

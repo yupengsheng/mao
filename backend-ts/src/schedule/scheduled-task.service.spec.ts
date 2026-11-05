@@ -397,7 +397,7 @@ describe('ScheduledTaskService', () => {
     await ran;
     expect(live).toHaveBeenCalledWith(
       expect.objectContaining({ id: 11 }), 7, expect.any(String), expect.objectContaining({ id: 88 }),
-      expect.any(Number), 1,
+      expect.any(Number), 1, 'SCHEDULED', null, null,
     );
     expect(harness.executeFromEvent).not.toHaveBeenCalled();
     expect(terminal.finishExecution).not.toHaveBeenCalled();
@@ -424,7 +424,7 @@ describe('ScheduledTaskService', () => {
     await svc.executeTask({ id: 1, userId: 7, sessionId: 11, cronExpression: '0 0 9 * * *', prompt: 'hello', fireCount: 0 });
     await ran;
     expect(terminal.finishExecution).toHaveBeenCalledWith(
-      11, 7, 'COMPLETED', expect.any(String), undefined, 'SCHEDULED',
+      11, 7, 'COMPLETED', expect.any(String), undefined, 'SCHEDULED', null,
     );
   });
 

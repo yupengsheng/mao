@@ -44,6 +44,7 @@ import { bindingCardParam, fileMessageParam, imageMessageParam, sendDingtalkMark
 import { DingtalkTokenCache } from './token.js';
 import type { DingtalkBot, DingtalkInboundContext, DingtalkNormalizedMessage } from './types.js';
 import { groupProjectKey, privateProjectKey, resolveDingtalkWorkspace } from './workspace.js';
+import type { LeaseHandle } from '../task/execution-lease.service.js';
 
 export interface DingtalkRuntimeConfig extends DingtalkMonitorConfig {
   oauth: DingtalkOauthConfig;
@@ -54,6 +55,8 @@ export interface DingtalkRuntimeConfig extends DingtalkMonitorConfig {
   groupContextMaxMinutes: number;
   /** 入站防抖合并窗口（ms）；0=禁用。 */
   mergeWindowMs: number;
+  /** 任务执行租约开关：关闭时保持改造前终态行为。 */
+  executionLeaseEnabled?: boolean;
 }
 
 export interface DingtalkRuntime {
@@ -86,7 +89,22 @@ export function createDingtalkRuntime(deps: {
   userRepo: { findById(id: number): Promise<{ id?: number } | null> };
   settingService: { getSiteBaseUrl(): Promise<string | null> };
   taskTerminal: {
-    finishExecution(sessionId: number, userId: number, phase: string, executionId: string, failureReason?: string): Promise<void>;
+    beginExecution(
+      sessionId: number,
+      executionId: string,
+      source?: string,
+      externalEvent?: null,
+    ): Promise<{ duplicate: boolean; lease: LeaseHandle | null }>;
+    finishExecution(
+      sessionId: number,
+      userId: number,
+      phase: string,
+      executionId: string,
+      failureReason?: string,
+      notifySource?: string,
+      lease?: LeaseHandle | null,
+    ): Promise<{ settled: boolean }>;
+    releaseExecutionLease(lease: LeaseHandle | null | undefined): Promise<void>;
     cancelActiveExecution(sessionId: number, userId: number): Promise<void>;
   };
   activityService: unknown;
@@ -264,6 +282,12 @@ export function createDingtalkRuntime(deps: {
       },
     },
     harnessService: deps.harness,
+    taskTerminalService: {
+      beginExecution: (sessionId, executionId, source, externalEvent) =>
+        deps.taskTerminal.beginExecution(sessionId, executionId, source, externalEvent),
+      releaseExecutionLease: (lease) => deps.taskTerminal.releaseExecutionLease(lease),
+    },
+    executionLeaseEnabled: deps.config.executionLeaseEnabled === true,
     createCancelFlag: (sessionId) => deps.agentLoop.registerCancelFlag(sessionId),
     releaseCancelFlag: (sessionId) => deps.agentLoop.removeCancelFlag(sessionId),
     onInterruptRunning: (sessionId) => {
@@ -311,9 +335,11 @@ export function createDingtalkRuntime(deps: {
         sessionService: deps.sessionService as never,
       }, sessionId, session.userId, executionId, model?.supportsVision === 1);
     },
-    onExecutionFinished: async (sessionId, _context, executionId, phase, failureReason) => {
+    onExecutionFinished: async (sessionId, _context, executionId, phase, failureReason, lease) => {
       const session = await deps.sessionService.getSession(sessionId);
-      await deps.taskTerminal.finishExecution(sessionId, session.userId, phase, executionId, failureReason);
+      await deps.taskTerminal.finishExecution(
+        sessionId, session.userId, phase, executionId, failureReason, undefined, lease,
+      );
     },
     afterDelivery: async (sessionId, phase) => {
       if (phase === 'FAILED') return;

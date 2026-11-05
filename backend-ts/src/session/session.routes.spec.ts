@@ -13,6 +13,7 @@ import type { RunTraceService } from './run-trace.service.js';
 import type { RunTraceRecordService } from './run-trace-record.service.js';
 import type { SessionTodoRepository, SubagentExecutionRepository } from './activity.repository.js';
 import type { AgentLookup, LlmModelLookup, UserLookup } from './types.js';
+import type { ExecutionWaitQueryStore } from '../task/execution-wait.repository.js';
 import type { PathSandbox } from '../harness/safety/path-sandbox.js';
 import type { OssStsService } from '../oss/oss-sts.service.js';
 import { useTmpDir } from '../testing/tmp-dir.js';
@@ -37,7 +38,14 @@ function session(overrides: Record<string, unknown> = {}) {
 }
 
 describe('session and admin routes', () => {
-  async function app(options: { participated?: boolean } = {}) {
+  async function app(options: {
+    participated?: boolean;
+    sessionOverrides?: Record<string, unknown>;
+    descendantsByRoots?: Map<number, ReturnType<typeof session>[]>;
+    approvalCounts?: Map<number, number>;
+    questionCounts?: Map<number, number>;
+    executionWaitRepository?: ExecutionWaitQueryStore | null;
+  } = {}) {
     const fastify = Fastify();
     fastify.setErrorHandler(handleError);
     fastify.addHook('preHandler', (req, _r, done) => {
@@ -45,9 +53,9 @@ describe('session and admin routes', () => {
       done();
     });
     const sessionService = {
-      createSession: vi.fn(async () => session()),
-      getSession: vi.fn(async () => session()),
-      listSessions: vi.fn(async () => [session()]),
+      createSession: vi.fn(async () => session(options.sessionOverrides)),
+      getSession: vi.fn(async () => session(options.sessionOverrides)),
+      listSessions: vi.fn(async () => [session(options.sessionOverrides)]),
       listSessionGroups: vi.fn(async () => []),
       listSessionsByGroup: vi.fn(),
       listSessionsByFilter: vi.fn(async () => ({ items: [session({ source: 'embed' })], total: 1, offset: 0, limit: 20, hasMore: false })),
@@ -56,7 +64,7 @@ describe('session and admin routes', () => {
       listSessionsForDashboard: vi.fn(async () => ({ running: [], recent: [] })),
       listSideTaskSessions: vi.fn(async () => []),
       listDescendantSideTaskSessions: vi.fn(async () => []),
-      listDescendantSideTaskSessionsByRoots: vi.fn(async () => new Map()),
+      listDescendantSideTaskSessionsByRoots: vi.fn(async () => options.descendantsByRoots ?? new Map()),
       listSubagentSessionsWithSideTasks: vi.fn(async () => []),
       deleteSession: vi.fn(),
       promoteSideTaskToMainSession: vi.fn(async () => session({ id: 2, sessionType: 'NORMAL', parentSessionId: null })),
@@ -130,6 +138,12 @@ describe('session and admin routes', () => {
       sessionCompactionService: compactionRecordService as unknown as SessionCompactionService,
       runTraceService: runTraceService as unknown as RunTraceService,
       runTraceRecordService: runTraceRecordService as unknown as RunTraceRecordService,
+      approvalRegistry: { countForSessionIds: vi.fn(() => options.approvalCounts ?? new Map()) },
+      askUserQuestionsRegistry: {
+        countPendingBySessionIds: vi.fn(() => options.questionCounts ?? new Map()),
+        getPendingForSession: vi.fn(() => []),
+      },
+      executionWaitRepository: options.executionWaitRepository,
       existsSessionUnderWorkspace: vi.fn(async () => options.participated ?? false),
     });
     registerAdminSessionRoutes(fastify, {
@@ -192,6 +206,103 @@ describe('session and admin routes', () => {
     expect((await json('GET', '/v1/admin/sessions/options/users')).body.data[0].username).toBe('u');
     expect((await json('GET', '/v1/admin/sessions/options/agents')).body.data[0].name).toBe('Agent');
     expect(sessionService.getFileChangeSummariesByMessageIds).not.toHaveBeenCalled();
+    await fastify.close();
+  });
+
+  it('Session 详情返回最早待处理等待，列表不返回 pendingWait', async () => {
+    const wait = {
+      id: 11,
+      sessionId: 1,
+      executionId: 'exec-1',
+      requestType: 'APPROVAL' as const,
+      requestId: 'req-1',
+      payloadSummary: '需要审批 git push',
+      expiresAt: '2026-11-05 12:00:00',
+      fencingToken: 3n,
+      expired: false,
+      recovered: true,
+    };
+    const executionWaitRepository = {
+      findEarliestPending: vi.fn(async () => wait),
+      countPendingBySessionIds: vi.fn(async () => new Map()),
+    } as unknown as ExecutionWaitQueryStore;
+    const { fastify } = await app({ executionWaitRepository });
+
+    const detail = JSON.parse((await fastify.inject({ method: 'GET', url: '/v1/sessions/1' })).body);
+    expect(detail.data.pendingWait).toEqual({
+      kind: 'APPROVAL',
+      requestId: 'req-1',
+      summary: '需要审批 git push',
+      expiresAt: '2026-11-05 12:00:00',
+      recovered: true,
+      actionable: false,
+    });
+    expect(executionWaitRepository.findEarliestPending).toHaveBeenCalledWith(1);
+
+    const list = JSON.parse((await fastify.inject({ method: 'GET', url: '/v1/sessions' })).body);
+    expect(list.data[0]).not.toHaveProperty('pendingWait');
+    expect(executionWaitRepository.findEarliestPending).toHaveBeenCalledTimes(1);
+    await fastify.close();
+  });
+
+  it('等待查询异常时详情不返回 pendingWait（Jackson 兼容省略 null），不阻断会话详情', async () => {
+    const executionWaitRepository = {
+      findEarliestPending: vi.fn(async () => { throw new Error('db down'); }),
+      countPendingBySessionIds: vi.fn(async () => new Map()),
+    } as unknown as ExecutionWaitQueryStore;
+    const { fastify } = await app({ executionWaitRepository });
+
+    const res = await fastify.inject({ method: 'GET', url: '/v1/sessions/1' });
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.code).toBe(0);
+    expect(body.data).not.toHaveProperty('pendingWait');
+    await fastify.close();
+  });
+
+  it('会话列表聚合后代等待，并对 Registry 与持久化计数逐项取 max', async () => {
+    const executionWaitRepository = {
+      findEarliestPending: vi.fn(async () => null),
+      countPendingBySessionIds: vi.fn(async () => new Map([
+        [1, { approval: 3, question: 1 }],
+        [2, { approval: 0, question: 4 }],
+      ])),
+    } as unknown as ExecutionWaitQueryStore;
+    const { fastify } = await app({
+      descendantsByRoots: new Map([[1, [session({ id: 2, sessionType: 'SIDE_TASK', parentSessionId: 1 })]]]),
+      approvalCounts: new Map([[1, 1], [2, 1]]),
+      questionCounts: new Map([[1, 2], [2, 0]]),
+      executionWaitRepository,
+    });
+
+    const res = await fastify.inject({ method: 'GET', url: '/v1/sessions' });
+    const data = JSON.parse(res.body).data[0];
+    expect(executionWaitRepository.countPendingBySessionIds).toHaveBeenCalledWith([1, 2]);
+    expect(data.pendingApprovalCount).toBe(3);
+    expect(data.pendingQuestionCount).toBe(2);
+    expect(data.treePendingApprovalCount).toBe(3);
+    expect(data.treePendingQuestionCount).toBe(5);
+    await fastify.close();
+  });
+
+  it('持久化计数查询失败时回退 Registry，不影响列表返回', async () => {
+    const executionWaitRepository = {
+      findEarliestPending: vi.fn(async () => null),
+      countPendingBySessionIds: vi.fn(async () => { throw new Error('db down'); }),
+    } as unknown as ExecutionWaitQueryStore;
+    const { fastify } = await app({
+      approvalCounts: new Map([[1, 2]]),
+      questionCounts: new Map([[1, 1]]),
+      executionWaitRepository,
+    });
+
+    const res = await fastify.inject({ method: 'GET', url: '/v1/sessions' });
+    expect(res.statusCode).toBe(200);
+    const data = JSON.parse(res.body).data[0];
+    expect(data.pendingApprovalCount).toBe(2);
+    expect(data.treePendingApprovalCount).toBe(2);
+    expect(data.pendingQuestionCount).toBe(1);
+    expect(data.treePendingQuestionCount).toBe(1);
     await fastify.close();
   });
 

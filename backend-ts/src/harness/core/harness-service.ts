@@ -47,6 +47,13 @@ import { BusinessException } from '../../common/business-exception.js';
 import { ErrorCode } from '../../common/error-code.js';
 import type { ChatRequest, ChatUsage, ToolCall } from '../llm/chat-request.js';
 import type { MemoryHint } from '../../memory/types.js';
+import {
+  EXECUTION_LEASE_HEARTBEAT_INTERVAL_MS,
+  LeaseRequiredError,
+  type ExecutionLeaseService,
+  type LeaseHandle,
+} from '../../task/execution-lease.service.js';
+import { LostExecutionLeaseError } from '../../task/task.service.js';
 
 const ASK_USER_QUESTIONS = 'ask_user_questions';
 /** 工作集模式的两个内置入口工具：只在该模式注入，全量模式不出现。 */
@@ -102,7 +109,8 @@ export class HarnessService {
      * 未注入时不补挂，行为与仅会话创建时挂载一致。
      */
     private readonly experienceMount?: { syncForSession(workspace: string, agentId: number, enabled: boolean, refreshIndex?: boolean): void } | null,
-    private readonly executionStarter?: ((sessionId: number, executionId?: string) => Promise<void>) | null,
+    private readonly executionLeaseService?: Pick<ExecutionLeaseService, 'heartbeat'> | null,
+    private readonly executionLeaseEnabled: boolean = false,
   ) {}
 
   prepareMessage(_sessionId: number, _userContent: unknown): string {
@@ -111,38 +119,94 @@ export class HarnessService {
 
   async executeFromEvent(
     sessionId: number, eventId: string, listener: AgentEventListener, cancelFlag?: AtomicBoolean | null,
+    lease?: LeaseHandle | null,
   ): Promise<void> {
-    await this.executeInternal(sessionId, listener, cancelFlag, undefined, eventId);
+    await this.executeInternal(sessionId, listener, cancelFlag, undefined, eventId, lease);
   }
 
   async execute(
     sessionId: number, _userContent: string | null, listener: AgentEventListener, cancelFlag?: AtomicBoolean | null,
-    executionUserId?: number | null,
+    executionUserId?: number | null, lease?: LeaseHandle | null,
   ): Promise<void> {
-    await this.executeInternal(sessionId, listener, cancelFlag, executionUserId);
+    await this.executeInternal(sessionId, listener, cancelFlag, executionUserId, undefined, lease);
   }
 
   private async executeInternal(
     sessionId: number, listener: AgentEventListener, cancelFlag?: AtomicBoolean | null,
-    executionUserId?: number | null, executionId?: string,
+    executionUserId?: number | null, executionId?: string, lease?: LeaseHandle | null,
   ): Promise<void> {
-    await this.beginTrackedExecution(sessionId, executionId);
-    const context = await this.buildContext(sessionId, listener, cancelFlag);
-    if (executionUserId != null) context.executionUserId = executionUserId;
-    const persistenceCallback = this.createPersistenceCallback(sessionId, context);
+    const flag = cancelFlag ?? new AtomicBoolean(false);
+    this.assertLease(sessionId, lease, executionId);
+    const stopHeartbeat = this.startLeaseHeartbeat(lease, flag);
     try {
+      const context = await this.buildContext(sessionId, listener, flag);
+      if (executionUserId != null) context.executionUserId = executionUserId;
+      const persistenceCallback = this.createPersistenceCallback(sessionId, context);
       await this.agentLoop.execute(context, listener, persistenceCallback);
     } finally {
+      stopHeartbeat();
       if (cancelFlag != null) this.agentLoop.removeCancelFlag(sessionId);
     }
   }
 
-  private async beginTrackedExecution(sessionId: number, executionId?: string): Promise<void> {
-    try {
-      await this.executionStarter?.(sessionId, executionId);
-    } catch (error) {
-      harnessLog('warn', `Failed to register task execution for session ${sessionId}`, error);
+  private assertLease(sessionId: number, lease?: LeaseHandle | null, executionId?: string): void {
+    if (lease == null) {
+      if (this.executionLeaseEnabled) throw new LeaseRequiredError(sessionId);
+      return;
     }
+    if (lease.sessionId !== sessionId) {
+      throw new Error(`execution lease session mismatch: expected=${sessionId}, actual=${lease.sessionId}`);
+    }
+    if (executionId != null && lease.executionId !== executionId) {
+      throw new LostExecutionLeaseError(executionId);
+    }
+  }
+
+  /**
+   * 租约心跳只负责执行归属；Task 终态与 release 仍由入口在 Harness 返回后处理。
+   * 心跳异常按设计累计两次后置取消标志，确认 token 失效则立即停止。
+   */
+  private startLeaseHeartbeat(lease: LeaseHandle | null | undefined, cancelFlag: AtomicBoolean): () => void {
+    if (lease == null || this.executionLeaseService == null) {
+      if (this.executionLeaseEnabled && lease != null) {
+        harnessLog('warn', `Execution lease heartbeat unavailable for session ${lease.sessionId}`);
+      }
+      return () => undefined;
+    }
+    let stopped = false;
+    let inFlight = false;
+    let consecutiveFailures = 0;
+    const tick = async () => {
+      if (stopped || inFlight) return;
+      inFlight = true;
+      try {
+        const alive = await this.executionLeaseService!.heartbeat(lease);
+        if (stopped) return;
+        if (!alive) {
+          harnessLog('warn', `lease_lost: heartbeat rejected for session ${lease.sessionId}, execution ${lease.executionId}`);
+          cancelFlag.set(true);
+          return;
+        }
+        consecutiveFailures = 0;
+      } catch (error) {
+        if (stopped) return;
+        consecutiveFailures += 1;
+        harnessLog(
+          'warn',
+          `lease_heartbeat_failed: session=${lease.sessionId}, execution=${lease.executionId}, attempt=${consecutiveFailures}`,
+          error,
+        );
+        if (consecutiveFailures >= 2) cancelFlag.set(true);
+      } finally {
+        inFlight = false;
+      }
+    };
+    const timer = setInterval(() => { void tick(); }, EXECUTION_LEASE_HEARTBEAT_INTERVAL_MS);
+    timer.unref?.();
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
   }
 
   createPersistenceCallback(targetSessionId: number, context: AgentExecutionContext): MessagePersistenceCallback {
@@ -307,10 +371,21 @@ export class HarnessService {
     }
   }
 
-  async executePrepared(context: AgentExecutionContext, listener: AgentEventListener): Promise<void> {
-    if (context.sessionId != null) await this.beginTrackedExecution(context.sessionId);
-    const persistence = this.createPersistenceCallback(context.sessionId!, context);
-    await this.agentLoop.execute(context, listener, persistence);
+  async executePrepared(
+    context: AgentExecutionContext, listener: AgentEventListener, lease?: LeaseHandle | null,
+  ): Promise<void> {
+    const sessionId = context.sessionId;
+    if (sessionId == null) throw new Error('executePrepared requires context.sessionId');
+    this.assertLease(sessionId, lease);
+    const flag = context.cancelFlag ?? new AtomicBoolean(false);
+    context.cancelFlag = flag;
+    const stopHeartbeat = this.startLeaseHeartbeat(lease, flag);
+    try {
+      const persistence = this.createPersistenceCallback(sessionId, context);
+      await this.agentLoop.execute(context, listener, persistence);
+    } finally {
+      stopHeartbeat();
+    }
   }
 
   async buildContext(
@@ -794,26 +869,33 @@ export class HarnessService {
     contextMode: 'fork' | 'summary' | 'none',
     listener: AgentEventListener,
     cancelFlag?: AtomicBoolean | null,
+    lease?: LeaseHandle | null,
   ): Promise<void> {
-    await this.beginTrackedExecution(sideSessionId);
-    if (contextMode === 'fork') {
-      await this.forkParentMessages(parentSessionId, sideSessionId);
-    }
-    // fork 后边路会话已有完整历史消息，buildContext 会自动加载；summary/none 不改消息表
-    const context = await this.buildContext(sideSessionId, listener, cancelFlag);
-    if (contextMode === 'summary') {
-      const contextSummary = await this.generateContextSummary(parentSessionId);
-      if (hasText(contextSummary)) {
-        context.systemPrompt = (context.systemPrompt ?? '')
-          + '\n\n<主任务背景摘要>\n' + contextSummary + '\n</主任务背景摘要>\n'
-          + '以上是主任务的最近对话摘要，本次边路任务的结果不需要反馈到主任务。';
-        context.preparedRequest = null;
+    const flag = cancelFlag ?? new AtomicBoolean(false);
+    this.assertLease(sideSessionId, lease);
+    const stopHeartbeat = this.startLeaseHeartbeat(lease, flag);
+    try {
+      if (contextMode === 'fork') {
+        await this.forkParentMessages(parentSessionId, sideSessionId);
       }
+      // fork 后边路会话已有完整历史消息，buildContext 会自动加载；summary/none 不改消息表
+      const context = await this.buildContext(sideSessionId, listener, flag);
+      if (contextMode === 'summary') {
+        const contextSummary = await this.generateContextSummary(parentSessionId);
+        if (hasText(contextSummary)) {
+          context.systemPrompt = (context.systemPrompt ?? '')
+            + '\n\n<主任务背景摘要>\n' + contextSummary + '\n</主任务背景摘要>\n'
+            + '以上是主任务的最近对话摘要，本次边路任务的结果不需要反馈到主任务。';
+          context.preparedRequest = null;
+        }
+      }
+      // contextMode === 'none': 跳过任何上下文注入
+      const persistenceCallback = this.createPersistenceCallback(sideSessionId, context);
+      await this.agentLoop.execute(context, listener, persistenceCallback);
+    } finally {
+      stopHeartbeat();
+      if (cancelFlag != null) this.agentLoop.removeCancelFlag(sideSessionId);
     }
-    // contextMode === 'none': 跳过任何上下文注入
-    const persistenceCallback = this.createPersistenceCallback(sideSessionId, context);
-    await this.agentLoop.execute(context, listener, persistenceCallback);
-    if (cancelFlag != null) this.agentLoop.removeCancelFlag(sideSessionId);
   }
 
   /**

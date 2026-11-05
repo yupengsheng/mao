@@ -12,6 +12,9 @@ import type { HarnessService } from './harness-service.js';
 import { CompositeAgentEventListener } from './composite-agent-event-listener.js';
 import type { SessionTodoMapper } from '../todo/session-todo.mapper.js';
 import type { SubagentRecoveryCoordinator } from '../delegate/subagent-recovery-coordinator.js';
+import type { ExecutionLeaseService, LeaseHandle } from '../../task/execution-lease.service.js';
+import type { ExecutionWaitRecord, ExecutionWaitRepository } from '../../task/execution-wait.repository.js';
+import type { TaskService } from '../../task/task.service.js';
 import {
   deployDrainSec,
   isRecentDeployLock,
@@ -31,6 +34,18 @@ export interface RecoveryExtraListener extends AgentEventListener {
   /** 恢复续跑失败时的终态通知（如飞书进度卡片 PATCH「已失败」）。 */
   fail?(message: string): Promise<boolean>;
 }
+
+/** 任务域二期恢复依赖；未装配或开关关闭时保持旧的静默阈值恢复路径。 */
+export interface CrashRecoveryDeps {
+  executionLeaseService?: ExecutionLeaseService | null;
+  executionWaitRepository?: ExecutionWaitRepository | null;
+  taskService?: TaskService | null;
+  ownerInstance?: string;
+  executionLeaseEnabled?: boolean;
+}
+
+/** 等待超时后的固定失败原因，供恢复收敛与前端/CLI 展示。 */
+export const EXECUTION_WAIT_EXPIRED_REASON = '等待用户处理超时，执行已终止';
 
 export class CrashRecoveryRunner {
   private deferredTimer: ReturnType<typeof setTimeout> | null = null;
@@ -81,6 +96,8 @@ export class CrashRecoveryRunner {
   private static readonly DEPLOY_SWEEP_GRACE_SEC = 60;
   /** deferred pass 被部署窗口推迟后的重试间隔（重试本身不查库，成本很低）。 */
   private static readonly DEFERRED_RETRY_DELAY_SEC = 15;
+  /** 同一等待在单实例内只重推一次恢复通知；重复巡检只做幂等投影。 */
+  private readonly notifiedRecoveredWaits = new Set<string>();
 
   constructor(
     private readonly sessionMapper: SessionMapper,
@@ -109,6 +126,7 @@ export class CrashRecoveryRunner {
     private readonly isSessionLocallyActive?: (sessionId: number) => boolean,
     /** 本实例监听的后端端口；与 active-backend-port 一致时才允许执行孤儿巡检。 */
     private readonly selfPort?: number,
+    private readonly recoveryDeps?: CrashRecoveryDeps,
   ) {}
 
   async run(): Promise<void> {
@@ -287,13 +305,14 @@ export class CrashRecoveryRunner {
   }
 
   /**
-   * 从 DB 收集崩溃遗留的 RUNNING/RESUMING 会话候选（排除子代理、被协调器阻塞的会话），
-   * 并按 session.id 去重。
+   * 从 DB 收集崩溃遗留的 RUNNING/RESUMING/WAITING_APPROVAL 会话候选
+   * （排除子代理、被协调器阻塞的会话），并按 session.id 去重。
    */
   private async collectCandidates(blocked: Set<number>, excludeLocallyActive = false): Promise<Session[]> {
     const running = this.sessionMapper.selectByPhase ? await this.sessionMapper.selectByPhase('RUNNING') : [];
     const resuming = this.sessionMapper.selectByPhase ? await this.sessionMapper.selectByPhase('RESUMING') : [];
-    return [...running, ...resuming].filter((session, index, all) =>
+    const waiting = this.sessionMapper.selectByPhase ? await this.sessionMapper.selectByPhase('WAITING_APPROVAL') : [];
+    return [...running, ...resuming, ...waiting].filter((session, index, all) =>
       session.sessionType !== 'SUBAGENT'
       && session.id != null
       && !blocked.has(session.id)
@@ -365,17 +384,262 @@ export class CrashRecoveryRunner {
   }
 
   private async runRecovery(snapshot: Session, sessionId: number): Promise<void> {
-    const userId = snapshot.userId ?? null;
-    let extra: RecoveryExtraListener | null = null;
     // 恢复前重查当前状态：候选来自启动时（或延迟恢复的初始）快照，蓝绿排空期间
     // 会话可能已被旧实例正常收尾进入终态，直接重放会把已完成会话误判为 FAILED。
     const current = await this.sessionMapper.selectById(sessionId);
-    if (current == null || (current.phase !== 'RUNNING' && current.phase !== 'RESUMING')) {
+    if (current == null || !['RUNNING', 'RESUMING', 'WAITING_APPROVAL'].includes(current.phase ?? '')) {
       harnessLog('info', `Skip recovery for session ${sessionId}: current phase=${current?.phase ?? 'deleted'}`);
       return;
     }
-    const session = current;
+    if (this.isLeaseRecoveryEnabled()) {
+      await this.runLeaseAwareRecovery(current, sessionId);
+      return;
+    }
+    await this.runRecoveryExecution(current, sessionId, randomUUID(), null);
+  }
+
+  private isLeaseRecoveryEnabled(): boolean {
+    return this.recoveryDeps?.executionLeaseEnabled === true
+      && this.recoveryDeps.executionLeaseService != null;
+  }
+
+  /**
+   * 租约感知恢复：先排除仍被其他实例持有的租约，再区分等待 / 过期 / 无等待三条路径。
+   * 所有任务终态与阶段写入都复用同一次 claim 得到的 handle。
+   */
+  private async runLeaseAwareRecovery(session: Session, sessionId: number): Promise<void> {
+    const deps = this.recoveryDeps!;
+    const leases = deps.executionLeaseService!;
+    const owner = deps.ownerInstance?.trim() ?? '';
+    if (owner === '') {
+      harnessLog('error', `Skip recovery for session ${sessionId}: execution lease owner is not configured`);
+      return;
+    }
+    try {
+      const active = await leases.getActive(sessionId);
+      if (active != null) {
+        harnessLog('info', `Skip recovery for session ${sessionId}: execution lease still active (executionId=${active.executionId})`);
+        return;
+      }
+    } catch (e) {
+      harnessLog('warn', `Skip recovery for session ${sessionId}: failed to read execution lease`, e);
+      return;
+    }
+
+    const priorExecutionId = await this.resolvePriorExecutionId(session, sessionId);
+    let waits: ExecutionWaitRecord[];
+    try {
+      waits = deps.executionWaitRepository == null
+        ? []
+        : await deps.executionWaitRepository.listPending(sessionId, priorExecutionId ?? undefined);
+      if (waits.length === 0 && priorExecutionId != null && deps.executionWaitRepository != null) {
+        // Task 主档可能已收敛而等待行仍挂在旧 attempt 上，按 session 再扫一次兜底。
+        waits = await deps.executionWaitRepository.listPending(sessionId);
+      }
+    } catch (e) {
+      // 读不到等待时不得无等待续跑，否则会绕过 PENDING 的权威门禁。
+      harnessLog('warn', `Skip recovery for session ${sessionId}: failed to read pending waits`, e);
+      return;
+    }
+    if (waits.length > 0) {
+      await this.recoverWaitingExecution(session, sessionId, waits, priorExecutionId, owner);
+      return;
+    }
+    await this.recoverWithoutWait(session, sessionId, owner);
+  }
+
+  private async resolvePriorExecutionId(session: Session, sessionId: number): Promise<string | null> {
+    const deps = this.recoveryDeps;
+    if (deps?.taskService != null && session.id != null) {
+      try {
+        // CrashRecoveryRunner 使用 harness 的宽松 Session 形状；任务域要求 userId 必填，
+        // 进入恢复前 session 已从数据库重新读取，这里仅做类型收口。
+        const executionId = await deps.taskService.getActiveExecutionId(session as never);
+        if (executionId != null) return executionId;
+      } catch (e) {
+        harnessLog('warn', `Recovery: failed to resolve task execution for session ${sessionId}`, e);
+      }
+    }
+    try {
+      const record = await deps?.executionLeaseService?.getRecord(sessionId);
+      return record?.executionId ?? null;
+    } catch (e) {
+      harnessLog('warn', `Recovery: failed to resolve lease execution for session ${sessionId}`, e);
+      return null;
+    }
+  }
+
+  private async recoverWaitingExecution(
+    session: Session,
+    sessionId: number,
+    scanned: ExecutionWaitRecord[],
+    priorExecutionId: string | null,
+    owner: string,
+  ): Promise<void> {
+    const deps = this.recoveryDeps!;
+    const leases = deps.executionLeaseService!;
+    const store = deps.executionWaitRepository;
+    if (store == null) {
+      harnessLog('warn', `Skip waiting recovery for session ${sessionId}: wait repository is not configured`);
+      return;
+    }
+    const executionId = priorExecutionId ?? scanned[0]?.executionId;
+    if (executionId == null || executionId.trim() === '') return;
+
+    let lease: LeaseHandle | null;
+    try {
+      lease = await leases.acquire(sessionId, executionId, owner);
+    } catch (e) {
+      harnessLog('warn', `Failed to claim lease for waiting session ${sessionId}`, e);
+      return;
+    }
+    if (lease == null) {
+      harnessLog('info', `Skip waiting recovery for session ${sessionId}: lease is held by another execution`);
+      return;
+    }
+
+    try {
+      const waits = await store.listPending(sessionId, executionId, lease.fencingToken);
+      if (waits.length === 0) {
+        // 扫描后等待已被用户处理：释放本次 claim，回到无等待续跑。
+        await this.releaseLeaseQuietly(lease);
+        await this.recoverWithoutWait(session, sessionId, owner);
+        return;
+      }
+      const expired = waits.filter((wait) => wait.expired);
+      const live = waits.filter((wait) => !wait.expired);
+      for (const wait of expired) {
+        try {
+          await store.expire(wait.id, lease.fencingToken);
+        } catch (e) {
+          harnessLog('warn', `Failed to expire wait for session ${sessionId}: requestId=${wait.requestId}`, e);
+        }
+      }
+      if (live.length === 0) {
+        await this.failExpiredWait(session, sessionId, executionId, lease);
+        return;
+      }
+      await this.projectRecoveredWait(session, sessionId, executionId, lease, live, store);
+    } catch (e) {
+      harnessLog('warn', `Waiting recovery failed for session ${sessionId}`, e);
+    } finally {
+      await this.releaseLeaseQuietly(lease);
+    }
+  }
+
+  private async failExpiredWait(
+    session: Session,
+    sessionId: number,
+    executionId: string,
+    lease: LeaseHandle,
+  ): Promise<void> {
+    const userId = session.userId ?? null;
+    try {
+      await this.taskTerminalService.finishExecution(
+        sessionId, userId, 'FAILED', executionId, EXECUTION_WAIT_EXPIRED_REASON, 'MANUAL', lease);
+      harnessLog('info', `Session ${sessionId}: expired execution wait settled as FAILED`);
+    } catch (e) {
+      harnessLog('warn', `Failed to settle expired execution wait for session ${sessionId}`, e);
+    }
+    if (userId != null) {
+      try {
+        await this.onExecutionFinished?.(sessionId, userId, 'FAILED');
+      } catch (e) {
+        harnessLog('warn', `Auto-consume after expired wait failed for session ${sessionId}`, e);
+      }
+    }
+  }
+
+  private async projectRecoveredWait(
+    session: Session,
+    sessionId: number,
+    executionId: string,
+    lease: LeaseHandle,
+    waits: ExecutionWaitRecord[],
+    store: ExecutionWaitRepository,
+  ): Promise<void> {
+    const userId = session.userId ?? null;
+    const phase = waits.some((wait) => wait.requestType === 'APPROVAL') ? 'WAITING_APPROVAL' : 'RUNNING';
+    const taskService = this.recoveryDeps?.taskService;
+    if (taskService != null) {
+      try {
+        await taskService.setExecutionStage(session as never, executionId, 'BLOCKED', lease);
+      } catch (e) {
+        harnessLog('warn', `Failed to project recovered wait as BLOCKED for session ${sessionId}`, e);
+      }
+    }
+    try {
+      await this.sessionService.updatePhase(sessionId, phase);
+    } catch (e) {
+      harnessLog('warn', `Failed to project recovered wait phase for session ${sessionId}`, e);
+    }
+    this.notifyClient(userId, sessionId, phase, executionId);
+
+    // 只有本轮真正从“未恢复”标记成功的等待才推送；重复扫描沿用内存幂等，
+    // 数据库标记失败则宁可不推，避免把可操作假象发给客户端。
+    let newlyMarked = new Set<number>();
+    try {
+      const marked = await store.markRecovered(waits.map((wait) => wait.id), lease.fencingToken);
+      newlyMarked = new Set(marked);
+    } catch (e) {
+      harnessLog('warn', `Failed to mark recovered waits for session ${sessionId}`, e);
+    }
+
+    let pushed = 0;
+    for (const wait of waits) {
+      if (userId == null) continue;
+      if (!newlyMarked.has(wait.id)) continue;
+      const key = `${sessionId}:${wait.requestId}`;
+      if (this.notifiedRecoveredWaits.has(key)) continue;
+      try {
+        this.registry.send(userId, wsEvent('execution_wait_recovered', sessionId, {
+          sessionId,
+          executionId,
+          requestId: wait.requestId,
+          requestType: wait.requestType,
+          summary: wait.payloadSummary,
+          expiresAt: wait.expiresAt,
+          recovered: true,
+          actionable: false,
+        }));
+        this.notifiedRecoveredWaits.add(key);
+        pushed += 1;
+      } catch (e) {
+        harnessLog('warn', `Failed to push recovered wait for session ${sessionId}: requestId=${wait.requestId}`, e);
+      }
+    }
+    harnessLog(
+      'info',
+      `Session ${sessionId}: recovered ${waits.length} pending wait(s), marked=${newlyMarked.size}, phase=${phase}, pushed=${pushed}`,
+    );
+  }
+
+  private async recoverWithoutWait(session: Session, sessionId: number, owner: string): Promise<void> {
+    const leases = this.recoveryDeps?.executionLeaseService;
+    if (leases == null) return;
     const executionId = randomUUID();
+    let lease: LeaseHandle | null;
+    try {
+      lease = await leases.acquire(sessionId, executionId, owner);
+    } catch (e) {
+      harnessLog('warn', `Failed to claim recovery lease for session ${sessionId}`, e);
+      return;
+    }
+    if (lease == null) {
+      harnessLog('info', `Skip recovery for session ${sessionId}: lease is held by another execution`);
+      return;
+    }
+    await this.runRecoveryExecution(session, sessionId, executionId, lease);
+  }
+
+  private async runRecoveryExecution(
+    session: Session,
+    sessionId: number,
+    executionId: string,
+    lease: LeaseHandle | null,
+  ): Promise<void> {
+    const userId = session.userId ?? null;
+    let extra: RecoveryExtraListener | null = null;
     // 恢复续跑的实际终态：默认 FAILED，供收尾回调（onExecutionFinished）按终态决定队列是否接力消费。
     let terminalPhase: 'COMPLETED' | 'FAILED' | 'CANCELLED' = 'FAILED';
     try {
@@ -401,7 +665,7 @@ export class CrashRecoveryRunner {
         harnessLog('warn', `Recovery extra listener failed for session ${sessionId}`, e);
       }
       try {
-        await this.taskTerminalService.beginRecoveryExecution(sessionId, executionId);
+        await this.taskTerminalService.beginRecoveryExecution(sessionId, executionId, lease);
       } catch (e) {
         // 任务记录不能阻断续跑；桥接层通常已吞掉存储异常，这里再兜住接口/装配异常。
         harnessLog('warn', `Recovery execution registration failed for session ${sessionId}`, e);
@@ -410,15 +674,15 @@ export class CrashRecoveryRunner {
       await this.sessionService.updatePhase(sessionId, 'RUNNING');
       this.notifyClient(userId, sessionId, 'RUNNING', executionId);
       const executionListener = extra == null ? listener as never : CompositeAgentEventListener.of(listener, extra);
-      await this.harnessService.execute(sessionId, null, executionListener as never, cancelFlag);
+      await this.harnessService.execute(sessionId, null, executionListener as never, cancelFlag, null, lease);
       if (cancelFlag.get()) {
         try { await extra?.cancel?.(); } catch (e) {
           harnessLog('warn', `Recovery extra cancel failed for session ${sessionId}`, e);
         }
-        await this.taskTerminalService.finishExecution(sessionId, userId, 'CANCELLED', executionId);
+        await this.taskTerminalService.finishExecution(sessionId, userId, 'CANCELLED', executionId, undefined, 'MANUAL', lease);
         terminalPhase = 'CANCELLED';
       } else {
-        await this.taskTerminalService.finishExecution(sessionId, userId, 'COMPLETED', executionId);
+        await this.taskTerminalService.finishExecution(sessionId, userId, 'COMPLETED', executionId, undefined, 'MANUAL', lease);
         terminalPhase = 'COMPLETED';
         // 成功终态必须 PATCH 飞书进度卡片：执行中的 round/tool 事件不会把卡片收成「已完成」，
         // 漏掉 complete 会让蓝绿/重启后续跑成功后卡片永久停在「正在处理」。
@@ -438,11 +702,12 @@ export class CrashRecoveryRunner {
       terminalPhase = 'FAILED';
       try {
         await this.taskTerminalService.finishExecution(
-          sessionId, userId, 'FAILED', executionId, failMessage);
+          sessionId, userId, 'FAILED', executionId, failMessage, 'MANUAL', lease);
       } catch { /* ignore */ }
     } finally {
       this.agentLoop.removeCancelFlag(sessionId);
       this.activityHeartbeat.clear(sessionId);
+      await this.releaseLeaseQuietly(lease);
       if (userId != null) {
         try {
           await this.onExecutionFinished?.(sessionId, userId, terminalPhase);
@@ -450,6 +715,15 @@ export class CrashRecoveryRunner {
           harnessLog('warn', `Auto-consume after recovery failed for session ${sessionId}`, e);
         }
       }
+    }
+  }
+
+  private async releaseLeaseQuietly(lease: LeaseHandle | null): Promise<void> {
+    if (lease == null) return;
+    try {
+      await this.recoveryDeps?.executionLeaseService?.release(lease);
+    } catch (e) {
+      harnessLog('warn', `Failed to release recovery lease for session ${lease.sessionId}`, e);
     }
   }
 

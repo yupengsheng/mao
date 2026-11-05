@@ -3,6 +3,7 @@ import { TaskWaitService } from './task-wait.service.js';
 import type { ExecutionWaitStore } from './execution-wait.repository.js';
 import type { TaskService } from './task.service.js';
 import type { Session } from '../session/types.js';
+import type { LeaseHandle } from './execution-lease.service.js';
 
 describe('TaskWaitService persistence', () => {
   const session: Session = { id: 11, userId: 7, agentId: 2, title: '任务', source: 'web', phase: 'RUNNING' };
@@ -11,6 +12,7 @@ describe('TaskWaitService persistence', () => {
     executionId?: string;
     enabled?: boolean;
     store?: Partial<ExecutionWaitStore>;
+    leaseLookup?: { getActive(sessionId: number): Promise<LeaseHandle | null> } | null;
   } = {}) {
     const taskService = { setExecutionStage: vi.fn().mockResolvedValue(undefined) } as unknown as TaskService;
     const executionId = 'executionId' in options ? options.executionId : 'exec-1';
@@ -23,7 +25,7 @@ describe('TaskWaitService persistence', () => {
       taskService,
       { getSession: async () => session },
       { getSessionExecution: () => executionId },
-      { enabled: options.enabled ?? true, store },
+      { enabled: options.enabled ?? true, store, leaseLookup: options.leaseLookup },
     );
     return { service, taskService, store };
   }
@@ -120,5 +122,35 @@ describe('TaskWaitService persistence', () => {
     expect(store.insertPending).not.toHaveBeenCalled();
     expect(store.release).not.toHaveBeenCalled();
     expect(taskService.setExecutionStage).toHaveBeenCalledTimes(2);
+  });
+
+  it('writes the active execution fencing token when it matches the wait execution', async () => {
+    const { service, store } = setup({
+      leaseLookup: {
+        getActive: vi.fn().mockResolvedValue({
+          sessionId: 11, executionId: 'exec-1', ownerInstance: 'node-a', fencingToken: 7n,
+          expiresAt: new Date('2026-11-05T08:00:00.000Z'),
+        }),
+      },
+    });
+
+    await service.started(startedInput);
+
+    expect(store.insertPending).toHaveBeenCalledWith(expect.objectContaining({ fencingToken: 7n }));
+  });
+
+  it('does not borrow another execution fencing token', async () => {
+    const { service, store } = setup({
+      leaseLookup: {
+        getActive: vi.fn().mockResolvedValue({
+          sessionId: 11, executionId: 'other-exec', ownerInstance: 'node-a', fencingToken: 7n,
+          expiresAt: new Date('2026-11-05T08:00:00.000Z'),
+        }),
+      },
+    });
+
+    await service.started(startedInput);
+
+    expect(store.insertPending).toHaveBeenCalledWith(expect.not.objectContaining({ fencingToken: expect.anything() }));
   });
 });

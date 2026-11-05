@@ -1,5 +1,6 @@
 import type { AtomicBoolean } from '../harness/atomic-boolean.js';
 import type { AgentEventListener } from '../harness/core/agent-event-listener.js';
+import type { LeaseHandle } from '../task/execution-lease.service.js';
 
 export interface DingtalkBot {
   id?: number;
@@ -67,7 +68,7 @@ export interface CancelFlag { get(): boolean; set(value: boolean): void; }
 
 export interface DingtalkHarnessService {
   prepareMessage(sessionId: number, content: unknown): Promise<string> | string;
-  execute(sessionId: number, eventId: string | null, listener: AgentEventListener, cancelFlag?: AtomicBoolean | CancelFlag | null, executionUserId?: number | null): Promise<void>;
+  execute(sessionId: number, eventId: string | null, listener: AgentEventListener, cancelFlag?: AtomicBoolean | CancelFlag | null, executionUserId?: number | null, lease?: LeaseHandle | null): Promise<void>;
 }
 
 export interface DingtalkInboundQueueRow {

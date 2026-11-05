@@ -10,6 +10,7 @@ import { isActivePhase } from '../session/session-vo.js';
 import { channelAssistantReply } from '../session/util/citation-markers.js';
 import type { TaskNotifySource } from '../session/task-terminal.service.js';
 import { collectMissedPoints } from './scheduled-task-missed.js';
+import type { LeaseHandle } from '../task/execution-lease.service.js';
 
 export interface ScheduledTask {
   id?: number;
@@ -129,7 +130,13 @@ export interface ScheduleMessageQueueService {
 }
 
 export interface ScheduleHarnessService {
-  executeFromEvent(sessionId: number, executionId: string, listener: unknown, cancelFlag?: { get(): boolean; set(v: boolean): void }): Promise<void>;
+  executeFromEvent(
+    sessionId: number,
+    executionId: string,
+    listener: unknown,
+    cancelFlag?: { get(): boolean; set(v: boolean): void } | null,
+    lease?: LeaseHandle | null,
+  ): Promise<void>;
 }
 
 /** Push the already-persisted USER prompt through the live WS execution path. */
@@ -143,7 +150,11 @@ export type ScheduledLiveExecution = (
   /** 触发本执行的定时任务 id：收件箱条目据此前置「定时任务」来源徽标。 */
   scheduledTaskId?: number | null,
   /** 触发来源（SCHEDULED=定时任务；WEBHOOK/API 由开放接口域传入），透传给收件箱徽标。 */
-  source?: 'SCHEDULED' | 'WEBHOOK' | 'API' | null,
+  source?: 'SCHEDULED' | 'WEBHOOK' | 'API' | 'SIGNAL' | null,
+  /** 开放接口外部事件去重键；定时任务固定为 null。 */
+  externalEvent?: { scope: string; id: string } | null,
+  /** 触发方必须在调用 Harness 前把门禁返回的 handle 原样透传。 */
+  lease?: LeaseHandle | null,
 ) => Promise<void>;
 
 /** Push the final assistant result to a Feishu channel session (no-op for non-Feishu sessions). */
@@ -197,8 +208,22 @@ const PREVIEW_MAX_COUNT = 10;
 const WEIXIN_ACTIVE_SEND_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 export interface ScheduleTaskTerminalService {
-  beginExecution?(sessionId: number, executionId: string, source?: TaskNotifySource): Promise<unknown>;
-  finishExecution(sessionId: number, userId: number, phase: string, executionId: string, reason?: string, notifySource?: TaskNotifySource): Promise<void>;
+  beginExecution?(
+    sessionId: number,
+    executionId: string,
+    source?: TaskNotifySource,
+    externalEvent?: null,
+  ): Promise<{ duplicate: boolean; lease: LeaseHandle | null }>;
+  finishExecution(
+    sessionId: number,
+    userId: number,
+    phase: string,
+    executionId: string,
+    reason?: string,
+    notifySource?: TaskNotifySource,
+    lease?: LeaseHandle | null,
+  ): Promise<{ settled: boolean }>;
+  releaseExecutionLease?(lease: LeaseHandle | null | undefined): Promise<void>;
 }
 
 export interface ScheduleWeixinSendService {
@@ -621,6 +646,7 @@ export class ScheduledTaskService {
             let sessionGone = false;
             let messageId: number | null = null;
             let startedAt: string | null = null;
+            let lease: LeaseHandle | null = null;
             try {
               // 拿到锁后重读最新任务状态，排队期间可能已被更新/暂停/删除
               const latest = task.id != null ? await this.store.selectById(task.id) : null;
@@ -728,16 +754,30 @@ export class ScheduledTaskService {
                   return;
                 }
               }
+              // 执行门禁必须先于阶段写入与消息落库：等待态/租约冲突时 Harness 不启动，
+              // 也不得把同会话其他在途执行写成 FAILED。
+              const begun = await this.taskTerminalService.beginExecution?.(
+                task.sessionId!, executionId, 'SCHEDULED',
+              ) ?? { duplicate: false, lease: null };
+              if (begun.duplicate) {
+                countThisRun = true;
+                pendingRetry = (await this.finishRun(runId, 'CANCELLED', {
+                  retryable: false, error: '重复触发，本次未执行', task, countOutcome: false,
+                })).willRetry;
+                await this.markTaskResult(task, 'CANCELLED');
+                return;
+              }
+              lease = begun.lease;
               const executionStartedAt = Date.now();
               startedAt = formatDateTime(new Date(executionStartedAt));
               await this.sessionService.updatePhase(task.sessionId!, 'RUNNING');
-              executionStarted = true;
               if (runId != null) await this.store.updateRun?.({ id: runId, status: 'RUNNING', startedAt });
               let savedMessage: Message;
               try {
                 savedMessage = await this.sessionService.saveMessage(task.sessionId!, 'USER', buildScheduledPrompt(task, task.prompt!, isManual ? 'manual' : 'scheduled'), null, null, null, 0, null);
               } catch (saveError) {
-                await this.sessionService.updatePhase(task.sessionId!, 'IDLE');
+                await this.taskTerminalService.releaseExecutionLease?.(lease).catch(() => undefined);
+                await this.sessionService.updatePhase(task.sessionId!, phase ?? 'IDLE');
                 countThisRun = true;
                 pendingRetry = (await this.finishRun(runId, 'FAILED', {
                   retryable: true,
@@ -750,8 +790,12 @@ export class ScheduledTaskService {
               }
               messageId = savedMessage?.id ?? null;
               if (runId != null && messageId != null) await this.store.updateRun?.({ id: runId, messageId });
+              executionStarted = true;
               if (this.liveExecution != null) {
-                await this.liveExecution(session, userId, executionId, savedMessage, executionStartedAt, task.id ?? null);
+                await this.liveExecution(
+                  session, userId, executionId, savedMessage, executionStartedAt, task.id ?? null,
+                  'SCHEDULED', null, lease,
+                );
                 // liveExecution（runExecution）内部 catch 吞掉失败/取消并落终态后正常返回，
                 // 必须回读会话真实终态：FAILED/CANCELLED 时不得标 COMPLETED，
                 // 也不得把上一轮 ASSISTANT 旧回复误推给飞书/微信。
@@ -770,18 +814,17 @@ export class ScheduledTaskService {
                   return;
                 }
               } else {
-                await this.taskTerminalService.beginExecution?.(task.sessionId!, executionId, 'SCHEDULED');
                 await this.harnessService.executeFromEvent(task.sessionId!, executionId, {
                   onContentDelta() {},
                   onToolCallStart() {},
                   onToolCallResult() {},
                   onMessageEnd() {},
                   onError() {},
-                });
+                }, null, lease);
                 // 遗留/测试路径（无 liveExecution）：这一轮确定由定时任务触发，显式传 SCHEDULED，
                 // 否则收件箱条目会缺「定时任务」来源（窄接口缺参会静默回落 MANUAL）
                 await this.taskTerminalService.finishExecution(
-                  task.sessionId!, userId, 'COMPLETED', executionId, undefined, 'SCHEDULED',
+                  task.sessionId!, userId, 'COMPLETED', executionId, undefined, 'SCHEDULED', lease,
                 );
               }
               pendingRetry = (await this.finishRun(runId, 'COMPLETED', { messageId, startedAt, task })).willRetry;
@@ -802,7 +845,7 @@ export class ScheduledTaskService {
               if (executionStarted) {
                 try {
                   await this.taskTerminalService.finishExecution(task.sessionId!, userId, 'FAILED', executionId,
-                    e instanceof Error ? e.message : String(e));
+                    e instanceof Error ? e.message : String(e), 'SCHEDULED', lease);
                 } catch { /* ignore */ }
               }
               pendingRetry = (await this.finishRun(runId, 'FAILED', {

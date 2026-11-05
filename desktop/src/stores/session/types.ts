@@ -1,4 +1,4 @@
-import type { WsTaskPhase } from '@mao/contracts'
+import type { TaskWaitVO, WsTaskPhase } from '@mao/contracts'
 
 export type SessionStatus = 'ACTIVE' | 'ARCHIVED'
 
@@ -78,6 +78,8 @@ export interface Session {
   treeUnread?: boolean
   treeRunning?: boolean
   treeFailed?: boolean
+  /** 仅会话详情返回：当前执行仍未处理的等待；列表 / dashboard / search 不返回。 */
+  pendingWait?: TaskWaitVO | null
   runtimeStatus?: SessionRuntimeStatus
 }
 

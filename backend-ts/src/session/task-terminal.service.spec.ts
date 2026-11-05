@@ -119,7 +119,7 @@ describe('TaskTerminalService memory extraction dispatch', () => {
       extraction,
       (fn) => { void Promise.resolve().then(fn); },
     );
-    await expect(terminal.finishExecution(11, 7, 'COMPLETED', 'exec-1')).resolves.toBeUndefined();
+    await expect(terminal.finishExecution(11, 7, 'COMPLETED', 'exec-1')).resolves.toEqual({ settled: false });
     // 既有事件链完整发生
     expect(sessionService.updatePhase).toHaveBeenCalledWith(11, 'COMPLETED');
     expect(sessionService.markLastMessageFinished).toHaveBeenCalledWith(11);
@@ -243,7 +243,7 @@ describe('TaskTerminalService 收件箱写入', () => {
       treeSignalPublisher as never,
       (fn) => { void Promise.resolve().then(fn); },
     );
-    await expect(terminal.finishExecution(11, 7, 'COMPLETED', 'exec-1')).resolves.toBeUndefined();
+    await expect(terminal.finishExecution(11, 7, 'COMPLETED', 'exec-1')).resolves.toEqual({ settled: false });
     expect(sessionService.updatePhase).toHaveBeenCalledWith(11, 'COMPLETED');
     expect(treeSignalPublisher.publish).toHaveBeenCalledWith(11);
   });
@@ -316,7 +316,7 @@ describe('TaskTerminalService 预算 WARN 结算（§5.8）', () => {
   it('settleWarn 抛错被吞：不影响任务终态事件链', async () => {
     const warner = { settleWarn: vi.fn(async () => { throw new Error('budget down'); }) };
     const h = buildWithWarner({}, warner);
-    await expect(h.terminal.finishExecution(11, 7, 'COMPLETED', 'exec-1')).resolves.toBeUndefined();
+    await expect(h.terminal.finishExecution(11, 7, 'COMPLETED', 'exec-1')).resolves.toEqual({ settled: false });
     await flush(h);
     expect(warner.settleWarn).toHaveBeenCalledTimes(1);
     expect(h.terminal).toBeTruthy();
@@ -324,7 +324,7 @@ describe('TaskTerminalService 预算 WARN 结算（§5.8）', () => {
 
   it('未注入 budgetWarner（budget 域未装配）时零影响', async () => {
     const h = buildWithWarner({}, null);
-    await expect(h.terminal.finishExecution(11, 7, 'COMPLETED', 'exec-1')).resolves.toBeUndefined();
+    await expect(h.terminal.finishExecution(11, 7, 'COMPLETED', 'exec-1')).resolves.toEqual({ settled: false });
     await flush(h);
   });
 
@@ -357,7 +357,7 @@ describe('TaskTerminalService 预算 WARN 结算（§5.8）', () => {
       null,
       warner as never,
     );
-    await expect(terminal.finishExecution(11, 7, 'COMPLETED', 'exec-1')).resolves.toBeUndefined();
+    await expect(terminal.finishExecution(11, 7, 'COMPLETED', 'exec-1')).resolves.toEqual({ settled: false });
     // 走到 submit 说明前置过滤都通过，抛错被 try/catch 吞掉（注入 inbox 时 recordInbox 先提交 1 次）
     expect(submitCalls).toBe(withInbox ? 2 : 1);
     expect(inbox.recordTaskTerminal).not.toHaveBeenCalled();
@@ -394,7 +394,7 @@ describe('TaskTerminalService citation registry build', () => {
   it('buildForSession 异步失败被吞掉，不影响 finishExecution 返回', async () => {
     const h = build();
     h.citationRegistry.buildForSession.mockRejectedValueOnce(new Error('db down'));
-    await expect(h.terminal.finishExecution(11, 7, 'COMPLETED', 'exec-1')).resolves.toBeUndefined();
+    await expect(h.terminal.finishExecution(11, 7, 'COMPLETED', 'exec-1')).resolves.toEqual({ settled: false });
     expect(h.citationRegistry.buildForSession).toHaveBeenCalledTimes(1);
   });
 
@@ -420,7 +420,7 @@ describe('TaskTerminalService citation registry build', () => {
       null,
       citationRegistry,
     );
-    await expect(terminal.finishExecution(11, 7, 'COMPLETED', 'exec-1')).resolves.toBeUndefined();
+    await expect(terminal.finishExecution(11, 7, 'COMPLETED', 'exec-1')).resolves.toEqual({ settled: false });
     expect(citationRegistry.buildForSession).toHaveBeenCalledTimes(1);
   });
 
@@ -465,5 +465,63 @@ describe('TaskTerminalService citation registry build', () => {
     expect(order).toContain('ws:session_status');
     // citations 写库严格早于终态事件发出
     expect(order.indexOf('citation:build')).toBeLessThan(order.indexOf('ws:session_status'));
+  });
+});
+
+describe('TaskTerminalService 终态等待清理', () => {
+  function buildWithWaits(releaseAllPending: ReturnType<typeof vi.fn>) {
+    const sessionService = {
+      getSession: vi.fn(async () => session()),
+      updateRuntimeStatus: vi.fn(async () => undefined),
+      updatePhase: vi.fn(async () => undefined),
+      markLastMessageFinished: vi.fn(async () => undefined),
+    };
+    const treeSignalPublisher = { publish: vi.fn(), publishAtRoot: vi.fn() };
+    const taskService = { settleExecution: vi.fn(async () => true) };
+    const executionWaitLookup = {
+      hasPending: vi.fn(async () => false),
+      releaseAllPending,
+    };
+    const terminal = new TaskTerminalService(
+      sessionService as never as SessionService,
+      { send: vi.fn(), sendWithResult: vi.fn(async () => ({} as never)) } as never,
+      { prepare: vi.fn(async () => null) } as never,
+      treeSignalPublisher as never,
+      () => {},
+      null,
+      undefined,
+      null,
+      'MANUAL',
+      null,
+      null,
+      null,
+      taskService as never,
+      null,
+      false,
+      executionWaitLookup,
+      '',
+    );
+    return { terminal, sessionService, treeSignalPublisher, taskService, executionWaitLookup };
+  }
+
+  it('终态结算成功后清理该 Session 全部 PENDING 等待', async () => {
+    const releaseAllPending = vi.fn(async () => 2);
+    const h = buildWithWaits(releaseAllPending);
+
+    await expect(h.terminal.finishExecution(11, 7, 'COMPLETED', 'exec-1')).resolves.toEqual({ settled: true });
+    expect(h.taskService.settleExecution).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 11 }), 'exec-1', 'COMPLETED', undefined, 'MANUAL',
+    );
+    expect(releaseAllPending).toHaveBeenCalledWith(11, 'CANCELLED', undefined);
+  });
+
+  it('等待清理异常被吞掉，不回滚终态也不阻断 WS 事件链', async () => {
+    const releaseAllPending = vi.fn(async () => { throw new Error('wait db down'); });
+    const h = buildWithWaits(releaseAllPending);
+
+    await expect(h.terminal.finishExecution(11, 7, 'COMPLETED', 'exec-1')).resolves.toEqual({ settled: true });
+    expect(releaseAllPending).toHaveBeenCalledTimes(1);
+    expect(h.sessionService.updatePhase).toHaveBeenCalledWith(11, 'COMPLETED');
+    expect(h.treeSignalPublisher.publish).toHaveBeenCalledWith(11);
   });
 });
