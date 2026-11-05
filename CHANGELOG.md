@@ -1,3 +1,14 @@
+## 0.0.462 (2026-11-05)
+
+### 后端
+- **用量分析用户 / Agent 明细支持服务端分页**：`GET /v1/admin/analytics/users|agents` 新增 `page` / `pageSize`，响应新增 `pagination: { page, pageSize, total }`（`pageSize` 上限 100）；不传分页参数时保留原 `limit` Top-N 行为。用户明细新增全局 `messageTop`，翻页时消息排行不再随当前页变化。
+
+### 管理后台
+- **用量分析用户 / Agent 明细可翻页查看全量**：明细表底部新增分页器，翻页、切换每页条数与统计周期均走服务端查询；分页状态写入 URL，刷新与分享链接可还原。CSV 导出明确为当前页数据。
+
+### 终端 CLI（mao-cli）
+- **`mao analytics users|agents` 支持 `--page` / `--page-size`**：可逐页拉取明细，输出包含 `pagination` 与用户消息排行 `messageTop`；不传分页参数时仍兼容 `--limit`。
+
 ## 0.0.461 (2026-11-05)
 
 ### 后端

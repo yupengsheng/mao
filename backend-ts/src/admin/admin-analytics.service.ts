@@ -760,6 +760,13 @@ export class AdminAnalyticsDbStore implements AdminAnalyticsStore {
 const PHASES = ['IDLE', ...ACTIVE_PHASES, 'COMPLETED', 'FAILED', 'CANCELLED'];
 const RANK_LIMIT = 20;
 const MAX_SCOPE_LIMIT = 100;
+const MAX_SCOPE_PAGE = 1_000_000;
+
+interface ScopeQueryOptions {
+  excludeConnectivity?: boolean;
+  page?: number;
+  pageSize?: number;
+}
 
 /**
  * 阶段分布必须覆盖 store 返回的每个 phase：未知 phase 追加在末尾，
@@ -1001,21 +1008,35 @@ export class AdminAnalyticsService {
     days: number,
     endOffset = 0,
     limit = RANK_LIMIT,
-    opts?: { excludeConnectivity?: boolean },
+    opts?: ScopeQueryOptions,
   ): Promise<Record<string, unknown>> {
     const { range, previous } = this.resolveWindows(days, endOffset);
-    const safeLimit = clampLimit(limit);
     const callOpts = { excludeConnectivity: opts?.excludeConnectivity !== false };
-    const [userActivity, tokenTop, activeUsers, previousTotals] = await Promise.all([
-      this.userActivity(range, safeLimit, callOpts),
-      this.userTokenTop(range, safeLimit),
+    const pagination = resolvePagination(opts, limit);
+    const [allRows, tokenTop, activeUsers, previousTotals] = await Promise.all([
+      this.userActivityRows(range, callOpts),
+      this.userTokenTop(range, pagination.pageSize),
       this.store.countActiveUsers(range),
       this.previousTotals(previous, callOpts),
     ]);
+    const userActivity = sliceScopeRows(allRows, pagination);
     return {
       period: this.periodMeta(range, previous),
       userActivity,
       tokenTop,
+      // 明细分页后，消息排行仍需独立的全局 Top N，避免翻页时图表跟着当前页变化
+      messageTop: allRows.slice(0, RANK_LIMIT).map((row) => ({
+        userId: row.userId,
+        username: row.username,
+        displayName: row.displayName,
+        messageCount: row.messageCount,
+        totalTokens: row.totalTokens,
+      })),
+      pagination: {
+        page: pagination.page,
+        pageSize: pagination.pageSize,
+        total: allRows.length,
+      },
       periodTotals: { activeUsers },
       previousTotals,
     };
@@ -1026,20 +1047,26 @@ export class AdminAnalyticsService {
     days: number,
     endOffset = 0,
     limit = RANK_LIMIT,
-    opts?: { excludeConnectivity?: boolean },
+    opts?: ScopeQueryOptions,
   ): Promise<Record<string, unknown>> {
     const { range, previous } = this.resolveWindows(days, endOffset);
-    const safeLimit = clampLimit(limit);
     const callOpts = { excludeConnectivity: opts?.excludeConnectivity !== false };
-    const [agentStats, tokenTop, previousTotals] = await Promise.all([
-      this.agentStats(range, safeLimit, callOpts),
-      this.agentTokenTop(range, safeLimit),
+    const pagination = resolvePagination(opts, limit);
+    const [allRows, tokenTop, previousTotals] = await Promise.all([
+      this.agentRows(range, callOpts),
+      this.agentTokenTop(range, pagination.pageSize),
       this.previousTotals(previous, callOpts),
     ]);
+    const agentStats = sliceScopeRows(allRows, pagination);
     return {
       period: this.periodMeta(range, previous),
       agentStats,
       tokenTop,
+      pagination: {
+        page: pagination.page,
+        pageSize: pagination.pageSize,
+        total: allRows.length,
+      },
       previousTotals,
     };
   }
@@ -1386,6 +1413,14 @@ export class AdminAnalyticsService {
     limit = RANK_LIMIT,
     callOpts?: { excludeConnectivity?: boolean },
   ): Promise<Array<Record<string, unknown>>> {
+    const rows = await this.agentRows(range, callOpts);
+    return rows.slice(0, clampLimit(limit));
+  }
+
+  private async agentRows(
+    range: AnalyticsRange,
+    callOpts?: { excludeConnectivity?: boolean },
+  ): Promise<Array<Record<string, unknown>>> {
     const opts = { excludeConnectivity: callOpts?.excludeConnectivity !== false };
     const [agents, sessionRows, messageRows, callRows] = await Promise.all([
       this.store.listAgents(),
@@ -1423,12 +1458,20 @@ export class AdminAnalyticsService {
       });
     }
     rows.sort(byNumberDesc('sessionCount', 'messageCount'));
-    return rows.slice(0, clampLimit(limit));
+    return rows;
   }
 
   private async userActivity(
     range: AnalyticsRange,
     limit = RANK_LIMIT,
+    callOpts?: { excludeConnectivity?: boolean },
+  ): Promise<Array<Record<string, unknown>>> {
+    const rows = await this.userActivityRows(range, callOpts);
+    return rows.slice(0, clampLimit(limit));
+  }
+
+  private async userActivityRows(
+    range: AnalyticsRange,
     callOpts?: { excludeConnectivity?: boolean },
   ): Promise<Array<Record<string, unknown>>> {
     const opts = { excludeConnectivity: callOpts?.excludeConnectivity !== false };
@@ -1472,7 +1515,7 @@ export class AdminAnalyticsService {
       });
     }
     rows.sort(byNumberDesc('messageCount', 'totalTokens'));
-    return rows.slice(0, clampLimit(limit));
+    return rows;
   }
 
   /** Token 排行独立按 totalTokens 排序截断，避免依赖消息数截断的明细集而遗漏重消耗用户。 */
@@ -1709,6 +1752,20 @@ function buildRange(endYmd: string, days: number): AnalyticsRange {
 
 function clampLimit(limit: number): number {
   return Math.max(1, Math.min(Math.trunc(limit) || RANK_LIMIT, MAX_SCOPE_LIMIT));
+}
+
+function resolvePagination(
+  opts: ScopeQueryOptions | undefined,
+  limit: number,
+): { page: number; pageSize: number } {
+  const rawPage = Math.trunc(Number(opts?.page));
+  const page = Number.isFinite(rawPage) && rawPage > 0 ? Math.min(rawPage, MAX_SCOPE_PAGE) : 1;
+  return { page, pageSize: clampLimit(opts?.pageSize ?? limit) };
+}
+
+function sliceScopeRows<T>(rows: T[], pagination: { page: number; pageSize: number }): T[] {
+  const start = (pagination.page - 1) * pagination.pageSize;
+  return rows.slice(start, start + pagination.pageSize);
 }
 
 function deltaPercent(current: number, previous: number | undefined): number | null {

@@ -19,14 +19,14 @@
         <div class="card-header">
           <span>Agent 用量明细</span>
           <div class="header-actions">
-            <span class="card-hint">按窗口内会话数 / 消息数排序</span>
-            <el-button :disabled="agentStats.length === 0" @click="exportRows">导出 CSV</el-button>
+            <span class="card-hint">按会话数 / 消息数降序 · 共 {{ total }} 条，当前第 {{ page }} 页</span>
+            <el-button :disabled="agentStats.length === 0" @click="exportRows">导出当前页 CSV</el-button>
           </div>
         </div>
       </template>
       <el-table :data="agentStats" size="small" stripe>
         <template #empty>
-          <el-empty description="窗口内暂无 Agent 会话" :image-size="48" />
+          <el-empty description="当前页暂无 Agent 数据" :image-size="48" />
         </template>
         <el-table-column label="Agent" min-width="150" show-overflow-tooltip>
           <template #default="{ row }">
@@ -68,6 +68,15 @@
           </template>
         </el-table-column>
       </el-table>
+      <ResponsivePagination
+        class="pagination"
+        :current-page="page"
+        :page-size="pageSize"
+        :total="total"
+        :page-sizes="[10, 20, 50, 100]"
+        @current-change="(value: number) => emit('current-change', value)"
+        @size-change="(value: number) => emit('size-change', value)"
+      />
     </el-card>
   </div>
 </template>
@@ -76,6 +85,7 @@
 import { computed } from 'vue'
 import { useRouter } from 'vue-router'
 import BaseChart from '../../../components/BaseChart.vue'
+import ResponsivePagination from '../../../components/ResponsivePagination.vue'
 import { CHART_PALETTE } from '../../../utils/echarts'
 import { formatCost, formatNumber, formatTokens, rankBarOption, type RankItem } from '../chart-options'
 import { exportCsv } from '../utils/csv'
@@ -83,9 +93,16 @@ import type { AgentsPayload } from '../types'
 import { withDrilldownPeriod } from '../utils/drilldown'
 
 const props = defineProps<{ payload: AgentsPayload | null; loading?: boolean }>()
+const emit = defineEmits<{
+  (e: 'current-change', value: number): void
+  (e: 'size-change', value: number): void
+}>()
 const router = useRouter()
 
 const agentStats = computed(() => props.payload?.agentStats || [])
+const total = computed(() => props.payload?.pagination?.total ?? agentStats.value.length)
+const page = computed(() => props.payload?.pagination?.page ?? 1)
+const pageSize = computed(() => props.payload?.pagination?.pageSize ?? 20)
 // Token 排行用后端独立截断的 tokenTop：agentStats 按会话/消息数截断，直接重排会遗漏 Token 重的 Agent
 const tokenItems = computed<RankItem[]>(() =>
   (props.payload?.tokenTop || [])
@@ -142,6 +159,11 @@ export default { name: 'AgentTab' }
   display: flex;
   align-items: center;
   gap: 12px;
+}
+
+.pagination {
+  margin-top: 12px;
+  justify-content: flex-end;
 }
 
 .linkish {

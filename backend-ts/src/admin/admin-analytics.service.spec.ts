@@ -960,6 +960,78 @@ describe('AdminAnalyticsService 成本聚合（§5.2 / 决策 13：成本唯一�
   });
 });
 
+describe('AdminAnalyticsService user/agent scope pagination', () => {
+  function buildPagedStore() {
+    const store = buildStore();
+    store.listUsers = vi.fn(async () => [
+      { id: 1, username: 'u1', displayName: 'U1' },
+      { id: 2, username: 'u2', displayName: 'U2' },
+      { id: 3, username: 'u3', displayName: 'U3' },
+    ]);
+    store.selectSessionCountsByUser = vi.fn(async () => [
+      { id: 1, sessionCount: 3 },
+      { id: 2, sessionCount: 1 },
+      { id: 3, sessionCount: 2 },
+    ]);
+    store.selectMessageStatsByUser = vi.fn(async () => [
+      { id: 1, messageCount: 5, totalTokens: 500 },
+      { id: 2, messageCount: 1, totalTokens: 900 },
+      { id: 3, messageCount: 3, totalTokens: 300 },
+    ]);
+    store.selectLlmCallStatsByUser = vi.fn(async () => []);
+    store.listAgents = vi.fn(async () => [
+      { id: 9, name: 'A9' },
+      { id: 10, name: 'A10' },
+      { id: 11, name: 'A11' },
+    ]);
+    store.selectSessionCountsByAgent = vi.fn(async () => [
+      { id: 9, sessionCount: 4 },
+      { id: 10, sessionCount: 1 },
+      { id: 11, sessionCount: 2 },
+    ]);
+    store.selectMessageStatsByAgent = vi.fn(async () => [
+      { id: 9, messageCount: 8, totalTokens: 800 },
+      { id: 10, messageCount: 2, totalTokens: 1200 },
+      { id: 11, messageCount: 5, totalTokens: 500 },
+    ]);
+    store.selectLlmCallStatsByAgent = vi.fn(async () => []);
+    return store;
+  }
+
+  it('usersScope 按全局排序切片，并保留全局消息排行', async () => {
+    const service = new AdminAnalyticsService({ getOverview: vi.fn(async () => ({})) } as never, buildPagedStore() as never);
+
+    const first = (await service.usersScope(7, 0, 20, { page: 1, pageSize: 2 })) as Record<string, any>;
+    expect(first.userActivity.map((row: any) => row.userId)).toEqual([1, 3]);
+    expect(first.messageTop.map((row: any) => row.userId)).toEqual([1, 3, 2]);
+    expect(first.pagination).toEqual({ page: 1, pageSize: 2, total: 3 });
+
+    const second = (await service.usersScope(7, 0, 20, { page: 2, pageSize: 2 })) as Record<string, any>;
+    expect(second.userActivity.map((row: any) => row.userId)).toEqual([2]);
+    expect(second.pagination).toEqual({ page: 2, pageSize: 2, total: 3 });
+  });
+
+  it('agentsScope 按全局排序切片，pageSize 上限仍为 100', async () => {
+    const service = new AdminAnalyticsService({ getOverview: vi.fn(async () => ({})) } as never, buildPagedStore() as never);
+
+    const first = (await service.agentsScope(7, 0, 20, { page: 1, pageSize: 500 })) as Record<string, any>;
+    expect(first.agentStats.map((row: any) => row.agentId)).toEqual([9, 11, 10]);
+    expect(first.pagination).toEqual({ page: 1, pageSize: 100, total: 3 });
+
+    const second = (await service.agentsScope(7, 0, 20, { page: 2, pageSize: 2 })) as Record<string, any>;
+    expect(second.agentStats.map((row: any) => row.agentId)).toEqual([10]);
+    expect(second.pagination).toEqual({ page: 2, pageSize: 2, total: 3 });
+  });
+
+  it('不传 page/pageSize 时保持 limit Top-N 兼容行为', async () => {
+    const service = new AdminAnalyticsService({ getOverview: vi.fn(async () => ({})) } as never, buildPagedStore() as never);
+
+    const legacy = (await service.usersScope(7, 0, 2)) as Record<string, any>;
+    expect(legacy.userActivity.map((row: any) => row.userId)).toEqual([1, 3]);
+    expect(legacy.pagination).toEqual({ page: 1, pageSize: 2, total: 3 });
+  });
+});
+
 describe('AdminAnalyticsService runTraceScope', () => {
   /** service 自己按今天解析窗口（不是文件顶部的固定 range），断言前先算出来。 */
   const traceRange = {

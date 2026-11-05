@@ -35,14 +35,14 @@
         <div class="card-header">
           <span>用户用量明细</span>
           <div class="header-actions">
-            <span class="card-hint">按窗口内消息数截断的 Top {{ userRows.length }}</span>
-            <el-button :disabled="userRows.length === 0" @click="exportRows">导出 CSV</el-button>
+            <span class="card-hint">按消息数降序 · 共 {{ total }} 条，当前第 {{ page }} 页</span>
+            <el-button :disabled="userRows.length === 0" @click="exportRows">导出当前页 CSV</el-button>
           </div>
         </div>
       </template>
       <el-table :data="userRows" size="small" stripe>
         <template #empty>
-          <el-empty description="窗口内暂无用户活跃" :image-size="48" />
+          <el-empty description="当前页暂无用户数据" :image-size="48" />
         </template>
         <el-table-column label="用户" min-width="140" show-overflow-tooltip>
           <template #default="{ row }">
@@ -81,6 +81,15 @@
           </template>
         </el-table-column>
       </el-table>
+      <ResponsivePagination
+        class="pagination"
+        :current-page="page"
+        :page-size="pageSize"
+        :total="total"
+        :page-sizes="[10, 20, 50, 100]"
+        @current-change="(value: number) => emit('current-change', value)"
+        @size-change="(value: number) => emit('size-change', value)"
+      />
     </el-card>
   </div>
 </template>
@@ -89,6 +98,7 @@
 import { computed } from 'vue'
 import { useRouter } from 'vue-router'
 import BaseChart from '../../../components/BaseChart.vue'
+import ResponsivePagination from '../../../components/ResponsivePagination.vue'
 import { CHART_PALETTE } from '../../../utils/echarts'
 import { formatCost, formatNumber, formatTokens, rankBarOption, type RankItem } from '../chart-options'
 import { exportCsv } from '../utils/csv'
@@ -97,9 +107,16 @@ import type { UsersPayload } from '../types'
 import { withDrilldownPeriod } from '../utils/drilldown'
 
 const props = defineProps<{ payload: UsersPayload | null; loading?: boolean }>()
+const emit = defineEmits<{
+  (e: 'current-change', value: number): void
+  (e: 'size-change', value: number): void
+}>()
 const router = useRouter()
 
 const userRows = computed(() => props.payload?.userActivity || [])
+const total = computed(() => props.payload?.pagination?.total ?? userRows.value.length)
+const page = computed(() => props.payload?.pagination?.page ?? 1)
+const pageSize = computed(() => props.payload?.pagination?.pageSize ?? 20)
 // Token 排行用后端独立截断的 tokenTop：userActivity 按消息数截断，直接重排会遗漏消息少但 Token 重的用户
 const tokenSource = computed(() =>
   (props.payload?.tokenTop || []).map((row) => ({
@@ -108,16 +125,15 @@ const tokenSource = computed(() =>
   }))
 )
 
-const messageItems = computed<RankItem[]>(() =>
-  userRows.value
-    .map((row) => ({
-      name: row.displayName || row.username || '未知',
-      value: Number(row.messageCount || 0)
-    }))
+const messageItems = computed<RankItem[]>(() => {
+  // 明细分页后必须用后端返回的全局 Top N，避免排行图随当前页变化；旧后端无该字段时回退当前页
+  const rows = props.payload?.messageTop || userRows.value
+  return rows
+    .map((row) => ({ name: row.displayName || row.username || '未知', value: Number(row.messageCount || 0) }))
     .filter((item) => item.value > 0)
     .sort((a, b) => b.value - a.value)
     .slice(0, 10)
-)
+})
 
 const tokenItems = computed<RankItem[]>(() =>
   [...tokenSource.value].filter((item) => item.value > 0).sort((a, b) => b.value - a.value).slice(0, 10)
@@ -182,6 +198,11 @@ export default { name: 'UserTab' }
   display: flex;
   align-items: center;
   gap: 12px;
+}
+
+.pagination {
+  margin-top: 12px;
+  justify-content: flex-end;
 }
 
 .linkish {

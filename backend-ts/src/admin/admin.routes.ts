@@ -55,6 +55,8 @@ interface AnalyticsQueryRaw {
   days?: string;
   endOffset?: string;
   limit?: string;
+  page?: string;
+  pageSize?: string;
   excludeConnectivity?: string;
   modelId?: string;
 }
@@ -63,6 +65,8 @@ function parseAnalyticsQuery(raw: AnalyticsQueryRaw): {
   days: number;
   endOffset: number;
   limit: number;
+  page?: number;
+  pageSize?: number;
   excludeConnectivity: boolean;
   modelId: number | null;
 } {
@@ -73,15 +77,26 @@ function parseAnalyticsQuery(raw: AnalyticsQueryRaw): {
   const days = Number(window?.days ?? raw.days ?? 30);
   const endOffset = Number(window?.endOffset ?? raw.endOffset ?? 0);
   const limit = Number(raw.limit ?? 20);
+  const hasPagination = raw.page != null || raw.pageSize != null;
+  const page = hasPagination ? normalizeInteger(raw.page, 1, 1_000_000) : undefined;
+  const pageSize = hasPagination ? normalizeInteger(raw.pageSize, 20, 100) : undefined;
   const modelIdRaw = raw.modelId == null || raw.modelId === '' ? null : Number(raw.modelId);
   return {
     days: Math.max(1, Math.min(Number.isFinite(days) ? days : 30, 90)),
     endOffset: Math.max(0, Math.min(Number.isFinite(endOffset) ? endOffset : 0, 365)),
     limit: Math.max(1, Math.min(Number.isFinite(limit) ? limit : 20, 100)),
+    page,
+    pageSize,
     // 默认排除连通性测试，避免模型配置自检污染质量指标
     excludeConnectivity: raw.excludeConnectivity !== 'false' && raw.excludeConnectivity !== '0',
     modelId: modelIdRaw != null && Number.isFinite(modelIdRaw) ? modelIdRaw : null,
   };
+}
+
+function normalizeInteger(raw: string | undefined, fallback: number, max: number): number {
+  const value = Math.trunc(Number(raw));
+  if (!Number.isFinite(value) || value < 1) return fallback;
+  return Math.min(value, max);
 }
 
 export function registerAdminAnalyticsRoutes(app: FastifyInstance, deps: AdminRouteDeps): void {
@@ -117,14 +132,14 @@ export function registerAdminAnalyticsRoutes(app: FastifyInstance, deps: AdminRo
 
   app.get('/v1/admin/analytics/users', async (req, reply) => {
     await requireRequestPermission(deps.permissionService, req, 'analytics:read');
-    const { days, endOffset, limit, excludeConnectivity } = parseAnalyticsQuery(req.query as AnalyticsQueryRaw);
-    sendJson(reply, 200, ok(await deps.analytics.usersScope(days, endOffset, limit, { excludeConnectivity })));
+    const { days, endOffset, limit, page, pageSize, excludeConnectivity } = parseAnalyticsQuery(req.query as AnalyticsQueryRaw);
+    sendJson(reply, 200, ok(await deps.analytics.usersScope(days, endOffset, limit, { excludeConnectivity, page, pageSize })));
   });
 
   app.get('/v1/admin/analytics/agents', async (req, reply) => {
     await requireRequestPermission(deps.permissionService, req, 'analytics:read');
-    const { days, endOffset, limit, excludeConnectivity } = parseAnalyticsQuery(req.query as AnalyticsQueryRaw);
-    sendJson(reply, 200, ok(await deps.analytics.agentsScope(days, endOffset, limit, { excludeConnectivity })));
+    const { days, endOffset, limit, page, pageSize, excludeConnectivity } = parseAnalyticsQuery(req.query as AnalyticsQueryRaw);
+    sendJson(reply, 200, ok(await deps.analytics.agentsScope(days, endOffset, limit, { excludeConnectivity, page, pageSize })));
   });
 
   app.get('/v1/admin/analytics/sessions', async (req, reply) => {

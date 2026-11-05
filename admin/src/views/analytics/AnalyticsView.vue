@@ -87,11 +87,15 @@
         v-else-if="activeTab === 'users'"
         :payload="usersPayload"
         :loading="activeLoading"
+        @current-change="handlePageChange"
+        @size-change="handlePageSizeChange"
       />
       <AgentTab
         v-else-if="activeTab === 'agents'"
         :payload="agentsPayload"
         :loading="activeLoading"
+        @current-change="handlePageChange"
+        @size-change="handlePageSizeChange"
       />
       <SessionTab
         v-else-if="activeTab === 'sessions'"
@@ -126,6 +130,7 @@ import {
 import { formatDateTime } from '../../utils/datetime'
 
 import type {
+  AnalyticsPagination,
   AgentsPayload,
   CustomPeriodRange,
   ModelsPayload,
@@ -186,6 +191,11 @@ const sceneModelId = ref<number | undefined>(
 const includeConnectivity = ref(route.query.conn !== '0')
 /** 运行轨迹榜的排行维度：Agent / 用户，走 URL（rtScope）供分享与刷新还原 */
 const runTraceDimension = ref<RunTraceDimension>(route.query.rtScope === 'user' ? 'user' : 'agent')
+/** 用户 / Agent 明细分页：各自独立保存，切 Tab 再回来仍停在原页；分页状态进 URL 便于分享与刷新还原 */
+const userPage = ref(normalizePageQuery(route.query.page))
+const userPageSize = ref(normalizePageSizeQuery(route.query.pageSize))
+const agentPage = ref(normalizePageQuery(route.query.page))
+const agentPageSize = ref(normalizePageSizeQuery(route.query.pageSize))
 /** 0=关闭；仅内存态，不持久化，保证默认关闭 */
 const AUTO_REFRESH_OPTIONS = [
   { label: '关闭', value: 0 },
@@ -265,8 +275,16 @@ const isEmpty = computed(() => {
     )
   }
   if (activeTab.value === 'models') return ((data.modelStats as ModelsPayload['modelStats']) || []).length === 0
-  if (activeTab.value === 'users') return ((data.userActivity as UsersPayload['userActivity']) || []).length === 0
-  if (activeTab.value === 'agents') return ((data.agentStats as AgentsPayload['agentStats']) || []).length === 0
+  if (activeTab.value === 'users') {
+    const pagination = data.pagination as AnalyticsPagination | undefined
+    if (pagination) return pagination.total === 0
+    return ((data.userActivity as UsersPayload['userActivity']) || []).length === 0
+  }
+  if (activeTab.value === 'agents') {
+    const pagination = data.pagination as AnalyticsPagination | undefined
+    if (pagination) return pagination.total === 0
+    return ((data.agentStats as AgentsPayload['agentStats']) || []).length === 0
+  }
   if (activeTab.value === 'sessions') {
     return ((data.phaseDistribution as Array<{ count: number }>) || []).every((row) => Number(row.count || 0) === 0)
   }
@@ -295,10 +313,25 @@ function normalizeTab(raw: unknown): TabId {
   return (TABS.some((tab) => tab.value === value) ? value : 'overview') as TabId
 }
 
+function normalizePageQuery(raw: unknown): number {
+  const value = Math.trunc(Number(raw))
+  return Number.isFinite(value) && value > 0 ? Math.min(value, 1_000_000) : 1
+}
+
+function normalizePageSizeQuery(raw: unknown): number {
+  const value = Math.trunc(Number(raw))
+  return Number.isFinite(value) && value > 0 ? Math.min(value, 100) : 20
+}
+
 function currentQuery() {
-  const needsLimit = activeTab.value === 'users' || activeTab.value === 'agents'
-  // 后端 scope 上限 100：用户/Agent 明细尽量拉满，减少 Top 20 截断
-  const query = buildAnalyticsQuery(period.value, customRange.value, needsLimit ? 100 : undefined)
+  const query = buildAnalyticsQuery(period.value, customRange.value)
+  if (activeTab.value === 'users') {
+    query.page = userPage.value
+    query.pageSize = userPageSize.value
+  } else if (activeTab.value === 'agents') {
+    query.page = agentPage.value
+    query.pageSize = agentPageSize.value
+  }
   // 连通性开关仅属于模型 Tab；其余 Tab 不传该参数，走后端默认口径（排除连通性测试），
   // 避免模型页的勾选状态静默改变其他 Tab 的质量指标
   if (activeTab.value === 'models') {
@@ -336,6 +369,10 @@ function syncUrl() {
       ? String(sceneModelId.value)
       : null
   const nextRtScope = nextTab === 'run-trace' && runTraceDimension.value === 'user' ? 'user' : null
+  const nextPage =
+    nextTab === 'users' ? String(userPage.value) : nextTab === 'agents' ? String(agentPage.value) : null
+  const nextPageSize =
+    nextTab === 'users' ? String(userPageSize.value) : nextTab === 'agents' ? String(agentPageSize.value) : null
   if (
     route.query.tab === nextTab &&
     route.query.period === nextPeriod &&
@@ -345,7 +382,9 @@ function syncUrl() {
     (route.query.modelId ?? null) === nextModelId &&
     (route.query.rtScope ?? null) === nextRtScope &&
     (route.query.start ?? null) === nextStart &&
-    (route.query.end ?? null) === nextEnd
+    (route.query.end ?? null) === nextEnd &&
+    (route.query.page ?? null) === nextPage &&
+    (route.query.pageSize ?? null) === nextPageSize
   ) {
     return
   }
@@ -380,6 +419,13 @@ function syncUrl() {
     delete query.start
     delete query.end
   }
+  if (nextPage != null && nextPageSize != null && (nextPage !== '1' || nextPageSize !== '20')) {
+    query.page = nextPage
+    query.pageSize = nextPageSize
+  } else {
+    delete query.page
+    delete query.pageSize
+  }
   router.replace({ query })
 }
 
@@ -393,6 +439,9 @@ function handleTabChange() {
 /** 换周期统一入口：粒度按新窗口重推、缓存作废、URL 同步后强刷。 */
 function applyPeriodChange() {
   grain.value = defaultTrendGrain(period.value, customRange.value)
+  // 换统计窗口后旧页码大概率越界，统一回到第一页
+  userPage.value = 1
+  agentPage.value = 1
   invalidateAnalytics()
   syncUrl()
   void loadActive(true)
@@ -474,6 +523,29 @@ function handleRunTraceDimensionChange(value: RunTraceDimension) {
   void loadActive(true)
 }
 
+function handlePageChange(page: number) {
+  if (activeTab.value === 'users') userPage.value = normalizePageQuery(page)
+  else if (activeTab.value === 'agents') agentPage.value = normalizePageQuery(page)
+  else return
+  syncUrl()
+  void loadActive(false)
+}
+
+function handlePageSizeChange(size: number) {
+  const pageSize = normalizePageSizeQuery(size)
+  if (activeTab.value === 'users') {
+    userPageSize.value = pageSize
+    userPage.value = 1
+  } else if (activeTab.value === 'agents') {
+    agentPageSize.value = pageSize
+    agentPage.value = 1
+  } else {
+    return
+  }
+  syncUrl()
+  void loadActive(false)
+}
+
 // ---- 浏览器前进/后退、外部分享链接等 URL 直变：由此 watch 驱动状态与加载 ----
 
 watch(
@@ -488,9 +560,23 @@ watch(
       route.query.modelId,
       route.query.rtScope,
       route.query.start,
-      route.query.end
+      route.query.end,
+      route.query.page,
+      route.query.pageSize
     ] as const,
-  ([tabValue, periodValue, daysValue, grainValue, connValue, modelIdValue, rtScopeValue, startValue, endValue]) => {
+  ([
+    tabValue,
+    periodValue,
+    daysValue,
+    grainValue,
+    connValue,
+    modelIdValue,
+    rtScopeValue,
+    startValue,
+    endValue,
+    pageValue,
+    pageSizeValue
+  ]) => {
     const nextTab = normalizeTab(tabValue)
     const nextPeriod = periodFromQueryValue(periodValue ?? daysValue ?? 'today', startValue, endValue)
     // 只有自定义周期才从 URL 还原区间：其他周期保留内存里的自定义区间，切回去还是用户选过的那段
@@ -503,12 +589,25 @@ watch(
         ? Number(modelIdValue)
         : undefined
     const nextRtScope: RunTraceDimension = rtScopeValue === 'user' ? 'user' : 'agent'
+    const nextPage = normalizePageQuery(pageValue)
+    const nextPageSize = normalizePageSizeQuery(pageSizeValue)
     const periodChanged = nextPeriod !== period.value
     const customChanged = nextCustom.start !== customRange.value.start || nextCustom.end !== customRange.value.end
     const grainChanged = nextGrain !== grain.value
     const connChanged = nextIncludeConn !== includeConnectivity.value
     const modelChanged = nextModelId !== sceneModelId.value
     const rtScopeChanged = nextRtScope !== runTraceDimension.value
+
+    let pageChanged = false
+    if (nextTab === 'users') {
+      pageChanged = nextPage !== userPage.value || nextPageSize !== userPageSize.value
+      userPage.value = nextPage
+      userPageSize.value = nextPageSize
+    } else if (nextTab === 'agents') {
+      pageChanged = nextPage !== agentPage.value || nextPageSize !== agentPageSize.value
+      agentPage.value = nextPage
+      agentPageSize.value = nextPageSize
+    }
 
     if (periodChanged) {
       period.value = nextPeriod
@@ -541,7 +640,7 @@ watch(
       (rtScopeChanged && nextTab === 'run-trace')
     ) {
       void loadActive(true)
-    } else if (tabChanged || !everLoaded) {
+    } else if (tabChanged || pageChanged || !everLoaded) {
       void loadActive(false)
     }
     everLoaded = true

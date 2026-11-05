@@ -234,5 +234,5 @@ export function buildAnalyticsQuery(
 /** 缓存键含周期语义；换周期自然 miss，force 由调用方先 invalidate。
  * scene / scope 也进键：运行轨迹榜换口径或换维度必须重新拉取。 */
 export function periodKey(scope: string, query: AnalyticsQuery): string {
-  return `${scope}|${query.range ?? ''}|${query.days ?? ''}|${query.start ?? ''}|${query.end ?? ''}|${query.limit ?? ''}|${query.modelId ?? ''}|${query.excludeConnectivity ?? ''}|${query.granularity ?? ''}|${query.scene ?? ''}|${query.scope ?? ''}`
+  return `${scope}|${query.range ?? ''}|${query.days ?? ''}|${query.start ?? ''}|${query.end ?? ''}|${query.limit ?? ''}|${query.page ?? ''}|${query.pageSize ?? ''}|${query.modelId ?? ''}|${query.excludeConnectivity ?? ''}|${query.granularity ?? ''}|${query.scene ?? ''}|${query.scope ?? ''}`
 }

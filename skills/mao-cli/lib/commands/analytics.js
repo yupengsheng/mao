@@ -15,14 +15,16 @@ function help() {
 
 命令:
   mao analytics summary [--days] [--end-offset]
-  mao analytics overview|trends|models|users|agents|sessions [--days] [--end-offset] [--limit]
+  mao analytics overview|trends|models|users|agents|sessions [--days] [--end-offset] [--limit] [--page] [--page-size]
   mao analytics trends [--granularity hour|day]
   mao analytics run-trace [--days] [--end-offset] [--scene agent|...] [--scope agent|user]
 
 说明:
   summary  旧版一页聚合（管理后台已改走分维度接口，CLI 仍可查全量）
   overview/trends/models/users/agents/sessions  与管理后台「用量分析」各 Tab 对应
-  users/agents 额外支持 --limit（默认 20，最大 100）
+  users/agents 额外支持 --limit（默认 20，最大 100；不传分页时保持旧 Top-N 行为）
+  users/agents 额外支持 --page / --page-size（服务端分页，pageSize 默认 20、最大 100）；
+             与 --limit 同传时以 --page-size 为准
   trends 额外支持 --granularity hour|day（默认 day；小时为上海时区整点）
   run-trace  运行轨迹三个榜（最慢的轮 / 最贵的轮 / 工具失败率），与管理后台「运行轨迹」Tab 对应；
              默认只统计 scene=agent 的轮，--scene 可换场景；--scope 选排行维度（agent 或 user，默认 agent）
@@ -80,9 +82,17 @@ async function run(ctx, subcommand, _rest, flags) {
     days: getNumber(flags, 'days'),
     endOffset: getNumber(flags, 'end-offset'),
   });
+  const page = getNumber(flags, 'page');
+  const pageSize = getNumber(flags, 'page-size');
+  if ((page != null || pageSize != null) && !LIMIT_SCOPES.has(subcommand)) {
+    printError('--page/--page-size 仅用于 analytics users 或 agents');
+    process.exit(1);
+  }
   if (LIMIT_SCOPES.has(subcommand)) {
     const limit = getNumber(flags, 'limit');
     if (limit != null) query.limit = limit;
+    if (page != null) query.page = page;
+    if (pageSize != null) query.pageSize = pageSize;
   }
   const granularity = getString(flags, 'granularity');
   if (granularity != null) {

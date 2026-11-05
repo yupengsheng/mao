@@ -72,6 +72,59 @@ describe('admin analytics run-trace route', () => {
   });
 });
 
+describe('admin analytics user/agent pagination params', () => {
+  async function pagedApp() {
+    const usersScope = vi.fn(async () => ({ userActivity: [], pagination: {} }));
+    const agentsScope = vi.fn(async () => ({ agentStats: [], pagination: {} }));
+    const fastify = Fastify();
+    fastify.setErrorHandler(handleError);
+    fastify.addHook('preHandler', (req, _r, done) => {
+      (req as unknown as { userId: number }).userId = 7;
+      done();
+    });
+    registerAdminAnalyticsRoutes(fastify, {
+      jwt: {} as never,
+      analytics: { usersScope, agentsScope } as never,
+      userRepo: {} as never,
+      permissionService: { hasPermission: vi.fn(async () => true) },
+    } as never);
+    return { fastify, usersScope, agentsScope };
+  }
+
+  it('透传 page/pageSize，并对非法值回落与上限截断', async () => {
+    const { fastify, usersScope, agentsScope } = await pagedApp();
+
+    await fastify.inject({ method: 'GET', url: '/v1/admin/analytics/users?days=7&page=2&pageSize=50' });
+    expect(usersScope).toHaveBeenCalledWith(7, 0, 20, {
+      excludeConnectivity: true,
+      page: 2,
+      pageSize: 50,
+    });
+
+    await fastify.inject({ method: 'GET', url: '/v1/admin/analytics/agents?days=7&page=abc&pageSize=999' });
+    expect(agentsScope).toHaveBeenCalledWith(7, 0, 20, {
+      excludeConnectivity: true,
+      page: 1,
+      pageSize: 100,
+    });
+
+    await fastify.close();
+  });
+
+  it('不传分页参数时时保留 undefined，服务端继续按 limit 走旧 Top-N', async () => {
+    const { fastify, usersScope } = await pagedApp();
+
+    await fastify.inject({ method: 'GET', url: '/v1/admin/analytics/users?days=7&limit=30' });
+    expect(usersScope).toHaveBeenCalledWith(7, 0, 30, {
+      excludeConnectivity: true,
+      page: undefined,
+      pageSize: undefined,
+    });
+
+    await fastify.close();
+  });
+});
+
 describe('admin analytics range param', () => {
   // 只 fake Date：shanghaiYmd() 走系统时钟，固定到 2026-10-29（周四）中午让窗口断言稳定
   beforeEach(() => {

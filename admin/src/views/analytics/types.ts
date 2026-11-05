@@ -259,11 +259,21 @@ export interface UserActivityRow {
   cost?: number
 }
 
+export interface AnalyticsPagination {
+  page: number
+  pageSize: number
+  total: number
+}
+
 export interface UsersPayload {
   period: AnalyticsPeriodMeta
   userActivity: UserActivityRow[]
+  /** 明细分页元信息；旧后端无此字段时前端按当前页行数兜底 */
+  pagination?: AnalyticsPagination
   /** 独立按 Token 排序截断的排行（与按消息数截断的 userActivity 互不影响） */
   tokenTop?: Array<{ userId: number; username?: string; displayName?: string; totalTokens: number }>
+  /** 独立按消息数排序的全局 Top N，避免明细分页后排行图跟着当前页变化 */
+  messageTop?: Array<{ userId: number; username?: string; displayName?: string; messageCount: number; totalTokens: number }>
   periodTotals: { activeUsers: number }
   previousTotals: PreviousTotals
 }
@@ -286,6 +296,8 @@ export interface AgentStatRow {
 export interface AgentsPayload {
   period: AnalyticsPeriodMeta
   agentStats: AgentStatRow[]
+  /** 明细分页元信息；旧后端无此字段时前端按当前页行数兜底 */
+  pagination?: AnalyticsPagination
   /** 独立按 Token 排序截断的排行（与按会话/消息数截断的 agentStats 互不影响） */
   tokenTop?: Array<{ agentId: number; agentName: string; totalTokens: number }>
   previousTotals: PreviousTotals
@@ -328,6 +340,8 @@ export interface AnalyticsQuery {
   start?: string
   end?: string
   limit?: number
+  page?: number
+  pageSize?: number
   modelId?: number
   excludeConnectivity?: boolean
   granularity?: 'hour' | 'day'

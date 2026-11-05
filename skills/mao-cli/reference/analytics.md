@@ -13,8 +13,8 @@
 | `analytics overview` | 总览 Tab | 运行态（实时/窗口）+ 窗口合计 + 环比 + Token spark + 构成与规则洞察 |
 | `analytics trends` | 趋势 Tab | 按天或按小时的序列（会话/消息/Token/后台调用/调用质量/平均耗时）；`--granularity hour\|day`，默认 day |
 | `analytics models` | 模型 Tab | 模型用量聚合 |
-| `analytics users` | 用户 Tab | 用户活跃排行/明细，支持 `--limit` |
-| `analytics agents` | Agent Tab | Agent 排行，支持 `--limit` |
+| `analytics users` | 用户 Tab | 用户活跃排行/明细，支持 `--limit` 或 `--page` / `--page-size` |
+| `analytics agents` | Agent Tab | Agent 排行，支持 `--limit` 或 `--page` / `--page-size` |
 | `analytics sessions` | 会话 Tab | phase 分布 + 会话类型/执行模式 + 实时运行态 |
 | `analytics run-trace` | 运行轨迹 Tab | 最慢的轮 / 最贵的轮 / 工具失败率三个榜；`--scene` 选场景（默认 agent），`--scope` 选排行维度（agent\|user，默认 agent） |
 | `analytics summary` | （旧）一页聚合 | 管理后台已切换分维度接口；CLI 仍保留全量汇总 |
@@ -26,6 +26,7 @@
 | `--days` | 否 | 整数 | 30 | 统计天数窗口，服务端 clamp 到 1–90 | `days` |
 | `--end-offset` | 否 | 整数 | 0 | 窗口结束日相对今天的前移天数（0=今日结尾，1=昨日结尾），服务端 clamp 到 0–365 | `endOffset` |
 | `--limit` | 否 | 整数 | 20 | 仅 `users` / `agents`：排行条数，服务端 clamp 到 1–100 | `limit` |
+| `--page` / `--page-size` | 否 | 整数 | `1` / `20` | 仅 `users` / `agents`：明细分页，`pageSize` 服务端 clamp 到 1–100；与 `--limit` 同传时以 `--page-size` 为准 | `page` / `pageSize` |
 | `--granularity` | 否 | `hour` \| `day` | `day` | 仅 `trends`：横轴粒度。`hour` 为 Asia/Shanghai 整点；窗口含今天时停在当前整点 | `granularity` |
 
 ### 语义统计周期（0.0.375 起）
@@ -121,14 +122,19 @@
 
 | 字段 | 说明 |
 |------|------|
-| `userActivity[]` | `userId` / `username` / `displayName` / `sessionCount` / `messageCount` / `totalTokens` / `lastLoginAt` / `callCount` / `callFailCount` / `callCancelledCount` / `callTokens` / `cost`，剔除零活跃用户，按消息数降序 |
+| `userActivity[]` | `userId` / `username` / `displayName` / `sessionCount` / `messageCount` / `totalTokens` / `lastLoginAt` / `callCount` / `callFailCount` / `callCancelledCount` / `callTokens` / `cost`，剔除零活跃用户，按消息数降序；传 `page` / `pageSize` 时只返回当前页 |
+| `pagination` | `{ page, pageSize, total }`；不传分页参数时为旧行为，仍按 `limit` 截断 |
+| `messageTop[]` | 独立按消息数排序的全局 Top 20（`userId` / `username` / `displayName` / `messageCount` / `totalTokens`）；分页后排行图不随当前页变化 |
+| `tokenTop[]` | 独立按 Token 排序的全局 Top N（`limit` 或 `pageSize`），避免漏掉消息少但 Token 重的用户 |
 | `periodTotals` | `{ activeUsers }` |
 
 ### agents
 
 | 字段 | 说明 |
 |------|------|
-| `agentStats[]` | `agentId` / `agentName` / `sessionCount` / `messageCount` / `totalTokens` / `callCount` / `callFailCount` / `callCancelledCount` / `callTokens` / `callSuccessRate` / `cost` |
+| `agentStats[]` | `agentId` / `agentName` / `sessionCount` / `messageCount` / `totalTokens` / `callCount` / `callFailCount` / `callCancelledCount` / `callTokens` / `callSuccessRate` / `cost`；传 `page` / `pageSize` 时只返回当前页 |
+| `pagination` | `{ page, pageSize, total }`；不传分页参数时为旧行为，仍按 `limit` 截断 |
+| `tokenTop[]` | 独立按 Token 排序的全局 Top N（`limit` 或 `pageSize`） |
 
 ### sessions
 
@@ -183,6 +189,7 @@ mao analytics trends --days 1 --granularity hour --raw
 mao analytics models --days 30 --raw
 mao analytics models --days 7 --raw   # 质量列与 sceneStats
 mao analytics users --days 7 --limit 50 --raw
+mao analytics users --days 7 --page 2 --page-size 50 --raw
 mao analytics agents --days 7 --raw
 mao analytics sessions --days 1 --end-offset 1 --raw
 mao analytics run-trace --days 7 --raw
