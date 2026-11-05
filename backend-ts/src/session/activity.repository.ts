@@ -102,6 +102,14 @@ export class SessionTodoRepository {
       [todoId, sessionId],
     );
   }
+
+  /** 会话删除 / 边路提升后回收整段待办，避免已不可达会话留下永久存活行。 */
+  async logicalDeleteBySession(sessionId: number): Promise<void> {
+    await this.db.execute(
+      `UPDATE session_todo SET deleted = 1 WHERE session_id = ? AND ${notDeleted()}`,
+      [sessionId],
+    );
+  }
 }
 
 export class SubagentExecutionRepository {

@@ -11,6 +11,7 @@ import type { EnvironmentInfoProvider } from '../harness/core/environment-info.j
 import type { GitOperationService } from './git-operation.service.js';
 import type { SessionCompactionService } from './session-compaction.service.js';
 import type { SessionCompactionEventService } from './session-compaction-event.service.js';
+import type { SessionTodoRepository } from './activity.repository.js';
 
 function session(id: number, title: string, sessionType: string, agentId: number | null, updatedAt: string): Session {
   return { id, userId: 7, title, sessionType, agentId, updatedAt, phase: 'COMPLETED' };
@@ -102,6 +103,7 @@ function makeService(onSessionDeleted?: (sessionId: number) => Promise<void> | v
   } as unknown as FileChangeRepository;
   const sessionCompactionService = { deleteBySessionId: vi.fn() } as unknown as SessionCompactionService;
   const sessionCompactionEventService = { deleteBySessionId: vi.fn() } as unknown as SessionCompactionEventService;
+  const todoRepo = { logicalDeleteBySession: vi.fn(async () => undefined) } as unknown as SessionTodoRepository;
   const service = new SessionService(
     sessionRepo,
     messageRepo,
@@ -113,11 +115,11 @@ function makeService(onSessionDeleted?: (sessionId: number) => Promise<void> | v
     {} as GitOperationService,
     sessionCompactionService,
     sessionCompactionEventService,
-    undefined,
+    todoRepo,
     undefined,
     onSessionDeleted,
   );
-  return { service, sessionRepo, messageRepo, fileChangeRepo, agentLookup, txDb };
+  return { service, sessionRepo, messageRepo, fileChangeRepo, agentLookup, todoRepo, txDb };
 }
 
 describe('SessionService archive', () => {
@@ -300,6 +302,28 @@ describe('SessionService archive', () => {
     }
   });
 
+  it('promotesSideTaskAndDeletesItsSessionTodos', async () => {
+    // 边路会话提升会先把待办复制到新主会话；旧边路会话不再可达，原行须在同一事务内回收。
+    const { service, sessionRepo, txDb } = makeService();
+    vi.mocked(sessionRepo.findById).mockResolvedValue({
+      id: 20,
+      userId: 7,
+      title: '边路任务',
+      sessionType: 'SIDE_TASK',
+      phase: 'COMPLETED',
+      executionMode: 'CLOUD',
+      workspace: '/tmp/w',
+    });
+    vi.mocked(sessionRepo.list).mockResolvedValue([]);
+
+    await service.promoteSideTaskToMainSession(20, 7);
+
+    expect(txDb.execute).toHaveBeenCalledWith(
+      expect.stringContaining('UPDATE session_todo SET deleted = 1'),
+      [20],
+    );
+  });
+
   it('rejectsDeleteWhenSessionRunning', async () => {
     const { service, sessionRepo } = makeService();
     vi.mocked(sessionRepo.findById).mockResolvedValue({ id: 11, userId: 7, phase: 'RUNNING' });
@@ -315,6 +339,26 @@ describe('SessionService archive', () => {
     await service.deleteSession(11);
 
     expect(sessionRepo.logicalDelete).toHaveBeenCalledWith(11);
+    expect(onSessionDeleted).toHaveBeenCalledWith(11);
+  });
+
+  it('deletesSessionTodosWhenSessionIsDeleted', async () => {
+    const { service, sessionRepo, todoRepo } = makeService();
+    vi.mocked(sessionRepo.findById).mockResolvedValue({ id: 11, userId: 7, phase: 'COMPLETED' });
+
+    await service.deleteSession(11);
+
+    expect(todoRepo.logicalDeleteBySession).toHaveBeenCalledWith(11);
+  });
+
+  it('keepsSessionDeletionWhenTodoCleanupFails', async () => {
+    const onSessionDeleted = vi.fn();
+    const { service, sessionRepo, todoRepo } = makeService(onSessionDeleted);
+    vi.mocked(sessionRepo.findById).mockResolvedValue({ id: 11, userId: 7, phase: 'COMPLETED' });
+    vi.mocked(todoRepo.logicalDeleteBySession).mockRejectedValueOnce(new Error('db down'));
+
+    await service.deleteSession(11);
+
     expect(onSessionDeleted).toHaveBeenCalledWith(11);
   });
 

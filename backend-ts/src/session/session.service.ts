@@ -605,6 +605,13 @@ export class SessionService {
     await this.sessionCompactionEventService.deleteBySessionId(id);
     await this.messageRepo.logicalDeleteBySession(id);
     await this.sessionRepo.logicalDelete(id);
+    if (this.todoRepo) {
+      try {
+        await this.todoRepo.logicalDeleteBySession(id);
+      } catch (e) {
+        console.error(`Failed to delete todos for session ${id}`, e);
+      }
+    }
     if (this.onSessionDeleted) {
       try {
         await this.onSessionDeleted(id);
@@ -760,6 +767,8 @@ export class SessionService {
             blockedBy: todo.blockedBy,
           } as SessionTodo);
         }
+        // 待办已复制到新主会话；旧边路会话随提升逻辑删除，原行不再可达。
+        await txTodoRepo.logicalDeleteBySession(sideSessionId);
       }
 
       await tx.execute('DELETE FROM session_compaction WHERE session_id = ?', [sideSessionId]);

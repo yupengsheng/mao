@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type mysql from 'mysql2/promise';
 import { Db } from '../db/db.js';
-import { SessionActivityRepository, SubagentExecutionRepository } from './activity.repository.js';
+import { SessionActivityRepository, SessionTodoRepository, SubagentExecutionRepository } from './activity.repository.js';
 
 function setup(affectedRows = 7) {
   const execute = vi.fn(async () => [{ affectedRows }, []]);
@@ -33,6 +33,20 @@ describe('SessionActivityRepository.deleteBatch', () => {
     expect(execute).toHaveBeenLastCalledWith(
       'DELETE FROM session_activity WHERE created_at < ? ORDER BY created_at, id LIMIT 1',
       ['2026-05-09 12:00:00'],
+    );
+  });
+});
+
+describe('SessionTodoRepository.logicalDeleteBySession', () => {
+  it('按会话逻辑删除整段待办', async () => {
+    const execute = vi.fn(async () => [{ affectedRows: 3 }, []]);
+    const repo = new SessionTodoRepository(new Db({ execute } as unknown as mysql.Pool));
+
+    await repo.logicalDeleteBySession(42);
+
+    expect(execute).toHaveBeenCalledWith(
+      'UPDATE session_todo SET deleted = 1 WHERE session_id = ? AND deleted = 0',
+      [42],
     );
   });
 });
