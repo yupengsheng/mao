@@ -80,6 +80,11 @@ export const ErrorCode = {
   /** 准入依赖读取失败。HTTP 503；失败关闭，不降级放行。 */
   ADMISSION_UNAVAILABLE: { code: 3055, message: '准入检查暂不可用，请稍后重试' },
 
+  /** 角色删除：不存在 / 仍有用户绑定 / 系统内置角色受保护。 */
+  ROLE_NOT_FOUND: { code: 3056, message: '角色不存在' },
+  ROLE_IN_USE: { code: 3057, message: '该角色下仍有用户，请先移除用户后再删除' },
+  ROLE_SYSTEM_PROTECTED: { code: 3058, message: '系统内置角色不可删除' },
+
   /** 用量预算 BLOCK 超线：message 动态携带 scope/当期消耗/上限（技术方案 §5.7）。 */
   BUDGET_EXCEEDED: { code: 3041, message: '用量预算已超限' },
 

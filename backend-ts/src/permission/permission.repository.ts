@@ -4,6 +4,7 @@ import type {
   Permission,
   PermissionRepository,
   Role,
+  RoleDeleteOutcome,
   RolePermission,
   RolePermissionRepository,
   RoleRepository,
@@ -51,6 +52,30 @@ export class MysqlRoleRepository implements RoleRepository {
       name: role.name,
       code: role.code,
       description: role.description,
+    });
+  }
+
+  async deleteIfUnused(id: number): Promise<RoleDeleteOutcome> {
+    return this.db.transaction(async (tx) => {
+      const role = await tx.queryOne<Role>(
+        `SELECT * FROM role WHERE id = ? AND ${notDeleted()} FOR UPDATE`,
+        [id],
+      );
+      if (!role) {
+        return 'not_found';
+      }
+      // 绑定检查与删除同事务；FOR UPDATE 锁住扫描区间，避免校验通过后
+      // 并发写入 user_role 留下悬空绑定。
+      const bindings = await tx.query<UserRole>(
+        'SELECT * FROM user_role WHERE role_id = ? FOR UPDATE',
+        [id],
+      );
+      if (bindings.length > 0) {
+        return 'in_use';
+      }
+      await tx.execute('DELETE FROM role_permission WHERE role_id = ?', [id]);
+      await tx.execute('DELETE FROM role WHERE id = ?', [id]);
+      return 'deleted';
     });
   }
 }

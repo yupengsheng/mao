@@ -28,6 +28,7 @@ describe('admin permission gates', () => {
       countRoleUsers: async () => 0,
       createRole,
       updateRole: async () => null,
+      deleteRole: vi.fn(),
       listPermissions: async () => [],
       assignPermissions: async () => undefined,
       changeRolesWithAdminGuard: async () => undefined,
@@ -44,6 +45,30 @@ describe('admin permission gates', () => {
     expect(created.code).toBe(1002);
     expect(createRole).not.toHaveBeenCalled();
     await app.close();
+  });
+
+  it('requires role:write to delete a role', async () => {
+    const denied = appWith(['role:read']);
+    const deleteRole = vi.fn();
+    registerPermissionRoutes(denied.app, {
+      hasPermission: denied.hasPermission,
+      deleteRole,
+    } as never);
+    const blocked = JSON.parse((await denied.app.inject({ method: 'DELETE', url: '/v1/roles/3' })).body);
+    expect(blocked.code).toBe(1002);
+    expect(deleteRole).not.toHaveBeenCalled();
+    await denied.app.close();
+
+    const allowed = appWith(['role:write']);
+    const remove = vi.fn(async () => undefined);
+    registerPermissionRoutes(allowed.app, {
+      hasPermission: allowed.hasPermission,
+      deleteRole: remove,
+    } as never);
+    const ok = JSON.parse((await allowed.app.inject({ method: 'DELETE', url: '/v1/roles/3' })).body);
+    expect(ok.code).toBe(0);
+    expect(remove).toHaveBeenCalledWith(3);
+    await allowed.app.close();
   });
 
   it('requires audit:read for audit logs', async () => {

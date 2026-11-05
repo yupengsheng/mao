@@ -17,10 +17,20 @@
             <el-table-column prop="name" label="角色" min-width="120" />
             <el-table-column prop="code" label="编码" width="110" />
             <el-table-column prop="userCount" label="用户数" width="80" align="right" />
-            <el-table-column label="操作" width="140" fixed="right">
+            <el-table-column label="操作" width="190" fixed="right">
               <template #default="{ row }">
                 <el-button type="primary" link size="small" @click.stop="handleViewMembers(row)">成员</el-button>
                 <el-button v-if="canWrite" type="primary" link size="small" @click.stop="handleEditRole(row)">编辑</el-button>
+                <el-button
+                  v-if="canWrite"
+                  type="danger"
+                  link
+                  size="small"
+                  :disabled="!!roleDeleteDisabledReason(row)"
+                  :loading="deletingRoleId === row.id"
+                  :title="roleDeleteDisabledReason(row)"
+                  @click.stop="handleDeleteRole(row)"
+                >删除</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -135,6 +145,7 @@ interface Permission {
 const loading = ref(false)
 const savingRole = ref(false)
 const savingPermissions = ref(false)
+const deletingRoleId = ref<number | null>(null)
 const roles = ref<Role[]>([])
 const permissions = ref<Permission[]>([])
 const currentRole = ref<Role | null>(null)
@@ -314,6 +325,47 @@ function handleViewMembers(role: Role) {
   router.push({ path: '/users', query: { roleId: String(role.id) } })
 }
 
+function roleDeleteDisabledReason(role: Role): string {
+  if (role.code === 'ADMIN' || role.code === 'USER') return '系统内置角色不可删除'
+  if ((role.userCount ?? 0) > 0) return '请先移除该角色下的用户'
+  return ''
+}
+
+async function handleDeleteRole(role: Role) {
+  if (deletingRoleId.value != null) return
+  const deletingCurrent = currentRole.value?.id === role.id
+  const dirtyHint = deletingCurrent && dirtyPermissions.value
+    ? '\n当前角色有未保存的权限修改，删除后将一并丢失。'
+    : ''
+  try {
+    await ElMessageBox.confirm(
+      `确认删除角色「${role.name}」吗？删除后不可恢复。${dirtyHint}`,
+      '删除角色',
+      {
+        confirmButtonText: '删除',
+        cancelButtonText: '取消',
+        type: 'warning',
+        confirmButtonClass: 'el-button--danger'
+      }
+    )
+  } catch {
+    return
+  }
+  deletingRoleId.value = role.id
+  try {
+    await api.delete(`/roles/${role.id}`)
+    ElMessage.success('角色已删除')
+    if (deletingCurrent) {
+      currentRole.value = null
+      selectedPermissionIds.value = []
+      dirtyPermissions.value = false
+    }
+    await fetchAll()
+  } catch { /* 拦截器已提示失败，吞掉避免误报页面异常 */ } finally {
+    deletingRoleId.value = null
+  }
+}
+
 async function saveRole() {
   if (savingRole.value) return
   const valid = await roleFormRef.value?.validate().catch(() => false)
@@ -405,8 +457,6 @@ onBeforeRouteLeave(async (_to, _from) => {
   }
 })
 
-// TODO: 需后端补 DELETE /roles/:id（校验角色下无用户）后再提供删除角色按钮，
-// 见评审文档 #7（permission.routes.ts 目前仅有 create/update/assign 端点）。
 </script>
 
 <style scoped>

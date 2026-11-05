@@ -119,6 +119,8 @@ CLI：`mao user ...`（见 [user.md](user.md)）。
 
 RBAC：创建角色、分配权限点、关联用户。角色列表的「成员」打开用户管理并只显示拥有该角色的用户（CLI：`mao user list --role-id <id>`）。普通用户不应有模型密钥、审计等敏感权限。保存权限期间不可继续勾选或切换角色，完成后界面与服务端保持一致。
 
+角色删除（0.0.452 起）：仅支持删除没有用户的自定义角色，删除时一并清理权限绑定；角色下仍有用户需先在用户管理迁走，系统内置 `ADMIN` / `USER` 不可删除。CLI：`mao role delete --id <id>`。
+
 CLI：`mao role ...`、`mao permission list`（见 [role.md](role.md)）。
 
 ## MCP 服务器

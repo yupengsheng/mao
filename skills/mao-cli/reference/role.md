@@ -11,6 +11,7 @@
 | 查看所有角色 | `role list` |
 | 新建角色 | `role create` |
 | 改角色名/描述 | `role update` |
+| 删除角色 | `role delete` |
 | 给角色设权限 | `role assign-permissions` |
 | 查看权限点目录 | `permission list` |
 
@@ -51,6 +52,20 @@ mao role create --name 运营 --code ops --description '运营人员'
 ```bash
 mao role update --id 2 --name 高级运营 --description '更新说明'
 ```
+
+## 命令：role delete
+
+| 参数 | 必填 | 类型 | 含义 | 后端字段 |
+|------|------|------|------|----------|
+| `--id` | 是 | 整数 | 角色 ID | 路径 |
+
+`DELETE /roles/{id}`
+
+```bash
+mao role delete --id 3
+```
+
+仅删除未绑定用户的角色，并一并清理该角色的权限绑定。角色下仍有用户时返回 `3057`，需先用 `mao user assign-roles` 把用户迁到其他角色；系统内置的 `ADMIN` / `USER` 角色不可删除（`3058`）。删除角色需要 `role:write`。
 
 ## 命令：role assign-permissions
 
@@ -94,3 +109,4 @@ mao permission list
 
 - `code===0` 成功
 - 赋权为覆盖式：传入的 ID 列表即最终权限集
+- 删除角色成功返回 `code===0`；角色不存在返回 `3056`，仍有用户返回 `3057`，系统角色返回 `3058`

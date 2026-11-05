@@ -153,6 +153,7 @@ describe('permission repositories', () => {
     await roles.findByIds([1, 2]);
     await roles.insert({ name: 'r', code: 'R' });
     await roles.updateById({ id: 1, name: 'r', code: 'R' });
+    expect(await roles.deleteIfUnused(1)).toBe('in_use');
 
     const perms = new MysqlPermissionRepository(db as never);
     await perms.findAll();
@@ -177,5 +178,20 @@ describe('permission repositories', () => {
     await ur.countByUserAndRole(1, 2);
     await ur.deleteByUserId(1);
     await ur.insert({ userId: 1, roleId: 2 });
+  });
+
+  it('deleteIfUnused reports missing and deletes unbound roles in one transaction', async () => {
+    const empty = mockDb(null, []);
+    empty.transaction.mockImplementation(async (fn) => fn(empty));
+    const roles = new MysqlRoleRepository(empty as never);
+    expect(await roles.deleteIfUnused(9)).toBe('not_found');
+    expect(empty.execute).not.toHaveBeenCalled();
+
+    const unbound = mockDb({ id: 9 }, []);
+    unbound.transaction.mockImplementation(async (fn) => fn(unbound));
+    const repo = new MysqlRoleRepository(unbound as never);
+    expect(await repo.deleteIfUnused(9)).toBe('deleted');
+    expect(unbound.execute).toHaveBeenCalledWith('DELETE FROM role_permission WHERE role_id = ?', [9]);
+    expect(unbound.execute).toHaveBeenCalledWith('DELETE FROM role WHERE id = ?', [9]);
   });
 });

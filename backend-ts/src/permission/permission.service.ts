@@ -55,6 +55,23 @@ export class PermissionService {
     return role;
   }
 
+  async deleteRole(id: number): Promise<void> {
+    const role = await this.roleRepo.findById(id);
+    if (!role) {
+      throw new BusinessException(ErrorCode.ROLE_NOT_FOUND);
+    }
+    if (role.code === 'ADMIN' || role.code === 'USER') {
+      throw new BusinessException(ErrorCode.ROLE_SYSTEM_PROTECTED);
+    }
+    const result = await this.roleRepo.deleteIfUnused(id);
+    if (result === 'not_found') {
+      throw new BusinessException(ErrorCode.ROLE_NOT_FOUND);
+    }
+    if (result === 'in_use') {
+      throw new BusinessException(ErrorCode.ROLE_IN_USE);
+    }
+  }
+
   listPermissions(): Promise<Permission[]> {
     return this.permissionRepo.findAll();
   }

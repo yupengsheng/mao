@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { BusinessException } from '../common/business-exception.js';
+import { ErrorCode } from '../common/error-code.js';
 import { PermissionService } from './permission.service.js';
 import type {
   PermissionRepository,
@@ -30,6 +31,7 @@ describe('PermissionService', () => {
     findByIds: vi.fn(),
     insert: vi.fn(async () => 3),
     updateById: vi.fn(),
+    deleteIfUnused: vi.fn(),
   } as unknown as RoleRepository;
   const permissionRepo = {
     findAll: vi.fn(),
@@ -87,6 +89,28 @@ describe('PermissionService', () => {
 
     vi.mocked(roleRepo.findById).mockResolvedValue(null);
     expect(await service.updateRole(99, 'x', 'x')).toBeNull();
+  });
+
+  it('deleteRoleProtectsSystemRolesAndMapsRepositoryOutcome', async () => {
+    vi.mocked(roleRepo.findById).mockResolvedValue(role(3, '运营', 'OPS'));
+    vi.mocked(roleRepo.deleteIfUnused).mockResolvedValue('deleted');
+    await service.deleteRole(3);
+    expect(roleRepo.deleteIfUnused).toHaveBeenCalledWith(3);
+
+    vi.mocked(roleRepo.deleteIfUnused).mockResolvedValue('in_use');
+    await expect(service.deleteRole(3)).rejects.toMatchObject({ code: ErrorCode.ROLE_IN_USE.code });
+
+    vi.mocked(roleRepo.deleteIfUnused).mockResolvedValue('not_found');
+    await expect(service.deleteRole(3)).rejects.toMatchObject({ code: ErrorCode.ROLE_NOT_FOUND.code });
+
+    vi.mocked(roleRepo.findById).mockResolvedValue(null);
+    await expect(service.deleteRole(99)).rejects.toMatchObject({ code: ErrorCode.ROLE_NOT_FOUND.code });
+
+    for (const code of ['ADMIN', 'USER']) {
+      vi.mocked(roleRepo.findById).mockResolvedValue(role(1, code, code));
+      await expect(service.deleteRole(1)).rejects.toMatchObject({ code: ErrorCode.ROLE_SYSTEM_PROTECTED.code });
+    }
+    expect(roleRepo.deleteIfUnused).toHaveBeenCalledTimes(3);
   });
 
   it('assignPermissionsAndRolesReplaceExistingBindings', async () => {

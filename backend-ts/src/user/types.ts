@@ -74,7 +74,14 @@ export interface RoleRepository {
   findByIds(ids: number[]): Promise<Role[]>;
   insert(role: Role): Promise<number>;
   updateById(role: Role): Promise<void>;
+  /**
+   * 原子删除未被用户绑定的角色：事务内锁角色与绑定，确认无引用后删除
+   * role_permission 和 role。返回结果供服务层映射业务错误。
+   */
+  deleteIfUnused(id: number): Promise<RoleDeleteOutcome>;
 }
+
+export type RoleDeleteOutcome = 'deleted' | 'not_found' | 'in_use';
 
 export interface PermissionRepository {
   findAll(): Promise<Permission[]>;
