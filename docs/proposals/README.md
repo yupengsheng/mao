@@ -2,6 +2,13 @@
 
 产品方向头脑风暴的产出。每份提案独立成文，评审通过后转入实施（届时可挪入 `docs/plan/` 或直接拆任务）。
 
+## 当前真实状态（2026-11-05）
+
+- 第 1～19 批绝大多数已落地，具体版本与行为以根 `CHANGELOG.md` 为准；下文“待评审 / 待实施”等字样多数是当时状态，不应直接当作 backlog。
+- 仍在推进或待排期：**任务域二期**（执行租约与等待态重启恢复，P1）、**定时任务运行记录分页**（P2）、**运行轨迹已加载页搜索**（P2）。
+- 其余零散项主要是 `mao-cli` 能力补齐、Todo 阻塞信息展示与管理后台低优体验优化。
+- 已否决方向集中在本文件末尾，勿重新提案。
+
 ## 已细化（2026-10-02）
 
 | 提案 | 文档 | 一句话 | 建议优先级 |
@@ -127,7 +134,7 @@
 
 | 提案 | 文档 | 一句话 | 规模 |
 |---|---|---|---|
-| 运行轨迹深度下钻 | [2026-10-22-run-trace-deep-dive.md](2026-10-22-run-trace-deep-dive.md)（待评审） | 借鉴 deepseek-harness Trajectory：run 内时间概览条带（首字/解码分段、悬停精确时刻、点击定位）+ 记录详情按需下钻（参数/结果/计时）+ 轨迹内搜索 + 解码耗时/吞吐/provider/请求编号补全 | 中 |
+| 运行轨迹深度下钻 | [2026-10-22-run-trace-deep-dive.md](2026-10-22-run-trace-deep-dive.md)（**P1 已实施** 0.0.336 / 0.0.337；P2 轨迹内已加载页搜索待排期；其余请求构成埋点未启动） | 借鉴 deepseek-harness Trajectory：run 内时间概览条带（首字/解码分段、悬停精确时刻、点击定位）+ 记录详情按需下钻（参数/结果/计时）+ 轨迹内搜索 + 解码耗时/吞吐/provider/请求编号补全 | 中 |
 
 排期注意：P1 的 VO 增量（`startedAtMs` / `provider`）会动 `trace-export.ts` 与桌面既有轨迹测试（`trace-token.bugcheck.test.ts` 等），实施时同步断言；P2 的请求构成埋点（`llm_call` 加 `prompt_version_id` / `tools_digest` 两列）触 harness 写入链路，单独评审、单独占迁移编号。
 
@@ -216,13 +223,13 @@
 
 背景：第十四批（平台化三件：MCP 输出 / 执行节点 / 用户自建 Agent）当日驳回后，方向收回「**让已经在用的人和团队用得更顺**」。本批从日常使用的三个断点入手，共同主题是「**焊平断点**」：**配置断点**（定时任务早就能在对话里一句话建好，哨兵还得切去设置页抄参数——同一页面下两件事能力不对称）、**人员断点**（会话 / 定时任务 / 哨兵全部以人为锚，人休假离职时没有任何交接机制，磨合好的会话上下文是最不可交接的资产）、**上手断点**（自托管的流失发生在部署后的前 10 分钟：默认密码没改、模型 Key 没配、不知道让 Agent 干什么，全无机制兜底）。三件互不依赖、全部零 / 低迁移、不碰执行内核，均避开已否决方向与 README 贡献边界。
 
-**评审结果（2026-10-25）：哨兵对话内配置、会话移交驳回（存档勿再评审）；首次成功体验方向认可，已细化技术方案待评审**，见 [../plan/2026-10-25-first-run-onboarding-technical-design.md](../plan/2026-10-25-first-run-onboarding-technical-design.md)（含 8 项待确认决策）。
+**评审结果（2026-10-25）：哨兵对话内配置、会话移交驳回（存档勿再评审）；首次成功体验已实施（0.0.347），入门 Agent 模板后于 0.0.388 移除。**
 
 | 提案 | 文档 | 一句话 | 规模 |
 |---|---|---|---|
 | 信号哨兵对话内配置 | [2026-10-25-signal-watcher-tools.md](2026-10-25-signal-watcher-tools.md)（已否决，存档） | 补齐 `create/list/update/delete_signal_watcher` 工具组（与定时任务工具组对称，零迁移零服务端改动），「盯住这个接口变了叫我」从一句配置教程变成一句话当场建好 | 小~中 |
 | 会话移交 | [2026-10-25-session-handover.md](2026-10-25-session-handover.md)（已否决，存档） | 终态会话整体移交（消息历史 + 绑定的定时任务 / 哨兵 + 边路记录）给同实例另一用户，双向确认 + 审计，人员变动不断链 | 小~中 |
-| 首次成功体验 | [2026-10-25-first-run-onboarding.md](2026-10-25-first-run-onboarding.md)（**已细化，技术方案待评审**：[../plan/2026-10-25-first-run-onboarding-technical-design.md](../plan/2026-10-25-first-run-onboarding-technical-design.md)；V171 一表，readiness 只读端点 + admin 全局横幅 + desktop 三步向导 + 入门模板） | 管理员三步就绪清单（改密 / 配模型 / 建 Agent，全可直跳）+ 用户三步向导（选 Agent / 边界图解 / 发第一条示例任务）+ 入门 Agent 模板，把激活漏斗最大的洞补上 | 小~中 |
+| 首次成功体验 | [2026-10-25-first-run-onboarding.md](2026-10-25-first-run-onboarding.md)（**已实施** 0.0.347，技术方案见 [../plan/2026-10-25-first-run-onboarding-technical-design.md](../plan/2026-10-25-first-run-onboarding-technical-design.md)；入门模板已于 0.0.388 移除） | 管理员三步就绪清单（改密 / 配模型 / 建 Agent，全可直跳）+ 用户三步向导（选 Agent / 边界图解 / 发第一条示例任务），把激活漏斗最大的洞补上 | 小~中 |
 
 排期注意（1、2 已否决，条目作废；以下仅剩第 3 件）：
 
@@ -235,13 +242,13 @@
 
 背景：第十五批把方向校准为「**让已经在用的人和团队用得更顺**」（首次成功体验已实施，0.0.347）。本批延续该方向，聚焦**日常使用的完整度与体验**，从代码现状摸底得出三类事实：**产出与阅读的错位**（Agent 天天产出 mermaid / 公式 / 表格，三端源码零渲染命中，用户只能复制到外部工具看图）、**半截子功能**（后端 pin / favorite / 列表 keyword 过滤全部就绪且排序已生效，desktop 零调用零入口）、**桌面壳的最后一块**（LOCAL 递不了文件、关窗即与任务失联，而 CLOUD 反而能传）。三件互不依赖，全部零迁移、零或近零后端改动，不碰执行内核。全部避开已否决方向（结构化回复卡片 / 会话移交 / 执行节点注册 / 安卓推送等）与 README 贡献边界。
 
-**评审结果：回复渲染完整度先行实施（0.0.350，技术方案见 [../plan/2026-10-25-message-rendering-technical-design.md](../plan/2026-10-25-message-rendering-technical-design.md)）；会话列表与长会话导航已评审定稿（v1.1：favorite / pin 整体移除，P1 收敛为 keyword 过滤 + 批量归档，技术方案见 [../plan/2026-10-26-session-list-navigation-technical-design.md](../plan/2026-10-26-session-list-navigation-technical-design.md)，含 C1–C15 全量冲突清单）；Electron 壳补完待评审。**
+**评审结果：三件均已实施（0.0.350 / 0.0.351 / 0.0.351）。**
 
 | 提案 | 文档 | 一句话 | 规模 |
 |---|---|---|---|
-| 回复渲染完整度 | [2026-10-25-message-rendering.md](2026-10-25-message-rendering.md)（**已实施**，技术方案见 [../plan/2026-10-25-message-rendering-technical-design.md](../plan/2026-10-25-message-rendering-technical-design.md)，含 §6 全量冲突清单） | Mermaid 图 / KaTeX 公式 / 表格复制——Agent 产出的结构化内容不再以源码形态阅读；零协议零后端，与已否决的「结构化回复卡片」划清边界 | 小~中 |
+| 回复渲染完整度 | [2026-10-25-message-rendering.md](2026-10-25-message-rendering.md)（**已实施** 0.0.350，技术方案见 [../plan/2026-10-25-message-rendering-technical-design.md](../plan/2026-10-25-message-rendering-technical-design.md)） | Mermaid 图 / KaTeX 公式 / 表格复制——Agent 产出的结构化内容不再以源码形态阅读；零协议零后端，与已否决的「结构化回复卡片」划清边界 | 小~中 |
 | 会话列表与长会话导航 | [2026-10-25-session-list-navigation.md](2026-10-25-session-list-navigation.md)（**已转入实施**，0.0.351，技术方案见 [../plan/2026-10-26-session-list-navigation-technical-design.md](../plan/2026-10-26-session-list-navigation-technical-design.md)，含 C1–C15 全量冲突清单） | 接通后端已就绪的标题过滤，补批量归档与轮次目录、只看回复；收藏与置顶两个半截子功能整体移除——会话找得回、排得开 | 小~中 |
-| Electron 壳补完 | [2026-10-25-electron-shell-completeness.md](2026-10-25-electron-shell-completeness.md)（方向已认可，已细化，技术方案待评审：[../plan/2026-10-26-electron-shell-completeness-technical-design.md](../plan/2026-10-26-electron-shell-completeness-technical-design.md)，含 §7 全量冲突清单） | LOCAL 附件拷入工作区（文件不出本机）+ 托盘 / 主进程原生通知 / 角标 / 全局快捷键 / 开机自启——窗口一关不再与任务失联 | 小~中 |
+| Electron 壳补完 | [2026-10-25-electron-shell-completeness.md](2026-10-25-electron-shell-completeness.md)（**已实施** 0.0.351，技术方案见 [../plan/2026-10-26-electron-shell-completeness-technical-design.md](../plan/2026-10-26-electron-shell-completeness-technical-design.md)） | LOCAL 附件拷入工作区（文件不出本机）+ 托盘 / 主进程原生通知 / 角标 / 全局快捷键 / 开机自启——窗口一关不再与任务失联 | 小~中 |
 
 排期注意：
 
@@ -255,13 +262,13 @@
 
 背景：第十六批（回复渲染 / 会话列表导航 / Electron 壳补完）落定后，延续「**让已经在用的人和团队用得更顺**」方向，对 backend-ts 全部路由与六端（admin / desktop / android / agent-cli / mao-cli / sdk/embed）消费方做逐一比对摸底，得出三个共同主题为「**把已建成的能力接上插座、把黑盒翻给用户看**」的方向：**文件预览**停在四种格式，而 Agent 高频产出（CSV 报表 / 压缩包 / 音视频）全部不可读；**定时任务编辑**后端 / admin / mao-cli 三处就绪，日常入口桌面端却只能启停删除；**预算**执行链路完整运行但全部长在 admin 域，用户被拦时无从自查。三件互不依赖、全部零 / 近零迁移、不碰执行内核。均避开已否决方向（结构化回复卡片 / 交付物中心 / 任务模板 / 执行节点 / 会话移交等）与 README 贡献边界。
 
-**评审结果（2026-10-26）：三件均已细化、技术方案待评审。**
+**评审结果（2026-10-26）：三件均已实施（0.0.354 / 0.0.354 / 0.0.355）。**
 
 | 提案 | 文档 | 一句话 | 规模 |
 |---|---|---|---|
 | 工作区文件预览完整度 | [2026-10-26-workspace-file-preview.md](2026-10-26-workspace-file-preview.md)（**已转入实施**，0.0.354，技术方案见 [../plan/2026-10-26-workspace-file-preview-technical-design.md](../plan/2026-10-26-workspace-file-preview-technical-design.md)，含 §6 全量冲突清单与 §13 实现期评审修正；方案对提案有三处范围修正：XLSX 库定 exceljs、`.tar/.gz` 收窄不做、DOCX 列 P2 伸展项） | CSV 表格化 / ZIP 包内浏览 / XLSX / DOCX / 音视频播放——0.0.350 回复渲染的同一条主线延伸到落盘文件，Agent 的成果不再以「二进制文件」面对 | 小~中 |
-| 定时任务编辑下沉 | [2026-10-26-scheduled-task-editing.md](2026-10-26-scheduled-task-editing.md)（**已细化，技术方案待评审**：[../plan/2026-10-26-scheduled-task-editing-technical-design.md](../plan/2026-10-26-scheduled-task-editing-technical-design.md)，含 §0 八项待确认决策与 §7 十八条冲突风险表；方案对提案有两处修正：admin 其实已在用 cron-preview、一次性任务允许改 Cron 配 mismatch 警告） | 接通后端已就绪的 PUT 全字段与 cron-preview 端点，桌面端从「只能启停删」到「改得动、输不错」；顺带修正 cron-preview 错位的权限门 | 小 |
-| 个人用量预算可见 | [2026-10-26-user-budget-visibility.md](2026-10-26-user-budget-visibility.md)（**已细化，技术方案待评审**：[../plan/2026-10-26-user-budget-visibility-technical-design.md](../plan/2026-10-26-user-budget-visibility-technical-design.md)，含 §0 十二项待确认决策与 §7 C1–C15 全量冲突风险表；零迁移、执行链路零改动、admin / mao-cli / agent-cli 零改动） | 只读端点 + 用量抽屉「预算」Tab + 收件箱预算提醒跳转，额度 / 已用 / 重置日翻给用户看，被拦时自查而非提工单 | 小~中 |
+| 定时任务编辑下沉 | [2026-10-26-scheduled-task-editing.md](2026-10-26-scheduled-task-editing.md)（**已实施** 0.0.354，技术方案见 [../plan/2026-10-26-scheduled-task-editing-technical-design.md](../plan/2026-10-26-scheduled-task-editing-technical-design.md)） | 接通后端已就绪的 PUT 全字段与 cron-preview 端点，桌面端从「只能启停删」到「改得动、输不错」；顺带修正 cron-preview 错位的权限门 | 小 |
+| 个人用量预算可见 | [2026-10-26-user-budget-visibility.md](2026-10-26-user-budget-visibility.md)（**已实施** 0.0.355，技术方案见 [../plan/2026-10-26-user-budget-visibility-technical-design.md](../plan/2026-10-26-user-budget-visibility-technical-design.md)） | 只读端点 + 用量抽屉「预算」Tab + 收件箱预算提醒跳转，额度 / 已用 / 重置日翻给用户看，被拦时自查而非提工单 | 小~中 |
 
 排期注意：
 
@@ -275,13 +282,13 @@
 
 背景：第十七批（文件预览 / 定时任务编辑 / 预算可见）落地后，延续「**提升现有功能完整度与用户体验**」方向，从「人与 Agent 的交接点」摸底得出三个断点：**人不在时**（审批只进收件箱不外推，提问外推只看 WS 在线——桌面开着人走了等于没提醒，审批 15 分钟后超时白跑）、**记忆不可见**（自动收集、去重、注入都已就绪，但对话现场零露出：记了什么不告诉、想记一句要去设置页手抄、`originSessionId` 存了没展示）、**追问没有抓手**（引用只到整文件粒度，回复 / 文件行区间 / Diff / 终端选区都带不进输入框，飞书渠道反而有引用回复注入）。三件互不依赖，均避开已否决方向（人工接管 / 团队知识层 / 经验资产化 / 结构化卡片 / 执行中引导等）与 README 贡献边界。
 
-**评审结果（2026-10-27）：记忆就地可见驳回（存档勿再评审）；待办未响应升级通知已确认，只做未响应升级（P2 会话级开关、P3 收尾体验驳回），技术方案见 [../plan/2026-10-27-pending-escalation-notify-technical-design.md](../plan/2026-10-27-pending-escalation-notify-technical-design.md)；选区引用追问已确认，P3 终端引用驳回，技术方案见 [../plan/2026-10-27-selection-quote-technical-design.md](../plan/2026-10-27-selection-quote-technical-design.md)。**
+**评审结果（2026-10-27）：记忆就地可见驳回（存档勿再评审）；待办未响应升级已实施（0.0.362）；选区引用追问已实施（0.0.363，P3 终端引用驳回）。**
 
 | 提案 | 文档 | 一句话 | 规模 |
 |---|---|---|---|
-| 待办未响应升级通知 | [2026-10-27-pending-escalation-notify.md](2026-10-27-pending-escalation-notify.md)（**已确认**，P2/P3 驳回，技术方案见 [../plan/2026-10-27-pending-escalation-notify-technical-design.md](../plan/2026-10-27-pending-escalation-notify-technical-design.md)：审批与提问 3 分钟无人处理即外推，固定延迟、零迁移、仅后端） | 审批 / 提问在 3 分钟内无人处理时，经已开启的飞书 / 钉钉 / 邮件提醒（不论桌面是否连着）——人走开了任务不白跑 | 小 |
+| 待办未响应升级通知 | [2026-10-27-pending-escalation-notify.md](2026-10-27-pending-escalation-notify.md)（**已实施** 0.0.362，技术方案见 [../plan/2026-10-27-pending-escalation-notify-technical-design.md](../plan/2026-10-27-pending-escalation-notify-technical-design.md)：审批与提问 3 分钟无人处理即外推，固定延迟、零迁移、仅后端） | 审批 / 提问在 3 分钟内无人处理时，经已开启的飞书 / 钉钉 / 邮件提醒（不论桌面是否连着）——人走开了任务不白跑 | 小 |
 | 记忆就地可见 | [2026-10-27-memory-in-context.md](2026-10-27-memory-in-context.md)（已否决，存档） | 回复下「已记住 N 条」回执可就地编辑 / 忽略，消息与选区一键「记住这个」，记忆列表可跳回来源会话 | — |
-| 选区引用追问 | [2026-10-27-selection-quote.md](2026-10-27-selection-quote.md)（**已确认**，P3 终端引用驳回，技术方案见 [../plan/2026-10-27-selection-quote-technical-design.md](../plan/2026-10-27-selection-quote-technical-design.md)：回复选区与文件 / Diff 行区间引用，标记格式不变，片段上限 200 行 / 8KB） | 回复选区引用、文件 / Diff 行区间引用（`report.py:120-145` 带片段）——圈一段就能问 | 小~中 |
+| 选区引用追问 | [2026-10-27-selection-quote.md](2026-10-27-selection-quote.md)（**已实施** 0.0.363，技术方案见 [../plan/2026-10-27-selection-quote-technical-design.md](../plan/2026-10-27-selection-quote-technical-design.md)：回复选区与文件 / Diff 行区间引用，标记格式不变，片段上限 200 行 / 8KB） | 回复选区引用、文件 / Diff 行区间引用（`report.py:120-145` 带片段）——圈一段就能问 | 小~中 |
 
 排期注意（记忆就地可见已否决，相关条目作废）：
 
@@ -295,9 +302,9 @@
 
 | 提案 | 文档 | 一句话 | 规模 |
 |---|---|---|---|
-| 会话内切换 Agent | [2026-10-29-in-session-agent-switch.md](2026-10-29-in-session-agent-switch.md)（**已细化，技术方案待评审**：[../plan/2026-10-29-in-session-agent-switch-technical-design.md](../plan/2026-10-29-in-session-agent-switch-technical-design.md)，7 项决策定案；P2「用其他 Agent 重开」已于 0.0.383 移除） | `PATCH` 补 `agentId` + 与模型切换同构的 UI，选错 Agent 不用重开会话 | 小~中 |
-| 会话来源全链路标记 | [2026-10-29-session-source-lineage.md](2026-10-29-session-source-lineage.md)（**已细化，技术方案待评审**：[../plan/2026-10-29-session-source-lineage-technical-design.md](../plan/2026-10-29-session-source-lineage-technical-design.md)，7 项决策定案） | source 闭集扩宽 + 4 个写入点各传一行，admin 会话管理补来源列与筛选——渠道用量从「目录名巧合」变成可查询的事实标签 | 小 |
-| 工作区总览与生命周期 | [2026-10-29-workspace-overview-lifecycle.md](2026-10-29-workspace-overview-lifecycle.md)（**已细化，技术方案待评审**：[../plan/2026-10-29-workspace-overview-lifecycle-technical-design.md](../plan/2026-10-29-workspace-overview-lifecycle-technical-design.md)，11 项决策定案） | 中央页签看全部工作区的大小 / 关联会话 / 最近使用，无进行中引用可强确认删除——自托管磁盘从只进不出到用户可自理 | 中 |
+| 会话内切换 Agent | [2026-10-29-in-session-agent-switch.md](2026-10-29-in-session-agent-switch.md)（**已实施** 0.0.380，技术方案见 [../plan/2026-10-29-in-session-agent-switch-technical-design.md](../plan/2026-10-29-in-session-agent-switch-technical-design.md)；P2「用其他 Agent 重开」已于 0.0.383 移除） | `PATCH` 补 `agentId` + 与模型切换同构的 UI，选错 Agent 不用重开会话 | 小~中 |
+| 会话来源全链路标记 | [2026-10-29-session-source-lineage.md](2026-10-29-session-source-lineage.md)（**已实施** 0.0.381，技术方案见 [../plan/2026-10-29-session-source-lineage-technical-design.md](../plan/2026-10-29-session-source-lineage-technical-design.md)） | source 闭集扩宽 + 4 个写入点各传一行，admin 会话管理补来源列与筛选——渠道用量从「目录名巧合」变成可查询的事实标签 | 小 |
+| 工作区总览与生命周期 | [2026-10-29-workspace-overview-lifecycle.md](2026-10-29-workspace-overview-lifecycle.md)（**已实施** 0.0.382，技术方案见 [../plan/2026-10-29-workspace-overview-lifecycle-technical-design.md](../plan/2026-10-29-workspace-overview-lifecycle-technical-design.md)；0.0.386 起不再统计目录大小） | 中央页签看全部工作区的大小 / 关联会话 / 最近使用，无进行中引用可强确认删除——自托管磁盘从只进不出到用户可自理 | 中 |
 
 排期注意：
 

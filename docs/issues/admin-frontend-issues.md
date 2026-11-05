@@ -2,6 +2,8 @@
 
 > 范围：仅覆盖 `admin/`（Vue 3 + Element Plus 管理后台），不涉及 `desktop/` 客户端。
 > 状态图例：✅ 已修复 ｜ 🔍 已核实非 bug ｜ ⬜ 待修复 ｜ 🆕 本轮新增发现
+>
+> **2026-11-05 复核**：Agent 列表已在 0.0.464 补齐服务端分页与状态筛选，原 #2 的“后端无分页”结论已过期。其余待办仍以本表状态为准；已修复项保留为整改记录。
 
 ---
 
@@ -12,7 +14,7 @@
 | # | 问题 | 文件 | 状态 | 说明 |
 |---|------|------|------|------|
 | 1 | 数据看板「运行监控」指标恒为 0 | `DashboardView.vue` | 🔍 已核实非 bug | 后端 `AdminAnalyticsService.summary()` 把 `runningSessions/waitingSessions/failedSessions/cancelledSessions` 放进 `overview`，前端 `governance.value = data?.overview` 实际能取到。原代码重复赋值冗余，已简化为统一引用 `overview`，消除歧义。 |
-| 2 | Agent 列表分页形同虚设、标签筛选在内存做 | `AgentListView.vue` | ✅ 已修复 | 后端 `/agents` 返回**纯数组（无分页）**，原代码把 `total=data.length` 且把 `page/size` 传给后端（被忽略），分页是假的。改为：加载全量到 `allAgents`，标签筛选基于全量，前端 `computed` 内做切片分页，`total` 取筛选后总数。 |
+| 2 | Agent 列表分页形同虚设、标签筛选在内存做 | `AgentListView.vue` | ✅ 已修复（0.0.464 升级为服务端分页） | 当时后端 `/agents` 无分页，先以全量 + 前端切片修复。0.0.464 起 `GET /v1/agents` 支持 `pageNum` / `pageSize` / `enabled`，名称与状态在数据库侧过滤，总数走 `x-total-count`；前端搜索、筛选、翻页、每页条数均改为服务端查询，删除末页最后一条后自动回退有效页。 |
 | 3 | 通知列表不支持分页 | `NotificationListView.vue` | ✅ 已修复 | 后端 `/notifications` 实际支持 `page/size/records/total`，原前端硬编码 `page:1,size:50` 且无分页控件。已补齐 `currentPage/pageSize/total` 与 `el-pagination`，并重置页码。 |
 | 4 | 角色权限保存后清空当前选中角色，体验断裂 | `RolePermissionView.vue` | ✅ 已修复 | `saveRole`/`savePermissions` 成功后不再清空 `currentRole`；保存权限后按 id 重新选中该角色，勾选状态保持同步。 |
 | 5 | 会话详情时间字段可能显示 `undefined` | `SessionDetailView.vue` | ✅ 已修复 | `lastActivityAt || updatedAt` 两者皆空时渲染字符串 `undefined`。新增 `formatTime()` 并对空值兜底为 `-`。 |
@@ -65,7 +67,7 @@
 
 ## 整改总结
 
-- **P0（数据错误）**：原 #1 经核查后端实际会把治理指标放入 `overview`，前端能取到，故非 bug；Agent 列表分页（#2）确为后端无分页导致的假分页，已改为可靠的前端分页。
+- **P0（数据错误）**：原 #1 经核查后端实际会把治理指标放入 `overview`，前端能取到，故非 bug；Agent 列表分页（#2）已先以前端分页兜底，并在 0.0.464 升级为服务端分页。
 - **第一轮已修复 14 项**：#2 #3 #4 #5 #6 #7 #8 #9 #10 #12 #13 #14 #15 #19（含 2 项核实非 bug：#1 看板指标、#18 代码高亮）。
 - **第二轮已修复 6 项**：#23 #24 #26 #27 #28 #30。
 - **第三轮已修复 3 项**：#21（列表返回刷新）#31（文件变更类型）#32（删除脚手架死代码）。

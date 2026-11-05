@@ -194,11 +194,19 @@ export class ScheduledTaskDbStore implements ScheduledTaskStore {
     return row != null;
   }
 
-  listRuns(taskId: number, limit: number): Promise<ScheduledTaskRun[]> {
+  listRuns(taskId: number, limit: number, offset = 0): Promise<ScheduledTaskRun[]> {
     return this.db.query(
-      `SELECT * FROM scheduled_task_run WHERE task_id = ? ORDER BY fire_time DESC LIMIT ?`,
-      [taskId, limit],
+      `SELECT * FROM scheduled_task_run WHERE task_id = ? ORDER BY fire_time DESC, id DESC LIMIT ? OFFSET ?`,
+      [taskId, limit, offset],
     );
+  }
+
+  async countRuns(taskId: number): Promise<number> {
+    const row = await this.db.queryOne<{ c: number }>(
+      'SELECT COUNT(*) AS c FROM scheduled_task_run WHERE task_id = ?',
+      [taskId],
+    );
+    return Number(row?.c ?? 0);
   }
 
   listDueRetries(now: string): Promise<ScheduledTaskRun[]> {

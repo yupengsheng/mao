@@ -84,6 +84,152 @@ export function toolSuccessRate(summary: RunTraceSummary): number | null {
   return Math.round((summary.toolSuccess / total) * 100)
 }
 
+/* ------------------------------------------------------------------ *
+ * 已加载页搜索（技术方案 2026-11-05-run-trace-loaded-search）
+ * 只索引面板已拿到的 run 数据，不请求后端、不读取抽屉里未加载的正文。
+ * 每个可见行最多产出一条命中：同一行多个字段同时匹配时只算一次，
+ * 「上一个 / 下一个」按行前进，不会在同一行内反复停留。
+ * ------------------------------------------------------------------ */
+
+export type TraceSearchAnchorKind = 'run' | 'round' | 'tool' | 'side' | 'subagent' | 'marker'
+
+export interface TraceSearchHit {
+  runId: number
+  /** 行锚点类型；与 RunTracePanel 的 rowAnchorId 共用同一套维度 */
+  kind: TraceSearchAnchorKind
+  /** 行锚点在面板内的 key；工具使用条带节点的 key（去掉 `tool:` 前缀） */
+  anchorKey: string
+  /** 供计数或无障碍提示使用的简短摘要，不参与匹配 */
+  label: string
+}
+
+export interface HighlightPart {
+  text: string
+  hit: boolean
+}
+
+/** 大小写不敏感地切分文本；query 为空或文本为空时原样返回一段。 */
+export function highlightParts(text: string | null | undefined, query: string): HighlightPart[] {
+  const source = text ?? ''
+  if (source === '') return []
+  const needle = query.trim().toLowerCase()
+  if (needle === '') return [{ text: source, hit: false }]
+
+  const haystack = source.toLowerCase()
+  const parts: HighlightPart[] = []
+  let cursor = 0
+  let matched = haystack.indexOf(needle)
+  while (matched >= 0) {
+    if (matched > cursor) parts.push({ text: source.slice(cursor, matched), hit: false })
+    parts.push({ text: source.slice(matched, matched + needle.length), hit: true })
+    cursor = matched + needle.length
+    matched = haystack.indexOf(needle, cursor)
+  }
+  if (cursor < source.length) parts.push({ text: source.slice(cursor), hit: false })
+  return parts
+}
+
+function includesQuery(values: Array<string | null | undefined>, needle: string): boolean {
+  return values.some((value) => value != null && value.toLowerCase().includes(needle))
+}
+
+function searchableToolName(name: string): string {
+  try {
+    return getToolDisplayName(name) || name
+  } catch {
+    return name
+  }
+}
+
+/**
+ * 搜索当前已加载的 run。匹配消息预览、轮次模型 / 提供方 / 场景 / 错误、
+ * 工具展示名 / 原名 / 目标 / 审批标记、旁路调用、子代理标题与压缩标记。
+ * 顺序与面板视觉顺序一致；清空 query 返回空数组，不做客户端过滤。
+ */
+export function searchTraceRuns(runs: RunTrace[], query: string): TraceSearchHit[] {
+  const needle = query.trim().toLowerCase()
+  if (needle === '') return []
+
+  const hits: TraceSearchHit[] = []
+  for (const run of runs) {
+    if (includesQuery([run.userMessagePreview], needle)) {
+      hits.push({
+        runId: run.runId,
+        kind: 'run',
+        anchorKey: 'summary',
+        label: run.userMessagePreview || '(空消息)',
+      })
+    }
+
+    // 工具行锚点必须与 runTimeNodes 完全同源：面板行 id 由条带 key 反查得到。
+    // 这里直接复用同一份 key（去掉 tool: 前缀），避免搜索定位与色条定位分叉。
+    const toolAnchors = new Map<TraceTool, string>()
+    for (const node of runTimeNodes(run)) {
+      if (node.toolRef != null) {
+        toolAnchors.set(node.toolRef, node.key.startsWith('tool:') ? node.key.slice('tool:'.length) : node.key)
+      }
+    }
+    const pushTool = (tool: TraceTool, segmentKind: string) => {
+      const displayName = searchableToolName(tool.name)
+      if (!includesQuery([displayName, tool.name, tool.target, tool.approvalMark], needle)) return
+      hits.push({
+        runId: run.runId,
+        kind: 'tool',
+        anchorKey: toolAnchors.get(tool) ?? `${segmentKind}:${toolAnchorKey(tool)}`,
+        label: [displayName, tool.target].filter(Boolean).join(' · '),
+      })
+    }
+
+    for (const segment of run.segments) {
+      for (const round of segment.rounds) {
+        const sceneLabel = llmCallSceneLabel(round.scene)
+        if (includesQuery([round.modelName, round.provider, round.scene, sceneLabel, round.errorMessage], needle)) {
+          hits.push({
+            runId: run.runId,
+            kind: 'round',
+            anchorKey: `${segment.kind}:${round.seq}`,
+            label: `#${round.seq} ${round.modelName ?? '未知模型'}`,
+          })
+        }
+        for (const tool of round.tools) pushTool(tool, segment.kind)
+      }
+      for (const tool of segment.unplacedTools) pushTool(tool, segment.kind)
+    }
+
+    run.sideCalls.forEach((side, index) => {
+      const sceneLabel = llmCallSceneLabel(side.scene)
+      if (!includesQuery([side.scene, sceneLabel, side.modelName], needle)) return
+      hits.push({
+        runId: run.runId,
+        kind: 'side',
+        anchorKey: String(index),
+        label: `${sceneLabel} · ${side.modelName ?? '未知模型'}`,
+      })
+    })
+
+    for (const link of run.subagentLinks) {
+      if (!includesQuery([link.title], needle)) continue
+      hits.push({
+        runId: run.runId,
+        kind: 'subagent',
+        anchorKey: String(link.sessionId),
+        label: link.title || `会话 ${link.sessionId}`,
+      })
+    }
+
+    run.markers.forEach((marker, index) => {
+      if (!includesQuery([marker.detail], needle)) return
+      hits.push({
+        runId: run.runId,
+        kind: 'marker',
+        anchorKey: String(index),
+        label: marker.detail,
+      })
+    })
+  }
+  return hits
+}
+
 /** "yyyy-MM-dd HH:mm:ss" → "HH:mm"；缺时间戳返回空串。 */
 export function formatClock(startedAt: string | null): string {
   if (startedAt == null) return ''

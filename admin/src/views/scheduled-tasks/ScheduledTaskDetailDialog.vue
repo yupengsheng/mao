@@ -69,6 +69,15 @@
         </el-table-column>
         <el-table-column prop="errorSummary" label="错误摘要" min-width="160" show-overflow-tooltip />
       </el-table>
+      <div v-if="!runsLoading && total > 0" class="runs-pagination">
+        <el-pagination
+          v-model:current-page="currentPage"
+          layout="prev, pager, next, total"
+          :total="total"
+          :page-size="pageSize"
+          @current-change="handlePageChange"
+        />
+      </div>
     </div>
 
     <div class="prompt-section">
@@ -100,7 +109,7 @@
 import { ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { api } from '../../api'
+import { api, apiGetWithHeaders } from '../../api'
 import ResponsiveDialog from '../../components/ResponsiveDialog.vue'
 import { formatDateTime } from '../../utils/datetime'
 import { execStatusLabel, execStatusTagType } from './task-display'
@@ -109,6 +118,10 @@ import type { ScheduledTaskRow, ScheduledTaskRunRow } from './types'
 const runs = ref<ScheduledTaskRunRow[]>([])
 const runsLoading = ref(false)
 const running = ref(false)
+const currentPage = ref(1)
+const pageSize = 20
+const total = ref(0)
+let loadSeq = 0
 
 const props = defineProps<{
   modelValue: boolean
@@ -129,21 +142,53 @@ const router = useRouter()
 watch(() => [props.modelValue, props.task?.id] as const, ([visible, taskId]) => {
   if (!visible || taskId == null) {
     runs.value = []
+    total.value = 0
     return
   }
-  void loadRuns(taskId)
+  currentPage.value = 1
+  void loadRuns(taskId, 1)
 }, { immediate: true })
 
-async function loadRuns(taskId: number) {
+function readTotalCount(headers: unknown): number {
+  if (!headers || typeof headers !== 'object') return NaN
+  const bag = headers as { get?: (name: string) => unknown } & Record<string, unknown>
+  const raw = typeof bag.get === 'function' ? bag.get('x-total-count') : bag['x-total-count']
+  const value = Array.isArray(raw) ? raw[0] : raw
+  return Number(value)
+}
+
+async function loadRuns(taskId: number, page = currentPage.value) {
+  const seq = ++loadSeq
   runsLoading.value = true
   try {
-    const { data } = await api.get(`/scheduled-tasks/${taskId}/runs`, { params: { limit: 20 } })
-    runs.value = Array.isArray(data) ? data : []
+    const { result, headers } = await apiGetWithHeaders<ScheduledTaskRunRow[]>(`/scheduled-tasks/${taskId}/runs`, {
+      params: { pageNum: page, pageSize },
+    })
+    if (seq !== loadSeq) return
+    const records = Array.isArray(result.data) ? result.data : []
+    const headerTotal = readTotalCount(headers)
+    total.value = Number.isFinite(headerTotal) ? headerTotal : records.length
+    const maxPage = Math.max(1, Math.ceil(total.value / pageSize))
+    if (page > maxPage) {
+      currentPage.value = maxPage
+      void loadRuns(taskId, maxPage)
+      return
+    }
+    currentPage.value = page
+    runs.value = records
   } catch {
-    runs.value = []
+    if (seq === loadSeq) {
+      runs.value = []
+      total.value = 0
+    }
   } finally {
-    runsLoading.value = false
+    if (seq === loadSeq) runsLoading.value = false
   }
+}
+
+function handlePageChange(page: number) {
+  if (props.task?.id == null) return
+  void loadRuns(props.task.id, page)
 }
 
 function runStatusLabel(status: string): string {
@@ -248,5 +293,11 @@ function copyPrompt() {
   font-size: 12px;
   color: var(--mao-muted);
   line-height: 1.5;
+}
+
+.runs-pagination {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 12px;
 }
 </style>

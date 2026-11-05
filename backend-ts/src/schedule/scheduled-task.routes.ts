@@ -119,10 +119,17 @@ export function registerScheduledTaskRoutes(app: FastifyInstance, deps: Schedule
       sendJson(reply, 200, failCode(ErrorCode.SCHEDULED_TASK_ACCESS_DENIED));
       return;
     }
+    const allowNonOwner = task.userId !== userId;
+    const pageNum = queryOptInt(req, 'pageNum');
+    const pageSize = queryOptInt(req, 'pageSize');
+    if (pageNum != null || pageSize != null) {
+      const page = await deps.service.listRunsPage(id, userId, pageNum ?? 1, pageSize ?? 20, { allowNonOwner });
+      reply.header('x-total-count', String(page.total));
+      sendJson(reply, 200, ok(page.records));
+      return;
+    }
     const rawLimit = queryInt(req, 'limit', 20);
-    sendJson(reply, 200, ok(await deps.service.listRuns(id, userId, rawLimit, {
-      allowNonOwner: task.userId !== userId,
-    })));
+    sendJson(reply, 200, ok(await deps.service.listRuns(id, userId, rawLimit, { allowNonOwner })));
   });
 
   app.post('/v1/scheduled-tasks/:id/run', async (req, reply) => {

@@ -1356,4 +1356,44 @@ describe('ScheduledTaskService manual run', () => {
     expect(h.store.deleteUnstartedRun).toHaveBeenCalledWith(1, fireTime);
     expect(h.runs).toHaveLength(0);
   });
+
+  it('paginates run history with deterministic clamping', async () => {
+    const localStubs = {
+      getSession: vi.fn(),
+      updatePhase: vi.fn(),
+      saveMessage: vi.fn(),
+      getMessages: vi.fn(),
+    };
+    const pagedStore: ScheduledTaskStore = {
+      insert: vi.fn(),
+      updateById: vi.fn(),
+      deleteById: vi.fn(),
+      selectById: vi.fn(async () => ({ id: 5, userId: 7 })),
+      listByUser: vi.fn(async () => []),
+      listAll: vi.fn(async () => ({ records: [], total: 0 })),
+      listDue: vi.fn(async () => []),
+      listRuns: vi.fn(async () => [{ id: 2, taskId: 5 }]),
+      countRuns: vi.fn(async () => 47),
+    };
+    const svc = new ScheduledTaskService(
+      pagedStore,
+      localStubs as never,
+      { enqueue: vi.fn() },
+      { executeFromEvent: vi.fn() },
+      { finishExecution: vi.fn() },
+      { sendText: vi.fn() },
+      { findByUserId: vi.fn() },
+      { findByAccountId: vi.fn() },
+    );
+
+    const page = await svc.listRunsPage(5, 7, 3, 999);
+    expect(pagedStore.listRuns).toHaveBeenCalledWith(5, 50, 100);
+    expect(page.total).toBe(47);
+
+    await svc.listRunsPage(5, 7, -3, 0);
+    expect(pagedStore.listRuns).toHaveBeenLastCalledWith(5, 1, 0);
+
+    await svc.listRuns(5, 7, 500);
+    expect(pagedStore.listRuns).toHaveBeenLastCalledWith(5, 50);
+  });
 });

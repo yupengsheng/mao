@@ -17,7 +17,7 @@ const HELP = `用法:
   mao scheduled-task get --id <id>
   mao scheduled-task update --id <id> [--name] [--prompt] [--cron-expression] [--status ACTIVE|PAUSED] [--retry-max 0-5] [--retry-interval-minutes 1-60] [--missed-policy RUN_ONCE|SKIP]
   mao scheduled-task run-now --id <id>
-  mao scheduled-task runs --id <id> [--limit 1-50]
+  mao scheduled-task runs --id <id> [--page-num <页码>] [--page-size <每页条数>] [--limit 1-50]
   mao scheduled-task delete --id <id>
 
 说明:
@@ -25,6 +25,7 @@ const HELP = `用法:
   list-all 需 session:read 权限；筛选参数与管理后台一致。
   update/delete 他人任务需 scheduled-task:write 权限（本人任务不受限）；任务名称 ≤200 字符、提示词 ≤10000 字符。
   run-now 立即执行一次且不改变下一次 cron 档期；他人任务需 scheduled-task:write。
+  runs 传 page-num/page-size 时分页，响应头 x-total-count 为总数；不传时沿用 limit 的旧行为。
 `;
 
 const STATUSES = new Set(['ACTIVE', 'PAUSED']);
@@ -136,8 +137,22 @@ async function handle(ctx) {
     }
     case 'runs': {
       const id = requireNumber(flags, 'id', '定时任务 ID');
+      const pageNum = optionalNumber(flags, 'page-num');
+      const pageSize = optionalNumber(flags, 'page-size');
       const limit = optionalNumber(flags, 'limit');
       const query = {};
+      if (pageNum !== undefined) {
+        if (!Number.isInteger(pageNum) || pageNum < 1) {
+          throw createCliError('--page-num 必须是大于等于 1 的整数');
+        }
+        query.pageNum = String(pageNum);
+      }
+      if (pageSize !== undefined) {
+        if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 50) {
+          throw createCliError('--page-size 必须是 1 到 50 的整数');
+        }
+        query.pageSize = String(pageSize);
+      }
       if (limit !== undefined) {
         if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
           throw createCliError('--limit 必须是 1 到 50 的整数');

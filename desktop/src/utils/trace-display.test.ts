@@ -10,6 +10,8 @@ import {
   runTimeWindow,
   timeBandGeometry,
   messageContentSummary,
+  highlightParts,
+  searchTraceRuns,
   type TimeBandNode,
 } from './trace-display'
 import type { RunTrace, TraceRound, TraceTool } from '../types/trace'
@@ -486,5 +488,117 @@ describe('messageContentSummary', () => {
     const summary = messageContentSummary('[{"type":"text"')
     expect(summary.multimodal).toBe(false)
     expect(summary.text).toBe('[{"type":"text"')
+  })
+})
+
+describe('highlightParts', () => {
+  it('空查询原样返回一段且不标记命中', () => {
+    expect(highlightParts('提交推送', '  ')).toEqual([{ text: '提交推送', hit: false }])
+  })
+
+  it('大小写不敏感，保留原文大小写并切出全部命中片段', () => {
+    expect(highlightParts('Read_File 和 read_file', 'read_FILE')).toEqual([
+      { text: 'Read_File', hit: true },
+      { text: ' 和 ', hit: false },
+      { text: 'read_file', hit: true },
+    ])
+  })
+
+  it('空文本返回空数组', () => {
+    expect(highlightParts(null, 'x')).toEqual([])
+    expect(highlightParts('', 'x')).toEqual([])
+  })
+})
+
+describe('searchTraceRuns', () => {
+  const run = makeRun({
+    runId: 31,
+    userMessagePreview: '排查登录页白屏',
+    segments: [
+      {
+        kind: 'current',
+        rounds: [
+          makeRound({
+            seq: 1,
+            modelName: 'step-5',
+            provider: 'anthropic',
+            scene: 'agent',
+            errorMessage: 'upstream timeout',
+            tools: [
+              makeTool({ toolCallId: 'call_read', name: 'read_file', target: 'src/login.vue', approvalMark: '已批准' }),
+              makeTool({ toolCallId: 'call_read_2', name: 'read_file', target: 'src/login.vue' }),
+            ],
+          }),
+        ],
+        unplacedTools: [makeTool({ toolCallId: 'call_glob', name: 'glob', target: 'src/**/*.vue' })],
+      },
+    ],
+    sideCalls: [{
+      scene: 'title',
+      modelName: 'step-mini',
+      createdAt: '2026-10-10 16:00:01',
+      startedAtMs: 1000,
+      provider: 'anthropic',
+      durationMs: 200,
+      promptTokens: 10,
+      completionTokens: 2,
+      cachedTokens: 0,
+      cacheCreationTokens: 0,
+      costMicros: null,
+      success: true,
+    }],
+    subagentLinks: [{ sessionId: 77, title: '登录页排查子代理' }],
+    markers: [{ kind: 'compaction', atMessageId: 901, detail: '压缩了 12 条历史消息' }],
+  })
+
+  it('空查询不返回命中', () => {
+    expect(searchTraceRuns([run], '   ')).toEqual([])
+  })
+
+  it('匹配消息预览、轮次、工具、旁路、子代理与压缩标记', () => {
+    expect(searchTraceRuns([run], '登录页').map((h) => h.kind)).toEqual(['run', 'subagent'])
+    expect(searchTraceRuns([run], 'step-mini').map((h) => h.kind)).toEqual(['side'])
+    expect(searchTraceRuns([run], 'timeout').map((h) => h.kind)).toEqual(['round'])
+    expect(searchTraceRuns([run], '已批准').map((h) => h.kind)).toEqual(['tool'])
+    expect(searchTraceRuns([run], '12 条').map((h) => h.kind)).toEqual(['marker'])
+  })
+
+  it('同一可见行多字段命中只算一条', () => {
+    expect(searchTraceRuns([run], 'read_file')).toHaveLength(2)
+    expect(searchTraceRuns([run], 'src/login.vue')).toHaveLength(2)
+  })
+
+  it('工具命中锚点与时间条带 key 同源（去掉 tool: 前缀），可直接作为行锚点 key', () => {
+    const hits = searchTraceRuns([run], 'glob')
+    const bandKey = runTimeNodes(run).find((n) => n.kind === 'tool' && n.toolRef?.name === 'glob')!.key
+    expect(hits).toEqual([{
+      runId: 31,
+      kind: 'tool',
+      anchorKey: bandKey.slice('tool:'.length),
+      label: 'glob · src/**/*.vue',
+    }])
+  })
+
+  it('顺序与面板视觉顺序一致：摘要 → 轮次 / 工具 → 未挂轮工具 → 旁路 → 子代理 → 标记', () => {
+    const orderedRun = makeRun({
+      runId: 32,
+      userMessagePreview: 'trace 上下文排查',
+      segments: [{
+        kind: 'current',
+        rounds: [makeRound({ modelName: 'trace-model', tools: [makeTool({ name: 'trace_tool', target: 'trace.txt' })] })],
+        unplacedTools: [],
+      }],
+      sideCalls: [{ ...run.sideCalls[0]!, modelName: 'trace-side' }],
+      subagentLinks: [{ sessionId: 78, title: 'trace-subagent' }],
+      markers: [{ kind: 'compaction', atMessageId: 902, detail: 'trace-marker' }],
+    })
+    expect(searchTraceRuns([orderedRun], 'trace').map((h) => h.kind)).toEqual([
+      'run',
+      'round',
+      'tool',
+      'side',
+      'subagent',
+      'marker',
+    ])
   })
 })

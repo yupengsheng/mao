@@ -98,7 +98,8 @@ export interface ScheduledTaskStore {
   clearPendingRetries?(taskId: number): Promise<void>;
   oldestQueuedRun?(taskId: number): Promise<ScheduledTaskRun | null>;
   hasPendingRetry?(taskId: number): Promise<boolean>;
-  listRuns?(taskId: number, limit: number): Promise<ScheduledTaskRun[]>;
+  listRuns?(taskId: number, limit: number, offset?: number): Promise<ScheduledTaskRun[]>;
+  countRuns?(taskId: number): Promise<number>;
   listDueRetries?(now: string): Promise<ScheduledTaskRun[]>;
   listMissedTasks?(before: string): Promise<ScheduledTask[]>;
   insertMissedIgnore?(run: Pick<ScheduledTaskRun, 'taskId' | 'fireTime' | 'sessionId'>): Promise<void>;
@@ -526,6 +527,22 @@ export class ScheduledTaskService {
     if (this.store.listRuns == null) return [];
     const size = Math.min(50, Math.max(1, Math.trunc(Number.isFinite(limit) ? limit : 20)));
     return this.store.listRuns(taskId, size);
+  }
+
+  async listRunsPage(
+    taskId: number,
+    userId: number,
+    pageNum: number,
+    pageSize: number,
+    opts?: { allowNonOwner?: boolean },
+  ): Promise<{ records: ScheduledTaskRun[]; total: number }> {
+    await this.getTaskOwnedByUser(taskId, userId, opts?.allowNonOwner);
+    if (this.store.listRuns == null) return { records: [], total: 0 };
+    const page = Math.max(1, Math.trunc(Number.isFinite(pageNum) ? pageNum : 1));
+    const size = Math.min(50, Math.max(1, Math.trunc(Number.isFinite(pageSize) ? pageSize : 20)));
+    const records = await this.store.listRuns(taskId, size, (page - 1) * size);
+    const total = this.store.countRuns ? await this.store.countRuns(taskId) : records.length;
+    return { records, total };
   }
 
   async executeTask(task: ScheduledTask, ctx?: { isRetry?: boolean; manual?: boolean; fireTime?: string; runId?: number }): Promise<void> {

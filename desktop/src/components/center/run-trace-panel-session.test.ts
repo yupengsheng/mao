@@ -715,3 +715,127 @@ describe('RunTracePanel 时间条带与记录下钻', () => {
     expect(findAllByClass(root, 'drawer-stub')).toHaveLength(0)
   })
 })
+
+// 已加载页搜索是「定位器」而不是过滤器：命中只负责展开 / 滚动 / 闪高亮，
+// 列表与时间条带始终保留原样；这里覆盖输入、命中计数、键盘翻页与清空回收。
+describe('RunTracePanel 已加载页搜索', () => {
+  const searchRun = makeTraceRun({
+    runId: 41,
+    userMessagePreview: '排查登录页白屏',
+    segments: [{
+      kind: 'current',
+      rounds: [makeTraceRound({
+        modelName: 'step-login',
+        tools: [{ toolCallId: 'call_glob', name: 'glob', target: 'src/login.vue', status: 'OK', durationMs: 100, startedAtMs: 0, approvalMark: null, actor: null }],
+      })],
+      unplacedTools: [],
+    }],
+    subagentLinks: [{ sessionId: 77, title: '登录页子代理' }],
+    markers: [{ kind: 'compaction', atMessageId: 901, detail: '压缩 12 条历史消息' }],
+  })
+
+  beforeEach(() => {
+    bandBars.length = 0
+    drawerOpened.length = 0
+    store = { ...makeStore(), getTraceRuns: () => [searchRun] }
+  })
+
+  function inputSearch(root: StubEl, value: string) {
+    const input = findAllByClass(root, 'trace-search-input')[0]!
+    ;(input.props.onInput as (event: unknown) => void)({ target: { value } })
+  }
+
+  function searchCount(root: StubEl): string {
+    const el = findAllByClass(root, 'trace-search-count')[0]
+    return el == null ? '' : flatText(el).trim()
+  }
+
+  it('命中消息预览时自动展开 run 并高亮片段', async () => {
+    const root = await mountPanel()
+    expect(findAllByClass(root, 'run-detail')).toHaveLength(0)
+
+    inputSearch(root, '登录')
+    await flush()
+
+    // 摘要 + 子代理标题两条命中；默认定位第一条
+    expect(searchCount(root)).toBe('1/2')
+    expect(findAllByClass(root, 'run-detail')).toHaveLength(1)
+    expect(findAllByClass(root, 'run-summary')[0]!.props.id).toBe('trace-11-run41-run-summary')
+    expect(findAllByClass(root, 'search-hit-text').length).toBeGreaterThan(0)
+  })
+
+  it('工具 / 子代理 / 压缩标记命中都有可定位的行锚点', async () => {
+    const root = await mountPanel()
+
+    inputSearch(root, 'glob')
+    await flush()
+    expect(findAllByClass(root, 'tool-row')[0]!.props.id).toBe('trace-11-run41-tool-current:call_glob|src/login.vue|glob|0')
+
+    inputSearch(root, '子代理')
+    await flush()
+    expect(findAllByClass(root, 'subagent-link')[0]!.props.id).toBe('trace-11-run41-subagent-77')
+
+    inputSearch(root, '压缩')
+    await flush()
+    expect(findAllByClass(root, 'marker-row')[0]!.props.id).toBe('trace-11-run41-marker-0')
+  })
+
+  it('无命中时提示「无命中」且不自动展开', async () => {
+    const root = await mountPanel()
+
+    inputSearch(root, '不存在的词')
+    await flush()
+
+    expect(searchCount(root)).toBe('无命中')
+    expect(findAllByClass(root, 'run-detail')).toHaveLength(0)
+    expect(findAllByClass(root, 'search-hit-text')).toHaveLength(0)
+  })
+
+  it('Enter / Shift+Enter 循环翻页，Escape 清空搜索', async () => {
+    const root = await mountPanel()
+    const input = findAllByClass(root, 'trace-search-input')[0]!
+    inputSearch(root, '登录')
+    await flush()
+    expect(searchCount(root)).toBe('1/2')
+
+    const keydown = (key: string, shiftKey = false) => {
+      ;(input.props.onKeydown as (event: unknown) => void)({ key, shiftKey, preventDefault: vi.fn() })
+    }
+    keydown('Enter')
+    await flush()
+    expect(searchCount(root)).toBe('2/2')
+
+    keydown('Enter')
+    await flush()
+    expect(searchCount(root)).toBe('1/2')
+
+    keydown('Enter', true)
+    await flush()
+    expect(searchCount(root)).toBe('2/2')
+
+    keydown('Escape')
+    await flush()
+    expect(findAllByClass(root, 'trace-search-count')).toHaveLength(0)
+    expect(input.props.value).toBe('')
+    // 清空只回收搜索态，已展开的 run 与列表保持不动
+    expect(findAllByClass(root, 'run-detail')).toHaveLength(1)
+    expect(findAllByClass(root, 'search-hit-text')).toHaveLength(0)
+  })
+
+  it('清空按钮回收计数与高亮，列表不被过滤', async () => {
+    const root = await mountPanel()
+    inputSearch(root, '登录')
+    await flush()
+    expect(findAllByClass(root, 'search-hit-text').length).toBeGreaterThan(0)
+
+    const buttons = findAllByClass(root, 'trace-search-btn')
+    expect(buttons).toHaveLength(3)
+    ;(buttons[2]!.props.onClick as () => void)()
+    await flush()
+
+    expect(findAllByClass(root, 'trace-search-count')).toHaveLength(0)
+    expect(findAllByClass(root, 'search-hit-text')).toHaveLength(0)
+    expect(findAllByClass(root, 'run-summary')).toHaveLength(1)
+    expect(findAllByClass(root, 'run-detail')).toHaveLength(1)
+  })
+})

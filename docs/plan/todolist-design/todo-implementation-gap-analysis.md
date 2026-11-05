@@ -1,6 +1,26 @@
 # TodoList 集成改进技术方案
 
-> 对照 `agent-todolist-design-pattern.md` 设计模式，逐项分析当前实现的差距并给出完整的改进方案。
+> **2026-11-05 状态校正：本文是历史差距分析，不是当前 backlog。** 文中多数缺口已实施，且下方部分路径仍指向已移除的 Java 后端。保留原文用于回溯设计判断；当前能力以本节状态表、源码与 `CHANGELOG.md` 为准。
+
+## 2026-11-05 当前实现状态
+
+| 设计关注点 | 当前实现 | 结论 |
+|---|---|---|
+| System Prompt 注入 | `backend-ts/src/harness/core/prompt-engine.ts` 已包含任务管理提示，并按 `task_create` / `task_update` / `task_list` / `task_delete` 动态注入 | 已实施 |
+| 工具拆分 | 已由单一 `todo` 拆为 `task_create` / `task_update` / `task_list` / `task_delete`，见 `harness/tool/impl/task-tools.ts` | 已实施 |
+| 行为规范与返回反馈 | 工具描述包含使用 / 不使用场景，返回值带下一步提示；读取已完成任务时会引导查找下一个可执行任务 | 已实施 |
+| 数据模型 | `V022` 已有 `description`、`active_form`、`sort_order`、`owner`、`claimed_at`、`blocked_by`；工具 schema 已暴露 `description` / `active_form` | 部分暴露 |
+| UI 可见性 | `TodoChecklist.vue` 已有进度、当前项高亮、自动聚焦与滚动提示 | 已实施 |
+| 单 in_progress 约束 | `resetInProgress` 与 `task_update` 状态机已保证同一会话仅一个进行中事项 | 已实施 |
+| 多 Agent 协作 / DAG | 未实现，且当前产品方向不包含多 Agent DAG | 非目标 |
+
+**剩余缺口**：`owner` / `blocked_by` 尚未暴露到任务工具 schema，UI 也不展示阻塞原因或依赖关系。若后续确有单 Agent 场景的依赖展示需求，应单独设计；不要把这项补强重新包装成多 Agent DAG 协作。
+
+以下保留 2026-05-20 前后的原始差距分析。
+
+---
+
+> 对照 `agent-todolist-design-pattern.md` 设计模式，逐项分析当时实现的差距并给出改进方案。
 
 ---
 

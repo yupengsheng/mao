@@ -6,6 +6,25 @@
         <span>运行轨迹</span>
       </div>
       <div class="trace-toolbar-actions">
+        <label class="trace-search" title="只搜索当前已加载的轨迹，不请求后端">
+          <input
+            class="trace-search-input"
+            type="text"
+            :value="searchQuery"
+            placeholder="搜索已加载轨迹"
+            aria-label="搜索已加载轨迹"
+            @input="onSearchInput"
+            @keydown="onSearchKeydown"
+          />
+          <span
+            v-if="searchQuery.trim()"
+            class="trace-search-count"
+            :class="{ 'is-empty': searchHits.length === 0 }"
+          >{{ searchHits.length === 0 ? '无命中' : `${searchHitPosition + 1}/${searchHits.length}` }}</span>
+          <button v-if="searchQuery.trim()" type="button" class="trace-search-btn" title="上一个命中（Shift+Enter）" :disabled="searchHits.length === 0" @click="stepSearch(-1)">↑</button>
+          <button v-if="searchQuery.trim()" type="button" class="trace-search-btn" title="下一个命中（Enter）" :disabled="searchHits.length === 0" @click="stepSearch(1)">↓</button>
+          <button v-if="searchQuery.trim()" type="button" class="trace-search-btn" title="清空搜索" @click="clearSearch">×</button>
+        </label>
         <label class="threshold-field" title="模型调用耗时达到该值记「慢」">
           <span>慢 ≥</span>
           <el-input-number
@@ -86,7 +105,12 @@
         class="run-card"
         :class="`severity-${runSeverity(run)}`"
       >
-        <button type="button" class="run-summary" @click="toggleRun(run.runId)">
+        <button
+          type="button"
+          class="run-summary"
+          :id="rowAnchorId(run.runId, 'run', 'summary')"
+          @click="toggleRun(run.runId)"
+        >
           <el-icon class="run-caret" :size="12">
             <ArrowRight v-if="!isExpanded(run.runId)" />
             <ArrowDown v-else />
@@ -101,7 +125,13 @@
           </span>
           <!-- 消息预览不带自己的点击入口：整行（含任务名）只做展开 / 收起切换；
                完整原文入口在展开区顶部「查看原文」（预览曾独占点击并把 toggle 拦掉） -->
-          <span class="run-preview">{{ run.userMessagePreview || '(空消息)' }}</span>
+          <span class="run-preview">
+            <span
+              v-for="(part, partIndex) in highlightParts(run.userMessagePreview || '(空消息)', searchQuery)"
+              :key="partIndex"
+              :class="{ 'search-hit-text': part.hit }"
+            >{{ part.text }}</span>
+          </span>
           <span class="run-metrics">
             <span>耗时 {{ formatMs(run.totals.wallClockMs) }}</span>
             <span>{{ formatTokens(tokenTotal(run)) }} tokens</span>
@@ -133,9 +163,27 @@
             <div v-for="round in segment.rounds" :key="`${segment.kind}-${round.seq}`" :id="rowAnchorId(run.runId, 'round', roundAnchorKey(segment.kind, round.seq))" class="round-row">
               <div class="round-head">
                 <span class="round-seq">#{{ round.seq }}</span>
-                <span class="round-model">{{ round.modelName ?? '未知模型' }}</span>
-                <span v-if="round.provider" class="round-provider" :title="`模型提供方 ${round.provider}`">{{ round.provider }}</span>
-                <span class="round-scene">{{ llmCallSceneLabel(round.scene) }}</span>
+                <span class="round-model">
+                  <span
+                    v-for="(part, partIndex) in highlightParts(round.modelName ?? '未知模型', searchQuery)"
+                    :key="partIndex"
+                    :class="{ 'search-hit-text': part.hit }"
+                  >{{ part.text }}</span>
+                </span>
+                <span v-if="round.provider" class="round-provider" :title="`模型提供方 ${round.provider}`">
+                  <span
+                    v-for="(part, partIndex) in highlightParts(round.provider, searchQuery)"
+                    :key="partIndex"
+                    :class="{ 'search-hit-text': part.hit }"
+                  >{{ part.text }}</span>
+                </span>
+                <span class="round-scene">
+                  <span
+                    v-for="(part, partIndex) in highlightParts(llmCallSceneLabel(round.scene), searchQuery)"
+                    :key="partIndex"
+                    :class="{ 'search-hit-text': part.hit }"
+                  >{{ part.text }}</span>
+                </span>
                 <span class="round-metrics">
                   <span>{{ formatMs(round.durationMs) }}</span>
                   <span v-if="decodingMs(round) != null" title="解码耗时 = 总耗时 − 首字耗时">解码 {{ formatMs(decodingMs(round)) }}</span>
@@ -159,15 +207,39 @@
                   >详情</button>
                 </span>
               </div>
-              <div v-if="round.errorMessage" class="round-error">{{ round.errorMessage }}</div>
+              <div v-if="round.errorMessage" class="round-error">
+                <span
+                  v-for="(part, partIndex) in highlightParts(round.errorMessage, searchQuery)"
+                  :key="partIndex"
+                  :class="{ 'search-hit-text': part.hit }"
+                >{{ part.text }}</span>
+              </div>
               <div v-for="tool in round.tools" :key="toolRowKey(run, tool)" :id="rowAnchorId(run.runId, 'tool', toolRowAnchor(run, tool))" class="tool-row">
                 <span class="tool-status" :class="tool.status === 'ERROR' ? 'tool-error' : 'tool-ok'">
                   {{ tool.status === 'ERROR' ? '✕' : '✓' }}
                 </span>
                 <span v-if="tool.actor === 'user'" class="tool-actor" title="用户手动操作">用户</span>
-                <span class="tool-name">{{ toolDisplayName(tool.name) }}</span>
-                <span v-if="tool.target" class="tool-target" :title="tool.target">{{ tool.target }}</span>
-                <span v-if="tool.approvalMark" class="tool-approval">{{ tool.approvalMark }}</span>
+                <span class="tool-name">
+                  <span
+                    v-for="(part, partIndex) in highlightParts(toolDisplayName(tool.name), searchQuery)"
+                    :key="partIndex"
+                    :class="{ 'search-hit-text': part.hit }"
+                  >{{ part.text }}</span>
+                </span>
+                <span v-if="tool.target" class="tool-target" :title="tool.target">
+                  <span
+                    v-for="(part, partIndex) in highlightParts(tool.target, searchQuery)"
+                    :key="partIndex"
+                    :class="{ 'search-hit-text': part.hit }"
+                  >{{ part.text }}</span>
+                </span>
+                <span v-if="tool.approvalMark" class="tool-approval">
+                  <span
+                    v-for="(part, partIndex) in highlightParts(tool.approvalMark, searchQuery)"
+                    :key="partIndex"
+                    :class="{ 'search-hit-text': part.hit }"
+                  >{{ part.text }}</span>
+                </span>
                 <span class="tool-duration">{{ tool.durationMs == null ? '—' : formatMs(tool.durationMs) }}</span>
                 <button
                   v-if="tool.toolCallId"
@@ -185,9 +257,27 @@
                   {{ tool.status === 'ERROR' ? '✕' : '✓' }}
                 </span>
                 <span v-if="tool.actor === 'user'" class="tool-actor" title="用户手动操作">用户</span>
-                <span class="tool-name">{{ toolDisplayName(tool.name) }}</span>
-                <span v-if="tool.target" class="tool-target" :title="tool.target">{{ tool.target }}</span>
-                <span v-if="tool.approvalMark" class="tool-approval">{{ tool.approvalMark }}</span>
+                <span class="tool-name">
+                  <span
+                    v-for="(part, partIndex) in highlightParts(toolDisplayName(tool.name), searchQuery)"
+                    :key="partIndex"
+                    :class="{ 'search-hit-text': part.hit }"
+                  >{{ part.text }}</span>
+                </span>
+                <span v-if="tool.target" class="tool-target" :title="tool.target">
+                  <span
+                    v-for="(part, partIndex) in highlightParts(tool.target, searchQuery)"
+                    :key="partIndex"
+                    :class="{ 'search-hit-text': part.hit }"
+                  >{{ part.text }}</span>
+                </span>
+                <span v-if="tool.approvalMark" class="tool-approval">
+                  <span
+                    v-for="(part, partIndex) in highlightParts(tool.approvalMark, searchQuery)"
+                    :key="partIndex"
+                    :class="{ 'search-hit-text': part.hit }"
+                  >{{ part.text }}</span>
+                </span>
                 <span class="tool-duration">{{ tool.durationMs == null ? '—' : formatMs(tool.durationMs) }}</span>
                 <button
                   v-if="tool.toolCallId"
@@ -203,8 +293,20 @@
           <div v-if="run.sideCalls.length > 0" class="side-calls">
             <div class="segment-label">旁路调用</div>
             <div v-for="(side, idx) in run.sideCalls" :key="idx" :id="rowAnchorId(run.runId, 'side', idx)" class="side-row">
-              <span class="side-scene">{{ llmCallSceneLabel(side.scene) }}</span>
-              <span class="side-model">{{ side.modelName ?? '未知模型' }}</span>
+              <span class="side-scene">
+                <span
+                  v-for="(part, partIndex) in highlightParts(llmCallSceneLabel(side.scene), searchQuery)"
+                  :key="partIndex"
+                  :class="{ 'search-hit-text': part.hit }"
+                >{{ part.text }}</span>
+              </span>
+              <span class="side-model">
+                <span
+                  v-for="(part, partIndex) in highlightParts(side.modelName ?? '未知模型', searchQuery)"
+                  :key="partIndex"
+                  :class="{ 'search-hit-text': part.hit }"
+                >{{ part.text }}</span>
+              </span>
               <span class="side-metrics">
                 <span>{{ formatMs(side.durationMs) }}</span>
                 <span>{{ formatTokens(tokenTotalOfSide(side)) }} tokens</span>
@@ -216,16 +318,28 @@
 
           <div v-if="run.subagentLinks.length > 0" class="subagent-links">
             <div class="segment-label">子代理</div>
-            <div v-for="link in run.subagentLinks" :key="link.sessionId" class="subagent-link">
-              <span class="subagent-title" :title="link.title ?? ''">{{ link.title || `会话 ${link.sessionId}` }}</span>
+            <div v-for="link in run.subagentLinks" :key="link.sessionId" :id="rowAnchorId(run.runId, 'subagent', link.sessionId)" class="subagent-link">
+              <span class="subagent-title" :title="link.title ?? ''">
+                <span
+                  v-for="(part, partIndex) in highlightParts(link.title || `会话 ${link.sessionId}`, searchQuery)"
+                  :key="partIndex"
+                  :class="{ 'search-hit-text': part.hit }"
+                >{{ part.text }}</span>
+              </span>
               <span class="subagent-id">#{{ link.sessionId }}</span>
             </div>
           </div>
 
           <div v-if="run.markers.length > 0" class="markers">
-            <div v-for="marker in run.markers" :key="marker.atMessageId" class="marker-row">
+            <div v-for="(marker, markerIndex) in run.markers" :key="marker.atMessageId" :id="rowAnchorId(run.runId, 'marker', markerIndex)" class="marker-row">
               <span class="marker-label">上下文压缩</span>
-              <span class="marker-detail" :title="marker.detail">{{ marker.detail }}</span>
+              <span class="marker-detail" :title="marker.detail">
+                <span
+                  v-for="(part, partIndex) in highlightParts(marker.detail, searchQuery)"
+                  :key="partIndex"
+                  :class="{ 'search-hit-text': part.hit }"
+                >{{ part.text }}</span>
+              </span>
             </div>
           </div>
         </div>
@@ -306,6 +420,7 @@ import { downloadTraceCsv, downloadTraceJson } from '../../utils/trace-export'
 import {
   decodingMs, formatClock, formatTokens, RUN_STATUS_META, runAttentionBadges, runStatus, summarizeRuns,
   throughput, formatThroughput, toolSuccessRate, toolAnchorKey as toolAnchorKeyOf, runTimeNodes,
+  highlightParts, searchTraceRuns,
 } from '../../utils/trace-display'
 import RunTraceTimeBand from './RunTraceTimeBand.vue'
 import RunTraceRecordDrawer from './RunTraceRecordDrawer.vue'
@@ -338,6 +453,18 @@ const unattributedExpanded = ref(false)
 const exporting = ref(false)
 /** 已加载的页数：执行结束后按同样页数重拉，避免把用户翻出来的历史页丢掉 */
 const loadedPages = ref(1)
+
+// ===== 已加载页搜索 =====
+// 只索引面板已拿到的 run；不请求后端、不把未加载的历史页算进命中。
+// 搜索是「定位器」而不是过滤器：列表、时间条带与搜索前完全一致，清空只回收高亮与计数。
+const searchQuery = ref('')
+const searchHits = computed(() => searchTraceRuns(runs.value, searchQuery.value))
+const activeHitIndex = ref(-1)
+/** 刷新 / 加载更多后命中数会变，展示与翻页都按夹紧后的位置走，避免显示 0/3 或越界 */
+const searchHitPosition = computed(() => {
+  if (searchHits.value.length === 0) return 0
+  return Math.min(Math.max(activeHitIndex.value, 0), searchHits.value.length - 1)
+})
 
 const slowMsInput = ref(sessionStore.traceThresholds.slowMs)
 const expensiveCostInput = ref(sessionStore.traceThresholds.expensiveCost)
@@ -563,7 +690,11 @@ function roundAnchorKey(segmentKind: string, seq: number): string {
  * （expandedRuns 是 Set，可同时展开多个 run，两段的 seq 又各自从 1 起）；
  * key 里的段维度防编辑重发的 before_edit / current 两段相撞。
  */
-function rowAnchorId(runId: number, kind: 'round' | 'tool' | 'side', key: string | number): string {
+function rowAnchorId(
+  runId: number,
+  kind: 'run' | 'round' | 'tool' | 'side' | 'subagent' | 'marker',
+  key: string | number,
+): string {
   return `trace-${props.sessionId}-run${runId}-${kind}-${key}`
 }
 
@@ -585,13 +716,71 @@ async function locateNode(runId: number, key: string) {
   const rawKey = key.slice(sep + 1)
   if (rawKey === '') return
   const anchor = rowAnchorId(runId, kind as 'round' | 'tool' | 'side', rawKey)
+  await scrollToAnchor(anchor)
+}
+
+/** 滚动到行锚点并闪一下；定位是辅助操作，行不存在时静默返回。 */
+async function scrollToAnchor(anchor: string) {
   await nextTick()
+  // 单测跑在 node 环境（无 DOM）；定位是渐进增强，环境没有 document 时静默跳过。
+  if (typeof document === 'undefined') return
   const row = document.getElementById(anchor)
   if (row == null) return
   row.scrollIntoView({ block: 'center', behavior: 'smooth' })
   row.classList.add('row-located')
   window.setTimeout(() => { row.classList.remove('row-located') }, 1200)
 }
+
+// ===== 已加载页搜索 =====
+function onSearchInput(event: Event) {
+  searchQuery.value = (event.target as HTMLInputElement | null)?.value ?? ''
+}
+
+function onSearchKeydown(event: KeyboardEvent) {
+  if (event.key === 'Enter') {
+    event.preventDefault()
+    stepSearch(event.shiftKey ? -1 : 1)
+  } else if (event.key === 'Escape') {
+    event.preventDefault()
+    clearSearch()
+  }
+}
+
+/** 自动展开命中的 run，再按行锚点定位；点击 / Enter 都走同一条路径。 */
+async function jumpToHit(index: number) {
+  const hits = searchHits.value
+  if (hits.length === 0) return
+  const nextIndex = ((index % hits.length) + hits.length) % hits.length
+  const hit = hits[nextIndex]!
+  activeHitIndex.value = nextIndex
+  if (!expandedRuns.value.has(hit.runId)) {
+    const nextExpanded = new Set(expandedRuns.value)
+    nextExpanded.add(hit.runId)
+    expandedRuns.value = nextExpanded
+  }
+  await scrollToAnchor(rowAnchorId(hit.runId, hit.kind, hit.anchorKey))
+}
+
+function stepSearch(delta: number) {
+  if (searchHits.value.length === 0) return
+  const base = activeHitIndex.value < 0 ? (delta > 0 ? -1 : 0) : activeHitIndex.value
+  void jumpToHit(base + delta)
+}
+
+function clearSearch() {
+  searchQuery.value = ''
+  activeHitIndex.value = -1
+}
+
+// 输入即定位第一个命中；清空只回收搜索态，不动列表与时间条带。
+watch(searchQuery, (query) => {
+  if (query.trim() === '') {
+    activeHitIndex.value = -1
+    return
+  }
+  activeHitIndex.value = searchHits.value.length > 0 ? 0 : -1
+  if (searchHits.value.length > 0) void jumpToHit(0)
+})
 
 // ===== 记录详情抽屉 =====
 /**
@@ -730,6 +919,79 @@ async function exportCsv() {
   align-items: center;
   gap: var(--aw-space-xxs);
   flex-wrap: wrap;
+}
+
+.trace-search {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: var(--aw-btn-height);
+  padding: 0 4px 0 6px;
+  border: 1px solid var(--aw-hairline);
+  border-radius: var(--aw-radius-xs);
+  background: var(--aw-surface);
+  color: var(--aw-ink-muted-64);
+}
+
+.trace-search:focus-within {
+  border-color: var(--aw-primary-line);
+}
+
+.trace-search-input {
+  width: 132px;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--aw-ink);
+  font-family: var(--aw-font-text);
+  font-size: var(--aw-text-fine);
+}
+
+.trace-search-input::placeholder {
+  color: var(--aw-ink-muted-40);
+}
+
+.trace-search-count {
+  flex-shrink: 0;
+  font-family: var(--aw-font-mono);
+  font-size: var(--aw-text-micro);
+  color: var(--aw-ink-muted-48);
+}
+
+.trace-search-count.is-empty {
+  color: var(--aw-ink-muted-40);
+}
+
+.trace-search-btn {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: var(--aw-radius-xs);
+  background: transparent;
+  color: var(--aw-ink-muted-48);
+  font-size: var(--aw-text-fine);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.trace-search-btn:hover:not(:disabled) {
+  color: var(--aw-primary);
+  background: var(--aw-primary-hover);
+}
+
+.trace-search-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* 搜索命中片段：只染色不改字宽，长期停留在轨迹里也不刺眼 */
+.search-hit-text {
+  border-radius: 2px;
+  background: var(--aw-warning-soft, rgba(230, 162, 60, 0.28));
+  color: inherit;
 }
 
 .threshold-field {

@@ -150,19 +150,22 @@ mao scheduled-task run-now --id 3 --json
 
 ### 用途
 
-查看某个定时任务最近的运行记录（触发时间、触发方式、状态、第几次尝试、耗时、成本、错误摘要）。`triggerType=MANUAL` 表示手动立即执行，`SCHEDULED` 或空表示按计划触发。默认 20 条，最多 50 条。
+查看某个定时任务最近的运行记录（触发时间、触发方式、状态、第几次尝试、耗时、成本、错误摘要）。`triggerType=MANUAL` 表示手动立即执行，`SCHEDULED` 或空表示按计划触发。传 `--page-num` / `--page-size` 时按页返回，响应头 `x-total-count` 为运行记录总数；不传分页参数时保留旧的 `--limit` 行为（默认 20 条，最多 50 条）。
 
 ### 参数说明
 
 | 参数 | 必填 | 类型 | 含义 |
 |------|------|------|------|
 | `--id` | 是 | 数字 | 定时任务 ID |
-| `--limit` | 否 | 数字 | 1–50，默认 20 |
+| `--page-num` | 否 | 数字 | 页码，从 1 开始；与 `--page-size` 一起使用 |
+| `--page-size` | 否 | 数字 | 每页条数，1–50，默认 20 |
+| `--limit` | 否 | 数字 | 兼容旧行为：不传分页参数时返回最近 N 条，1–50，默认 20 |
 
 ### 示例
 
 ```bash
 mao scheduled-task runs --id 3 --limit 10 --json
+mao scheduled-task runs --id 3 --page-num 2 --page-size 20 --json
 ```
 
 ---
