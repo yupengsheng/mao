@@ -68,7 +68,7 @@ Mao 不是又一个 ChatGPT 套壳，也不是 Dify / n8n 那样的低代码工�
 
 登录后点击顶栏「执行记录」（`/execution-records`），可按状态、首次来源筛选并分页浏览，查看最近 50 次执行的状态、实际来源、时间和失败原因，一键打开关联会话。筛选「等待处理」可找到需要回答或审批的任务，处理仍在原会话中进行。页面可见时每 10 秒刷新，也可手动刷新。边路任务定位到根会话下的对应页签，子代理打开只读页签。
 
-也可使用用户 JWT 调用 `GET /api/v1/tasks`（支持 stage、source、agentId、sessionId、page、size）及 `GET /api/v1/tasks/:id`，或使用 `mao task list`、`mao task get --id <id>`。飞书、钉钉补写取消会优先使用当前执行 ID，内存清空时可回查任务记录，避免一次运行被另记为一个取消尝试。跨渠道归并、原始外部事件去重和独立记录修复 Job 属于后续阶段；本期恢复仍由既有崩溃恢复调度触发，登记新尝试并失败关闭旧未完成尝试。自动续跑仅覆盖 `RUNNING` / `RESUMING`，多实例并发仍依赖部署排空与静默阈值，不是数据库租约。使用前需由现有 Flyway 机制应用 V179 迁移。
+也可使用用户 JWT 调用 `GET /api/v1/tasks`（支持 stage、source、agentId、sessionId、page、size）及 `GET /api/v1/tasks/:id`，或使用 `mao task list`、`mao task get --id <id>`。开放触发（API / Webhook / Signal）任务的 `agent_task.policy_version` 记录 `open-run-admission/v1`，供审计触发准入策略；手工、定时与 IM 通道任务保持为空，后续手工重跑不会清空已有版本，该字段不在查询响应中返回。飞书、钉钉补写取消会优先使用当前执行 ID，内存清空时可回查任务记录，避免一次运行被另记为一个取消尝试。跨渠道归并、原始外部事件去重和独立记录修复 Job 属于后续阶段；本期恢复仍由既有崩溃恢复调度触发，登记新尝试并失败关闭旧未完成尝试。自动续跑仅覆盖 `RUNNING` / `RESUMING`，多实例并发仍依赖部署排空与静默阈值，不是数据库租约。使用前需由现有 Flyway 机制应用 V179 迁移。
 
 接口、CLI 参数及限制见 [执行任务记录](skills/mao-cli/reference/task.md)，实现边界见 [第一期技术方案](docs/plan/2026-11-03-super-agent-task-domain-technical-design.md)、[执行记录界面方案](docs/plan/2026-11-03-task-execution-center-design.md)、[等待状态方案](docs/plan/2026-11-03-task-waiting-state-design.md)、[执行入口与取消方案](docs/plan/2026-11-03-task-execution-lifecycle-design.md) 和 [恢复执行登记方案](docs/plan/2026-11-04-persistent-execution-recovery-design.md)。
 

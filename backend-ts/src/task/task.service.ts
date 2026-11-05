@@ -2,6 +2,7 @@ import { BusinessException } from '../common/business-exception.js';
 import { ErrorCode } from '../common/error-code.js';
 import { nowSql } from '../common/datetime.js';
 import type { AgentTaskVO, TaskDetailVO, TaskExecutionVO, TaskPageVO, TaskTriggerVO } from '@mao/contracts';
+import { OPEN_RUN_ADMISSION_POLICY_VERSION } from '../openapi/admission.js';
 import type { Session } from '../session/types.js';
 import type { TaskRepository } from './task.repository.js';
 import type { AgentTask, TaskExecution, TaskPageFilter, TaskSource, TaskStage, TaskTrigger } from './types.js';
@@ -16,6 +17,12 @@ function sourceOf(session: Session, source?: TaskSource): TaskSource {
   if (session.source === 'weixin') return 'WEIXIN';
   if (session.source === 'dingtalk') return 'DINGTALK';
   return 'MANUAL';
+}
+
+function policyVersionOf(source: TaskSource): string | null {
+  return source === 'API' || source === 'WEBHOOK' || source === 'SIGNAL'
+    ? OPEN_RUN_ADMISSION_POLICY_VERSION
+    : null;
 }
 
 export class TaskService {
@@ -34,7 +41,7 @@ export class TaskService {
         return existing;
       }
       const execution = await this.createExecution(repo, task, executionId, 'WORKING', actualSource);
-      await repo.updateById(task.id!, { stage: 'WORKING', lastExecutionId: executionId, title: this.title(current), agentId: current.agentId ?? null });
+      await repo.updateById(task.id!, this.taskFields(current, 'WORKING', executionId, actualSource));
       return execution;
     });
   }
@@ -66,9 +73,7 @@ export class TaskService {
       }
 
       const execution = await this.createExecution(repo, task, executionId, 'WORKING', actualSource);
-      await repo.updateById(task.id!, {
-        stage: 'WORKING', lastExecutionId: executionId, title: this.title(current), agentId: current.agentId ?? null,
-      });
+      await repo.updateById(task.id!, this.taskFields(current, 'WORKING', executionId, actualSource));
       return execution;
     });
   }
@@ -119,7 +124,7 @@ export class TaskService {
       await repo.updateExecution(execution.id!, { status: phase, finishedAt: nowSql(), failureReason: failureReason ?? null });
       const currentExecution = task.lastExecutionId == null ? null : await repo.executionById(task.lastExecutionId);
       if (currentExecution == null || execution.attemptNo >= currentExecution.attemptNo) {
-        await repo.updateById(task.id!, { stage: phase, lastExecutionId: executionId, title: this.title(current), agentId: current.agentId ?? null });
+        await repo.updateById(task.id!, this.taskFields(current, phase, executionId, actualSource));
       }
     });
   }
@@ -170,9 +175,20 @@ export class TaskService {
   private async ensureTask(repo: TaskRepository, session: Session, source: TaskSource): Promise<AgentTask> {
     const existing = await repo.findBySessionId(session.userId, session.id!);
     if (existing != null) return existing;
-    const task: AgentTask = { userId: session.userId, agentId: session.agentId ?? null, sessionId: session.id!, title: this.title(session), stage: 'QUEUED', source, lastExecutionId: null };
+    const task: AgentTask = {
+      userId: session.userId, agentId: session.agentId ?? null, sessionId: session.id!, title: this.title(session),
+      stage: 'QUEUED', source, policyVersion: policyVersionOf(source), lastExecutionId: null,
+    };
     task.id = await repo.insert(task);
     return task;
+  }
+
+  private taskFields(session: Session, stage: TaskStage, executionId: string, source: TaskSource): Partial<AgentTask> {
+    const policyVersion = policyVersionOf(source);
+    return {
+      stage, lastExecutionId: executionId, title: this.title(session), agentId: session.agentId ?? null,
+      ...(policyVersion == null ? {} : { policyVersion }),
+    };
   }
 
   private async createExecution(repo: TaskRepository, task: AgentTask, executionId: string, status: TaskStage, source: TaskSource): Promise<TaskExecution> {

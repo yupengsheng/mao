@@ -73,7 +73,7 @@
 
 ## 边界
 
-- 本期不写入 `agent_task.policy_version`；该字段仅由 V179 预留。
+- 准入策略版本由任务记录写入：API / Webhook / Signal 触发的任务在创建或再次执行时记录 `OPEN_RUN_ADMISSION_POLICY_VERSION`（`open-run-admission/v1`）；手工、定时与 IM 通道保持为空，后续手工重跑不会清空。
 - 不复用 `BUDGET_EXCEEDED`（`3041` 与 `SHARE_NOT_FOUND` 撞号）。
 - 不做动态 scope 增量授权、跨用户委派或基于内容的模型路由。
 - 不改变 Webhook 公开路径对不存在 / 停用 / 验签失败的既有 404 语义。

@@ -4,6 +4,7 @@ import { TaskWaitService } from './task-wait.service.js';
 import { ApprovalRegistry } from '../harness/approval/approval-registry.js';
 import { AskUserQuestionsRegistry } from '../harness/tool/ask-user-questions-registry.js';
 import { TaskTerminalService } from '../session/task-terminal.service.js';
+import { OPEN_RUN_ADMISSION_POLICY_VERSION } from '../openapi/admission.js';
 import type { TaskRepository } from './task.repository.js';
 import type { AgentTask, TaskExecution, TaskTrigger } from './types.js';
 import type { Session } from '../session/types.js';
@@ -44,6 +45,35 @@ describe('Task execution lifecycle', () => {
     expect(result?.task).not.toHaveProperty('userId');
     expect(result?.task).toMatchObject({ id: 1, sessionId: 11, lastExecutionId: 'public', createdAt: null, updatedAt: null });
     expect(result?.latestExecution).toMatchObject({ executionId: 'public', finishedAt: null, createdAt: null });
+  });
+
+  it('stamps the admission policy version for programmatic runs and keeps it across later manual runs', async () => {
+    const setup = fixture();
+    await setup.service.beginExecution(setup.session, 'api', 'API');
+    expect(setup.task()?.policyVersion).toBe(OPEN_RUN_ADMISSION_POLICY_VERSION);
+    await setup.service.settleExecution(setup.session, 'api', 'COMPLETED');
+    await setup.service.beginExecution(setup.session, 'manual', 'MANUAL');
+    expect(setup.task()?.policyVersion).toBe(OPEN_RUN_ADMISSION_POLICY_VERSION);
+  });
+
+  it('leaves the policy version empty for manual and scheduled runs', async () => {
+    const manual = fixture();
+    await manual.service.beginExecution(manual.session, 'manual', 'MANUAL');
+    expect(manual.task()?.policyVersion).toBeNull();
+
+    const scheduled = fixture();
+    await scheduled.service.beginExecution(scheduled.session, 'scheduled', 'SCHEDULED');
+    expect(scheduled.task()?.policyVersion).toBeNull();
+  });
+
+  it('stamps the policy version when a programmatic run only produces a terminal record', async () => {
+    const setup = fixture();
+    await setup.service.settleExecution(setup.session, 'webhook-only', 'FAILED', 'late', 'WEBHOOK');
+    expect(setup.task()).toMatchObject({
+      policyVersion: OPEN_RUN_ADMISSION_POLICY_VERSION,
+      stage: 'FAILED',
+      lastExecutionId: 'webhook-only',
+    });
   });
 
   it('creates one task and numbered attempts for repeated runs on a session', async () => {

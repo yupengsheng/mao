@@ -24,7 +24,7 @@
 | agent_task_execution | execution_id 全局唯一、task_id、session_id、attempt_no、状态、开始/结束时间、失败原因 |
 | agent_task_trigger | 每次执行的来源，source_event_id 唯一，本期值为 execution_id |
 
-不存储外部消息正文或凭证。`policy_version` 仅预留，尚无策略版本功能。表之间使用逻辑关联，遵循现有仓库风格。
+不存储外部消息正文或凭证。`policy_version` 记录任务最近一次适用的触发准入策略版本：API / Webhook / Signal 为 `open-run-admission/v1`，手工、定时与 IM 通道为空；后续手工重跑不会清空。表之间使用逻辑关联，遵循现有仓库风格。
 
 TaskService 的每次开始/结算都在 Db.transaction 的同一连接中，先对本人有效 Session 做 `SELECT ... FOR UPDATE`，再创建/更新三张表。这使同一 Session 的任务创建与尝试编号串行化。任一写入失败整个事务回滚；执行与入口记录的唯一约束拦截重复 ID。
 
