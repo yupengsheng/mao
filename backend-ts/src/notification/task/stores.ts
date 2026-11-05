@@ -1,5 +1,5 @@
 import type { Db } from '../../db/db.js';
-import type { UserTaskNotificationPreference, TaskNotificationDelivery } from './types.js';
+import { DeliveryStatus, type UserTaskNotificationPreference, type TaskNotificationDelivery } from './types.js';
 import type { PreferenceStore } from './preference.service.js';
 import type { DeliveryStore } from './delivery.service.js';
 
@@ -47,5 +47,15 @@ export class DeliveryDbStore implements DeliveryStore {
       [row.status ?? null, row.nextRetryAt ?? null, id, expectedStatus],
     );
     return result.affectedRows > 0;
+  }
+
+  async suppressPendingBySession(sessionId: number): Promise<number> {
+    const result = await this.db.execute(
+      `UPDATE task_notification_delivery
+          SET status = ?, next_retry_at = NULL
+        WHERE session_id = ? AND status IN (?, ?, ?)`,
+      [DeliveryStatus.SUPPRESSED_WS, sessionId, DeliveryStatus.WAITING_WS, DeliveryStatus.PENDING, DeliveryStatus.SENDING],
+    );
+    return result.affectedRows;
   }
 }

@@ -103,6 +103,8 @@ mao settings test smtp --smtp-host smtp.example.com --smtp-port 465 --smtp-secur
 
 启用时的跨字段校验：host / port / fromAddr 必填（批量保存同一事务内整体判定）；密码非必填（适配无需认证的内网中继）。投递失败可见性与钉钉 / 飞书一致：重试耗尽后只落 `task_notification_delivery`（FAILED + 原因），用户侧无提醒；「配置缺失/已停用」为不可重试失败，不会无谓重试 20 分钟。
 
+删除会话时，该会话尚未发出的任务通知（`WAITING_WS` / `PENDING` / `SENDING`）会同步置为 `SUPPRESSED_WS`，不再外推或重试；已成功 / 已失败的历史投递记录保留。抑制失败只记录后端日志，不影响会话删除。
+
 等价命令：`mao settings test smtp`（见上）。注意自托管实例的发信信誉（SPF / DKIM / 中继）决定邮件是否进收件箱而非垃圾箱，部署建议见 [DEPLOY.md](../../../DEPLOY.md#邮件通知渠道smtp)。
 
 ## 云端终端配置（`terminal.*`，0.0.97 起）

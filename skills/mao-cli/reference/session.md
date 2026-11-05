@@ -20,6 +20,10 @@
 
 `session_todo` 以 `session_id` 归属会话。删除会话时，该会话的全部待办行置为 `deleted = 1`；边路任务提升时，待办会复制到新主会话，旧边路会话的原始行在同一事务内逻辑删除。待办清理失败只记录日志，不阻断会话删除；已归档但未删除的会话待办不受影响。
 
+## 任务通知抑制
+
+`task_notification_delivery` 以 `session_id` 归属会话。删除会话时，该会话所有未终态投递行（`WAITING_WS` / `PENDING` / `SENDING`）置为 `SUPPRESSED_WS`，并清空 `next_retry_at`，避免继续外推任务完成、提问或审批提醒；`SUCCEEDED` / `FAILED` 等已终态历史行保持不变。抑制失败只记录日志，不阻断会话删除；调度器发送前会重查状态，已被抑制的行不会再发。
+
 ## 任务记录回收
 
 `agent_task`、`agent_task_execution` 与 `agent_task_trigger` 都以 `session_id` 归属会话。删除会话时，任务主档置为 `deleted = 1`，执行与入口记录物理删除；边路任务提升时，在同一事务内回收旧边路会话的任务记录。清理失败只记录日志，不阻断会话删除。任务历史不会迁移到提升后的新会话。

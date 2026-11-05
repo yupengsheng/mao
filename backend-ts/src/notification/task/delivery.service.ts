@@ -16,6 +16,8 @@ export interface DeliveryStore {
   ): Promise<boolean>;
   /** 按幂等键取行。审批帧抑制拿不到内存里的 delivery 对象时用。 */
   findByEventKey?(eventKey: string): Promise<TaskNotificationDelivery | null>;
+  /** 会话删除时抑制未终态投递，避免继续向已删除会话外推。返回受影响行数。 */
+  suppressPendingBySession?(sessionId: number): Promise<number>;
 }
 
 /** 桌面端仍连接、人未处理时，过这么久再外推。固定值，不进偏好表、不进系统设置。 */
@@ -160,6 +162,13 @@ export class TaskNotificationDeliveryService {
     if (!this.store.findByEventKey) return;
     const row = await this.store.findByEventKey(eventKey);
     await this.suppressPending(row);
+  }
+
+  /** 会话删除后抑制该会话所有未终态投递；已成功 / 已失败的历史行保持原状。 */
+  async suppressPendingBySession(sessionId: number): Promise<void> {
+    if (!this.store.suppressPendingBySession) return;
+    if (!Number.isSafeInteger(sessionId) || sessionId <= 0) return;
+    await this.store.suppressPendingBySession(sessionId);
   }
 
   /**

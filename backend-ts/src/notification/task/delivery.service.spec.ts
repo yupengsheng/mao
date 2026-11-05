@@ -6,7 +6,11 @@ import { WEIXIN_PROJECT_KEY } from '../../domain/types.js';
 import type { Session } from '../../domain/types.js';
 
 describe('TaskNotificationDeliveryService', () => {
-  const store: DeliveryStore = { insert: vi.fn(async () => 1), updateById: vi.fn() };
+  const store: DeliveryStore = {
+    insert: vi.fn(async () => 1),
+    updateById: vi.fn(),
+    suppressPendingBySession: vi.fn(async () => 0),
+  };
   const preferenceService = { findEnabled: vi.fn() } as unknown as TaskNotificationPreferenceService;
   const queueService: QueueLister = { listPending: vi.fn(async () => []) };
   const metrics = { created: vi.fn(), suppressedByWebSocket: vi.fn(), sent: vi.fn(), retried: vi.fn(), pending: vi.fn() } as TaskNotificationMetrics;
@@ -223,5 +227,15 @@ describe('TaskNotificationDeliveryService', () => {
       status: 'SUPPRESSED_WS',
       nextRetryAt: null,
     });
+  });
+
+  it('suppressesAllPendingDeliveriesForDeletedSession', async () => {
+    vi.mocked(store.suppressPendingBySession!).mockClear();
+    await service.suppressPendingBySession(42);
+    expect(store.suppressPendingBySession).toHaveBeenCalledWith(42);
+
+    await service.suppressPendingBySession(0);
+    await service.suppressPendingBySession(Number.NaN);
+    expect(store.suppressPendingBySession).toHaveBeenCalledTimes(1);
   });
 });
