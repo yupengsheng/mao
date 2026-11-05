@@ -37,6 +37,7 @@ import type { SessionActivityCleanup } from './session/session-activity-cleanup.
 import type { SessionCompactionEventCleanup } from './session/session-compaction-event-cleanup.js';
 import type { SubagentExecutionCleanup } from './session/subagent-execution-cleanup.js';
 import type { MessageQueueCleanup } from './session/message-queue-cleanup.js';
+import type { DingtalkProgressCardCleanup } from './dingtalk/progress-card-cleanup.js';
 import type { AuthStateCleanup } from './auth/auth-state-cleanup.js';
 import type { GroupMessageLogCleanup } from './channel/group-message-log-cleanup.js';
 import type { FeishuP2pMessageCleanup } from './channel/feishu-p2p-message-cleanup.js';
@@ -84,6 +85,7 @@ export interface ShutdownDeps {
   sessionCompactionEventCleanup: SessionCompactionEventCleanup;
   subagentExecutionCleanup: SubagentExecutionCleanup;
   messageQueueCleanup: MessageQueueCleanup;
+  dingtalkProgressCardCleanup: DingtalkProgressCardCleanup;
   inboundEventCleanup: InboundEventCleanup;
   authStateCleanup: AuthStateCleanup;
   groupMessageLogCleanup: GroupMessageLogCleanup;
@@ -107,6 +109,7 @@ export function createShutdownHandler(deps: ShutdownDeps): () => Promise<void> {
     sessionCompactionEventCleanup,
     subagentExecutionCleanup,
     messageQueueCleanup,
+    dingtalkProgressCardCleanup,
     inboundEventCleanup,
     authStateCleanup,
     groupMessageLogCleanup,
@@ -157,6 +160,7 @@ export function createShutdownHandler(deps: ShutdownDeps): () => Promise<void> {
       sessionCompactionEventCleanup.stop();
       subagentExecutionCleanup.stop();
       messageQueueCleanup.stop();
+      dingtalkProgressCardCleanup.stop();
       inboundEventCleanup.stop();
       authStateCleanup.stop();
       groupMessageLogCleanup.stop();

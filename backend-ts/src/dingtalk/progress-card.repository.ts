@@ -1,4 +1,5 @@
 import type { Db } from '../db/db.js';
+import { ACTIVE_PHASE_SQL_LIST } from '../session/util/session-group-key.js';
 
 export interface DingtalkProgressCardRow {
   sessionId: number;
@@ -57,5 +58,35 @@ export class MysqlDingtalkProgressCardRepository {
 
   async deleteBySessionId(sessionId: number): Promise<void> {
     await this.db.execute('DELETE FROM dingtalk_progress_card WHERE session_id = ?', [sessionId]);
+  }
+
+  /**
+   * 分批删除过期的进度卡映射。只清理会话已不存在 / 已逻辑删除 / 非活跃相位的行，
+   * 运行中、待恢复、等待审批与取消中的会话即使映射很旧也保留。LIMIT 钳制在 1~5000。
+   */
+  async deleteStaleBatch(cutoff: string, limit: number): Promise<number> {
+    const safeLimit = Number.isFinite(limit)
+      ? Math.max(1, Math.min(5000, Math.floor(limit)))
+      : 1;
+    const result = await this.db.execute(
+      `DELETE FROM dingtalk_progress_card WHERE session_id IN (
+         SELECT session_id FROM (
+           SELECT p.session_id
+           FROM dingtalk_progress_card p
+           LEFT JOIN session s ON s.id = p.session_id
+           WHERE p.updated_at < ?
+             AND (
+               s.id IS NULL
+               OR s.deleted = 1
+               OR s.phase IS NULL
+               OR s.phase NOT IN (${ACTIVE_PHASE_SQL_LIST})
+             )
+           ORDER BY p.updated_at, p.session_id
+           LIMIT ${safeLimit}
+         ) candidates
+       )`,
+      [cutoff],
+    );
+    return Number(result.affectedRows ?? 0);
   }
 }
