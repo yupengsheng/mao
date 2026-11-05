@@ -33,6 +33,7 @@ describe('MysqlFeishuCardSnapshotRepository', () => {
     expect(db.execute.mock.calls[0][0]).toContain('message_id = VALUES(message_id)');
     expect(db.execute.mock.calls[0][0]).toContain('round = VALUES(round)');
     expect(db.execute.mock.calls[0][0]).toContain('content = VALUES(content)');
+    expect(db.execute.mock.calls[0][0]).toContain('updated_at = CURRENT_TIMESTAMP');
   });
 
   it('findByCardMessageId 映射 camelCase 行', async () => {
@@ -61,6 +62,32 @@ describe('MysqlFeishuCardSnapshotRepository', () => {
     db.queryOne.mockResolvedValue(null);
     const repo = new MysqlFeishuCardSnapshotRepository(db as never);
     expect(await repo.findByCardMessageId('om_missing')).toBeNull();
+  });
+
+  it('deleteBatch 按最后写入时间删除并返回受影响行数', async () => {
+    const db = fakeDb();
+    db.execute.mockResolvedValue({ affectedRows: 37 });
+    const repo = new MysqlFeishuCardSnapshotRepository(db as never);
+
+    await expect(repo.deleteBatch('2026-05-09 12:00:00', 5000)).resolves.toBe(37);
+    expect(db.execute).toHaveBeenCalledWith(
+      'DELETE FROM feishu_card_snapshot WHERE updated_at < ? ORDER BY updated_at, id LIMIT 5000',
+      ['2026-05-09 12:00:00'],
+    );
+  });
+
+  it('deleteBatch 钳制非法与超限 limit', async () => {
+    const db = fakeDb();
+    db.execute.mockResolvedValue({ affectedRows: 0 });
+    const repo = new MysqlFeishuCardSnapshotRepository(db as never);
+
+    await repo.deleteBatch('2026-05-09 12:00:00', 0);
+    await repo.deleteBatch('2026-05-09 12:00:00', Number.NaN);
+    await repo.deleteBatch('2026-05-09 12:00:00', 999_999);
+
+    expect(db.execute.mock.calls[0][0]).toContain('LIMIT 1');
+    expect(db.execute.mock.calls[1][0]).toContain('LIMIT 1');
+    expect(db.execute.mock.calls[2][0]).toContain('LIMIT 5000');
   });
 
   it('mapCardSnapshotRow 对主键字段不全/非法的行返回 null', () => {

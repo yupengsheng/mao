@@ -412,7 +412,11 @@ export function assembleFeishuHandler(deps: FeishuHandlerDeps): FeishuHandlerRes
           console.warn(`飞书点踩查询卡片快照失败, cardMessageId=${cardMessageId}, sessionId=${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
           return null;
         });
-        messageId = snapshot?.messageId;
+        if (snapshot == null) {
+          console.warn(`飞书点踩未找到卡片快照, cardMessageId=${cardMessageId}, sessionId=${sessionId}`);
+          return null;
+        }
+        messageId = snapshot.messageId;
       }
       const result = await d.feedbackService.toggleSessionDislike(session.userId, sessionId, FEISHU_DISLIKE_SOURCE, messageId);
       if (result == null) return null;

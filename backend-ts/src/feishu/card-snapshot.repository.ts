@@ -15,6 +15,8 @@ export interface FeishuCardSnapshotRow {
 export interface FeishuCardSnapshotRepository {
   upsert(row: FeishuCardSnapshotRow): Promise<void>;
   findByCardMessageId(cardMessageId: string): Promise<FeishuCardSnapshotRow | null>;
+  /** 按最后写入时间分批删除过期快照，返回实际删除行数。 */
+  deleteBatch(cutoff: string, limit: number): Promise<number>;
 }
 
 /** Db.query / queryOne 已 toCamel；兼容未转换的 snake_case 行。主键字段不全视为无映射。 */
@@ -47,12 +49,13 @@ export class MysqlFeishuCardSnapshotRepository implements FeishuCardSnapshotRepo
 
   async upsert(row: FeishuCardSnapshotRow): Promise<void> {
     // uk 在 card_message_id：重试为同一张卡重新完成时覆盖旧快照（消息/轮次/耗时不一致）。
+    // updated_at 显式刷新：清理按最后一次终态写入计时，旧卡重试后不会因首次创建时间过早被立刻删除。
     await this.db.execute(
-      `INSERT INTO feishu_card_snapshot (card_message_id, session_id, bot_id, message_id, status, round, elapsed_ms, content)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO feishu_card_snapshot (card_message_id, session_id, bot_id, message_id, status, round, elapsed_ms, content, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
        ON DUPLICATE KEY UPDATE session_id = VALUES(session_id), bot_id = VALUES(bot_id),
          message_id = VALUES(message_id), status = VALUES(status), round = VALUES(round),
-         elapsed_ms = VALUES(elapsed_ms), content = VALUES(content)`,
+         elapsed_ms = VALUES(elapsed_ms), content = VALUES(content), updated_at = CURRENT_TIMESTAMP`,
       [row.cardMessageId, row.sessionId, row.botId, row.messageId, row.status, row.round, row.elapsedMs, row.content],
     );
   }
@@ -64,5 +67,16 @@ export class MysqlFeishuCardSnapshotRepository implements FeishuCardSnapshotRepo
     );
     if (row == null) return null;
     return mapCardSnapshotRow(row);
+  }
+
+  async deleteBatch(cutoff: string, limit: number): Promise<number> {
+    const safeLimit = Number.isFinite(limit)
+      ? Math.max(1, Math.min(5000, Math.floor(limit)))
+      : 1;
+    const result = await this.db.execute(
+      `DELETE FROM feishu_card_snapshot WHERE updated_at < ? ORDER BY updated_at, id LIMIT ${safeLimit}`,
+      [cutoff],
+    );
+    return Number(result.affectedRows ?? 0);
   }
 }

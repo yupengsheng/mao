@@ -37,6 +37,7 @@ import type { SessionActivityCleanup } from './session/session-activity-cleanup.
 import type { AuthStateCleanup } from './auth/auth-state-cleanup.js';
 import type { GroupMessageLogCleanup } from './channel/group-message-log-cleanup.js';
 import type { FeishuP2pMessageCleanup } from './channel/feishu-p2p-message-cleanup.js';
+import type { FeishuCardSnapshotCleanup } from './feishu/card-snapshot-cleanup.js';
 
 /** 停机时需要优雅关闭的所有组件。 */
 export interface ShutdownDeps {
@@ -81,6 +82,7 @@ export interface ShutdownDeps {
   authStateCleanup: AuthStateCleanup;
   groupMessageLogCleanup: GroupMessageLogCleanup;
   feishuP2pMessageCleanup: FeishuP2pMessageCleanup;
+  feishuCardSnapshotCleanup: FeishuCardSnapshotCleanup;
 }
 
 /**
@@ -100,6 +102,7 @@ export function createShutdownHandler(deps: ShutdownDeps): () => Promise<void> {
     authStateCleanup,
     groupMessageLogCleanup,
     feishuP2pMessageCleanup,
+    feishuCardSnapshotCleanup,
   } = deps;
 
   const isDrainingForDeploy = (): boolean => isDrainingInstance(cfg.app.harness.runtimeDir, cfg.server.port);
@@ -146,6 +149,7 @@ export function createShutdownHandler(deps: ShutdownDeps): () => Promise<void> {
       authStateCleanup.stop();
       groupMessageLogCleanup.stop();
       feishuP2pMessageCleanup.stop();
+      feishuCardSnapshotCleanup.stop();
       weixinMonitor.shutdown();
       feishuMonitor.shutdown();
       dingtalk.shutdown();
