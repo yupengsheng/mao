@@ -41,6 +41,7 @@ import type { SessionCompactionEventService } from './session-compaction-event.s
 import { FileChangeRepository, isSessionSource, MessageRepository, SessionRepository, type SessionListFilter, type SessionSource } from './session.repository.js';
 import { SessionTodoRepository } from './activity.repository.js';
 import { TaskRepository } from '../task/task.repository.js';
+import { DeliveryStatus } from '../notification/task/types.js';
 import type {
   AgentLookup,
   AgentRef,
@@ -782,6 +783,20 @@ export class SessionService {
       await tx.execute('DELETE FROM weixin_session_peer WHERE session_id = ?', [sideSessionId]);
       await tx.execute('DELETE FROM feishu_thread_session WHERE session_id = ?', [sideSessionId]);
       await tx.execute('DELETE FROM feishu_session_channel WHERE session_id = ?', [sideSessionId]);
+      // 旧边路会话随后逻辑删除，未发出的完成 / 提问 / 审批提醒不应再外推；
+      // 与 onSessionDeleted 的存储层抑制保持同一语义，仅命中非终态行。
+      await tx.execute(
+        `UPDATE task_notification_delivery
+            SET status = ?, next_retry_at = NULL
+          WHERE session_id = ? AND status IN (?, ?, ?)`,
+        [
+          DeliveryStatus.SUPPRESSED_WS,
+          sideSessionId,
+          DeliveryStatus.WAITING_WS,
+          DeliveryStatus.PENDING,
+          DeliveryStatus.SENDING,
+        ],
+      );
       // 边路会话提升后旧会话逻辑删除，任务域不再可达；与主会话删除采用同一回收语义。
       await new TaskRepository(tx).deleteBySessionId(sideSessionId);
       await txMessageRepo.logicalDeleteBySession(sideSessionId);

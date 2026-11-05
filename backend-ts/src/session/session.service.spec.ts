@@ -349,6 +349,28 @@ describe('SessionService archive', () => {
     }
   });
 
+  it('promotesSideTaskAndSuppressesItsPendingNotifications', async () => {
+    // 提升不走 onSessionDeleted；旧边路会话的未发送提醒须在同一事务内抑制。
+    const { service, sessionRepo, txDb } = makeService();
+    vi.mocked(sessionRepo.findById).mockResolvedValue({
+      id: 20,
+      userId: 7,
+      title: '边路任务',
+      sessionType: 'SIDE_TASK',
+      phase: 'COMPLETED',
+      executionMode: 'CLOUD',
+      workspace: '/tmp/w',
+    });
+    vi.mocked(sessionRepo.list).mockResolvedValue([]);
+
+    await service.promoteSideTaskToMainSession(20, 7);
+
+    expect(txDb.execute).toHaveBeenCalledWith(
+      expect.stringContaining('UPDATE task_notification_delivery'),
+      ['SUPPRESSED_WS', 20, 'WAITING_WS', 'PENDING', 'SENDING'],
+    );
+  });
+
   it('rejectsDeleteWhenSessionRunning', async () => {
     const { service, sessionRepo } = makeService();
     vi.mocked(sessionRepo.findById).mockResolvedValue({ id: 11, userId: 7, phase: 'RUNNING' });

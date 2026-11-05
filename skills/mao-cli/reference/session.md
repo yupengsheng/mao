@@ -22,7 +22,7 @@
 
 ## 任务通知抑制
 
-`task_notification_delivery` 以 `session_id` 归属会话。删除会话时，该会话所有未终态投递行（`WAITING_WS` / `PENDING` / `SENDING`）置为 `SUPPRESSED_WS`，并清空 `next_retry_at`，避免继续外推任务完成、提问或审批提醒；`SUCCEEDED` / `FAILED` 等已终态历史行保持不变。抑制失败只记录日志，不阻断会话删除；调度器发送前会重查状态，已被抑制的行不会再发。
+`task_notification_delivery` 以 `session_id` 归属会话。删除会话或边路任务提升时，该会话所有未终态投递行（`WAITING_WS` / `PENDING` / `SENDING`）置为 `SUPPRESSED_WS`，并清空 `next_retry_at`，避免继续外推任务完成、提问或审批提醒；`SUCCEEDED` / `FAILED` 等已终态历史行保持不变。删除路径抑制失败只记录日志，不阻断会话删除；边路提升在同一事务内完成，失败整体回滚。调度器发送前会重查状态，已被抑制的行不会再发。
 
 ## 任务记录回收
 
