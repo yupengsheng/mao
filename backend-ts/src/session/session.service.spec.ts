@@ -350,6 +350,28 @@ describe('SessionService archive', () => {
     );
   });
 
+  it('promotesSideTaskAndClearsItsQueuedMessages', async () => {
+    // 边路任务提升不走 onSessionDeleted：旧边路会话的 PENDING 排队消息须在同一事务内终态化。
+    const { service, sessionRepo, txDb } = makeService();
+    vi.mocked(sessionRepo.findById).mockResolvedValue({
+      id: 20,
+      userId: 7,
+      title: '边路任务',
+      sessionType: 'SIDE_TASK',
+      phase: 'COMPLETED',
+      executionMode: 'CLOUD',
+      workspace: '/tmp/w',
+    });
+    vi.mocked(sessionRepo.list).mockResolvedValue([]);
+
+    await service.promoteSideTaskToMainSession(20, 7);
+
+    expect(txDb.execute).toHaveBeenCalledWith(
+      expect.stringMatching(/UPDATE message_queue\s+SET status = 'DELETED' WHERE session_id = \? AND status = 'PENDING' AND deleted = 0/),
+      [20],
+    );
+  });
+
   it('promotesSideTaskAndDeletesItsTaskRecords', async () => {
     // 边路任务同样会登记执行；提升后旧边路会话不再可达，任务主档与子记录须在同一事务内回收。
     const { service, sessionRepo, txDb } = makeService();

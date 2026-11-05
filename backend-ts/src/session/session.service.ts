@@ -40,6 +40,7 @@ import type { SessionCompactionService } from './session-compaction.service.js';
 import type { SessionCompactionEventService } from './session-compaction-event.service.js';
 import { FileChangeRepository, isSessionSource, MessageRepository, SessionRepository, type SessionListFilter, type SessionSource } from './session.repository.js';
 import { SessionTodoRepository } from './activity.repository.js';
+import { MessageQueueRepository } from './message-queue.repository.js';
 import { TaskRepository } from '../task/task.repository.js';
 import { DeliveryStatus } from '../notification/task/types.js';
 import { cancelOpenRunsForSession } from '../schedule/scheduled-task.store.js';
@@ -804,6 +805,9 @@ export class SessionService {
           DeliveryStatus.SENDING,
         ],
       );
+      // 边路会话的排队消息随旧会话失效：不经过 onSessionDeleted，需在同一事务内
+      // 把 PENDING 行置为 DELETED，避免提升后留下永久待执行行（与删除会话同语义）。
+      await new MessageQueueRepository(tx).clearPending(sideSessionId);
       // 边路会话提升后旧会话逻辑删除，任务域不再可达；与主会话删除采用同一回收语义。
       await new TaskRepository(tx).deleteBySessionId(sideSessionId);
       await txMessageRepo.logicalDeleteBySession(sideSessionId);

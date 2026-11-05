@@ -36,6 +36,10 @@ WHERE session_id = ? AND status = 'PENDING' AND deleted = 0
 
 `MessageQueueService` 构造晚于 `SessionService`，因此继续沿用 `AppContext` 延迟注入模式，避免调整大段装配顺序。
 
+### 边路任务提升即时回收
+
+边路任务提升是「插入新主会话 + 逻辑删除旧边路会话」，不经过 `onSessionDeleted`。因此 `SessionService.promoteSideTaskToMainSession()` 在同一事务内复用同一条件更新，把旧边路会话的 `PENDING` 行置为 `DELETED`，与删除会话保持同一终态语义。旧边路会话的排队消息不会被复制到新主会话，避免提升后重复执行用户已排队但尚未发送的内容。
+
 ### 每小时孤儿修复
 
 `MessageQueueCleanup.cleanupOnce()` 先调用 `clearOrphanedPendingBatch(limit)`，把不存在或已逻辑删除会话的 `PENDING` 行转为终态：
@@ -69,3 +73,4 @@ LIMIT n
 - repository：只命中会话不存在 / 已逻辑删除的 `PENDING` 行，保留有效会话，校验排序与 `LIMIT` 钳制。
 - cleanup：先收敛孤儿再删终态、两阶段各自分批、单轮 20 批上限、异常隔离与累计计数。
 - session：会话逻辑删除后触发 `onSessionDeleted`，确保装配层具备即时回收时机。
+- session：边路任务提升事务内命中旧边路会话的 `PENDING` 行，且只更新 `status = 'PENDING' AND deleted = 0`。
