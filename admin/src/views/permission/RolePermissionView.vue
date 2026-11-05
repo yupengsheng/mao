@@ -58,9 +58,15 @@
             <div class="role-title">
               <strong>{{ currentRole.name }}</strong>
               <el-tag size="small">{{ currentRole.code }}</el-tag>
+              <el-input
+                v-model="permissionKeyword"
+                class="permission-search"
+                placeholder="搜索权限名称或权限码"
+                clearable
+              />
             </div>
             <el-collapse v-model="expandedGroups" class="permission-groups">
-              <el-collapse-item v-for="group in permissionGroups" :key="group.id" :name="group.id">
+              <el-collapse-item v-for="group in filteredPermissionGroups" :key="group.id" :name="group.id">
                 <template #title>
                   <div class="group-title" @click.stop>
                     <el-checkbox
@@ -92,6 +98,11 @@
                 </el-checkbox-group>
               </el-collapse-item>
             </el-collapse>
+            <el-empty
+              v-if="filteredPermissionGroups.length === 0"
+              description="未找到匹配权限"
+              :image-size="48"
+            />
           </div>
         </el-card>
       </el-col>
@@ -118,7 +129,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, reactive, ref, onActivated, onMounted, onUnmounted } from 'vue'
+import { computed, reactive, ref, watch, onActivated, onMounted, onUnmounted } from 'vue'
 import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import type { FormInstance, FormRules } from 'element-plus'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -231,6 +242,28 @@ const permissionGroups = computed<PermissionGroup[]>(() => {
 
 const expandedGroups = ref<string[]>([])
 const selectedPermissionIds = ref<number[]>([])
+const permissionKeyword = ref('')
+
+const filteredPermissionGroups = computed<PermissionGroup[]>(() => {
+  const keyword = permissionKeyword.value.trim().toLowerCase()
+  if (!keyword) return permissionGroups.value
+  return permissionGroups.value
+    .map((group) => ({
+      ...group,
+      items: group.items.filter(
+        (permission) =>
+          permission.name.toLowerCase().includes(keyword) || permission.code.toLowerCase().includes(keyword)
+      )
+    }))
+    .filter((group) => group.items.length > 0)
+})
+
+// 搜索时自动展开命中分组；清空后恢复全部展开，避免结果藏在折叠项里。
+watch(permissionKeyword, () => {
+  expandedGroups.value = permissionKeyword.value.trim()
+    ? filteredPermissionGroups.value.map((group) => group.id)
+    : permissionGroups.value.map((group) => group.id)
+})
 
 function isGroupAllSelected(group: PermissionGroup): boolean {
   return group.items.every((p) => selectedPermissionIds.value.includes(p.id))
@@ -469,8 +502,15 @@ onBeforeRouteLeave(async (_to, _from) => {
 .role-title {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 16px;
+}
+
+.permission-search {
+  flex: 0 1 220px;
+  min-width: 160px;
+  margin-left: auto;
 }
 
 .permission-grid {

@@ -177,6 +177,7 @@ import { donutOption, formatCost, formatNumber, formatTokens, topWithOthers, typ
 import { exportCsv } from '../utils/csv'
 import { percent } from '../composables/metrics'
 import type { ModelsPayload } from '../types'
+import { withDrilldownPeriod } from '../utils/drilldown'
 
 const props = defineProps<{ payload: ModelsPayload | null; loading?: boolean }>()
 const emit = defineEmits<{
@@ -298,7 +299,7 @@ function handleConnectivityChange(value: boolean | string | number) {
 }
 
 function go(path: string) {
-  router.push(path)
+  router.push(withDrilldownPeriod(path, props.payload?.period))
 }
 </script>
 

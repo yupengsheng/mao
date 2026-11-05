@@ -80,6 +80,7 @@ import { CHART_PALETTE } from '../../../utils/echarts'
 import { formatCost, formatNumber, formatTokens, rankBarOption, type RankItem } from '../chart-options'
 import { exportCsv } from '../utils/csv'
 import type { AgentsPayload } from '../types'
+import { withDrilldownPeriod } from '../utils/drilldown'
 
 const props = defineProps<{ payload: AgentsPayload | null; loading?: boolean }>()
 const router = useRouter()
@@ -95,7 +96,7 @@ const tokenItems = computed<RankItem[]>(() =>
 )
 
 function go(path: string) {
-  router.push(path)
+  router.push(withDrilldownPeriod(path, props.payload?.period))
 }
 
 function exportRows() {

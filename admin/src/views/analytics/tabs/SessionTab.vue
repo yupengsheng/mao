@@ -81,7 +81,7 @@
       </div>
       <div class="actions">
         <el-button type="primary" link @click="go('/sessions?phase=FAILED')">查看失败会话</el-button>
-        <el-button link @click="go(withWindow('/llm-calls?success=false'))">查看失败调用</el-button>
+        <el-button link @click="go('/llm-calls?success=false')">查看失败调用</el-button>
       </div>
     </el-card>
 
@@ -117,7 +117,7 @@
                 v-if="typeof item.key === 'number' && item.key > 0"
                 class="linkish"
                 type="button"
-                @click="go(withWindow(`/llm-calls?success=false&modelId=${item.key}`))"
+                @click="go(`/llm-calls?success=false&modelId=${item.key}`)"
               >
                 {{ item.name }}
               </button>
@@ -139,7 +139,7 @@
           </template>
           <div class="fail-rows">
             <div v-for="item in failByScene" :key="`s-${item.key}`" class="fail-row">
-              <button class="linkish" type="button" @click="go(withWindow(`/llm-calls?success=false&scene=${item.key}`))">
+              <button class="linkish" type="button" @click="go(`/llm-calls?success=false&scene=${item.key}`)">
                 {{ sceneLabel(String(item.key)) }}
               </button>
               <span class="fail">{{ formatNumber(item.failCount) }}</span>
@@ -161,6 +161,7 @@ import { phaseLabel, executionModeLabel } from '../../../utils/labels'
 import { llmCallSceneLabel, formatMs } from '../../../utils/llmCallLabels'
 import { formatTps } from '../../../utils/throughput'
 import { donutOption, formatCompact, formatNumber, phaseColor, phaseRankItems, type RankItem } from '../chart-options'
+import { withDrilldownPeriod } from '../utils/drilldown'
 import type { SessionsPayload } from '../types'
 
 const props = defineProps<{ payload: SessionsPayload | null; loading?: boolean }>()
@@ -214,16 +215,9 @@ function sceneLabel(scene: string): string {
   return llmCallSceneLabel(scene)
 }
 
-/** 后端统计窗口是 YYYY-MM-DD 日期区间；SessionListView 不消费时间参数，仅 llm-calls 支持透传 */
-function withWindow(path: string): string {
-  const meta = props.payload?.period
-  if (!meta) return path
-  const sep = path.includes('?') ? '&' : '?'
-  return `${path}${sep}startDate=${meta.start}&endDate=${meta.end}`
-}
-
+/** 会话与调用流水都支持 startDate/endDate，下钻时保持当前统计窗口。 */
 function go(path: string) {
-  router.push(path)
+  router.push(withDrilldownPeriod(path, props.payload?.period))
 }
 </script>
 

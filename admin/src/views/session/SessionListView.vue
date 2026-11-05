@@ -76,6 +76,19 @@
               <el-option v-for="opt in SESSION_SOURCE_OPTIONS" :key="opt.value" :label="opt.label" :value="opt.value" />
             </el-select>
           </el-form-item>
+          <el-form-item label="创建日期">
+            <el-date-picker
+              v-model="filters.dateRange"
+              type="daterange"
+              value-format="YYYY-MM-DD"
+              range-separator="至"
+              start-placeholder="开始日期"
+              end-placeholder="结束日期"
+              unlink-panels
+              style="width: 250px"
+              @change="handleSearch"
+            />
+          </el-form-item>
         </FilterPanel>
       </el-form>
 
@@ -274,7 +287,8 @@ const filters = reactive({
   status: '' as string,
   source: '' as string,
   keyword: '' as string,
-  messageScope: 'CONVERSATION' as string
+  messageScope: 'CONVERSATION' as string,
+  dateRange: null as string[] | null
 })
 
 const userOptions = ref<Array<{ id: number; username: string; displayName: string }>>([])
@@ -291,6 +305,10 @@ function applyRouteQuery() {
   filters.keyword = typeof q.keyword === 'string' ? q.keyword : ''
   // 非法值回落到默认口径，避免地址栏拼错就查不到东西
   filters.messageScope = q.messageScope === 'ALL' ? 'ALL' : 'CONVERSATION'
+  filters.dateRange =
+    typeof q.startDate === 'string' && q.startDate && typeof q.endDate === 'string' && q.endDate
+      ? [q.startDate, q.endDate]
+      : null
 }
 
 /** 上次已经写进筛选表单的 query。地址没变时只刷新列表，不冲掉表单里尚未写入 URL 的条件。 */
@@ -344,6 +362,10 @@ async function fetchSessions() {
     if (filters.keyword) params.keyword = filters.keyword
     // 默认口径由后端决定，只在放宽到全部消息时传参
     if (filters.messageScope === 'ALL') params.messageScope = 'ALL'
+    if (filters.dateRange?.[0] && filters.dateRange[1]) {
+      params.startDate = filters.dateRange[0]
+      params.endDate = filters.dateRange[1]
+    }
 
     const { data } = await api.get('/admin/sessions', { params })
     if (seq !== fetchSessionsSeq) return
@@ -379,6 +401,7 @@ function handleReset() {
   filters.source = ''
   filters.keyword = ''
   filters.messageScope = 'CONVERSATION'
+  filters.dateRange = null
   currentPage.value = 1
   fetchSessions()
 }

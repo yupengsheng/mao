@@ -94,6 +94,7 @@ import { formatCost, formatNumber, formatTokens, rankBarOption, type RankItem } 
 import { exportCsv } from '../utils/csv'
 import { formatDateTime } from '../../../utils/datetime'
 import type { UsersPayload } from '../types'
+import { withDrilldownPeriod } from '../utils/drilldown'
 
 const props = defineProps<{ payload: UsersPayload | null; loading?: boolean }>()
 const router = useRouter()
@@ -123,7 +124,7 @@ const tokenItems = computed<RankItem[]>(() =>
 )
 
 function go(path: string) {
-  router.push(path)
+  router.push(withDrilldownPeriod(path, props.payload?.period))
 }
 
 function exportRows() {

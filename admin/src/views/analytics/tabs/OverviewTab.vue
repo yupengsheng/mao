@@ -26,9 +26,9 @@
           :class="{ clickable: !!item.path }"
           role="button"
           :tabindex="item.path ? 0 : -1"
-          @click="go(item.path)"
-          @keydown.enter.prevent="go(item.path)"
-          @keydown.space.prevent="go(item.path)"
+          @click="goWindow(item.path)"
+          @keydown.enter.prevent="goWindow(item.path)"
+          @keydown.space.prevent="goWindow(item.path)"
         >
           <div class="label">{{ item.label }}</div>
           <div class="value-row">
@@ -82,9 +82,9 @@
                 :class="[item.tone, { clickable: !!item.path }]"
                 role="button"
                 :tabindex="item.path ? 0 : -1"
-                @click="go(item.path)"
-                @keydown.enter.prevent="go(item.path)"
-                @keydown.space.prevent="go(item.path)"
+                @click="goWindow(item.path)"
+                @keydown.enter.prevent="goWindow(item.path)"
+                @keydown.space.prevent="goWindow(item.path)"
               >
                 <span class="live-label">{{ item.label }}</span>
                 <span class="live-value">{{ formatNumber(item.value) }}</span>
@@ -93,8 +93,8 @@
           </div>
 
           <div class="live-actions">
-            <el-button link type="primary" @click="go('/sessions?phase=FAILED')">查看失败会话</el-button>
-            <el-button link type="primary" @click="go('/analytics?tab=sessions')">会话结构详情</el-button>
+            <el-button link type="primary" @click="goWindow('/sessions?phase=FAILED')">查看失败会话</el-button>
+            <el-button link type="primary" @click="goWindow('/analytics?tab=sessions')">会话结构详情</el-button>
           </div>
         </el-card>
       </el-col>
@@ -108,7 +108,7 @@
           </template>
           <ul class="insights">
             <li v-for="(item, index) in insights" :key="index" :class="item.level">
-              <button v-if="item.path" class="insight-link" type="button" @click="go(item.path)">
+              <button v-if="item.path" class="insight-link" type="button" @click="goWindow(item.path)">
                 {{ item.text }}
               </button>
               <span v-else>{{ item.text }}</span>
@@ -135,6 +135,7 @@ import BaseChart from '../../../components/BaseChart.vue'
 import { CHART_PALETTE } from '../../../utils/echarts'
 import { formatCompact, formatCost, formatTokens, sparklineOption } from '../chart-options'
 import { delta, deltaClass, deltaText, ppDelta } from '../composables/metrics'
+import { withDrilldownPeriod } from '../utils/drilldown'
 import type { OverviewPayload, PeriodTotals, PreviousTotals } from '../types'
 
 const props = defineProps<{
@@ -282,6 +283,11 @@ function rateText(value: number | null | undefined): string {
 
 function go(path?: string) {
   if (path) router.push(path)
+}
+
+/** 窗口类指标与洞察下钻时带上当前周期；实时快照仍用 go()。 */
+function goWindow(path?: string) {
+  if (path) router.push(withDrilldownPeriod(path, props.payload?.period))
 }
 </script>
 

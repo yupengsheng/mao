@@ -127,6 +127,7 @@ import { useRouter } from 'vue-router'
 import { formatMs, llmCallSceneLabel } from '../../../utils/llmCallLabels'
 import { formatCost, formatNumber } from '../chart-options'
 import { exportCsv } from '../utils/csv'
+import { withDrilldownPeriod } from '../utils/drilldown'
 import type { RunTracePayload, RunTraceRoundRow, RunTraceToolFailureRow } from '../types'
 
 const props = defineProps<{
@@ -144,7 +145,7 @@ const sceneLabel = computed(() => llmCallSceneLabel(props.payload?.scene ?? 'age
 
 function goSessions(row: RunTraceRoundRow) {
   const key = props.payload?.scope === 'user' ? 'userId' : 'agentId'
-  void router.push(`/sessions?${key}=${row.scopeKey}`)
+  void router.push(withDrilldownPeriod(`/sessions?${key}=${row.scopeKey}`, props.payload?.period))
 }
 
 const ROUND_HEADER = ['Agent / 用户', '会话 ID', '模型', '结束时间', '耗时(ms)', 'Token', '成本']
