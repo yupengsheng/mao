@@ -39,8 +39,11 @@ export function registerUserSkillRoutes(app: FastifyInstance, deps: Pick<SkillRo
 
   app.post('/v1/user-skills/upload', async (request, reply) => {
     const userId = requireUserId(request);
-    const files = await collectNamedFiles(request, 'files');
-    const result = userSkillService.uploadUserSkill(userId, files);
+    const collected = await collectNamedFiles(request, 'files');
+    if (!collected.ok) {
+      return sendJson(reply, 200, fail(400, collected.message));
+    }
+    const result = userSkillService.uploadUserSkill(userId, collected.files);
     return sendJson(reply, 200, result.code === 0 ? ok(result.data) : result);
   });
 
@@ -182,8 +185,11 @@ export function registerSkillDocRoutes(
     const userId = requireUserId(request);
     // 系统级技能库写操作（覆盖系统技能），与个人 Skill 删除一致要求 skill:write
     await requirePermission(permissionService, userId, 'skill:write');
-    const files = await collectNamedFiles(request, 'files');
-    const result = skillDocService.uploadSkill(files);
+    const collected = await collectNamedFiles(request, 'files');
+    if (!collected.ok) {
+      return sendJson(reply, 200, fail(400, collected.message));
+    }
+    const result = skillDocService.uploadSkill(collected.files);
     return sendJson(reply, 200, result.code === 0 ? ok(result.data) : result);
   });
 
@@ -328,7 +334,9 @@ async function collectAdminSkillUpload(
   return { ok: true, files, userIdValues };
 }
 
-async function collectNamedFiles(request: FastifyRequest, fieldName: string): Promise<UploadedSkillFile[]> {
+type CollectedNamedFiles = { ok: true; files: UploadedSkillFile[] } | { ok: false; message: string };
+
+async function collectNamedFiles(request: FastifyRequest, fieldName: string): Promise<CollectedNamedFiles> {
   const files: UploadedSkillFile[] = [];
   try {
     // Busboy 默认会丢掉 filename 中的目录（skill/SKILL.md → SKILL.md），
@@ -344,8 +352,9 @@ async function collectNamedFiles(request: FastifyRequest, fieldName: string): Pr
         await part.toBuffer();
       }
     }
-  } catch {
-    return files;
+  } catch (error) {
+    // 截断/超限时已读到的部分文件可能只是前缀，绝不能落盘。
+    return { ok: false, message: multipartAbortMessage(error) };
   }
-  return files;
+  return { ok: true, files };
 }

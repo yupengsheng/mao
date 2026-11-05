@@ -51,7 +51,9 @@ mao skill-docs get --name bigdata-cli
 1. 若 `--dir` 下直接有 `SKILL.md`：将该目录视为单个技能，技能名=目录名，上传路径形如 `目录名/SKILL.md` 及子文件。
 2. 若 `--dir` 为多技能根：递归子目录，相对路径须含 `技能名/...`。
 
-成功：`data` 为已导入技能名字符串数组。
+成功：`data` 为 `{ imported, failed }`。`imported` 是已导入技能名数组；`failed` 是失败包明细，每项含 `folder`（技能目录名）与 `reason`（缺 `SKILL.md`、frontmatter 非法、frontmatter 名与目录名不一致、写盘失败等原因）。
+
+部分包失败不会影响其他包写入，响应仍为成功（`code=0`）；全部包失败时 `imported` 为空数组、`failed` 列出全部原因。CLI 非 `--raw` 模式会把失败逐条输出到 stderr，全部失败时退出码为 1，便于脚本判断。
 
 ```bash
 mao skill-docs upload --dir ./my-skill
@@ -88,6 +90,7 @@ mao skill-docs delete --name my-skill
 ## 成功失败判断
 
 - 上传无文件 / 无合法相对路径 → CLI 或服务端报错
+- 上传中有包校验或写盘失败 → 成功包照常导入，失败包进入 `failed`；CLI 逐条输出失败原因
 - `assign` 未指定用户、用户 ID 非法、用户不存在、上传中断或文件数超限 → 业务错误；中断和超限不会写入任何用户。多名用户中途失败时，message 会列出已经写成功的用户
 - `assign` 或用户技能上传与系统技能同名 → 409 整批拒绝，不写入任何用户
 - 删除不存在 → 业务错误 message（如 Skill not found）

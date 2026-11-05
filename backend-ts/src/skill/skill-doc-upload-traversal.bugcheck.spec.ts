@@ -36,7 +36,7 @@ describe('BUGCHECK skill upload path traversal', () => {
     const { service, skillsDir } = createService();
     service.uploadSkill([
       { originalFilename: 'myskill/../evil.txt', buffer: Buffer.from('pwned') },
-      { originalFilename: 'myskill/SKILL.md', buffer: Buffer.from('# ok\n') },
+      { originalFilename: 'myskill/SKILL.md', buffer: Buffer.from('---\nname: myskill\ndescription: Test skill\n---\n# ok\n') },
     ]);
     // 正确行为：穿越文件被拒绝或收敛进 myskill/，任何情况下 skills 根都不得出现 evil.txt
     expect(existsSync(join(skillsDir, 'evil.txt'))).toBe(false);

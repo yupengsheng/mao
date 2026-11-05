@@ -414,4 +414,153 @@ describe('skill routes', () => {
     }
     await app.close();
   });
+
+  async function createSkillApp(
+    skillsDir: string,
+    userDir: string,
+    limits?: { files?: number },
+  ) {
+    const loader = new SkillLoader(new PathSandbox(skillsDir), skillsDir, 1);
+    const app = Fastify();
+    if (limits != null) {
+      await app.register(multipart, { limits });
+    } else {
+      await app.register(multipart);
+    }
+    app.setErrorHandler(handleError);
+    app.addHook('preHandler', (req, _r, done) => { req.userId = 1; done(); });
+    registerSkillRoutes(app, {
+      userSkillService: new UserSkillService(userDir, noSystemSkillNames),
+      skillDocService: new SkillDocService(loader),
+      skillSyncService: {
+        writeSyncZip: vi.fn(async (_a, _s, out) => { out.end(); }),
+      } as unknown as SkillSyncService,
+      sessionService: {
+        getSession: vi.fn(async () => ({ id: 1, userId: 1, agentId: 9 })),
+      } as unknown as SessionService,
+      agentService: {
+        removeSkillNameFromAll: vi.fn(async () => 0),
+      } as never,
+      agentLookup: {
+        findById: vi.fn(async () => ({ id: 9, name: 'A' })),
+      } as unknown as AgentLookup,
+      permissionService: { hasPermission: vi.fn(async () => true) },
+      userLookup: {
+        findByIds: vi.fn(async () => []),
+        listOptions: vi.fn(async () => []),
+      },
+    });
+    return app;
+  }
+
+  function skillUploadRequest(files: Array<{ name: string; content: string }>) {
+    const boundary = `----maoSkillUpload${Math.random().toString(16).slice(2)}`;
+    const payload = files.flatMap((file) => [
+      `--${boundary}`,
+      `Content-Disposition: form-data; name="files"; filename="${file.name}"`,
+      'Content-Type: text/markdown',
+      '',
+      file.content,
+    ]);
+    payload.push(`--${boundary}--`, '');
+    return {
+      headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+      payload: payload.join('\r\n'),
+    };
+  }
+
+  it('reports partial system skill uploads with per-folder failures', async () => {
+    const skillsDir = useTmpDir('mao-sdoc-');
+    const userDir = useTmpDir('mao-user-s-');
+    const app = await createSkillApp(skillsDir, userDir);
+    const request = skillUploadRequest([
+      { name: 'good-skill/SKILL.md', content: '---\nname: good-skill\ndescription: Good\n---\nBody\n' },
+      { name: 'missing-skill/notes.md', content: 'no skill md' },
+    ]);
+
+    const res = JSON.parse((await app.inject({
+      method: 'POST',
+      url: '/v1/skill-docs/upload',
+      ...request,
+    })).body);
+    expect(res.code).toBe(0);
+    expect(res.data.imported).toEqual(['good-skill']);
+    expect(res.data.failed).toHaveLength(1);
+    expect(res.data.failed[0].folder).toBe('missing-skill');
+    expect(res.data.failed[0].reason).toContain('missing SKILL.md');
+    expect(existsSync(join(skillsDir, 'good-skill', 'SKILL.md'))).toBe(true);
+    expect(existsSync(join(skillsDir, 'missing-skill'))).toBe(false);
+    await app.close();
+  });
+
+  it('returns every failed folder when all system skill packages fail validation', async () => {
+    const skillsDir = useTmpDir('mao-sdoc-');
+    const userDir = useTmpDir('mao-user-s-');
+    const app = await createSkillApp(skillsDir, userDir);
+    const request = skillUploadRequest([
+      { name: 'bad-md/SKILL.md', content: '# missing frontmatter\n' },
+      { name: 'mismatch/SKILL.md', content: '---\nname: other-name\ndescription: X\n---\nBody\n' },
+    ]);
+
+    const res = JSON.parse((await app.inject({
+      method: 'POST',
+      url: '/v1/skill-docs/upload',
+      ...request,
+    })).body);
+    expect(res.code).toBe(0);
+    expect(res.data.imported).toEqual([]);
+    expect(res.data.failed.map((item: { folder: string }) => item.folder)).toEqual(['bad-md', 'mismatch']);
+    expect(res.data.failed[0].reason).toContain('SKILL.md 校验失败');
+    expect(res.data.failed[1].reason).toContain('不一致');
+    expect(existsSync(join(skillsDir, 'bad-md'))).toBe(false);
+    expect(existsSync(join(skillsDir, 'mismatch'))).toBe(false);
+    await app.close();
+  });
+
+  it('isolates a system skill write failure and keeps other packages', async () => {
+    const skillsDir = useTmpDir('mao-sdoc-');
+    const userDir = useTmpDir('mao-user-s-');
+    const app = await createSkillApp(skillsDir, userDir);
+    const request = skillUploadRequest([
+      { name: 'broken/SKILL.md', content: '---\nname: broken\ndescription: Broken\n---\nBody\n' },
+      { name: 'broken/conflict', content: 'file blocks directory' },
+      { name: 'broken/conflict/child.md', content: 'cannot create' },
+      { name: 'healthy/SKILL.md', content: '---\nname: healthy\ndescription: Healthy\n---\nBody\n' },
+    ]);
+
+    const res = JSON.parse((await app.inject({
+      method: 'POST',
+      url: '/v1/skill-docs/upload',
+      ...request,
+    })).body);
+    expect(res.code).toBe(0);
+    expect(res.data.imported).toEqual(['healthy']);
+    expect(res.data.failed).toHaveLength(1);
+    expect(res.data.failed[0].folder).toBe('broken');
+    expect(res.data.failed[0].reason).toContain('写入失败');
+    expect(existsSync(join(skillsDir, 'broken'))).toBe(false);
+    expect(existsSync(join(skillsDir, 'healthy', 'SKILL.md'))).toBe(true);
+    await app.close();
+  });
+
+  it('rejects a truncated system upload without writing skills', async () => {
+    const skillsDir = useTmpDir('mao-sdoc-');
+    const userDir = useTmpDir('mao-user-s-');
+    const app = await createSkillApp(skillsDir, userDir, { files: 1 });
+    const request = skillUploadRequest([
+      { name: 'first/SKILL.md', content: '---\nname: first\ndescription: First\n---\nBody\n' },
+      { name: 'second/SKILL.md', content: '---\nname: second\ndescription: Second\n---\nBody\n' },
+    ]);
+
+    const res = JSON.parse((await app.inject({
+      method: 'POST',
+      url: '/v1/skill-docs/upload',
+      ...request,
+    })).body);
+    expect(res.code).toBe(400);
+    expect(res.message).toContain('未写入');
+    expect(existsSync(join(skillsDir, 'first'))).toBe(false);
+    expect(existsSync(join(skillsDir, 'second'))).toBe(false);
+    await app.close();
+  });
 });

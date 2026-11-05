@@ -306,7 +306,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, onActivated, onMounted, watch } from 'vue'
+import { computed, h, ref, onActivated, onMounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { UploadFilled } from '@element-plus/icons-vue'
 import { api } from '../../api'
@@ -671,6 +671,26 @@ function prepareSkillUploadFiles(files: File[]) {
   return valid
 }
 
+type SkillUploadFailure = { folder?: string; reason?: string }
+
+/** 兼容旧后端（data 为名称数组）与新结构（{ imported, failed }），避免缓存版本直接崩溃。 */
+function parseSkillUploadResponse(data: unknown): { imported: string[]; failed: SkillUploadFailure[] } {
+  if (Array.isArray(data)) {
+    return { imported: data.filter((item): item is string => typeof item === 'string'), failed: [] }
+  }
+  if (data == null || typeof data !== 'object') {
+    return { imported: [], failed: [] }
+  }
+  const payload = data as { imported?: unknown; failed?: unknown }
+  const imported = Array.isArray(payload.imported)
+    ? payload.imported.filter((item): item is string => typeof item === 'string')
+    : []
+  const failed = Array.isArray(payload.failed)
+    ? payload.failed.filter((item): item is SkillUploadFailure => item != null && typeof item === 'object')
+    : []
+  return { imported, failed }
+}
+
 async function uploadFiles(files: File[], target: UploadTarget, options?: { busyHeld?: boolean }) {
   if (uploadBusy.value && !options?.busyHeld) return
   if (!options?.busyHeld) uploadBusy.value = true
@@ -704,8 +724,33 @@ async function uploadFiles(files: File[], target: UploadTarget, options?: { busy
       ElMessage.success(names ? `已将 ${names} 添加到 ${count} 个用户` : `已添加到 ${count} 个用户`)
       await fetchPersonalSkills()
     } else {
-      const names = data || []
-      ElMessage.success(`Skills 上传成功：${names.join(', ')}`)
+      const { imported, failed } = parseSkillUploadResponse(data)
+      if (failed.length > 0) {
+        if (imported.length > 0) {
+          ElMessage.success(`Skills 上传成功：${imported.join(', ')}`)
+        }
+        await fetchSkillDocs()
+        await ElMessageBox.alert(
+          h('div', [
+            h('p', imported.length > 0
+              ? `成功 ${imported.length} 个：${imported.join('、')}`
+              : '没有 Skill 导入成功。'),
+            h('ul', { style: 'margin: 8px 0 0; padding-left: 20px' }, failed.map((item) =>
+              h('li', [
+                h('strong', item.folder || '未知目录'),
+                `：${item.reason || '未知原因'}`,
+              ]))),
+          ]),
+          imported.length > 0 ? '部分 Skill 上传失败' : 'Skill 上传失败',
+          { type: imported.length > 0 ? 'warning' : 'error', confirmButtonText: '知道了' },
+        ).catch(() => undefined)
+        return
+      }
+      if (imported.length > 0) {
+        ElMessage.success(`Skills 上传成功：${imported.join(', ')}`)
+      } else {
+        ElMessage.warning('上传完成，但没有导入任何 Skill')
+      }
       await fetchSkillDocs()
     }
   } catch {

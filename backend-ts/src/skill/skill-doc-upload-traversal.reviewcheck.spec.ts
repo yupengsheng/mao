@@ -43,7 +43,7 @@ describe('skill upload traversal (extended vectors)', () => {
       { originalFilename: '/myskill/SKILL.md', buffer: Buffer.from('pwned') },
       { originalFilename: '..%2fmyskill/SKILL.md', buffer: Buffer.from('pwned') },
       // --- 合法文件（必须落盘） ---
-      { originalFilename: 'myskill/SKILL.md', buffer: Buffer.from('# ok\n') },
+      { originalFilename: 'myskill/SKILL.md', buffer: Buffer.from('---\nname: myskill\ndescription: Test skill\n---\n# ok\n') },
       { originalFilename: 'myskill/sub/nested.md', buffer: Buffer.from('# nested\n') },
     ]);
 
@@ -64,6 +64,7 @@ describe('skill upload traversal (extended vectors)', () => {
     const { service, skillsDir } = createService();
     // %2e%2e 不被服务端解码，只是普通目录名；./ 前导段归一化后仍在技能子目录内
     service.uploadSkill([
+      { originalFilename: 'myskill/SKILL.md', buffer: Buffer.from('---\nname: myskill\ndescription: Test skill\n---\n# ok\n') },
       { originalFilename: 'myskill/%2e%2e/evil.txt', buffer: Buffer.from('x') },
       { originalFilename: 'myskill/./ok.txt', buffer: Buffer.from('x') },
     ]);

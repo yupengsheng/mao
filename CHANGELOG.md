@@ -1,3 +1,14 @@
+## 0.0.453 (2026-11-05)
+
+### 后端
+- **系统 Skill 上传改为逐包校验与部分成功**：`POST /v1/skill-docs/upload` 的 `data` 改为 `{ imported, failed }`；缺少 `SKILL.md`、frontmatter 非法、frontmatter 名与目录名不一致或写盘失败的包进入 `failed` 并返回原因，不再因单个包失败中断整批。单包采用暂存目录写入后交换，失败不污染或覆盖已有技能；multipart 截断/超限仍整体拒绝且不写入。
+
+### 管理后台
+- **Skill 上传展示逐包失败明细**：部分成功时提示成功数量并弹窗列出失败目录与原因；全部失败按错误弹窗展示。兼容旧版后端返回的名称数组。
+
+### 终端 CLI（mao-cli）
+- **`mao skill-docs upload` 输出逐包失败原因**：非 `--raw` 模式将 `failed` 逐条写入 stderr，全部失败时退出码为 1；接口响应结构同步为 `{ imported, failed }`。
+
 ## 0.0.452 (2026-11-05)
 
 ### 后端

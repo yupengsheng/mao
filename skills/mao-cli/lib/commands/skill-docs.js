@@ -41,6 +41,7 @@ async function run(ctx, subcommand, _rest, flags) {
     case 'upload': {
       const files = collectSkillUploadFiles(requireFlag(flags, 'dir', 'Skill 目录'));
       const result = await uploadMultipart(ctx, '/skill-docs/upload', files);
+      reportSkillUploadFailures(result, ctx.raw);
       emitResult(result, { raw: ctx.raw });
       return;
     }
@@ -76,6 +77,21 @@ async function run(ctx, subcommand, _rest, flags) {
     default:
       printError(`未知 skill-docs 命令: ${subcommand}`);
       process.exit(1);
+  }
+}
+
+/** 逐包上传的部分失败在新响应结构的 data.failed 中；旧后端数组响应保持原样。 */
+function reportSkillUploadFailures(result, raw) {
+  if (raw) return;
+  const data = result && result.data;
+  if (data == null || Array.isArray(data) || typeof data !== 'object') return;
+  const failed = Array.isArray(data.failed) ? data.failed : [];
+  if (failed.length === 0) return;
+  for (const item of failed) {
+    printError(`失败 ${item && item.folder ? item.folder : '未知目录'}: ${item && item.reason ? item.reason : '未知原因'}`);
+  }
+  if (!Array.isArray(data.imported) || data.imported.length === 0) {
+    process.exitCode = 1;
   }
 }
 
