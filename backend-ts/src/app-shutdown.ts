@@ -29,6 +29,7 @@ import type { WatcherScheduler } from './signal/watcher-scheduler.js';
 import type { SignalCheckCleanup } from './signal/signal-check-cleanup.js';
 import type { EcpRenewScheduler } from './auth/ecp-renew.scheduler.js';
 import type { TaskRecordRepairService } from './task/task-record-repair.service.js';
+import type { TaskExecutionRetentionService } from './task/task-execution-retention.service.js';
 
 /** 停机时需要优雅关闭的所有组件。 */
 export interface ShutdownDeps {
@@ -65,6 +66,7 @@ export interface ShutdownDeps {
   wsHandler: StreamingWsHandler;
   sessionService: SessionService;
   taskRecordRepair: TaskRecordRepairService;
+  taskExecutionRetention: TaskExecutionRetentionService;
 }
 
 /**
@@ -78,7 +80,7 @@ export function createShutdownHandler(deps: ShutdownDeps): () => Promise<void> {
     watcherScheduler, signalCheckCleanup, ecpRenewScheduler,
     shellManager, terminalManager, ptyChannelHubs, ptyHubGeneration,
     containerRegistry, channelServer, runtimeCleanup, activityHeartbeat, wsRegistry,
-    agentLoop, wsHandler, sessionService, taskRecordRepair,
+    agentLoop, wsHandler, sessionService, taskRecordRepair, taskExecutionRetention,
   } = deps;
 
   const isDrainingForDeploy = (): boolean => isDrainingInstance(cfg.app.harness.runtimeDir, cfg.server.port);
@@ -117,6 +119,7 @@ export function createShutdownHandler(deps: ShutdownDeps): () => Promise<void> {
       crash.stopPeriodicSweep();
       drainWatcher.stop();
       taskRecordRepair.stop();
+      taskExecutionRetention.stop();
       weixinMonitor.shutdown();
       feishuMonitor.shutdown();
       dingtalk.shutdown();

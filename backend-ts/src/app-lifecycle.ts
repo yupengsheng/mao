@@ -25,6 +25,7 @@ import { DeployDrainWatcher } from './harness/core/deploy-drain-watcher.js';
 import { createShutdownHandler } from './app-shutdown.js';
 import { TaskRepository } from './task/task.repository.js';
 import { TaskRecordRepairService } from './task/task-record-repair.service.js';
+import { TaskExecutionRetentionService } from './task/task-execution-retention.service.js';
 
 export interface LifecycleDeps {
   app: FastifyInstance;
@@ -105,6 +106,8 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
   scheduledRunCleanup.start();
   const taskRecordRepair = new TaskRecordRepairService(new TaskRepository(db));
   taskRecordRepair.start();
+  const taskExecutionRetention = new TaskExecutionRetentionService(new TaskRepository(db));
+  taskExecutionRetention.start();
   d.callLogService.start();
   d.callLogCleanup.start();
   d.callLogRepair.start();
@@ -213,7 +216,7 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
     containerRegistry: d.containerRegistry, channelServer: d.channelServer, runtimeCleanup,
     activityHeartbeat: d.activityHeartbeat, wsRegistry: d.wsRegistry,
     agentLoop: d.agentLoop, wsHandler: d.wsHandler, sessionService: d.sessionService,
-    taskRecordRepair,
+    taskRecordRepair, taskExecutionRetention,
   });
   drainWatcher.start();
 

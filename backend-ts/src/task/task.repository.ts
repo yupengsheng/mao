@@ -126,6 +126,44 @@ export class TaskRepository {
     await this.db.updateById('agent_task_execution', id, fields);
   }
 
+  /**
+   * 清理超过保留期且不属于任务最近 keepPerTask 次尝试的终态执行，并删除对应入口记录。
+   * 只处理 COMPLETED / FAILED / CANCELLED，绝不触碰 WORKING / BLOCKED；单批使用
+   * ORDER BY id LIMIT，避免长事务，多实例重复执行幂等。
+   */
+  async deleteStaleExecutions(cutoff: string, keepPerTask: number, limit: number): Promise<number> {
+    const safeKeep = Number.isFinite(keepPerTask) && keepPerTask > 0 ? Math.trunc(keepPerTask) : 200;
+    const safeLimit = Number.isFinite(limit) && limit > 0 ? Math.min(5000, Math.trunc(limit)) : 500;
+    return this.db.transaction(async (db) => {
+      const executions = await db.query<{ id: number; executionId: string }>(
+        `SELECT e.id, e.execution_id
+           FROM agent_task_execution e
+          WHERE e.status IN ('COMPLETED', 'FAILED', 'CANCELLED')
+            AND e.created_at < ?
+            AND e.attempt_no <= (
+              SELECT MAX(x.attempt_no) - ? FROM agent_task_execution x WHERE x.task_id = e.task_id
+            )
+          ORDER BY e.id ASC
+          LIMIT ?`,
+        [cutoff, safeKeep, safeLimit],
+      );
+      if (executions.length === 0) return 0;
+
+      const ids = executions.map((execution) => execution.id);
+      const executionIds = executions.map((execution) => execution.executionId);
+      const placeholders = ids.map(() => '?').join(', ');
+      await db.execute(
+        `DELETE FROM agent_task_trigger WHERE source_event_id IN (${placeholders})`,
+        executionIds,
+      );
+      const result = await db.execute(
+        `DELETE FROM agent_task_execution WHERE id IN (${placeholders})`,
+        ids,
+      );
+      return Number(result.affectedRows ?? 0);
+    });
+  }
+
   async insertTrigger(trigger: TaskTrigger): Promise<void> {
     await this.db.insert('agent_task_trigger', trigger);
   }

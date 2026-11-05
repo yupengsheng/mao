@@ -64,4 +64,49 @@ describe('TaskRepository', () => {
     expect(sql).toContain('LIMIT ?');
     expect(params).toEqual(['2026-11-05 11:58:00', 100]);
   });
+
+  it('deletes stale terminal executions beyond the per-task keep window and their triggers', async () => {
+    const tx = {
+      query: vi.fn().mockResolvedValue([
+        { id: 10, executionId: 'exec-10' },
+        { id: 11, executionId: 'exec-11' },
+      ]),
+      execute: vi.fn()
+        .mockResolvedValueOnce({ affectedRows: 2 })
+        .mockResolvedValueOnce({ affectedRows: 2 }),
+    };
+    const db = { transaction: vi.fn(async (work: (connection: unknown) => Promise<unknown>) => work(tx)) };
+    const repo = new TaskRepository(db as unknown as Db);
+
+    await expect(repo.deleteStaleExecutions('2026-08-07 12:00:00', 200, 500)).resolves.toBe(2);
+
+    const [selectSql, selectParams] = tx.query.mock.calls[0]!;
+    expect(selectSql).toContain("e.status IN ('COMPLETED', 'FAILED', 'CANCELLED')");
+    expect(selectSql).toContain('e.created_at < ?');
+    expect(selectSql).toContain('MAX(x.attempt_no) - ?');
+    expect(selectSql).toContain('ORDER BY e.id ASC');
+    expect(selectSql).toContain('LIMIT ?');
+    expect(selectParams).toEqual(['2026-08-07 12:00:00', 200, 500]);
+
+    expect(tx.execute).toHaveBeenNthCalledWith(
+      1,
+      'DELETE FROM agent_task_trigger WHERE source_event_id IN (?, ?)',
+      ['exec-10', 'exec-11'],
+    );
+    expect(tx.execute).toHaveBeenNthCalledWith(
+      2,
+      'DELETE FROM agent_task_execution WHERE id IN (?, ?)',
+      [10, 11],
+    );
+  });
+
+  it('does not issue deletes when no stale terminal execution is eligible', async () => {
+    const tx = { query: vi.fn().mockResolvedValue([]), execute: vi.fn() };
+    const db = { transaction: vi.fn(async (work: (connection: unknown) => Promise<unknown>) => work(tx)) };
+    const repo = new TaskRepository(db as unknown as Db);
+
+    await expect(repo.deleteStaleExecutions('2026-08-07 12:00:00', 200, 500)).resolves.toBe(0);
+
+    expect(tx.execute).not.toHaveBeenCalled();
+  });
 });
