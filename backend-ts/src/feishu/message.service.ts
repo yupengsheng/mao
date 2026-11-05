@@ -141,7 +141,7 @@ export class FeishuMessageService {
     if (context.chatId == null) throw new Error('Feishu group message requires chatId');
     const existing = await this.repository.findGroupConversation(accountId, context.chatId);
     if (existing != null) return existing;
-    return this.createConversation(accountId, context.chatId, context);
+    return this.withChatLock(`${accountId}:${context.chatId}`, () => this.createConversation(accountId, context.chatId!, context));
   }
 
   /** 查询话题→会话映射；未记录返回 null。 */

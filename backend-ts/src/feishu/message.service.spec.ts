@@ -97,7 +97,38 @@ describe('FeishuMessageService', () => {
     const conv = await service.getOrCreateGroup('1', makeContext());
     expect(conv.sessionId).toBe(9);
     expect(sessionFactory.create).toHaveBeenCalledOnce();
+    expect(repository.findGroupConversation).toHaveBeenCalledTimes(2);
     expect(repository.saveConversation).toHaveBeenCalledWith(expect.objectContaining({ appId: '1', chatId: 'oc_group', sessionId: 9, ownerUserId: 3 }));
+  });
+
+  it('creates a new group session when the active pointer targets a deleted session', async () => {
+    const repository = makeRepo({
+      findGroupConversation: vi.fn(async () => null),
+      saveConversation: vi.fn(async (c: unknown) => ({ id: 2, ...c })),
+    });
+    const sessionFactory = { create: vi.fn(async () => ({ sessionId: 12, ownerUserId: 3, workspace: '/ws' })) };
+    const service = new FeishuMessageService(repository as never, sessionFactory as never, 20, 120);
+
+    const conv = await service.getOrCreateGroup('1', makeContext());
+
+    expect(conv.sessionId).toBe(12);
+    expect(repository.findGroupConversation).toHaveBeenCalledTimes(2);
+    expect(repository.saveConversation).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 12 }));
+  });
+
+  it('creates a new p2p session when the active pointer targets a deleted session', async () => {
+    const repository = makeRepo({
+      findGroupConversation: vi.fn(async () => null),
+      saveConversation: vi.fn(async (c: unknown) => ({ id: 2, ...c })),
+    });
+    const sessionFactory = { create: vi.fn(async () => ({ sessionId: 13, ownerUserId: 3 })) };
+    const service = new FeishuMessageService(repository as never, sessionFactory as never, 20, 120);
+
+    const conv = await service.getOrCreateP2p('1', makeContext({ chatType: 'p2p' }), 3);
+
+    expect(conv.sessionId).toBe(13);
+    expect(repository.findGroupConversation).toHaveBeenCalledTimes(2);
+    expect(repository.saveConversation).toHaveBeenCalledWith(expect.objectContaining({ chatId: 'p2p:union:on_user', sessionId: 13 }));
   });
 
   it('creates p2p conversation keyed by prefixed identity with owner isolation', async () => {
@@ -293,6 +324,13 @@ describe('FeishuMessageService', () => {
     const conv = await service.findActiveP2p('1', makeContext({ chatType: 'p2p' }), 3);
     expect(conv?.sessionId).toBe(7);
     expect(repository.findGroupConversation).toHaveBeenCalledWith('1', 'p2p:union:on_user', 3);
+  });
+
+  it('returns null for an active p2p pointer whose session was deleted', async () => {
+    const repository = makeRepo({ findGroupConversation: vi.fn(async () => null) });
+    const service = new FeishuMessageService(repository as never, { create: vi.fn() } as never, 20, 120);
+
+    await expect(service.findActiveP2p('1', makeContext({ chatType: 'p2p' }), 3)).resolves.toBeNull();
   });
 
   it('records p2p message mapping tolerantly and skips empty message ids', async () => {

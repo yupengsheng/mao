@@ -11,6 +11,40 @@ function setup(rows: Record<string, unknown>[]) {
   return { repo: new MysqlFeishuMessageRepository(db), query, execute };
 }
 
+describe('MysqlFeishuMessageRepository active conversation pointer', () => {
+  it('only returns a pointer whose session still exists', async () => {
+    const { repo, query } = setup([{ session_id: 9, app_id: '1', chat_id: 'oc_group', owner_user_id: 3 }]);
+
+    await expect(repo.findGroupConversation('1', 'oc_group')).resolves.toMatchObject({ sessionId: 9 });
+    expect(query).toHaveBeenCalledWith(
+      expect.stringContaining('JOIN `session` s ON s.id = c.session_id AND s.deleted = 0'),
+      ['1', 'oc_group'],
+    );
+  });
+
+  it('applies the owner filter when looking up a p2p pointer', async () => {
+    const { repo, query } = setup([]);
+
+    await expect(repo.findGroupConversation('1', 'p2p:union:on_user', 3)).resolves.toBeNull();
+    expect(query).toHaveBeenCalledWith(
+      expect.stringContaining('WHERE c.app_id = ? AND c.chat_id = ? AND c.owner_user_id = ? LIMIT 1'),
+      ['1', 'p2p:union:on_user', 3],
+    );
+  });
+
+  it('resets group context columns before switching the active session', async () => {
+    const { repo, execute } = setup([{ session_id: 10, app_id: '1', chat_id: 'oc_group', owner_user_id: 3 }]);
+
+    await repo.saveConversation({ appId: '1', chatId: 'oc_group', sessionId: 10, ownerUserId: 3, workspace: '/ws' });
+
+    const sql = execute.mock.calls[0][0] as string;
+    expect(sql).toContain('last_context_log_id = IF(session_id = VALUES(session_id), last_context_log_id, 0)');
+    expect(sql).toContain('context_summary = IF(session_id = VALUES(session_id), context_summary, NULL)');
+    expect(sql).toContain('context_summary_log_id = IF(session_id = VALUES(session_id), context_summary_log_id, 0)');
+    expect(sql.indexOf('last_context_log_id = IF')).toBeLessThan(sql.indexOf('session_id = VALUES(session_id), owner_user_id'));
+  });
+});
+
 describe('MysqlFeishuMessageRepository p2p mapping', () => {
   it('returns the mapped session after Db converts column names', async () => {
     const { repo, query } = setup([{ session_id: 5 }]);

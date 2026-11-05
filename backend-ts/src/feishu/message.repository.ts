@@ -110,8 +110,12 @@ export class MysqlFeishuMessageRepository implements FeishuMessageRepository {
 
   findGroupConversation(appId: string, chatId: string, ownerUserId?: number): Promise<FeishuConversation | null> {
     const sql = ownerUserId == null
-      ? 'SELECT * FROM feishu_chat WHERE app_id = ? AND chat_id = ? LIMIT 1'
-      : 'SELECT * FROM feishu_chat WHERE app_id = ? AND chat_id = ? AND owner_user_id = ? LIMIT 1';
+      ? `SELECT c.* FROM feishu_chat c
+         JOIN \`session\` s ON s.id = c.session_id AND s.deleted = 0
+         WHERE c.app_id = ? AND c.chat_id = ? LIMIT 1`
+      : `SELECT c.* FROM feishu_chat c
+         JOIN \`session\` s ON s.id = c.session_id AND s.deleted = 0
+         WHERE c.app_id = ? AND c.chat_id = ? AND c.owner_user_id = ? LIMIT 1`;
     const params = ownerUserId == null ? [appId, chatId] : [appId, chatId, ownerUserId];
     return this.db.queryOne<FeishuConversation>(sql, params);
   }
@@ -134,7 +138,11 @@ export class MysqlFeishuMessageRepository implements FeishuMessageRepository {
     await this.db.execute(
       `INSERT INTO feishu_chat (app_id, chat_id, session_id, owner_user_id, workspace)
        VALUES (?, ?, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE session_id = VALUES(session_id), owner_user_id = VALUES(owner_user_id), workspace = VALUES(workspace)`,
+       ON DUPLICATE KEY UPDATE
+         last_context_log_id = IF(session_id = VALUES(session_id), last_context_log_id, 0),
+         context_summary = IF(session_id = VALUES(session_id), context_summary, NULL),
+         context_summary_log_id = IF(session_id = VALUES(session_id), context_summary_log_id, 0),
+         session_id = VALUES(session_id), owner_user_id = VALUES(owner_user_id), workspace = VALUES(workspace)`,
       [conversation.appId, conversation.chatId, conversation.sessionId, conversation.ownerUserId, conversation.workspace ?? null],
     );
     // 会话 → 通道绑定（不可变）：任何会话行写入路径同步落绑定，活跃指针切换不影响反查。
