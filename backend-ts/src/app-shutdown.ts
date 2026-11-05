@@ -34,6 +34,7 @@ import type { AuditLogCleanup } from './audit/audit-log-cleanup.js';
 import type { InboundEventCleanup } from './channel/inbound-event-cleanup.js';
 import type { LlmCallCleanup } from './usage/llm-call-cleanup.js';
 import type { SessionActivityCleanup } from './session/session-activity-cleanup.js';
+import type { SessionCompactionEventCleanup } from './session/session-compaction-event-cleanup.js';
 import type { AuthStateCleanup } from './auth/auth-state-cleanup.js';
 import type { GroupMessageLogCleanup } from './channel/group-message-log-cleanup.js';
 import type { FeishuP2pMessageCleanup } from './channel/feishu-p2p-message-cleanup.js';
@@ -78,6 +79,7 @@ export interface ShutdownDeps {
   auditLogCleanup: AuditLogCleanup;
   llmCallCleanup: LlmCallCleanup;
   sessionActivityCleanup: SessionActivityCleanup;
+  sessionCompactionEventCleanup: SessionCompactionEventCleanup;
   inboundEventCleanup: InboundEventCleanup;
   authStateCleanup: AuthStateCleanup;
   groupMessageLogCleanup: GroupMessageLogCleanup;
@@ -98,6 +100,7 @@ export function createShutdownHandler(deps: ShutdownDeps): () => Promise<void> {
     containerRegistry, channelServer, runtimeCleanup, activityHeartbeat, wsRegistry,
     agentLoop, wsHandler, sessionService, taskRecordRepair, taskExecutionRetention, auditLogCleanup, llmCallCleanup,
     sessionActivityCleanup,
+    sessionCompactionEventCleanup,
     inboundEventCleanup,
     authStateCleanup,
     groupMessageLogCleanup,
@@ -145,6 +148,7 @@ export function createShutdownHandler(deps: ShutdownDeps): () => Promise<void> {
       auditLogCleanup.stop();
       llmCallCleanup.stop();
       sessionActivityCleanup.stop();
+      sessionCompactionEventCleanup.stop();
       inboundEventCleanup.stop();
       authStateCleanup.stop();
       groupMessageLogCleanup.stop();

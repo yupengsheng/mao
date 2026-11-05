@@ -38,6 +38,8 @@ import { FeishuP2pMessageCleanup } from './channel/feishu-p2p-message-cleanup.js
 import { LlmCallCleanup } from './usage/llm-call-cleanup.js';
 import { SessionActivityCleanup } from './session/session-activity-cleanup.js';
 import { SessionActivityRepository } from './session/activity.repository.js';
+import { SessionCompactionEventCleanup } from './session/session-compaction-event-cleanup.js';
+import { SessionCompactionEventRepository } from './session/session-compaction.repository.js';
 import { AuthStateCleanup } from './auth/auth-state-cleanup.js';
 import { MysqlFeishuOauthStateRepository } from './auth/feishu-oauth.repository.js';
 import { MysqlEcpOauthStateRepository } from './auth/ecp-oauth.repository.js';
@@ -146,6 +148,10 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
     () => d.settingService.getSessionActivityRetentionDays(),
   );
   sessionActivityCleanup.start();
+  const sessionCompactionEventCleanup = new SessionCompactionEventCleanup(
+    new SessionCompactionEventRepository(db),
+  );
+  sessionCompactionEventCleanup.start();
   const feishuMessageRepo = new MysqlFeishuMessageRepository(db);
   const dingtalkMessageRepo = new MysqlDingtalkMessageRepository(db);
   const weixinMessageRepo = new WeixinInboundMessageRepository(db);
@@ -302,7 +308,8 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
     containerRegistry: d.containerRegistry, channelServer: d.channelServer, runtimeCleanup,
     activityHeartbeat: d.activityHeartbeat, wsRegistry: d.wsRegistry,
     agentLoop: d.agentLoop, wsHandler: d.wsHandler, sessionService: d.sessionService,
-    taskRecordRepair, taskExecutionRetention, auditLogCleanup, llmCallCleanup, sessionActivityCleanup, inboundEventCleanup,
+    taskRecordRepair, taskExecutionRetention, auditLogCleanup, llmCallCleanup, sessionActivityCleanup,
+    sessionCompactionEventCleanup, inboundEventCleanup,
     authStateCleanup, groupMessageLogCleanup, feishuP2pMessageCleanup, feishuCardSnapshotCleanup,
   });
   drainWatcher.start();

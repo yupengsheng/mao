@@ -102,4 +102,16 @@ export class SessionCompactionEventRepository {
     const result = await this.db.execute(`DELETE FROM session_compaction_event WHERE session_id = ?`, [sessionId]);
     return Number(result.affectedRows ?? 0);
   }
+
+  /** 按创建时间分批删除过期压缩事件，返回实际删除行数；LIMIT 钳制在 1~5000。 */
+  async deleteBatch(cutoff: string, limit: number): Promise<number> {
+    const safeLimit = Number.isFinite(limit)
+      ? Math.max(1, Math.min(5000, Math.floor(limit)))
+      : 1;
+    const result = await this.db.execute(
+      `DELETE FROM session_compaction_event WHERE created_at < ? ORDER BY created_at, id LIMIT ${safeLimit}`,
+      [cutoff],
+    );
+    return Number(result.affectedRows ?? 0);
+  }
 }
