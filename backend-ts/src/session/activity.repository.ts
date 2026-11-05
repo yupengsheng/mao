@@ -117,6 +117,40 @@ export class SubagentExecutionRepository {
       childIds,
     );
   }
+
+  /**
+   * 分批删除过期且结果已收口的执行记录。
+   * 子会话仍存在时保留该子会话 id 最大的一条，避免 /subagents 元数据、进度与重试入口丢失；
+   * 子会话已逻辑删除或不存在时不再保留。LIMIT 钳制在 1~5000。
+   */
+  async deleteBatch(cutoff: string, limit: number): Promise<number> {
+    const safeLimit = Number.isFinite(limit)
+      ? Math.max(1, Math.min(5000, Math.floor(limit)))
+      : 1;
+    const result = await this.db.execute(
+      `DELETE FROM subagent_execution WHERE id IN (
+         SELECT candidate_id FROM (
+           SELECT e.id AS candidate_id
+           FROM subagent_execution e
+           LEFT JOIN session s ON s.id = e.child_session_id AND s.deleted = 0
+           WHERE e.status IN ('COMPLETED', 'FAILED', 'CANCELLED')
+             AND e.delivery_status IN ('DELIVERED', 'SUPPRESSED', 'LEGACY')
+             AND e.updated_at < ?
+             AND (
+               s.id IS NULL
+               OR e.id <> (
+                 SELECT MAX(latest.id) FROM subagent_execution latest
+                 WHERE latest.child_session_id = e.child_session_id
+               )
+             )
+           ORDER BY e.updated_at, e.id
+           LIMIT ${safeLimit}
+         ) candidates
+       )`,
+      [cutoff],
+    );
+    return Number(result.affectedRows ?? 0);
+  }
 }
 
 function camelToSnake(key: string): string {

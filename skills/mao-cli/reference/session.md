@@ -286,6 +286,12 @@ mao session side-tasks --id 12
 mao session subagents --id 12 --json
 ```
 
+### 子智能体执行记录保留
+
+执行记录默认保留 180 天，按最后一次更新（`updated_at`）计时，后台每小时自动清理。清理条件为：状态已是 `COMPLETED` / `FAILED` / `CANCELLED`，且结果投递状态为 `DELIVERED` / `SUPPRESSED` / `LEGACY`。`RUNNING` / `RECOVERING` 与 `PENDING` 投递记录永不清理。
+
+子会话仍存在（含已归档）时，每个子会话至少保留 `id` 最大的一条记录，`session subagents` 的 `agentType`、`taskDescription` 与阶段兜底不会因清理丢失；子会话被逻辑删除或实体不存在后，其过期终态记录会被全部清理。重试复用同一条执行记录并刷新 `updated_at`，会重新计时。超过 180 天的历史执行审计不可恢复，但子会话及其消息不受影响。
+
 ---
 
 ## 命令：mao session promote-side-task
