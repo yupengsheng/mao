@@ -232,6 +232,8 @@ export interface AppContext {
   terminalManagerRef: TerminalManager | null;
   /** 定时任务清理回调：会话删除路径延迟解引用。 */
   deleteScheduledTasksForSession: ((sessionId: number) => Promise<void>) | null;
+  /** 消息队列清理回调：构造晚于 SessionService，会话删除路径延迟解引用。 */
+  clearSessionMessageQueue: ((sessionId: number) => Promise<void>) | null;
   /** MCP 同步服务：会话删除路径延迟解引用。 */
   mcpSyncRef: McpSyncService | null;
   /** 容器运行时激活标志：幂等激活用。 */
@@ -251,6 +253,7 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     notifyFeishuPendingMismatch: undefined,
     terminalManagerRef: null,
     deleteScheduledTasksForSession: null,
+    clearSessionMessageQueue: null,
     mcpSyncRef: null,
     containerRuntimeActive: false,
     closing: null,
@@ -534,6 +537,7 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     // 快照存活期是会话级，只在会话删除路径回收）。mcpSync 晚于本 service 构造，故延迟解引用。
     async (sessionId) => {
       await ctx.deleteScheduledTasksForSession?.(sessionId);
+      await ctx.clearSessionMessageQueue?.(sessionId);
       ctx.mcpSyncRef?.clearCloudSnapshot(sessionId);
       // 工作区规则快照同理会话级资源，物理删行（技术方案 §4.6）
       await workspaceRulesSnapshotService.deleteBySessionId(sessionId);
@@ -549,6 +553,7 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
 
   const activityService = new ActivityService(new SessionActivityRepository(db));
   const messageQueueService = new MessageQueueService(new MessageQueueRepository(db));
+  ctx.clearSessionMessageQueue = (sessionId) => messageQueueService.clear(sessionId);
   const subagentExecutionRepo = new SubagentExecutionRepository(db);
   const activityHeartbeat = new SessionActivityHeartbeat(sessionService);
 

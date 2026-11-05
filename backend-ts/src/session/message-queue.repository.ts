@@ -128,17 +128,36 @@ export class MessageQueueRepository {
   }
 
   /**
+   * 会话已不存在 / 已逻辑删除时，把其 PENDING 队列行置为 DELETED。
+   * 处理删除后才入队的并发残留与历史孤儿；终态行仍按保留期统一清理。
+   */
+  async clearOrphanedPendingBatch(limit: number): Promise<number> {
+    const result = await this.db.execute(
+      `UPDATE message_queue
+       SET status = 'DELETED'
+       WHERE status = 'PENDING' AND deleted = 0
+         AND NOT EXISTS (
+           SELECT 1 FROM \`session\` s WHERE s.id = message_queue.session_id AND s.deleted = 0
+         )
+       ORDER BY updated_at, id
+       LIMIT ${clampLimit(limit)}`,
+    );
+    return Number(result.affectedRows ?? 0);
+  }
+
+  /**
    * 分批删除已消费 / 已移除的队列行，返回实际删除行数。
    * 业务只读取 PENDING 行，终态行仅保留一段时间供排障；LIMIT 钳制在 1~5000。
    */
   async deleteTerminalBatch(cutoff: string, limit: number): Promise<number> {
-    const safeLimit = Number.isFinite(limit)
-      ? Math.max(1, Math.min(5000, Math.floor(limit)))
-      : 1;
     const result = await this.db.execute(
-      `DELETE FROM message_queue WHERE status = 'DELETED' AND updated_at < ? ORDER BY updated_at, id LIMIT ${safeLimit}`,
+      `DELETE FROM message_queue WHERE status = 'DELETED' AND updated_at < ? ORDER BY updated_at, id LIMIT ${clampLimit(limit)}`,
       [cutoff],
     );
     return Number(result.affectedRows ?? 0);
   }
+}
+
+function clampLimit(limit: number): number {
+  return Number.isFinite(limit) ? Math.max(1, Math.min(5000, Math.floor(limit))) : 1;
 }

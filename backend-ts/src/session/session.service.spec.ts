@@ -20,7 +20,7 @@ function message(id: number, sessionId: number, content: string | null): Message
   return { id, sessionId, role: 'USER', content };
 }
 
-function makeService() {
+function makeService(onSessionDeleted?: (sessionId: number) => Promise<void> | void) {
   const txDb = {
     insert: vi.fn(async (table: string, data: Record<string, unknown>) => {
       if (table === 'session') return 99;
@@ -113,6 +113,9 @@ function makeService() {
     {} as GitOperationService,
     sessionCompactionService,
     sessionCompactionEventService,
+    undefined,
+    undefined,
+    onSessionDeleted,
   );
   return { service, sessionRepo, messageRepo, fileChangeRepo, agentLookup, txDb };
 }
@@ -302,6 +305,17 @@ describe('SessionService archive', () => {
     vi.mocked(sessionRepo.findById).mockResolvedValue({ id: 11, userId: 7, phase: 'RUNNING' });
     await expect(service.deleteSession(11)).rejects.toMatchObject({ code: ErrorCode.PARAM_INVALID.code });
     expect(sessionRepo.logicalDelete).not.toHaveBeenCalled();
+  });
+
+  it('invokesOnSessionDeletedAfterLogicalDelete', async () => {
+    const onSessionDeleted = vi.fn();
+    const { service, sessionRepo } = makeService(onSessionDeleted);
+    vi.mocked(sessionRepo.findById).mockResolvedValue({ id: 11, userId: 7, phase: 'COMPLETED' });
+
+    await service.deleteSession(11);
+
+    expect(sessionRepo.logicalDelete).toHaveBeenCalledWith(11);
+    expect(onSessionDeleted).toHaveBeenCalledWith(11);
   });
 
   it('rejectsEditMessageFromOtherSession', async () => {

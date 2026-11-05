@@ -36,3 +36,37 @@ describe('MessageQueueRepository.deleteTerminalBatch', () => {
     expect(execute.mock.calls[4][0]).toContain('LIMIT 12');
   });
 });
+
+describe('MessageQueueRepository.clearOrphanedPendingBatch', () => {
+  it('只收敛会话不存在或已逻辑删除的 PENDING 行', async () => {
+    const { repo, execute } = build(7);
+
+    await expect(repo.clearOrphanedPendingBatch(5000)).resolves.toBe(7);
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    const [sql, params] = execute.mock.calls[0];
+    expect(sql).toContain("SET status = 'DELETED'");
+    expect(sql).toContain("status = 'PENDING' AND deleted = 0");
+    expect(sql).toContain('NOT EXISTS');
+    expect(sql).toContain('s.deleted = 0');
+    expect(sql).toContain('ORDER BY updated_at, id');
+    expect(sql).toContain('LIMIT 5000');
+    expect(params).toBeUndefined();
+  });
+
+  it('LIMIT 钳制在 1~5000，非法值不会拼进 SQL', async () => {
+    const { repo, execute } = build();
+
+    await repo.clearOrphanedPendingBatch(0);
+    await repo.clearOrphanedPendingBatch(Number.NaN);
+    await repo.clearOrphanedPendingBatch(Number.POSITIVE_INFINITY);
+    await repo.clearOrphanedPendingBatch(99999);
+    await repo.clearOrphanedPendingBatch(12.9);
+
+    expect(execute.mock.calls[0][0]).toContain('LIMIT 1');
+    expect(execute.mock.calls[1][0]).toContain('LIMIT 1');
+    expect(execute.mock.calls[2][0]).toContain('LIMIT 1');
+    expect(execute.mock.calls[3][0]).toContain('LIMIT 5000');
+    expect(execute.mock.calls[4][0]).toContain('LIMIT 12');
+  });
+});
