@@ -188,7 +188,7 @@ mao open run --agent-id 12 --message "跑一遍 nightly 巡检" \
 - 首次已被拒绝（参数错误、预算拦截等）时，同键重试返回参数错误，不能复用该键；确认修正请求后换新键。
 - 同键但 `agentId` / `sessionId` / `message` 任一不同会返回参数错误，避免把两个业务请求误当成同一件。
 - 幂等记录复用调用流水，只在流水保留期内有效（`openapi.callLogRetentionDays`，默认 90 天）。因此外部系统仍应使用足够稳定且长期不重复的事件 ID。
-- `pending` 与 `queued` 都是处理中；`pending` 若遇到进程崩溃可能长期停留，本期不做自动恢复，需要用新键重试。
+- `pending` 与 `queued` 都是处理中。超过 2 小时且队列里已无待执行消息时，后台每分钟运行一次的修复 Job 会按可确定的终态自动收敛：Session 已结束则回写 `completed` / `failed` / `cancelled`；排队调用对应 Session 已删除或不存在时回写 `failed`，错误码固定为 `EXECUTION_INTERRUPTED`。`pending` 且尚未写入 `session_id` 的记录仍可能处于直跑受理过程，不做修复。
 
 ## 触发来源准入
 
@@ -206,7 +206,7 @@ API Token、入站 Webhook 与 Signal 哨兵在创建/复用会话、落消息�
 
 - 默认只记消息长度和字段名，不记正文。`mao open token log-full-body --id <id> --enabled true` 才记录完整请求体（敏感字段名会被打码），操作留审计。
 - 带幂等键的重复请求不新增流水，只回放首次受理结果；原始流水进入 `rejected` 后，该键不可再用。调用方可用「调用记录」查看首次请求的最终状态。
-- 排队中的调用在执行结束后回写成功、失败或取消。长时间没有终态、而且队列里也已经没有这条消息的，统计里算「结果未知」。
+- 排队中的调用在执行结束后回写成功、失败或取消。超过 2 小时没有终态、而且队列里也已经没有这条消息的，统计里算「结果未知」；随后自动修复 Job 会按 Session 终态收敛，或把已无排队消息的 `queued` 流水标记为 `failed` / `EXECUTION_INTERRUPTED`。
 - Token 一小时内连续失败达到阈值（默认 10，系统设置可关）会自动停用，之后调用返回 403。属主用 `mao open token re-enable --id <id>` 恢复。限流和取消不计入次数。
 - 管理端「重发」只对 API 调用开放，用量记在 Token 属主头上。没开完整记录时需要手工粘贴 message。Webhook 不能从服务端重发。
 
@@ -230,9 +230,9 @@ mao open calls get --id 100
 | `hook` 返回 403 + `3054` | 触发器已停用、Agent 或绑定会话与请求不一致；检查触发器配置 |
 | 返回 503 + `3055` | 准入依赖暂不可用，执行未启动；稍后重试，不计入触发器连续失败 |
 | 重试返回 `deduplicated=true` | 幂等键命中了首次请求，未再次执行；用 `processing` / `queued` 判断是否仍在处理 |
-| 重试一直返回 `processing=true` | 首次流水仍是 `pending` / `queued`。先查调用记录；若进程崩溃导致 `pending` 长期不结束，本期没有自动恢复，需换新幂等键重试 |
+| 重试一直返回 `processing=true` | 首次流水仍是 `pending` / `queued`。先查调用记录；超过 2 小时且队列无待执行消息时会自动收敛（Session 已结束按终态，排队记录无法续跑则 `failed` / `EXECUTION_INTERRUPTED`），稍后重试即可回放终态；`pending` 且无 `session_id` 的极端情况仍需换新幂等键重试 |
 | 返回「幂等键已用于其他请求」 | 同键请求的 `agentId` / `sessionId` / `message` 或 Webhook 原始请求体已变化；修正后换新键 |
 | 返回「该幂等键对应的请求已被拒绝」 | 首次请求已失败，不能复用该键；修正原因后换新键重试 |
 | 订阅一直重试 | 目标 URL 非 2xx；用 `open subscription deliveries --id <id>` 看 `lastHttpStatus` / `lastError` |
 
-相关文档：桌面端「设置 → 开放接口」页面（含内嵌「接口文档」卡片的查阅 / 下载 / 复制）；设计细节见仓库 `docs/plan/2026-10-05-open-api-webhook-technical-design.md`、`docs/plan/2026-11-04-open-run-admission-design.md`。
+相关文档：桌面端「设置 → 开放接口」页面（含内嵌「接口文档」卡片的查阅 / 下载 / 复制）；设计细节见仓库 `docs/plan/2026-10-05-open-api-webhook-technical-design.md`、`docs/plan/2026-11-04-open-run-admission-design.md`、`docs/plan/2026-11-05-open-call-log-repair-design.md`。

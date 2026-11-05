@@ -29,6 +29,10 @@ import {
 const REJECT_LOG_PER_MINUTE = 20;
 const P95_SAMPLE_LIMIT = 50_000;
 const FAILURE_BUCKET_MS = 600_000;
+const TERMINAL_SESSION_PHASES = new Set(['COMPLETED', 'FAILED', 'CANCELLED']);
+
+export const INTERRUPTED_CALL_ERROR_CODE = 'EXECUTION_INTERRUPTED';
+export const INTERRUPTED_CALL_ERROR_SUMMARY = '执行中断或服务重启，队列已无待执行消息，已自动收敛';
 
 export interface AuthRejectInput {
   reason: 'not_found' | 'revoked' | 'expired' | 'auto_disabled';
@@ -327,6 +331,72 @@ export class OpenApiCallLogService {
     } catch (e) {
       console.warn(`[openapi] failed to settle queued call, id=${callLogId}: ${(e as Error).message}`);
     }
+  }
+
+  /**
+   * 收敛长期滞留的 pending/queued 流水。事务内重新锁定流水和 Session，并复核
+   * 超时与队列状态；只有能确定终态时才写入。afterTerminal 在提交后执行，
+   * Token 停用计数与失败通知与正常回写保持同一语义。
+   */
+  async settleStale(callLogId: number, staleBefore: string): Promise<boolean> {
+    let settled: {
+      row: OpenApiCallLogRow;
+      outcome: OpenCallOutcome;
+      errorCode: string | null;
+      errorSummary: string | null;
+    } | null = null;
+    try {
+      settled = await this.deps.repo.transaction(async (repo) => {
+        const row = await repo.lockById(callLogId);
+        if (row == null || (row.outcome !== 'pending' && row.outcome !== 'queued')) return null;
+        if (row.createdAt != null && row.createdAt >= staleBefore) return null;
+        if (await repo.hasPendingQueue(callLogId)) return null;
+
+        const session = row.sessionId == null ? null : await repo.lockSession(row.sessionId);
+        const liveSession = session != null && Number(session.deleted ?? 0) === 0 ? session : null;
+        let outcome: OpenCallOutcome;
+        let errorCode: string | null = null;
+        let errorSummary: string | null = null;
+        if (liveSession != null && TERMINAL_SESSION_PHASES.has(liveSession.phase ?? '')) {
+          outcome = terminalOutcome(liveSession.phase as 'COMPLETED' | 'FAILED' | 'CANCELLED');
+          if (outcome === 'failed') errorSummary = '执行失败';
+        } else if (liveSession == null && row.outcome === 'queued') {
+          outcome = 'failed';
+          errorCode = INTERRUPTED_CALL_ERROR_CODE;
+          errorSummary = INTERRUPTED_CALL_ERROR_SUMMARY;
+        } else {
+          return null;
+        }
+
+        const changed = await repo.settleStale(callLogId, {
+          outcome,
+          errorCode,
+          errorSummary,
+          finishedAt: formatDateTime(this.now()),
+        });
+        return changed ? { row, outcome, errorCode, errorSummary } : null;
+      });
+    } catch (e) {
+      console.warn(`[openapi] failed to settle stale call, id=${callLogId}: ${(e as Error).message}`);
+      return false;
+    }
+
+    if (settled == null) return false;
+    try {
+      await this.afterTerminal({
+        id: callLogId,
+        source: (settled.row.source ?? 'API') as OpenCallSource,
+        tokenId: settled.row.tokenId ?? null,
+        userId: settled.row.userId ?? null,
+        replayOfId: settled.row.replayOfId ?? null,
+        outcome: settled.outcome,
+        errorCode: settled.errorCode,
+        errorSummary: settled.errorSummary,
+      });
+    } catch (e) {
+      console.warn(`[openapi] stale call settled but terminal side effects failed, id=${callLogId}: ${(e as Error).message}`);
+    }
+    return true;
   }
 
   async listForUser(userId: number, page: number, size: number, filter: CallLogListFilter) {

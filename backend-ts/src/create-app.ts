@@ -883,7 +883,7 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     notifCipher, outboundSubscriptionService, holder, agentExecutor,
     openCallLogHolder, openTriggerSettle, openCallSettle,
   });
-  const { openRunService, callLogService, callLogCleanup, webhookTriggerService, watcherService, watcherScheduler, signalCheckCleanup, digestService, digestScheduler, signalWatcherRepo } = openApiServices;
+  const { openRunService, callLogService, callLogCleanup, callLogRepair, webhookTriggerService, watcherService, watcherScheduler, signalCheckCleanup, digestService, digestScheduler, signalWatcherRepo } = openApiServices;
 
 
   const feishuHandler = assembleFeishuHandler({
@@ -945,7 +945,7 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     app, db, cfg, ctx,
     scheduledStore, scheduledService, settingService, notifCipher, senderRegistry,
     sessionService, outboundDeliveryRepo, outboundSubscriptionRepo, auditService,
-    agentExecutor, inboxCleanupStore, callLogService, callLogCleanup,
+    agentExecutor, inboxCleanupStore, callLogService, callLogCleanup, callLogRepair,
     ecpSessionRepo, weixinMonitor, feishuMonitor, dingtalk, pendingBindingMessages,
     shellManager, terminalManager, wsHandler, subagentMapper, sessionMap, sessionSvc,
     compactionSvc, definitionRegistry, backgroundSubagentManager, agentLoop: holder.loop!, visibility,

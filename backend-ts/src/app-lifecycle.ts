@@ -104,6 +104,7 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
   taskRecordRepair.start();
   d.callLogService.start();
   d.callLogCleanup.start();
+  d.callLogRepair.start();
   const ecpRenewScheduler = new EcpRenewScheduler(
     d.ecpSessionRepo,
     () => d.settingService.getEcpConfig(),
@@ -201,7 +202,7 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
     crash, drainWatcher,
     weixinMonitor: d.weixinMonitor, feishuMonitor: d.feishuMonitor, dingtalk: d.dingtalk,
     weixinInboundHandler: d.weixinInboundHandler, feishuInboundProcessor: d.feishuInboundProcessor,
-    scheduler, deliveryScheduler, callLogService: d.callLogService, callLogCleanup: d.callLogCleanup,
+    scheduler, deliveryScheduler, callLogService: d.callLogService, callLogCleanup: d.callLogCleanup, callLogRepair: d.callLogRepair,
     watcherScheduler: d.watcherScheduler, signalCheckCleanup: d.signalCheckCleanup, ecpRenewScheduler,
     shellManager: d.shellManager, terminalManager: d.terminalManager,
     ptyChannelHubs: d.ptyChannelHubs, ptyHubGeneration: d.ptyHubGeneration,

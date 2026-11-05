@@ -20,6 +20,7 @@ import { OpenRunAdmissionService } from './openapi/admission.js';
 import { OpenApiCallLogRepository } from './openapi/open-api-call-log.repository.js';
 import { OpenApiCallLogService } from './openapi/open-api-call-log.service.js';
 import { OpenApiCallLogCleanup } from './openapi/open-api-call-log.cleanup.js';
+import { OpenApiCallLogRepairService } from './openapi/open-api-call-log.repair.service.js';
 import { MysqlWebhookTriggerRepository } from './openapi/openapi.repository.js';
 import { WebhookTriggerService, type WebhookTriggerDeps } from './openapi/webhook-trigger.service.js';
 import { SignalSecretCipher } from './signal/signal-cipher.js';
@@ -58,6 +59,7 @@ export interface OpenApiServicesResult {
   openRunService: OpenRunService;
   callLogService: OpenApiCallLogService;
   callLogCleanup: OpenApiCallLogCleanup;
+  callLogRepair: OpenApiCallLogRepairService;
   webhookTriggerService: WebhookTriggerService;
   watcherService: WatcherService;
   watcherScheduler: WatcherScheduler;
@@ -93,12 +95,14 @@ export function assembleOpenApiServices(deps: OpenApiServicesDeps): OpenApiServi
     liveExecution: createScheduledLiveExecution(wsHandler),
     admission,
   });
+  const callLogRepo = new OpenApiCallLogRepository(db);
   const callLogService = new OpenApiCallLogService({
-    repo: new OpenApiCallLogRepository(db),
+    repo: callLogRepo,
     tokens: apiTokenService,
     inbox: inboxService,
     openRun: openRunService,
   });
+  const callLogRepair = new OpenApiCallLogRepairService(callLogRepo, callLogService);
   openCallLogHolder.current = callLogService;
   openCallSettle.current = (callLogId, phase, queueWaitMs, messageId) => callLogService.settleQueued(callLogId, phase, queueWaitMs, messageId);
   apiTokenService.setOutcomePolicy({
@@ -171,7 +175,7 @@ export function assembleOpenApiServices(deps: OpenApiServicesDeps): OpenApiServi
   digestScheduler.start();
 
   return {
-    openRunService, callLogService, callLogCleanup, webhookTriggerService,
+    openRunService, callLogService, callLogCleanup, callLogRepair, webhookTriggerService,
     watcherService, watcherScheduler, signalCheckCleanup, digestService, digestScheduler,
     signalWatcherRepo,
   };

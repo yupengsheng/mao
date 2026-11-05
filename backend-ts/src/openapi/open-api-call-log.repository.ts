@@ -57,6 +57,24 @@ export interface CallLogBucketRow {
   unknown: number;
 }
 
+export interface OpenApiCallLogRepairCandidate {
+  id: number;
+  outcome: string;
+  sessionId: number | null;
+  userId: number | null;
+  source: string | null;
+  tokenId: number | null;
+  replayOfId: number | null;
+  createdAt: string | null;
+}
+
+export interface LockedSessionRow {
+  id?: number;
+  userId?: number | null;
+  phase?: string | null;
+  deleted?: number | null;
+}
+
 const LIST_COLUMNS = `
   l.id, l.token_id, l.trigger_id, l.agent_id, l.user_id, l.session_id, l.message_id,
   l.source, l.source_ip, l.token_prefix, l.request_summary_json, l.http_status, l.outcome,
@@ -93,6 +111,10 @@ const JOINS = `
 
 export class OpenApiCallLogRepository {
   constructor(private readonly db: Db) {}
+
+  transaction<T>(work: (repo: OpenApiCallLogRepository) => Promise<T>): Promise<T> {
+    return this.db.transaction((db) => work(new OpenApiCallLogRepository(db)));
+  }
 
   insert(row: {
     tokenId?: number | null;
@@ -194,6 +216,77 @@ export class OpenApiCallLogRepository {
       [outcome, finishedAt, finishedAt, queueWaitMs, messageId, id],
     );
     return result.affectedRows === 1;
+  }
+
+  /** 修复滞留流水。CAS 语义与正常回写一致，谁先落终态谁生效。 */
+  async settleStale(id: number, patch: {
+    outcome: OpenCallOutcome;
+    errorCode: string | null;
+    errorSummary: string | null;
+    finishedAt: string;
+  }): Promise<boolean> {
+    const result = await this.db.execute(
+      `UPDATE open_api_call_log
+       SET outcome = ?, finished_at = ?,
+           execution_ms = TIMESTAMPDIFF(MICROSECOND, created_at, ?) DIV 1000,
+           error_code = ?, error_summary = ?
+       WHERE id = ? AND outcome IN ('pending', 'queued')`,
+      [patch.outcome, patch.finishedAt, patch.finishedAt, patch.errorCode, patch.errorSummary, id],
+    );
+    return result.affectedRows === 1;
+  }
+
+  /**
+   * 超时且队列里已没有待执行消息的流水。pending 且无 session_id 时仍在直跑，
+   * 无法从数据库判断是否崩溃，因此不进入候选。
+   */
+  listRepairCandidates(staleBefore: string, limit: number): Promise<OpenApiCallLogRepairCandidate[]> {
+    return this.db.query<OpenApiCallLogRepairCandidate>(
+      `SELECT l.id, l.outcome, l.session_id, l.user_id, l.source, l.token_id,
+              l.replay_of_id, l.created_at
+         FROM open_api_call_log l
+         LEFT JOIN \`session\` s ON s.id = l.session_id
+        WHERE l.outcome IN ('pending', 'queued')
+          AND l.created_at < ?
+          AND (l.session_id IS NOT NULL OR l.outcome = 'queued')
+          AND NOT EXISTS (
+            SELECT 1 FROM message_queue mq
+             WHERE mq.open_call_log_id = l.id
+               AND mq.status = 'PENDING'
+               AND mq.deleted = 0
+          )
+          AND (
+            (s.id IS NOT NULL AND s.deleted = 0 AND s.phase IN ('COMPLETED', 'FAILED', 'CANCELLED'))
+            OR (l.outcome = 'queued' AND (s.id IS NULL OR s.deleted <> 0))
+          )
+        ORDER BY l.created_at ASC, l.id ASC
+        LIMIT ?`,
+      [staleBefore, limit],
+    );
+  }
+
+  lockById(id: number): Promise<OpenApiCallLogRow | null> {
+    return this.db.queryOne<OpenApiCallLogRow>(
+      'SELECT * FROM open_api_call_log WHERE id = ? FOR UPDATE',
+      [id],
+    );
+  }
+
+  lockSession(id: number): Promise<LockedSessionRow | null> {
+    return this.db.queryOne<LockedSessionRow>(
+      'SELECT * FROM `session` WHERE id = ? FOR UPDATE',
+      [id],
+    );
+  }
+
+  async hasPendingQueue(openCallLogId: number): Promise<boolean> {
+    const row = await this.db.queryOne<{ id: number }>(
+      `SELECT id FROM message_queue
+        WHERE open_call_log_id = ? AND status = 'PENDING' AND deleted = 0
+        LIMIT 1`,
+      [openCallLogId],
+    );
+    return row != null;
   }
 
   findById(id: number, userId?: number): Promise<OpenApiCallLogRow | null> {

@@ -115,8 +115,11 @@ describe('开放调用流水纯逻辑', () => {
 
 function memoryRepo() {
   const rows = new Map<number, OpenApiCallLogRow>();
+  const sessions = new Map<number, { id: number; phase: string; deleted: number }>();
+  const pending = new Set<number>();
   let next = 1;
   const repo = {
+    transaction: vi.fn(async (work: (store: unknown) => Promise<unknown>) => work(repo)),
     insert: vi.fn(async (row: OpenApiCallLogRow) => {
       for (const existing of rows.values()) {
         if (row.idempotencyScope != null && row.idempotencyKey != null
@@ -153,6 +156,15 @@ function memoryRepo() {
       row.executionMs = 1000;
       return true;
     }),
+    lockById: vi.fn(async (id: number) => rows.get(id) ?? null),
+    lockSession: vi.fn(async (id: number) => sessions.get(id) ?? null),
+    hasPendingQueue: vi.fn(async (id: number) => pending.has(id)),
+    settleStale: vi.fn(async (id: number, patch: Partial<OpenApiCallLogRow> & { outcome: string }) => {
+      const row = rows.get(id);
+      if (row == null || (row.outcome !== 'pending' && row.outcome !== 'queued')) return false;
+      Object.assign(row, patch, { executionMs: 1000 });
+      return true;
+    }),
     findById: vi.fn(async (id: number, userId?: number) => {
       const row = rows.get(id) ?? null;
       if (row == null) return null;
@@ -165,6 +177,8 @@ function memoryRepo() {
     trafficByToken: vi.fn(async () => []),
     deleteBatch: vi.fn(async () => 0),
     rows,
+    sessions,
+    pending,
   };
   return repo;
 }
@@ -316,6 +330,31 @@ describe('OpenApiCallLogService', () => {
     });
     expect(replayCallLog({ outcome: 'completed', sessionId: 11, messageId: 12 })).toEqual({
       sessionId: 11, messageId: 12, queued: false, processing: false,
+    });
+  });
+
+  it('滞留流水修复前重复幂等请求返回 processing，修复后可回放终态', async () => {
+    const repo = memoryRepo();
+    repo.sessions.set(9, { id: 9, phase: 'COMPLETED', deleted: 0 });
+    const service = new OpenApiCallLogService({
+      repo: repo as unknown as OpenApiCallLogRepository,
+      now: () => Date.parse('2026-10-09T12:00:00+08:00'),
+    });
+    const input = {
+      source: 'API' as const, tokenId: 3, userId: 7, agentId: 1, sessionId: 9,
+      body: { message: 'hi' },
+      idempotencyScope: 'token:3', idempotencyKey: 'build-42', requestFingerprint: 'fingerprint-a',
+    };
+    const first = await service.begin(input);
+    const pendingDuplicate = await service.begin(input);
+    expect(replayCallLog(pendingDuplicate!.row!)).toMatchObject({ processing: true, sessionId: 9 });
+
+    await expect(service.settleStale(first!.id, '2026-10-09 11:00:00')).resolves.toBe(true);
+
+    const settledDuplicate = await service.begin(input);
+    expect(settledDuplicate!.row).toMatchObject({ outcome: 'completed' });
+    expect(replayCallLog(settledDuplicate!.row!)).toEqual({
+      sessionId: 9, messageId: null, queued: false, processing: false,
     });
   });
 

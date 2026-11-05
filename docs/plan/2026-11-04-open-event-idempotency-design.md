@@ -35,7 +35,7 @@
 
 ## 边界
 
-本期不把外部事件 ID 改写为 `agent_task_trigger.sourceEventId`；该字段继续表示一次实际 execution 的入口 ID。跨渠道归并、独立业务 Task、Webhook 事件长期留存清理和重启后未完成请求的自动恢复留待后续阶段。
+本期不把外部事件 ID 改写为 `agent_task_trigger.sourceEventId`；该字段继续表示一次实际 execution 的入口 ID。跨渠道归并、独立业务 Task 与 Webhook 事件长期留存清理留待后续阶段；重启后滞留流水的自动收敛已在 `2026-11-05-open-call-log-repair-design.md` 补齐。
 
 ## 状态语义与已知边界
 
@@ -44,5 +44,5 @@
 - `completed` / `failed` / `cancelled`：重复请求回放首次的会话与消息 ID，`processing: false`；执行结果仍以调用流水或出站事件为准。
 - `rejected`：首次请求已失败，幂等键不可复用；重复请求返回参数错误。
 - 幂等有效期与调用流水保留期一致（默认 90 天）。超出保留期后同一键可能再次执行，外部系统应使用长期唯一的事件 ID。
-- 本期不自动恢复崩溃后长期停留的 `pending` 行；调用方需换新键重试，并可通过调用记录判断首次请求状态。
+- 本期不自动恢复崩溃后长期停留的 `pending` 行；该边界已由 2026-11-05 的修复 Job 补齐：有 `session_id` 且 Session 已终态、或 `queued` 且队列无待执行消息的流水会自动收敛；`pending` 且无 `session_id` 的极端情况仍需换新键重试。
 

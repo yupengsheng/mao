@@ -23,6 +23,7 @@ import type { ScheduledTaskScheduler } from './schedule/scheduled-task.service.j
 import type { WebhookDeliveryScheduler } from './notification/task/delivery.scheduler.js';
 import type { OpenApiCallLogService } from './openapi/open-api-call-log.service.js';
 import type { OpenApiCallLogCleanup } from './openapi/open-api-call-log.cleanup.js';
+import type { OpenApiCallLogRepairService } from './openapi/open-api-call-log.repair.service.js';
 import type { WatcherScheduler } from './signal/watcher-scheduler.js';
 import type { SignalCheckCleanup } from './signal/signal-check-cleanup.js';
 import type { EcpRenewScheduler } from './auth/ecp-renew.scheduler.js';
@@ -45,6 +46,7 @@ export interface ShutdownDeps {
   deliveryScheduler: WebhookDeliveryScheduler;
   callLogService: OpenApiCallLogService;
   callLogCleanup: OpenApiCallLogCleanup;
+  callLogRepair: OpenApiCallLogRepairService;
   watcherScheduler: WatcherScheduler;
   signalCheckCleanup: SignalCheckCleanup;
   ecpRenewScheduler: EcpRenewScheduler;
@@ -70,7 +72,7 @@ export function createShutdownHandler(deps: ShutdownDeps): () => Promise<void> {
   const {
     app, db, cfg, ctx, crash, drainWatcher,
     weixinMonitor, feishuMonitor, dingtalk, weixinInboundHandler, feishuInboundProcessor,
-    scheduler, deliveryScheduler, callLogService, callLogCleanup,
+    scheduler, deliveryScheduler, callLogService, callLogCleanup, callLogRepair,
     watcherScheduler, signalCheckCleanup, ecpRenewScheduler,
     shellManager, terminalManager, ptyChannelHubs, ptyHubGeneration,
     containerRegistry, channelServer, runtimeCleanup, activityHeartbeat, wsRegistry,
@@ -122,6 +124,7 @@ export function createShutdownHandler(deps: ShutdownDeps): () => Promise<void> {
       await settleInFlightExecutions(isDrainingForDeploy() ? drainGraceMs() : 0);
       scheduler.stop();
       deliveryScheduler.stop();
+      callLogRepair.stop();
       callLogService.stop();
       callLogCleanup.stop();
       watcherScheduler.stop();
