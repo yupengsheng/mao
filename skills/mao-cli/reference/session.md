@@ -256,7 +256,7 @@ mao session mark-read --id 12
 
 ### 用途
 
-获取看板分组会话，通常含 `running` 与 `recent`。
+获取看板分组会话，通常含 `running` 与 `recent`。只返回主会话，不含边路任务与子代理（它们在所属主会话的树信号里展示）。
 
 ### 参数说明
 

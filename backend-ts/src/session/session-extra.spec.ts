@@ -159,6 +159,19 @@ describe('SessionService extra', () => {
     expect(sessionRepo.logicalDelete).toHaveBeenCalled();
   });
 
+  it('listSessionsForDashboard excludes side tasks and subagents from both buckets', async () => {
+    const { service, sessionRepo } = makeService();
+    await service.listSessionsForDashboard(7);
+    const calls = vi.mocked(sessionRepo.list).mock.calls.filter(
+      ([sql]) => typeof sql === 'string' && sql.includes("status = 'ACTIVE'"),
+    );
+    expect(calls).toHaveLength(2);
+    for (const [sql, params] of calls) {
+      expect(sql).toContain("session_type NOT IN ('SUBAGENT', 'SIDE_TASK')");
+      expect(params).toEqual([7]);
+    }
+  });
+
   it('updateMemoryInjectionDisabledWritesNumericFlag', async () => {
     const { service, sessionRepo } = makeService();
     vi.mocked(sessionRepo.findById).mockResolvedValue({ id: 11, userId: 7 } as never);

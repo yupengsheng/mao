@@ -1720,13 +1720,16 @@ export class SessionService {
   async listSessionsForDashboard(userId: number): Promise<Record<string, Session[]>> {
     // 运行中口径与 ACTIVE_PHASES（isActivePhase / 删除提升守卫）一致，含 CANCELLING（取消流程进行中）；
     // recent 用同一集合取反，保证两个分桶互补、不重不漏。
+    // 与主列表同口径排除边路 / 子代理：它们只在所属主会话的树信号里展示；
+    // 父链中断的孤儿边路也不应凭 phase 混进看板。
+    const typeFilter = `session_type NOT IN ('SUBAGENT', 'SIDE_TASK')`;
     const running = await this.sessionRepo.list(
-      `user_id = ? AND status = 'ACTIVE' AND phase IN (${ACTIVE_PHASE_SQL_LIST})`,
+      `user_id = ? AND status = 'ACTIVE' AND ${typeFilter} AND phase IN (${ACTIVE_PHASE_SQL_LIST})`,
       [userId],
       'ORDER BY last_activity_at DESC',
     );
     const recent = await this.sessionRepo.list(
-      `user_id = ? AND status = 'ACTIVE' AND phase NOT IN (${ACTIVE_PHASE_SQL_LIST})`,
+      `user_id = ? AND status = 'ACTIVE' AND ${typeFilter} AND phase NOT IN (${ACTIVE_PHASE_SQL_LIST})`,
       [userId],
       'ORDER BY updated_at DESC LIMIT 20',
     );
