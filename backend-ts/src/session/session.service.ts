@@ -42,6 +42,7 @@ import { FileChangeRepository, isSessionSource, MessageRepository, SessionReposi
 import { SessionTodoRepository } from './activity.repository.js';
 import { TaskRepository } from '../task/task.repository.js';
 import { DeliveryStatus } from '../notification/task/types.js';
+import { cancelOpenRunsForSession } from '../schedule/scheduled-task.store.js';
 import type {
   AgentLookup,
   AgentRef,
@@ -783,6 +784,12 @@ export class SessionService {
       await tx.execute('DELETE FROM weixin_session_peer WHERE session_id = ?', [sideSessionId]);
       await tx.execute('DELETE FROM feishu_thread_session WHERE session_id = ?', [sideSessionId]);
       await tx.execute('DELETE FROM feishu_session_channel WHERE session_id = ?', [sideSessionId]);
+      // 定时任务以会话为执行载体：提升后改绑新主会话，未开始的运行行随旧会话取消。
+      await cancelOpenRunsForSession(tx, sideSessionId, '边路任务已提升');
+      await tx.execute(
+        'UPDATE scheduled_task SET session_id = ? WHERE session_id = ? AND deleted = 0',
+        [targetId, sideSessionId],
+      );
       // 旧边路会话随后逻辑删除，未发出的完成 / 提问 / 审批提醒不应再外推；
       // 与 onSessionDeleted 的存储层抑制保持同一语义，仅命中非终态行。
       await tx.execute(

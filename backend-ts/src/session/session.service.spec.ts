@@ -324,6 +324,32 @@ describe('SessionService archive', () => {
     );
   });
 
+  it('promotesSideTaskAndRebindsItsScheduledTasks', async () => {
+    // 边路任务提升不走 onSessionDeleted：定时任务改绑新主会话，未开始的运行随旧会话取消。
+    const { service, sessionRepo, txDb } = makeService();
+    vi.mocked(sessionRepo.findById).mockResolvedValue({
+      id: 20,
+      userId: 7,
+      title: '边路任务',
+      sessionType: 'SIDE_TASK',
+      phase: 'COMPLETED',
+      executionMode: 'CLOUD',
+      workspace: '/tmp/w',
+    });
+    vi.mocked(sessionRepo.list).mockResolvedValue([]);
+
+    await service.promoteSideTaskToMainSession(20, 7);
+
+    expect(txDb.execute).toHaveBeenCalledWith(
+      expect.stringContaining("r.status = 'CANCELLED'"),
+      [expect.any(String), '边路任务已提升', 20],
+    );
+    expect(txDb.execute).toHaveBeenCalledWith(
+      'UPDATE scheduled_task SET session_id = ? WHERE session_id = ? AND deleted = 0',
+      [99, 20],
+    );
+  });
+
   it('promotesSideTaskAndDeletesItsTaskRecords', async () => {
     // 边路任务同样会登记执行；提升后旧边路会话不再可达，任务主档与子记录须在同一事务内回收。
     const { service, sessionRepo, txDb } = makeService();

@@ -26,7 +26,7 @@ describe('ScheduledTaskDbStore.deleteBySessionId', () => {
     expect(cancelSql).toContain("r.status = 'CANCELLED'");
     expect(cancelSql).toContain("r.status = 'QUEUED'");
     expect(cancelSql).toContain("r.status = 'RUNNING' AND r.started_at IS NULL");
-    expect(tx.execute.mock.calls[1]![1]).toEqual([expect.any(String), 42]);
+    expect(tx.execute.mock.calls[1]![1]).toEqual([expect.any(String), '会话已删除', 42]);
 
     const retrySql = String(tx.execute.mock.calls[2]![0]);
     expect(retrySql).toContain('SET r.next_retry_at = NULL');

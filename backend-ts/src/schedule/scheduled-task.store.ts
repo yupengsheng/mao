@@ -3,6 +3,34 @@ import { notDeleted } from '../db/db.js';
 import { formatDateTime } from '../common/json.js';
 import type { ScheduledTask, ScheduledTaskListFilter, ScheduledTaskRun, ScheduledTaskStore, TaskFailureOutcome } from './scheduled-task.service.js';
 
+/**
+ * 会话即将不可达时，取消属于该会话的排队 / 未开跑运行行并清空重试。
+ * 调用方负责事务；普通删除把任务一并软删，边路提升则在取消后把任务改绑到新主会话。
+ */
+export async function cancelOpenRunsForSession(
+  db: Pick<Db, 'execute'>,
+  sessionId: number,
+  reason: string,
+): Promise<void> {
+  await db.execute(
+    `UPDATE scheduled_task_run r
+       JOIN scheduled_task t ON t.id = r.task_id
+        SET r.status = 'CANCELLED', r.finished_at = ?, r.error_summary = ?,
+            r.next_retry_at = NULL
+      WHERE t.session_id = ?
+        AND (r.status = 'QUEUED' OR (r.status = 'RUNNING' AND r.started_at IS NULL))`,
+    [formatDateTime(new Date()), reason, sessionId],
+  );
+  // 仍未到点的重试同样失去意义；重置后即使任务被人工恢复也不会补打旧档期。
+  await db.execute(
+    `UPDATE scheduled_task_run r
+       JOIN scheduled_task t ON t.id = r.task_id
+        SET r.next_retry_at = NULL
+      WHERE t.session_id = ? AND r.next_retry_at IS NOT NULL`,
+    [sessionId],
+  );
+}
+
 export class ScheduledTaskDbStore implements ScheduledTaskStore {
   constructor(private readonly db: Db) {}
 
@@ -24,25 +52,7 @@ export class ScheduledTaskDbStore implements ScheduledTaskStore {
         'UPDATE scheduled_task SET deleted = 1 WHERE session_id = ? AND deleted = 0',
         [sessionId],
       );
-      // 任务已随会话删除，排队中或已认领但未开跑的运行行不会再有消费者；
-      // 在同一事务内取消，避免它们停留在非终态直到 90 天历史清理。
-      await tx.execute(
-        `UPDATE scheduled_task_run r
-           JOIN scheduled_task t ON t.id = r.task_id
-            SET r.status = 'CANCELLED', r.finished_at = ?, r.error_summary = '会话已删除',
-                r.next_retry_at = NULL
-          WHERE t.session_id = ?
-            AND (r.status = 'QUEUED' OR (r.status = 'RUNNING' AND r.started_at IS NULL))`,
-        [formatDateTime(new Date()), sessionId],
-      );
-      // 仍未到点的重试同样失去意义；重置后即使任务被人工恢复也不会补打旧档期。
-      await tx.execute(
-        `UPDATE scheduled_task_run r
-           JOIN scheduled_task t ON t.id = r.task_id
-            SET r.next_retry_at = NULL
-          WHERE t.session_id = ? AND r.next_retry_at IS NOT NULL`,
-        [sessionId],
-      );
+      await cancelOpenRunsForSession(tx, sessionId, '会话已删除');
     });
   }
 
