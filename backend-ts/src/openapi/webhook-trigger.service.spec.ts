@@ -32,6 +32,8 @@ interface Harness {
     listByUser: ReturnType<typeof vi.fn>;
     countByUser: ReturnType<typeof vi.fn>;
     updateFields: ReturnType<typeof vi.fn>;
+    clearSessionBindingBySessionId: ReturnType<typeof vi.fn>;
+    clearSessionBindingIfMatches: ReturnType<typeof vi.fn>;
     deleteById: ReturnType<typeof vi.fn>;
     recordOutcome: ReturnType<typeof vi.fn>;
   };
@@ -56,6 +58,8 @@ function makeHarness(row: WebhookTrigger | null = triggerRow(), callLogEnabled =
     listByUser: vi.fn(async () => []),
     countByUser: vi.fn(async () => 0),
     updateFields: vi.fn(async () => undefined),
+    clearSessionBindingBySessionId: vi.fn(async () => 0),
+    clearSessionBindingIfMatches: vi.fn(async () => true),
     deleteById: vi.fn(async () => true),
     recordOutcome: vi.fn(async () => ({ consecutiveFailures: 0, disabled: false })),
   };
@@ -316,6 +320,67 @@ describe('WebhookTriggerService（P2）', () => {
     await expect(h.service.handleFire('a'.repeat(32), signedHeaders(body), body))
       .rejects.toMatchObject({ code: 3055 });
     expect(h.repo.recordOutcome).not.toHaveBeenCalled();
+  });
+
+  it('绑定会话已删除：自动解绑并按新建会话重试一次，后续触发不再携带旧会话', async () => {
+    const trigger = triggerRow({ sessionId: 11 });
+    const h = makeHarness(trigger);
+    h.repo.clearSessionBindingIfMatches.mockImplementation(async () => {
+      trigger.sessionId = null;
+      return true;
+    });
+    h.openRunRun
+      .mockRejectedValueOnce(new BusinessException(ErrorCode.SESSION_NOT_FOUND))
+      .mockResolvedValueOnce({ sessionId: 21, messageId: 2, queued: false, terminalPhase: 'COMPLETED' })
+      .mockResolvedValueOnce({ sessionId: 22, messageId: 3, queued: false, terminalPhase: 'COMPLETED' });
+
+    const first = await h.service.handleFire('a'.repeat(32), signedHeaders(body), body);
+    expect(first).toMatchObject({ ok: true, sessionId: 21, queued: false });
+    expect(h.repo.clearSessionBindingIfMatches).toHaveBeenCalledWith(1, 11);
+    expect(h.openRunRun).toHaveBeenCalledTimes(2);
+    expect(h.openRunRun.mock.calls[0][0]).toMatchObject({ sessionId: 11 });
+    expect(h.openRunRun.mock.calls[1][0]).toMatchObject({ sessionId: null });
+    expect(h.callLog.markRejected).not.toHaveBeenCalled();
+    expect(h.callLog.markAccepted).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() =>
+      expect(h.repo.recordOutcome).toHaveBeenCalledWith(1, 'COMPLETED', TRIGGER_DISABLE_AFTER_FAILURES, expect.any(String)));
+
+    const second = await h.service.handleFire('a'.repeat(32), signedHeaders(body), body);
+    expect(second).toMatchObject({ ok: true, sessionId: 22 });
+    expect(h.openRunRun).toHaveBeenCalledTimes(3);
+    expect(h.openRunRun.mock.calls[2][0]).toMatchObject({ sessionId: null });
+  });
+
+  it('解绑重试仍失败：只执行两次，拒绝流水只写一次', async () => {
+    const retryError = new Error('retry failed');
+    const h = makeHarness(triggerRow({ sessionId: 11 }));
+    h.openRunRun
+      .mockRejectedValueOnce(new BusinessException(ErrorCode.SESSION_NOT_FOUND))
+      .mockRejectedValueOnce(retryError);
+
+    await expect(h.service.handleFire('a'.repeat(32), signedHeaders(body), body)).rejects.toThrow('retry failed');
+    expect(h.openRunRun).toHaveBeenCalledTimes(2);
+    expect(h.callLog.markRejected).toHaveBeenCalledTimes(1);
+    expect(h.callLog.markRejected.mock.calls[0][2]).toBe(retryError);
+    expect(h.repo.recordOutcome).not.toHaveBeenCalled();
+  });
+
+  it('失效会话期间已改绑其他会话：不把旧请求投到新绑定', async () => {
+    const h = makeHarness(triggerRow({ sessionId: 11 }));
+    h.repo.clearSessionBindingIfMatches.mockResolvedValue(false);
+    h.repo.findById.mockResolvedValue(triggerRow({ sessionId: 12 }));
+    h.openRunRun.mockRejectedValue(new BusinessException(ErrorCode.SESSION_NOT_FOUND));
+
+    await expect(h.service.handleFire('a'.repeat(32), signedHeaders(body), body))
+      .rejects.toMatchObject({ code: ErrorCode.SESSION_NOT_FOUND.code });
+    expect(h.openRunRun).toHaveBeenCalledTimes(1);
+    expect(h.openRunRun.mock.calls[0][0]).toMatchObject({ sessionId: 11 });
+  });
+
+  it('会话删除路径主动解绑该会话的全部 Webhook 触发器', async () => {
+    const h = makeHarness();
+    await h.service.clearSessionBindingBySessionId(11);
+    expect(h.repo.clearSessionBindingBySessionId).toHaveBeenCalledWith(11);
   });
 
   it('非预算异常：不入连败、原样上抛（原有语义不变）', async () => {

@@ -165,6 +165,27 @@ export class MysqlWebhookTriggerRepository {
     await this.db.updateById('webhook_trigger', id, data);
   }
 
+  /** 会话删除后回收绑定：绑定会话失效时回退为“每次触发新建会话”。 */
+  async clearSessionBindingBySessionId(sessionId: number): Promise<number> {
+    const result = await this.db.execute(
+      'UPDATE webhook_trigger SET session_id = NULL WHERE session_id = ?',
+      [sessionId],
+    );
+    return Number(result.affectedRows ?? 0);
+  }
+
+  /**
+   * 触发时自愈用条件解绑：只清理仍指向本次失效会话的绑定，
+   * 避免并发手工重绑到新会话后被旧请求覆盖。
+   */
+  async clearSessionBindingIfMatches(id: number, sessionId: number): Promise<boolean> {
+    const result = await this.db.execute(
+      'UPDATE webhook_trigger SET session_id = NULL WHERE id = ? AND session_id = ?',
+      [id, sessionId],
+    );
+    return Number(result.affectedRows ?? 0) === 1;
+  }
+
   async deleteById(id: number, userId: number): Promise<boolean> {
     const result = await this.db.execute('DELETE FROM webhook_trigger WHERE id = ? AND user_id = ?', [id, userId]);
     return result.affectedRows === 1;

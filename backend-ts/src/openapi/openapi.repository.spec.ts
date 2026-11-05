@@ -192,6 +192,33 @@ describe('MysqlWebhookTriggerRepository.recordOutcome', () => {
   });
 });
 
+describe('MysqlWebhookTriggerRepository session binding cleanup', () => {
+  it('会话删除时按 session_id 批量解绑，回退为每次触发新建会话', async () => {
+    const execute = vi.fn(async () => ({ affectedRows: 2 }));
+    const repo = new MysqlWebhookTriggerRepository({ execute } as unknown as Db);
+
+    await expect(repo.clearSessionBindingBySessionId(11)).resolves.toBe(2);
+    expect(execute).toHaveBeenCalledWith(
+      'UPDATE webhook_trigger SET session_id = NULL WHERE session_id = ?',
+      [11],
+    );
+  });
+
+  it('自愈时只解绑仍指向失效会话的触发器，避免覆盖并发改绑', async () => {
+    const execute = vi.fn(async () => ({ affectedRows: 1 }));
+    const repo = new MysqlWebhookTriggerRepository({ execute } as unknown as Db);
+
+    await expect(repo.clearSessionBindingIfMatches(3, 11)).resolves.toBe(true);
+    expect(execute).toHaveBeenCalledWith(
+      'UPDATE webhook_trigger SET session_id = NULL WHERE id = ? AND session_id = ?',
+      [3, 11],
+    );
+
+    execute.mockResolvedValue({ affectedRows: 0 } as never);
+    await expect(repo.clearSessionBindingIfMatches(3, 11)).resolves.toBe(false);
+  });
+});
+
 describe('MysqlOutboundDeliveryRepository.deleteHistory', () => {
   it('只删终态记录，按 cutoff 和受限批量执行', async () => {
     const execute = vi.fn(async () => ({ affectedRows: 37 }));

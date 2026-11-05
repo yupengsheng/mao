@@ -234,6 +234,8 @@ export interface AppContext {
   deleteScheduledTasksForSession: ((sessionId: number) => Promise<void>) | null;
   /** 消息队列清理回调：构造晚于 SessionService，会话删除路径延迟解引用。 */
   clearSessionMessageQueue: ((sessionId: number) => Promise<void>) | null;
+  /** Webhook 触发器绑定回收：开放接口服务晚于 SessionService 构造，删除路径延迟解引用。 */
+  clearWebhookTriggerSessionBindings: ((sessionId: number) => Promise<void>) | null;
   /** MCP 同步服务：会话删除路径延迟解引用。 */
   mcpSyncRef: McpSyncService | null;
   /** 容器运行时激活标志：幂等激活用。 */
@@ -254,6 +256,7 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     terminalManagerRef: null,
     deleteScheduledTasksForSession: null,
     clearSessionMessageQueue: null,
+    clearWebhookTriggerSessionBindings: null,
     mcpSyncRef: null,
     containerRuntimeActive: false,
     closing: null,
@@ -543,6 +546,12 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
       await workspaceRulesSnapshotService.deleteBySessionId(sessionId);
       // 通道映射是会话级资源：会话已逻辑删除，映射不可再被合法使用。
       await sessionChannelMappingRepo.deleteBySessionId(sessionId);
+      // Webhook 触发器绑定会话失效后回退为“每次触发新建会话”；清理失败不阻断会话删除。
+      try {
+        await ctx.clearWebhookTriggerSessionBindings?.(sessionId);
+      } catch (e) {
+        console.warn(`Failed to clear webhook trigger bindings for session ${sessionId}: ${(e as Error).message}`);
+      }
     },
     (sessionId) => approvalRuleRepo.deleteBySessionId(sessionId),
     experienceMountService,
@@ -895,6 +904,7 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     openCallLogHolder, openTriggerSettle, openCallSettle,
   });
   const { openRunService, callLogService, callLogCleanup, callLogRepair, webhookTriggerService, watcherService, watcherScheduler, signalCheckCleanup, digestService, digestScheduler, signalWatcherRepo } = openApiServices;
+  ctx.clearWebhookTriggerSessionBindings = (sessionId) => webhookTriggerService.clearSessionBindingBySessionId(sessionId);
 
 
   const feishuHandler = assembleFeishuHandler({

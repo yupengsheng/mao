@@ -171,6 +171,11 @@ export class WebhookTriggerService {
     await this.deps.triggerRepo.deleteById(id, userId);
   }
 
+  /** 会话删除路径调用：绑定会话失效后回退为“每次触发新建会话”。 */
+  async clearSessionBindingBySessionId(sessionId: number): Promise<void> {
+    await this.deps.triggerRepo.clearSessionBindingBySessionId(sessionId);
+  }
+
   async rotateSecret(userId: number, id: number): Promise<{ plainSecret: string }> {
     await this.requireOwned(userId, id);
     const plainSecret = generateWebhookSecret();
@@ -256,33 +261,41 @@ export class WebhookTriggerService {
         deduplicated: true,
       };
     }
+    const message = this.wrapPayload(trigger.name ?? '', rawBody);
+    const execute = (sessionId: number | null) => this.deps.openRun.run({
+      userId: trigger.userId!,
+      agentId: trigger.agentId ?? 0,
+      sessionId,
+      source: 'WEBHOOK',
+      triggerId: trigger.id ?? null,
+      callLogId: begun?.id ?? null,
+      admissionBinding: { kind: 'WEBHOOK_TRIGGER', triggerId: trigger.id! },
+      message,
+    });
     let result: OpenRunResult;
     try {
-      result = await this.deps.openRun.run({
-        userId: trigger.userId,
-        agentId: trigger.agentId ?? 0,
-        sessionId: trigger.sessionId ?? null,
-        source: 'WEBHOOK',
-        triggerId: trigger.id ?? null,
-        callLogId: begun?.id ?? null,
-        admissionBinding: { kind: 'WEBHOOK_TRIGGER', triggerId: trigger.id! },
-        message: this.wrapPayload(trigger.name ?? '', rawBody),
-      });
+      result = await execute(trigger.sessionId ?? null);
     } catch (e) {
-      if (begun != null && !begun.duplicate) {
-        await this.deps.callLog?.markRejected(begun.id, begun.startedAt, e);
+      const staleSessionId = trigger.sessionId ?? null;
+      let canRetryUnbound = false;
+      if (this.isSessionNotFound(e) && staleSessionId != null && trigger.id != null) {
+        try {
+          canRetryUnbound = await this.clearStaleSessionBinding(trigger.id, staleSessionId);
+        } catch (unbindError) {
+          console.warn(`[openapi] failed to clear stale trigger session, triggerId=${trigger.id}: ${(unbindError as Error).message}`);
+        }
       }
-      // 预算 BLOCK 与准入拒绝：任务未启动，无终态可投递；但计入连败与自动停用护栏正向联动，
-      // 否则这类确定性 4xx 会被外部无限重试刷量。准入暂不可用（503）是瞬时故障，不计连败。
-      if (
-        e instanceof BusinessException
-        && (e.code === ErrorCode.BUDGET_EXCEEDED.code || e.code === ErrorCode.ADMISSION_REJECTED.code)
-        && trigger.id != null
-      ) {
-        await this.recordOutcome(trigger.id, 'FAILED').catch((err) =>
-          console.warn(`[openapi] failed to record rejected outcome, triggerId=${trigger.id}: ${(err as Error).message}`));
+      if (canRetryUnbound) {
+        try {
+          result = await execute(null);
+        } catch (retryError) {
+          await this.handleRunFailure(begun, retryError, trigger.id ?? null);
+          throw retryError;
+        }
+      } else {
+        await this.handleRunFailure(begun, e, trigger.id ?? null);
+        throw e;
       }
-      throw e;
     }
     await this.deps.callLog?.markAccepted(begun?.id ?? null, begun?.startedAt ?? Date.now(), result);
     // 直跑路径（未排队）：执行已在本请求内收敛，终态由 openRun 回读，就地做同源计数
@@ -325,6 +338,41 @@ export class WebhookTriggerService {
       });
     } catch (e) {
       console.warn(`[openapi] failed to notify trigger disabled, triggerId=${triggerId}: ${(e as Error).message}`);
+    }
+  }
+
+  private isSessionNotFound(error: unknown): boolean {
+    return error instanceof BusinessException && error.code === ErrorCode.SESSION_NOT_FOUND.code;
+  }
+
+  /**
+   * 只解绑仍指向本次失效会话的触发器。条件更新影响 0 行时重新读取：
+   * 若已被会话删除钩子解绑，同样可以安全地按“新建会话”重试；
+   * 若被并发改绑到其他会话，则保留新绑定，不把本次请求误投到新会话。
+   */
+  private async clearStaleSessionBinding(triggerId: number, sessionId: number): Promise<boolean> {
+    if (await this.deps.triggerRepo.clearSessionBindingIfMatches(triggerId, sessionId)) return true;
+    const latest = await this.deps.triggerRepo.findById(triggerId);
+    return latest != null && (latest.sessionId ?? null) == null;
+  }
+
+  private async handleRunFailure(
+    begun: { id: number; startedAt: number; duplicate: boolean } | null,
+    error: unknown,
+    triggerId: number | null,
+  ): Promise<void> {
+    if (begun != null && !begun.duplicate) {
+      await this.deps.callLog?.markRejected(begun.id, begun.startedAt, error);
+    }
+    // 预算 BLOCK 与准入拒绝：任务未启动，无终态可投递；但计入连败与自动停用护栏正向联动，
+    // 否则这类确定性 4xx 会被外部无限重试刷量。准入暂不可用（503）是瞬时故障，不计连败。
+    if (
+      error instanceof BusinessException
+      && (error.code === ErrorCode.BUDGET_EXCEEDED.code || error.code === ErrorCode.ADMISSION_REJECTED.code)
+      && triggerId != null
+    ) {
+      await this.recordOutcome(triggerId, 'FAILED').catch((err) =>
+        console.warn(`[openapi] failed to record rejected outcome, triggerId=${triggerId}: ${(err as Error).message}`));
     }
   }
 
