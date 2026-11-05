@@ -5,7 +5,17 @@
         <div class="card-header">
           <span>调用流水</span>
           <div class="header-actions">
-            <el-button :loading="exporting" @click="handleExportCsv">导出 CSV</el-button>
+            <el-dropdown trigger="click" @command="handleExportCommand">
+              <el-button :loading="exporting">导出</el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="filtered-csv">当前筛选 · CSV</el-dropdown-item>
+                  <el-dropdown-item command="filtered-json">当前筛选 · JSON</el-dropdown-item>
+                  <el-dropdown-item command="all-csv" divided>全量 · CSV</el-dropdown-item>
+                  <el-dropdown-item command="all-json">全量 · JSON</el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
             <el-button @click="fetchRecords">
               <el-icon><Refresh /></el-icon>
             </el-button>
@@ -262,7 +272,7 @@ const userOptions = ref<Array<{ id: number; username?: string | null; displayNam
 const agentOptions = ref<Array<{ id: number; name: string }>>([])
 const modelOptions = ref<Array<{ id: number; name: string; provider?: string | null }>>([])
 const modelSearching = ref(false)
-const EXPORT_PAGE_SIZE = 500
+const EXPORT_PAGE_SIZE = 100
 const EXPORT_MAX_ROWS = 10000
 const filters = reactive({
   scene: '',
@@ -447,54 +457,134 @@ function csvCell(value: unknown): string {
   return `"${text.replace(/"/g, '""')}"`
 }
 
-function handleExportCsv() {
-  if (rejectInvalidFilters()) return
-  if (total.value > EXPORT_MAX_ROWS) {
-    ElMessage.warning(`当前筛选共 ${total.value} 条，超出导出上限 ${EXPORT_MAX_ROWS} 条，请缩小筛选范围后重试`)
-    return
-  }
-  doExportCsv()
+type LlmExportScope = 'filtered' | 'all'
+type LlmExportFormat = 'csv' | 'json'
+
+function handleExportCommand(command: string) {
+  const [scope, format] = command.split('-') as [LlmExportScope, LlmExportFormat]
+  if ((scope !== 'filtered' && scope !== 'all') || (format !== 'csv' && format !== 'json')) return
+  void exportRecords(scope, format)
 }
 
-async function doExportCsv() {
+/** 导出开始时冻结筛选条件，避免用户在分页拉取过程中改表单导致口径漂移。 */
+function exportFilterSnapshot(scope: LlmExportScope): Record<string, unknown> {
+  if (scope === 'all') return {}
+  const params = buildFilterParams(1, EXPORT_PAGE_SIZE)
+  delete params.page
+  delete params.size
+  return params
+}
+
+function exportLimitMessage(scope: LlmExportScope, total: number): string {
+  if (scope === 'all') {
+    return `全量共 ${total} 条，超出导出上限 ${EXPORT_MAX_ROWS} 条，请先设置筛选条件后使用「当前筛选」导出`
+  }
+  return `当前筛选共 ${total} 条，超出导出上限 ${EXPORT_MAX_ROWS} 条，请缩小筛选范围后重试`
+}
+
+async function collectExportRows(
+  scope: LlmExportScope,
+  baseParams: Record<string, unknown>,
+): Promise<{ rows: any[]; total: number } | null> {
+  const rows: any[] = []
+  let exportTotal: number | null = null
+  let pageNum = 1
+  for (;;) {
+    if (rows.length >= EXPORT_MAX_ROWS) break
+    const { data } = await api.get('/admin/llm-calls', {
+      params: { ...baseParams, page: pageNum, size: EXPORT_PAGE_SIZE }
+    })
+    const pageRows: any[] = data?.records || []
+    if (exportTotal == null) {
+      exportTotal = Number(data?.total ?? 0)
+      if (exportTotal > EXPORT_MAX_ROWS) {
+        ElMessage.warning(exportLimitMessage(scope, exportTotal))
+        return null
+      }
+    }
+    if (pageRows.length === 0) break
+    rows.push(...pageRows.slice(0, EXPORT_MAX_ROWS - rows.length))
+    if (rows.length >= (exportTotal ?? 0) || pageRows.length < EXPORT_PAGE_SIZE) break
+    pageNum += 1
+  }
+  return { rows, total: exportTotal ?? rows.length }
+}
+
+function buildExportCsv(rows: any[]): string {
+  const header = [
+    '时间', '用户', '模型', '输入 Token', '输出 Token', '成本', '耗时(ms)', '吞吐(tok/s)',
+    '缓存 Token', '缓存写 Token', '状态', '错误信息', '会话 ID', 'Agent ID',
+    '场景', '供应商', '上游模型 ID', '协议', '推理强度', '流式', '首字耗时(ms)',
+    '重试次数', '合计 Token', 'Agent 名称', '记录 ID'
+  ]
+  const lines = [header.map(csvCell).join(',')]
+  for (const row of rows) {
+    // 吞吐与表格列同源同公式：不可解码行（非流式）留空
+    const tps = throughput(row)
+    lines.push([
+      row.createdAt,
+      row.displayName || row.username || row.userId || '',
+      row.modelName || row.providerModelId || '',
+      row.promptTokens || 0,
+      row.completionTokens || 0,
+      row.costMicros == null ? '' : (row.costMicros / 1000000).toFixed(6),
+      row.durationMs ?? '',
+      tps == null ? '' : tps.toFixed(1),
+      row.cachedTokens || 0,
+      row.cacheCreationTokens || 0,
+      row.cancelled === 1 ? '取消' : (row.success === 1 ? '成功' : '失败'),
+      row.errorMessage || '',
+      row.sessionId ?? '',
+      row.agentId ?? '',
+      llmCallSceneLabel(row.scene),
+      row.provider || '',
+      row.providerModelId || '',
+      llmCallProtocolLabel(row.protocol),
+      row.effort || '',
+      row.stream === 1 ? '是' : '否',
+      row.firstTokenMs ?? '',
+      row.retryCount ?? 0,
+      row.totalTokens || 0,
+      row.agentName || '',
+      row.id ?? ''
+    ].map(csvCell).join(','))
+  }
+  return `\uFEFF${lines.join('\r\n')}`
+}
+
+async function exportRecords(scope: LlmExportScope, format: LlmExportFormat) {
+  if (scope === 'filtered' && rejectInvalidFilters()) return
+  const baseParams = exportFilterSnapshot(scope)
   exporting.value = true
   try {
-    const rows: any[] = []
-    let pageNum = 1
-    while (rows.length < total.value && rows.length < EXPORT_MAX_ROWS) {
-      const { data } = await api.get('/admin/llm-calls', {
-        params: buildFilterParams(pageNum, EXPORT_PAGE_SIZE)
-      })
-      const records: any[] = data?.records || []
-      if (records.length === 0) break
-      rows.push(...records)
-      pageNum += 1
+    const result = await collectExportRows(scope, baseParams)
+    if (!result) return
+    const { rows, total: exportedTotal } = result
+    if (rows.length === 0) {
+      ElMessage.info('当前条件下没有可导出的调用记录')
+      return
     }
-    const header = ['时间', '用户', '模型', '输入 Token', '输出 Token', '成本', '耗时(ms)', '吞吐(tok/s)', '缓存 Token', '缓存写 Token', '状态', '错误信息', '会话 ID', 'Agent ID']
-    const lines = [header.map(csvCell).join(',')]
-    for (const row of rows) {
-      // 吞吐与表格列同源同公式：不可解码行（非流式）留空
-      const tps = throughput(row)
-      lines.push([
-        row.createdAt,
-        row.displayName || row.username || row.userId || '',
-        row.modelName || row.providerModelId || '',
-        row.promptTokens || 0,
-        row.completionTokens || 0,
-        row.costMicros == null ? '' : (row.costMicros / 1000000).toFixed(6),
-        row.durationMs ?? '',
-        tps == null ? '' : tps.toFixed(1),
-        row.cachedTokens || 0,
-        row.cacheCreationTokens || 0,
-        row.cancelled === 1 ? '取消' : (row.success === 1 ? '成功' : '失败'),
-        row.errorMessage || '',
-        row.sessionId ?? '',
-        row.agentId ?? ''
-      ].map(csvCell).join(','))
+    const date = new Date().toISOString().slice(0, 10)
+    const scopePart = scope === 'all' ? 'all' : 'filtered'
+    if (format === 'csv') {
+      downloadBlob(
+        new Blob([buildExportCsv(rows)], { type: 'text/csv;charset=utf-8;' }),
+        `llm-calls-${scopePart}-${date}.csv`
+      )
+    } else {
+      const payload = {
+        exportedAt: new Date().toISOString(),
+        scope: scope === 'all' ? 'all' : 'current-filter',
+        total: exportedTotal,
+        filters: scope === 'filtered' ? baseParams : null,
+        records: rows
+      }
+      downloadBlob(
+        new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' }),
+        `llm-calls-${scopePart}-${date}.json`
+      )
     }
-    const blob = new Blob([`\uFEFF${lines.join('\r\n')}`], { type: 'text/csv;charset=utf-8;' })
-    downloadBlob(blob, `llm-calls-${new Date().toISOString().slice(0, 10)}.csv`)
-    ElMessage.success(`已导出 ${rows.length} 条调用记录`)
+    ElMessage.success(`已导出${scope === 'all' ? '全量' : '当前筛选'} ${rows.length} 条调用记录`)
   } catch { /* 拦截器已提示失败 */ } finally {
     exporting.value = false
   }

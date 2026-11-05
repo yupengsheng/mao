@@ -6,7 +6,16 @@
         <span class="page-title">{{ sessionInfo?.title || '会话详情' }}</span>
       </template>
       <template #extra>
-        <el-button :loading="exporting" @click="exportMessages">导出记录</el-button>
+        <el-dropdown trigger="click" @command="handleExportCommand">
+          <el-button :loading="exporting">导出记录</el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="json">JSON（完整记录）</el-dropdown-item>
+              <el-dropdown-item command="markdown">Markdown（便于阅读）</el-dropdown-item>
+              <el-dropdown-item command="csv">CSV（表格分析）</el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
         <el-button :loading="infoLoading || messagesLoading" @click="fetchDetail">
           <el-icon><Refresh /></el-icon>
         </el-button>
@@ -18,9 +27,18 @@
       </el-button>
       <span class="page-title">{{ sessionInfo?.title || '会话详情' }}</span>
       <div class="mobile-page-actions">
-        <el-button text :loading="exporting" aria-label="导出记录" @click="exportMessages">
-          <el-icon><Download /></el-icon>
-        </el-button>
+        <el-dropdown trigger="click" @command="handleExportCommand">
+          <el-button text :loading="exporting" aria-label="导出记录">
+            <el-icon><Download /></el-icon>
+          </el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="json">导出 JSON</el-dropdown-item>
+              <el-dropdown-item command="markdown">导出 Markdown</el-dropdown-item>
+              <el-dropdown-item command="csv">导出 CSV</el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
         <el-button text :loading="infoLoading || messagesLoading" aria-label="刷新" @click="fetchDetail">
           <el-icon><Refresh /></el-icon>
         </el-button>
@@ -172,7 +190,7 @@ import { sessionSourceLabel, sessionSourceTagType } from '../../utils/sessionSou
 import { useBreakpoint } from '../../composables/useBreakpoint'
 import { mapApiMessagesToChat } from './utils/chatMessage'
 import { mergeLatestPage } from './utils/messagePageMerge'
-import type { ChatMessage } from './types/chat'
+import type { ChatMessage, ToolCall } from './types/chat'
 import MessageGroup from './components/MessageGroup.vue'
 import WorkspaceFileDialog from './components/WorkspaceFileDialog.vue'
 import WorkspaceFilePreviewDialog from './components/WorkspaceFilePreviewDialog.vue'
@@ -420,38 +438,194 @@ function mergeMessages(olderMessages: ChatMessage[], currentMessages: ChatMessag
   return olderMessages.concat(currentMessages.filter(msg => !seen.has(msg.id)))
 }
 
-/** 循环 beforeMessageId 拉全量消息（含工具调用、思考过程），导出 JSON 文件留存证据 */
-async function exportMessages() {
+type SessionExportFormat = 'json' | 'markdown' | 'csv'
+
+function handleExportCommand(command: string) {
+  if (command !== 'json' && command !== 'markdown' && command !== 'csv') return
+  void exportMessages(command)
+}
+
+/** 循环 beforeMessageId 拉全量消息（含工具调用、思考过程），供三种格式导出共用。 */
+async function collectExportMessages(): Promise<ChatMessage[]> {
+  const id = route.params.id
+  const allMessages: ChatMessage[] = []
+  let beforeId: string | null = null
+  // 游标防御：后端异常重复返回同一 nextBeforeMessageId 时中断；轮次封顶避免无限循环
+  const MAX_EXPORT_ROUNDS = 200
+  const pageOf = (payload: unknown): { messages?: Array<Record<string, unknown>>; hasMore?: boolean; nextBeforeMessageId?: number | string | null } =>
+    (payload ?? {}) as { messages?: Array<Record<string, unknown>>; hasMore?: boolean; nextBeforeMessageId?: number | string | null }
+  for (let round = 0; round < MAX_EXPORT_ROUNDS; round++) {
+    const res = await api.get(`/admin/sessions/${id}/messages`, {
+      params: { roundLimit: 50, ...(beforeId ? { beforeMessageId: beforeId } : {}) }
+    })
+    const page = pageOf((res as { data?: unknown }).data)
+    const pageMessages = mapApiMessagesToChat(page.messages || [], String(id))
+    allMessages.unshift(...pageMessages)
+    if (!page.hasMore || !page.nextBeforeMessageId || pageMessages.length === 0) break
+    const nextCursor = String(page.nextBeforeMessageId)
+    if (nextCursor === beforeId) break
+    beforeId = nextCursor
+  }
+  return allMessages
+}
+
+function roleLabel(role: ChatMessage['role']): string {
+  if (role === 'user') return '用户'
+  if (role === 'assistant') return '助手'
+  return '系统'
+}
+
+function toolStatusLabel(status: ToolCall['status']): string {
+  if (status === 'success') return '成功'
+  if (status === 'error') return '失败'
+  if (status === 'running') return '执行中'
+  return '待执行'
+}
+
+function toolInputText(toolCall: ToolCall): string {
+  if (toolCall.input == null) return ''
+  try {
+    return JSON.stringify(toolCall.input, null, 2)
+  } catch {
+    return String(toolCall.input)
+  }
+}
+
+function fencedCode(content: string, language = ''): string {
+  const maxTicks = Math.max(0, ...(content.match(/`+/g) ?? []).map((run) => run.length))
+  const fence = '`'.repeat(Math.max(3, maxTicks + 1))
+  return `${fence}${language}\n${content}\n${fence}`
+}
+
+function buildSessionMarkdown(messages: ChatMessage[]): string {
+  const info = sessionInfo.value
+  const title = info?.title || '会话记录'
+  const lines = [
+    `# ${title}`,
+    '',
+    `- 会话 ID: ${info?.id ?? route.params.id}`,
+    `- 用户: ${info?.userName || '-'}`,
+    `- Agent: ${info?.agentName || '-'}`,
+    `- 模型: ${info?.modelName || '-'}`,
+    `- 导出时间: ${formatDateTime(new Date().toISOString())}`,
+    `- 消息数: ${messages.length}`,
+    '',
+    '---',
+    ''
+  ]
+  messages.forEach((message, index) => {
+    lines.push(`## ${index + 1}. ${roleLabel(message.role)} · ${formatDateTime(message.createdAt)}`, '')
+    if (message.thinkingContent?.trim()) {
+      lines.push('### 思考过程', '', message.thinkingContent.trim(), '')
+    }
+    if (message.content?.trim()) {
+      lines.push(message.content.trim(), '')
+    }
+    if (message.images?.length) {
+      lines.push('### 图片', '')
+      message.images.forEach((image, imageIndex) => {
+        lines.push(image.startsWith('data:')
+          ? `- 图片 ${imageIndex + 1}：内联图片已省略`
+          : `![图片 ${imageIndex + 1}](${image})`)
+      })
+      lines.push('')
+    }
+    if (message.toolCalls?.length) {
+      lines.push('### 工具调用', '')
+      message.toolCalls.forEach((toolCall, toolIndex) => {
+        lines.push(`#### ${toolIndex + 1}. \`${toolCall.name || '未命名工具'}\` · ${toolStatusLabel(toolCall.status)}`, '')
+        if (toolCall.summary?.trim()) lines.push(toolCall.summary.trim(), '')
+        const input = toolInputText(toolCall)
+        if (input) lines.push('参数：', '', fencedCode(input, 'json'), '')
+        if (toolCall.result?.trim()) lines.push('结果：', '', fencedCode(toolCall.result.trim(), 'text'), '')
+      })
+    }
+    if (message.fileChanges?.length) {
+      lines.push('### 文件变更', '')
+      message.fileChanges.forEach((change) => {
+        lines.push(`- \`${change.path}\` · ${change.type} · +${change.linesAdded ?? 0}/-${change.linesDeleted ?? 0}`)
+      })
+      lines.push('')
+    }
+  })
+  return lines.join('\n')
+}
+
+function csvCell(value: unknown): string {
+  const text = value == null ? '' : String(value)
+  return `"${text.replace(/"/g, '""')}"`
+}
+
+function buildSessionCsv(messages: ChatMessage[]): string {
+  const header = ['序号', '时间', '角色', '类型', '内容']
+  const rows: Array<Array<string | number>> = []
+  let sequence = 0
+  const pushRow = (time: string, role: string, type: string, content: string) => {
+    rows.push([++sequence, time, role, type, content])
+  }
+  for (const message of messages) {
+    const time = message.createdAt ? formatDateTime(message.createdAt) : '-'
+    const role = roleLabel(message.role)
+    if (message.thinkingContent?.trim()) pushRow(time, role, '思考', message.thinkingContent.trim())
+    if (message.content?.trim()) pushRow(time, role, '正文', message.content.trim())
+    if (message.images?.length) {
+      const images = message.images.map((image, index) => image.startsWith('data:')
+        ? `图片 ${index + 1}：内联图片已省略`
+        : `图片 ${index + 1}：${image}`)
+      pushRow(time, role, '图片', images.join('\n'))
+    }
+    for (const toolCall of message.toolCalls ?? []) {
+      const details = [
+        `工具：${toolCall.name || '未命名工具'}`,
+        `状态：${toolStatusLabel(toolCall.status)}`,
+        toolCall.summary?.trim() ? `摘要：${toolCall.summary.trim()}` : '',
+        toolInputText(toolCall) ? `参数：${toolInputText(toolCall)}` : '',
+        toolCall.result?.trim() ? `结果：${toolCall.result.trim()}` : ''
+      ].filter(Boolean)
+      pushRow(time, role, '工具调用', details.join('\n'))
+    }
+    for (const change of message.fileChanges ?? []) {
+      pushRow(time, role, '文件变更', `${change.path} · ${change.type} · +${change.linesAdded ?? 0}/-${change.linesDeleted ?? 0}`)
+    }
+    if (!message.thinkingContent?.trim() && !message.content?.trim() && !message.images?.length
+      && !message.toolCalls?.length && !message.fileChanges?.length) {
+      pushRow(time, role, '消息', '')
+    }
+  }
+  const lines = [header, ...rows].map((row) => row.map(csvCell).join(','))
+  return `\uFEFF${lines.join('\r\n')}`
+}
+
+async function exportMessages(format: SessionExportFormat) {
   const id = route.params.id
   if (exporting.value) return
   exporting.value = true
   try {
-    const allMessages: ChatMessage[] = []
-    let beforeId: string | null = null
-    // 游标防御：后端异常重复返回同一 nextBeforeMessageId 时中断；轮次封顶避免无限循环
-    const MAX_EXPORT_ROUNDS = 200
-    const pageOf = (payload: unknown): { messages?: Array<Record<string, unknown>>; hasMore?: boolean; nextBeforeMessageId?: number | string | null } =>
-      (payload ?? {}) as { messages?: Array<Record<string, unknown>>; hasMore?: boolean; nextBeforeMessageId?: number | string | null }
-    for (let round = 0; round < MAX_EXPORT_ROUNDS; round++) {
-      const res = await api.get(`/admin/sessions/${id}/messages`, {
-        params: { roundLimit: 50, ...(beforeId ? { beforeMessageId: beforeId } : {}) }
-      })
-      const page = pageOf((res as { data?: unknown }).data)
-      const pageMessages = mapApiMessagesToChat(page.messages || [], String(id))
-      allMessages.unshift(...pageMessages)
-      if (!page.hasMore || !page.nextBeforeMessageId || pageMessages.length === 0) break
-      const nextCursor = String(page.nextBeforeMessageId)
-      if (nextCursor === beforeId) break
-      beforeId = nextCursor
+    const allMessages = await collectExportMessages()
+    const date = new Date().toISOString().slice(0, 10)
+    const baseName = `session-${id}-${date}`
+    if (format === 'json') {
+      const payload = {
+        sessionId: sessionInfo.value?.id ?? id,
+        title: sessionInfo.value?.title ?? '',
+        exportedAt: new Date().toISOString(),
+        messages: allMessages
+      }
+      downloadBlob(
+        new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }),
+        `${baseName}.json`
+      )
+    } else if (format === 'markdown') {
+      downloadBlob(
+        new Blob([buildSessionMarkdown(allMessages)], { type: 'text/markdown;charset=utf-8' }),
+        `${baseName}.md`
+      )
+    } else {
+      downloadBlob(
+        new Blob([buildSessionCsv(allMessages)], { type: 'text/csv;charset=utf-8' }),
+        `${baseName}.csv`
+      )
     }
-    const payload = {
-      sessionId: sessionInfo.value?.id ?? id,
-      title: sessionInfo.value?.title ?? '',
-      exportedAt: new Date().toISOString(),
-      messages: allMessages
-    }
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
-    downloadBlob(blob, `session-${id}-${new Date().toISOString().slice(0, 10)}.json`)
     ElMessage.success(`已导出 ${allMessages.length} 条消息`)
   } catch {
     /* 拦截器已提示失败 */
