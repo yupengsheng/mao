@@ -60,7 +60,16 @@
             </router-link>
             <span v-else>{{ sessionInfo.agentName || '-' }}</span>
           </el-descriptions-item>
-          <el-descriptions-item label="模型">{{ sessionInfo.modelName || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="模型">
+            <router-link
+              v-if="sessionInfo.modelName"
+              class="drill-link"
+              :to="{ path: '/llm-calls', query: { sessionId: String(sessionInfo.id) } }"
+            >
+              {{ sessionInfo.modelName }}
+            </router-link>
+            <span v-else>-</span>
+          </el-descriptions-item>
           <el-descriptions-item label="执行模式">
             <el-tag :type="sessionInfo.executionMode === 'CLOUD' ? 'primary' : 'warning'" size="small">
               {{ executionModeLabel(sessionInfo.executionMode) }}
