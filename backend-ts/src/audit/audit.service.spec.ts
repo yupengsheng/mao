@@ -11,6 +11,7 @@ describe('AuditLogService', () => {
     }),
     selectPage: vi.fn(),
     findById: vi.fn(),
+    deleteBatch: vi.fn(),
   };
   const service = new AuditLogService(repo);
 

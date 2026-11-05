@@ -26,6 +26,8 @@ import { createShutdownHandler } from './app-shutdown.js';
 import { TaskRepository } from './task/task.repository.js';
 import { TaskRecordRepairService } from './task/task-record-repair.service.js';
 import { TaskExecutionRetentionService } from './task/task-execution-retention.service.js';
+import { MysqlAuditLogRepository } from './audit/audit.repository.js';
+import { AuditLogCleanup } from './audit/audit-log-cleanup.js';
 
 export interface LifecycleDeps {
   app: FastifyInstance;
@@ -108,6 +110,11 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
   taskRecordRepair.start();
   const taskExecutionRetention = new TaskExecutionRetentionService(new TaskRepository(db));
   taskExecutionRetention.start();
+  const auditLogCleanup = new AuditLogCleanup(
+    new MysqlAuditLogRepository(db),
+    () => d.settingService.getAuditRetentionDays(),
+  );
+  auditLogCleanup.start();
   d.callLogService.start();
   d.callLogCleanup.start();
   d.callLogRepair.start();
@@ -216,7 +223,7 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
     containerRegistry: d.containerRegistry, channelServer: d.channelServer, runtimeCleanup,
     activityHeartbeat: d.activityHeartbeat, wsRegistry: d.wsRegistry,
     agentLoop: d.agentLoop, wsHandler: d.wsHandler, sessionService: d.sessionService,
-    taskRecordRepair, taskExecutionRetention,
+    taskRecordRepair, taskExecutionRetention, auditLogCleanup,
   });
   drainWatcher.start();
 

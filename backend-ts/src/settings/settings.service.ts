@@ -714,6 +714,13 @@ export class SystemSettingService {
     return Number.isInteger(n) && n > 0 ? n : 90;
   }
 
+  /** 审计日志保留天数（audit.retentionDays，V048；默认 180）。 */
+  async getAuditRetentionDays(): Promise<number> {
+    const raw = await this.getOpt('audit.retentionDays');
+    const n = raw == null ? NaN : Number(raw);
+    return Number.isInteger(n) && n > 0 ? n : 180;
+  }
+
   /**
    * 自定义 HTTP 工具内网放行清单（V163）：CIDR JSON 数组 → 合法 CIDR 列表。
    * 非法/缺失按空数组处理（=一律按私网拒绝，失败即拒绝不放开）。

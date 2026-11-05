@@ -9,6 +9,7 @@ export interface AuditLogRepository {
     filter: AuditListFilter,
   ): Promise<{ records: AuditLog[]; total: number }>;
   findById(id: number): Promise<AuditLog | null>;
+  deleteBatch(cutoff: string, limit: number): Promise<number>;
 }
 
 export interface AuditRecordInput {

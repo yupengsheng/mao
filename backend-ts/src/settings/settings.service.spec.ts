@@ -74,6 +74,17 @@ describe('SystemSettingService', () => {
     expect(mapper.updateById).toHaveBeenCalledWith(row);
   });
 
+  it('getAuditRetentionDays 读取正整数，缺失或非法回落 180 天', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue({ ...setting('audit.retentionDays', '审计', 1), value: '365' });
+    await expect(service().getAuditRetentionDays()).resolves.toBe(365);
+
+    vi.mocked(mapper.findByKey).mockResolvedValue({ ...setting('audit.retentionDays', '审计', 1), value: '0' });
+    await expect(service().getAuditRetentionDays()).resolves.toBe(180);
+
+    vi.mocked(mapper.findByKey).mockResolvedValue(null);
+    await expect(service().getAuditRetentionDays()).resolves.toBe(180);
+  });
+
   it('updateAllowsEmptyWeixinAgentId', async () => {
     const row = setting(SystemSettingService.WEIXIN_AGENT_ID_KEY, '微信', 1);
     vi.mocked(mapper.findByKey).mockResolvedValue(row);

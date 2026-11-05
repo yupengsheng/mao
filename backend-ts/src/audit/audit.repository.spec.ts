@@ -54,3 +54,17 @@ describe('audit 分页排序键必须唯一', () => {
     expect(new Set(ids).size).toBe(25);
   });
 });
+
+describe('audit 日志清理', () => {
+  it('按创建时间分批删除，LIMIT 上限钳制为 5000', async () => {
+    const db = mockDb([]);
+    db.execute.mockResolvedValue({ affectedRows: 123, insertId: 0 });
+    const repo = new MysqlAuditLogRepository(db as never);
+
+    await expect(repo.deleteBatch('2026-01-01 00:00:00', 100000)).resolves.toBe(123);
+
+    const sql = String(db.execute.mock.calls[0]![0]);
+    expect(sql).toContain('DELETE FROM audit_log WHERE created_at < ? ORDER BY id LIMIT 5000');
+    expect(db.execute.mock.calls[0]![1]).toEqual(['2026-01-01 00:00:00']);
+  });
+});

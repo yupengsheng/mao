@@ -75,4 +75,14 @@ export class MysqlAuditLogRepository implements AuditLogRepository {
   findById(id: number): Promise<AuditLog | null> {
     return this.db.queryOne<AuditLog>('SELECT * FROM audit_log WHERE id = ?', [id]);
   }
+
+  /** 按创建时间分批删除过期审计日志，走 idx_audit_created，避免长事务。 */
+  async deleteBatch(cutoff: string, limit: number): Promise<number> {
+    const safeLimit = Math.max(1, Math.min(5000, Math.floor(limit)));
+    const result = await this.db.execute(
+      `DELETE FROM audit_log WHERE created_at < ? ORDER BY id LIMIT ${safeLimit}`,
+      [cutoff],
+    );
+    return result.affectedRows;
+  }
 }
