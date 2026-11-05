@@ -1,4 +1,5 @@
 import type { Db } from '../db/db.js';
+import { ACTIVE_PHASE_SQL_LIST } from '../session/util/session-group-key.js';
 
 /** 会话当前活跃的飞书进度卡片（崩溃恢复后续更卡片的关键映射）。 */
 export interface FeishuProgressCardRow {
@@ -14,6 +15,7 @@ export interface FeishuProgressCardRepository {
   upsert(row: FeishuProgressCardRow): Promise<void>;
   findBySessionId(sessionId: number): Promise<FeishuProgressCardRow | null>;
   deleteBySessionId(sessionId: number): Promise<void>;
+  deleteStaleBatch(cutoff: string, limit: number): Promise<number>;
 }
 
 /** Db.query / queryOne 已 toCamel；兼容未转换的 snake_case 行。字段不全视为无映射。 */
@@ -60,5 +62,35 @@ export class MysqlFeishuProgressCardRepository implements FeishuProgressCardRepo
 
   async deleteBySessionId(sessionId: number): Promise<void> {
     await this.db.execute('DELETE FROM feishu_progress_card WHERE session_id = ?', [sessionId]);
+  }
+
+  /**
+   * 分批删除过期的进度卡映射。只清理会话已不存在 / 已逻辑删除 / 非活跃相位的行，
+   * 运行中、待恢复、等待审批与取消中的会话即使映射很旧也保留。LIMIT 钳制在 1~5000。
+   */
+  async deleteStaleBatch(cutoff: string, limit: number): Promise<number> {
+    const safeLimit = Number.isFinite(limit)
+      ? Math.max(1, Math.min(5000, Math.floor(limit)))
+      : 1;
+    const result = await this.db.execute(
+      `DELETE FROM feishu_progress_card WHERE id IN (
+         SELECT id FROM (
+           SELECT p.id
+           FROM feishu_progress_card p
+           LEFT JOIN session s ON s.id = p.session_id
+           WHERE p.updated_at < ?
+             AND (
+               s.id IS NULL
+               OR s.deleted = 1
+               OR s.phase IS NULL
+               OR s.phase NOT IN (${ACTIVE_PHASE_SQL_LIST})
+             )
+           ORDER BY p.updated_at, p.id
+           LIMIT ${safeLimit}
+         ) candidates
+       )`,
+      [cutoff],
+    );
+    return Number(result.affectedRows ?? 0);
   }
 }

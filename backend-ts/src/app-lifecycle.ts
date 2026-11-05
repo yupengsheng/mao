@@ -56,6 +56,8 @@ import { FeishuCardSnapshotCleanup } from './feishu/card-snapshot-cleanup.js';
 import { MysqlFeishuCardSnapshotRepository } from './feishu/card-snapshot.repository.js';
 import { DingtalkProgressCardCleanup } from './dingtalk/progress-card-cleanup.js';
 import { MysqlDingtalkProgressCardRepository } from './dingtalk/progress-card.repository.js';
+import { FeishuProgressCardCleanup } from './feishu/progress-card-cleanup.js';
+import { MysqlFeishuProgressCardRepository } from './feishu/progress-card.repository.js';
 
 export interface LifecycleDeps {
   app: FastifyInstance;
@@ -169,6 +171,10 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
     new MysqlDingtalkProgressCardRepository(db),
   );
   dingtalkProgressCardCleanup.start();
+  const feishuProgressCardCleanup = new FeishuProgressCardCleanup(
+    new MysqlFeishuProgressCardRepository(db),
+  );
+  feishuProgressCardCleanup.start();
   const feishuMessageRepo = new MysqlFeishuMessageRepository(db);
   const dingtalkMessageRepo = new MysqlDingtalkMessageRepository(db);
   const weixinMessageRepo = new WeixinInboundMessageRepository(db);
@@ -326,7 +332,7 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
     activityHeartbeat: d.activityHeartbeat, wsRegistry: d.wsRegistry,
     agentLoop: d.agentLoop, wsHandler: d.wsHandler, sessionService: d.sessionService,
     taskRecordRepair, taskExecutionRetention, auditLogCleanup, llmCallCleanup, sessionActivityCleanup,
-    sessionCompactionEventCleanup, subagentExecutionCleanup, messageQueueCleanup, dingtalkProgressCardCleanup, inboundEventCleanup,
+    sessionCompactionEventCleanup, subagentExecutionCleanup, messageQueueCleanup, dingtalkProgressCardCleanup, feishuProgressCardCleanup, inboundEventCleanup,
     authStateCleanup, groupMessageLogCleanup, feishuP2pMessageCleanup, feishuCardSnapshotCleanup,
   });
   drainWatcher.start();
