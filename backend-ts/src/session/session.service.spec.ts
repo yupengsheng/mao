@@ -109,6 +109,7 @@ function makeService(
   const fileChangeRepo = {
     listBySession: vi.fn(async () => []),
     insert: vi.fn(),
+    deleteBySession: vi.fn(async () => undefined),
   } as unknown as FileChangeRepository;
   const sessionCompactionService = { deleteBySessionId: vi.fn() } as unknown as SessionCompactionService;
   const sessionCompactionEventService = { deleteBySessionId: vi.fn() } as unknown as SessionCompactionEventService;
@@ -410,6 +411,28 @@ describe('SessionService archive', () => {
     }
   });
 
+  it('promotesSideTaskAndDeletesOldFileChanges', async () => {
+    // 文件变更已复制到新主会话，旧边路行须在同一事务内物理回收。
+    const { service, sessionRepo, txDb } = makeService();
+    vi.mocked(sessionRepo.findById).mockResolvedValue({
+      id: 20,
+      userId: 7,
+      title: '边路任务',
+      sessionType: 'SIDE_TASK',
+      phase: 'COMPLETED',
+      executionMode: 'CLOUD',
+      workspace: '/tmp/w',
+    });
+    vi.mocked(sessionRepo.list).mockResolvedValue([]);
+
+    await service.promoteSideTaskToMainSession(20, 7);
+
+    expect(txDb.execute).toHaveBeenCalledWith(
+      'DELETE FROM message_file_change WHERE session_id = ?',
+      [20],
+    );
+  });
+
   it('promotesSideTaskAndRebindsApprovalRulesAndWebhookTriggers', async () => {
     // 会话级审批规则与绑定该会话的 Webhook 触发器都应以 targetId 继续生效，不能指向已删除边路会话。
     const { service, sessionRepo, txDb } = makeService();
@@ -523,6 +546,15 @@ describe('SessionService archive', () => {
 
     expect(sessionRepo.logicalDelete).toHaveBeenCalledWith(11);
     expect(onSessionDeleted).toHaveBeenCalledWith(11);
+  });
+
+  it('deletesFileChangesWhenSessionIsDeleted', async () => {
+    const { service, sessionRepo, fileChangeRepo } = makeService();
+    vi.mocked(sessionRepo.findById).mockResolvedValue({ id: 11, userId: 7, phase: 'COMPLETED' });
+
+    await service.deleteSession(11);
+
+    expect(fileChangeRepo.deleteBySession).toHaveBeenCalledWith(11);
   });
 
   it('deletesSessionTodosWhenSessionIsDeleted', async () => {

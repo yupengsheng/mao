@@ -1239,6 +1239,11 @@ export class FileChangeRepository {
     await this.db.updateById('message_file_change', id, data as Record<string, unknown>);
   }
 
+  /** 会话删除 / 边路提升时物理回收该会话的文件变更行（含 diff 正文，避免长期占用）。 */
+  async deleteBySession(sessionId: number): Promise<void> {
+    await this.db.execute('DELETE FROM message_file_change WHERE session_id = ?', [sessionId]);
+  }
+
   listBySession(sessionId: number): Promise<FileChange[]> {
     return this.db.query<FileChange>(
       `SELECT * FROM message_file_change WHERE session_id = ? ORDER BY id ASC`,

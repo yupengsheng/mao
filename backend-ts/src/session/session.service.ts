@@ -610,6 +610,12 @@ export class SessionService {
     await this.sessionCompactionService.deleteBySessionId(id);
     await this.sessionCompactionEventService.deleteBySessionId(id);
     await this.messageRepo.logicalDeleteBySession(id);
+    // 文件变更行含 before/after 快照（MEDIUMTEXT），会话删除后不再可达；失败不阻断删除。
+    try {
+      await this.fileChangeRepo.deleteBySession(id);
+    } catch (e) {
+      console.error(`Failed to delete file changes for session ${id}`, e);
+    }
     await this.sessionRepo.logicalDelete(id);
     if (this.todoRepo) {
       try {
@@ -777,6 +783,8 @@ export class SessionService {
         await txTodoRepo.logicalDeleteBySession(sideSessionId);
       }
 
+      // 文件变更已复制到新主会话；旧边路行含完整 diff 快照，随旧会话物理回收。
+      await txFileChangeRepo.deleteBySession(sideSessionId);
       await tx.execute('DELETE FROM session_compaction WHERE session_id = ?', [sideSessionId]);
       await tx.execute('DELETE FROM session_compaction_event WHERE session_id = ?', [sideSessionId]);
       // 工作区规则快照同属会话级资源：本路径不走 onSessionDeleted，需在同一事务内回收，
