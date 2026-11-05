@@ -44,6 +44,10 @@ function makeBot(id: number): FeishuBot {
 function makeRepo(bots: FeishuBot[]) {
   return {
     list: vi.fn(async () => bots),
+    listPage: vi.fn(async (pageNum: number, pageSize: number) => ({
+      records: bots.slice((pageNum - 1) * pageSize, pageNum * pageSize),
+      total: bots.length,
+    })),
     findById: vi.fn(async (id: number) => bots.find((b) => b.id === id) ?? null),
     findByAppKey: vi.fn(async () => null),
     create: vi.fn(async () => 0),

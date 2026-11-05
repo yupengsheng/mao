@@ -3,7 +3,7 @@ import { hasText } from '../common/case.js';
 import { BusinessException } from '../common/business-exception.js';
 import { ErrorCode } from '../common/error-code.js';
 import { requireRequestPermission, sendOk } from '../common/http-error.js';
-import { bodyOf, pathId } from '../common/request.js';
+import { bodyOf, pathId, queryOptInt, queryOptStr } from '../common/request.js';
 import { encryptAesGcm } from '../crypto/aes-gcm.js';
 import type { FeishuBotRuntimeStatus } from './monitor.service.js';
 import type { FeishuBot, FeishuBotRepository, FeishuBotView } from './types.js';
@@ -40,7 +40,19 @@ export function registerFeishuBotRoutes(app: FastifyInstance, deps: FeishuBotRou
 
   app.get('/v1/admin/feishu-bots', async (request, reply) => {
     await requireRequestPermission(permissionService, request, 'feishu-bot:read');
-    return sendOk(reply, (await repository.list()).map(toView));
+    const pageNum = queryOptInt(request, 'pageNum');
+    const pageSize = queryOptInt(request, 'pageSize');
+    const keyword = queryOptStr(request, 'keyword');
+    if (pageNum == null && pageSize == null && keyword == null) {
+      return sendOk(reply, (await repository.list()).map(toView));
+    }
+    const page = await repository.listPage(
+      Math.max(1, pageNum ?? 1),
+      Math.min(200, Math.max(1, pageSize ?? 20)),
+      keyword?.trim() || undefined,
+    );
+    reply.header('x-total-count', String(page.total));
+    return sendOk(reply, page.records.map(toView));
   });
 
   app.get('/v1/admin/feishu-bots/:id', async (request, reply) => {

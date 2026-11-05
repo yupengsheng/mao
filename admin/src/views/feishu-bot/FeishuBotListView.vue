@@ -21,13 +21,14 @@
             clearable
             placeholder="搜索名称 / App ID"
             style="width: 240px"
+            @input="onKeywordInput"
           >
             <template #prefix><el-icon><Search /></el-icon></template>
           </el-input>
         </el-form-item>
       </el-form>
 
-      <el-table v-if="!isMobile" :data="filteredBots" v-loading="loading" stripe>
+      <el-table v-if="!isMobile" :data="bots" v-loading="loading" stripe>
         <template #empty>
           <el-empty :description="keyword.trim() ? '没有匹配的机器人' : '暂无飞书机器人'" :image-size="60" />
         </template>
@@ -92,7 +93,7 @@
       </el-table>
 
       <div v-else class="mobile-card-list" v-loading="loading">
-        <el-card v-for="row in filteredBots" :key="row.id" shadow="hover">
+        <el-card v-for="row in bots" :key="row.id" shadow="hover">
           <div class="mobile-card-head">
             <span class="mobile-card-title">{{ row.name }}</span>
             <el-tag :type="row.enabled ? 'success' : 'info'" size="small">
@@ -120,8 +121,21 @@
             </template>
           </div>
         </el-card>
-        <el-empty v-if="!loading && bots.length === 0" description="暂无飞书机器人" />
+        <el-empty
+          v-if="!loading && bots.length === 0"
+          :description="keyword.trim() ? '没有匹配的机器人' : '暂无飞书机器人'"
+        />
       </div>
+
+      <ResponsivePagination
+        class="pagination"
+        v-model:current-page="currentPage"
+        v-model:page-size="pageSize"
+        :page-sizes="[10, 20, 50, 100]"
+        :total="total"
+        @current-change="fetchBots"
+        @size-change="handleSizeChange"
+      />
     </el-card>
 
     <ResponsiveDialog v-if="formVisible" v-model="formVisible" :title="isEdit ? '编辑飞书机器人' : '添加飞书机器人'" width="560px">
@@ -171,14 +185,15 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onActivated, reactive, ref } from 'vue'
+import { computed, onActivated, onUnmounted, reactive, ref } from 'vue'
 import type { FormInstance, FormRules } from 'element-plus'
 import { Search } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { api } from '../../api'
+import { api, apiGetWithHeaders } from '../../api'
 import { useBreakpoint } from '../../composables/useBreakpoint'
 import { useAuthStore } from '../../stores/auth'
 import ResponsiveDialog from '../../components/ResponsiveDialog.vue'
+import ResponsivePagination from '../../components/ResponsivePagination.vue'
 
 interface FeishuBot {
   id: number
@@ -205,6 +220,9 @@ const loading = ref(false)
 const submitting = ref(false)
 const bots = ref<FeishuBot[]>([])
 const keyword = ref('')
+const currentPage = ref(1)
+const pageSize = ref(10)
+const total = ref(0)
 /** botId → 运行连接状态（来自 /admin/feishu-bots/status，内存态，无记录时不显示）。 */
 const runtimeStatusMap = ref<Record<number, FeishuBotRuntimeState>>({})
 const agents = ref<any[]>([])
@@ -215,11 +233,14 @@ const editingId = ref<number | null>(null)
 const formRef = ref<FormInstance>()
 
 const textModels = computed(() => models.value.filter(model => !model.modelType || model.modelType === 'text'))
-const filteredBots = computed(() => {
-  const kw = keyword.value.trim().toLowerCase()
-  if (!kw) return bots.value
-  return bots.value.filter((bot) => `${bot.name} ${bot.appId}`.toLowerCase().includes(kw))
-})
+
+function readTotalCount(headers: unknown): number {
+  if (!headers || typeof headers !== 'object') return NaN
+  const bag = headers as { get?: (name: string) => unknown } & Record<string, unknown>
+  const raw = typeof bag.get === 'function' ? bag.get('x-total-count') : bag['x-total-count']
+  const value = Array.isArray(raw) ? raw[0] : raw
+  return Number(value)
+}
 
 const form = reactive({
   name: '',
@@ -243,20 +264,60 @@ const formRules: FormRules = {
   }]
 }
 
-async function loadData() {
+let fetchBotsSeq = 0
+async function fetchBots() {
+  const seq = ++fetchBotsSeq
   loading.value = true
   try {
-    const [{ data: botData }, { data: agentData }, { data: modelData }] = await Promise.all([
-      api.get('/admin/feishu-bots'),
+    const { result, headers } = await apiGetWithHeaders<FeishuBot[]>('/admin/feishu-bots', {
+      params: {
+        keyword: keyword.value.trim() || undefined,
+        pageNum: currentPage.value,
+        pageSize: pageSize.value,
+      }
+    })
+    if (seq !== fetchBotsSeq) return
+    bots.value = result.data || []
+    const headerTotal = readTotalCount(headers)
+    total.value = Number.isFinite(headerTotal) ? headerTotal : bots.value.length
+    const maxPage = Math.max(1, Math.ceil(total.value / pageSize.value))
+    if (currentPage.value > maxPage) {
+      currentPage.value = maxPage
+      void fetchBots()
+    }
+  } catch { /* 拦截器已提示失败，吞掉避免误报页面异常 */ } finally {
+    if (seq === fetchBotsSeq) loading.value = false
+  }
+}
+
+async function loadOptions() {
+  try {
+    const [{ data: agentData }, { data: modelData }] = await Promise.all([
       api.get('/agents', { params: { includeDisabled: true } }),
       api.get('/models/active')
     ])
-    bots.value = botData || []
     agents.value = agentData || []
     models.value = modelData || []
-  } catch { /* 拦截器已提示失败，吞掉避免误报页面异常 */ } finally {
-    loading.value = false
-  }
+  } catch { /* 拦截器已提示失败；保留已有选项 */ }
+}
+
+function loadData() {
+  return Promise.all([fetchBots(), loadOptions()])
+}
+
+let keywordDebounceTimer: ReturnType<typeof setTimeout> | null = null
+function onKeywordInput() {
+  currentPage.value = 1
+  if (keywordDebounceTimer) clearTimeout(keywordDebounceTimer)
+  keywordDebounceTimer = setTimeout(() => {
+    keywordDebounceTimer = null
+    void fetchBots()
+  }, 300)
+}
+
+function handleSizeChange() {
+  currentPage.value = 1
+  void fetchBots()
 }
 
 async function loadRuntimeStatus() {
@@ -375,6 +436,7 @@ async function handleSubmit() {
     } else {
       await api.post('/admin/feishu-bots', payload)
       ElMessage.success('机器人添加成功')
+      currentPage.value = 1
     }
     formVisible.value = false
     await loadData()
@@ -411,6 +473,13 @@ onActivated(() => {
   loadData()
   loadRuntimeStatus()
 })
+
+onUnmounted(() => {
+  if (keywordDebounceTimer) {
+    clearTimeout(keywordDebounceTimer)
+    keywordDebounceTimer = null
+  }
+})
 </script>
 
 <style scoped>
@@ -434,4 +503,5 @@ onActivated(() => {
 .mobile-card-row span:last-child { overflow: hidden; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
 .mobile-card-actions { display: flex; gap: 8px; margin-top: 8px; }
 .op-muted { color: var(--mao-muted); }
+.pagination { margin-top: 20px; justify-content: flex-end; }
 </style>

@@ -79,7 +79,7 @@
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/v1/admin/feishu-bots` | 机器人列表（`appSecret` 不返回，仅 `appSecretConfigured`） |
+| GET | `/v1/admin/feishu-bots` | 机器人列表（`appSecret` 不返回，仅 `appSecretConfigured`）。支持 `pageNum` / `pageSize` / `keyword`（匹配名称与 App ID），分页时总数在 `x-total-count`；不传新参数返回全量数组 |
 | GET | `/v1/admin/feishu-bots/:id` | 单个机器人 |
 | POST | `/v1/admin/feishu-bots` | 创建：`appKey`、`name`、`appId`、`appSecret`、`agentId?`、`modelId?`、`enabled?` |
 | PUT | `/v1/admin/feishu-bots/:id` | 更新（`appSecret` 传空串不修改） |

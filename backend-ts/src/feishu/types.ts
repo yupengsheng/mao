@@ -15,6 +15,7 @@ export interface FeishuBot {
 export interface FeishuBotView extends Omit<FeishuBot, 'appSecret'> { appSecretConfigured: boolean; }
 export interface FeishuBotRepository {
   list(): Promise<FeishuBot[]>; findById(id: number): Promise<FeishuBot | null>; findByAppKey(appKey: string): Promise<FeishuBot | null>;
+  listPage(pageNum: number, pageSize: number, keyword?: string | null): Promise<{ records: FeishuBot[]; total: number }>;
   create(bot: FeishuBot): Promise<number>; update(bot: FeishuBot): Promise<void>; softDelete(id: number): Promise<void>;
 }
 

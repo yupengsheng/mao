@@ -15,6 +15,15 @@ function bot(overrides: Partial<FeishuBot> = {}): FeishuBot {
 function createRepo(bots: FeishuBot[]): FeishuBotRepository {
   return {
     list: vi.fn(async () => bots),
+    listPage: vi.fn(async (pageNum: number, pageSize: number, keyword?: string | null) => {
+      const matched = keyword
+        ? bots.filter((item) => `${item.name} ${item.appId}`.includes(keyword))
+        : bots;
+      return {
+        records: matched.slice((pageNum - 1) * pageSize, pageNum * pageSize),
+        total: matched.length,
+      };
+    }),
     findById: vi.fn(async (id: number) => bots.find((b) => b.id === id) ?? null),
     findByAppKey: vi.fn(async () => null),
     create: vi.fn(async () => 1),
@@ -51,6 +60,28 @@ async function createApp(bots: FeishuBot[], options: {
 }
 
 describe('admin feishu bot status routes', () => {
+  it('paginates and searches bots while preserving the legacy full-list response', async () => {
+    const { app, repository } = await createApp([
+      bot(),
+      bot({ id: 2, appKey: 'k2', name: 'support', appId: 'cli_support' }),
+    ]);
+
+    const legacy = JSON.parse((await app.inject({ method: 'GET', url: '/v1/admin/feishu-bots' })).body);
+    expect(legacy.data).toHaveLength(2);
+    expect(legacy.data[0]).not.toHaveProperty('appSecret');
+    expect(repository.list).toHaveBeenCalled();
+    expect(repository.listPage).not.toHaveBeenCalled();
+
+    const paged = await app.inject({
+      method: 'GET',
+      url: '/v1/admin/feishu-bots?pageNum=1&pageSize=10&keyword=support',
+    });
+    expect(paged.headers['x-total-count']).toBe('1');
+    expect(JSON.parse(paged.body).data).toEqual([expect.objectContaining({ id: 2, name: 'support' })]);
+    expect(repository.listPage).toHaveBeenCalledWith(1, 10, 'support');
+    await app.close();
+  });
+
   it('returns connection status for each bot with failure details', async () => {
     const { app } = await createApp([bot(), bot({ id: 2, appKey: 'k2', name: 'bot-2', appId: 'cli_app_2', enabled: 0 })], {
       status: { botId: 1, status: 'failed', lastFailureReason: 'appSecret 解密失败', lastFailureAt: '2026-09-19T01:00:00.000Z', lastReadyAt: '2026-09-18T23:00:00.000Z' },
