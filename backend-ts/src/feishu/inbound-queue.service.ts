@@ -1,6 +1,9 @@
 import type { FeishuInboundQueueRow, FeishuTaskQueuePort, FeishuCardActionPort } from './types.js';
 import type { FeishuInboundQueueRepository } from './inbound-queue.repository.js';
 
+const RECOVERY_ORPHAN_BATCH_SIZE = 5000;
+const RECOVERY_ORPHAN_MAX_BATCHES = 20;
+
 /**
  * 飞书入站任务队列服务：FIFO 排队 + CAS 认领 + 跳队首 + 取消 + 启动恢复。
  * 实现 FeishuTaskQueuePort（handler 消费）与 FeishuCardActionPort（卡片按钮回调）两个端口。
@@ -83,6 +86,11 @@ export class FeishuTaskQueueService implements FeishuTaskQueuePort, FeishuCardAc
    *  未落库 → 复位为 QUEUED（消息从未持久化，无法恢复，由队列重新消费，保证不丢）。
    *  再清理终态行，返回有待消费 QUEUED 行的 sessionId 集合。 */
   async hydrate(): Promise<number[]> {
+    try {
+      await this.deleteOrphanedRows();
+    } catch (error) {
+      console.warn('飞书队列孤儿行清理失败，继续恢复存活会话的队列', error);
+    }
     const running = await this.repo.listRunning();
     for (const row of running) {
       const persisted = await this.repo.findPersistedMessageByQueueId(row.sessionId, row.id);
@@ -95,5 +103,12 @@ export class FeishuTaskQueueService implements FeishuTaskQueuePort, FeishuCardAc
     await this.repo.deleteTerminal();
     const rows = await this.repo.listRecoverable();
     return [...new Set(rows.map((r) => r.sessionId))];
+  }
+
+  private async deleteOrphanedRows(): Promise<void> {
+    for (let i = 0; i < RECOVERY_ORPHAN_MAX_BATCHES; i += 1) {
+      const removed = await this.repo.deleteOrphanedBatch(RECOVERY_ORPHAN_BATCH_SIZE);
+      if (removed < RECOVERY_ORPHAN_BATCH_SIZE) return;
+    }
   }
 }

@@ -22,6 +22,7 @@ function repo(overrides: Partial<Record<keyof FeishuInboundQueueRepository, unkn
     resetRunningToQueued: vi.fn(async () => false),
     findPersistedMessageByQueueId: vi.fn(async () => null),
     deleteTerminal: vi.fn(async () => 0),
+    deleteOrphanedBatch: vi.fn(async () => 0),
     listRecoverable: vi.fn(async () => []),
   };
   const instance = { ...base, ...overrides };
@@ -109,6 +110,47 @@ describe('FeishuTaskQueueService', () => {
     expect(r.resetRunningToQueued).toHaveBeenCalledTimes(1);
     expect(r.resetRunningToQueued).toHaveBeenCalledWith(2);
     expect(ids).toEqual([7, 8]);
+  });
+
+  it('prunes orphaned rows before recovering running rows', async () => {
+    const calls: string[] = [];
+    const r = repo({
+      deleteOrphanedBatch: vi.fn(async () => {
+        calls.push('prune');
+        return 0;
+      }),
+      listRunning: vi.fn(async () => {
+        calls.push('listRunning');
+        return [];
+      }),
+      listRecoverable: vi.fn(async () => [row({ sessionId: 7 })]),
+    });
+    const ids = await new FeishuTaskQueueService(r).hydrate();
+    expect(calls).toEqual(['prune', 'listRunning']);
+    expect(ids).toEqual([7]);
+  });
+
+  it('keeps pruning until a short batch', async () => {
+    const deleteOrphanedBatch = vi.fn()
+      .mockResolvedValueOnce(5000)
+      .mockResolvedValueOnce(5000)
+      .mockResolvedValueOnce(3);
+    const r = repo({ deleteOrphanedBatch });
+    await new FeishuTaskQueueService(r).hydrate();
+    expect(deleteOrphanedBatch).toHaveBeenCalledTimes(3);
+  });
+
+  it('continues recovery when orphan pruning fails', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const r = repo({
+      deleteOrphanedBatch: vi.fn(async () => { throw new Error('db down'); }),
+      listRunning: vi.fn(async () => [row({ id: 2, status: 'RUNNING' })]),
+      findPersistedMessageByQueueId: vi.fn(async () => ({ id: 100 })),
+      listRecoverable: vi.fn(async () => []),
+    });
+    await expect(new FeishuTaskQueueService(r).hydrate()).resolves.toEqual([]);
+    expect(r.findPersistedMessageByQueueId).toHaveBeenCalledWith(7, 2);
+    warn.mockRestore();
   });
 
   it('hasPending reflects countPending > 0', async () => {

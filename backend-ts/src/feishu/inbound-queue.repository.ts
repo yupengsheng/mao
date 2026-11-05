@@ -113,6 +113,24 @@ export class FeishuInboundQueueRepository {
     return row?.rankNo ?? 1;
   }
 
+  /** 批量删除 session 已不存在或已逻辑删除的队列行，避免启动恢复把消息投给已删会话。 */
+  deleteOrphanedBatch(limit: number): Promise<number> {
+    const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.min(5000, Math.floor(limit))) : 1;
+    return this.db.execute(
+      `DELETE FROM feishu_inbound_queue WHERE id IN (
+         SELECT id FROM (
+           SELECT q.id
+           FROM feishu_inbound_queue q
+           LEFT JOIN \`session\` s ON s.id = q.session_id
+           WHERE s.id IS NULL OR s.deleted = 1
+           ORDER BY q.id
+           LIMIT ?
+         ) AS stale
+       )`,
+      [safeLimit],
+    ).then((result) => result.affectedRows);
+  }
+
   listRecoverable(): Promise<FeishuInboundQueueRow[]> {
     return this.db.query<FeishuInboundQueueRow>(
       "SELECT * FROM feishu_inbound_queue WHERE status IN ('QUEUED', 'RUNNING')",
