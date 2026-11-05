@@ -1,5 +1,78 @@
 import { describe, expect, it, vi } from 'vitest';
 import { DingtalkMessageService, GROUP_CONTEXT_TITLE } from './message.service.js';
+import type { DingtalkConversation } from './message.repository.js';
+import type { DingtalkInboundContext } from './types.js';
+
+function context(overrides: Partial<DingtalkInboundContext> = {}): DingtalkInboundContext {
+  return {
+    accountId: '7',
+    chatType: 'group',
+    conversationId: 'cid',
+    messageId: 'm1',
+    senderUserid: 'u1',
+    senderUnionId: null,
+    senderName: '张三',
+    msgtype: 'text',
+    text: 'hello',
+    downloadCodes: [],
+    fileName: null,
+    quotedText: null,
+    isInAtList: true,
+    ...overrides,
+  };
+}
+
+function conversation(sessionId: number): DingtalkConversation {
+  return {
+    id: 1, botId: 7, conversationId: 'cid', chatType: 'group', sessionId, ownerUserId: 3, workspace: '/ws', title: null,
+  };
+}
+
+describe('DingtalkMessageService active conversation pointer', () => {
+  it('reuses a live pointer without creating a session', async () => {
+    const findConversation = vi.fn(async () => conversation(10));
+    const saveConversation = vi.fn();
+    const create = vi.fn();
+    const service = new DingtalkMessageService({ findConversation, saveConversation } as never, { create }, 10, 120);
+
+    await expect(service.getOrCreate('7', context(), 3)).resolves.toMatchObject({ sessionId: 10 });
+    expect(create).not.toHaveBeenCalled();
+    expect(saveConversation).not.toHaveBeenCalled();
+  });
+
+  it('lazily creates and saves a new session when the pointer is stale', async () => {
+    const findConversation = vi.fn(async () => null);
+    const saveConversation = vi.fn(async (row: Omit<DingtalkConversation, 'id'>) => ({ id: 1, ...row }));
+    const create = vi.fn(async () => ({ sessionId: 20, ownerUserId: 3, workspace: '/ws' }));
+    const service = new DingtalkMessageService({ findConversation, saveConversation } as never, { create }, 10, 120);
+
+    await expect(service.getOrCreate('7', context(), 3)).resolves.toMatchObject({ sessionId: 20 });
+    expect(saveConversation).toHaveBeenCalledWith({
+      botId: 7, conversationId: 'cid', chatType: 'group', sessionId: 20, ownerUserId: 3, workspace: '/ws', title: null,
+    });
+  });
+
+  it('serializes concurrent first messages for the same conversation', async () => {
+    let stored: DingtalkConversation | null = null;
+    const findConversation = vi.fn(async () => stored);
+    const saveConversation = vi.fn(async (row: Omit<DingtalkConversation, 'id'>) => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      stored = { id: 1, ...row };
+      return stored;
+    });
+    const create = vi.fn(async () => ({ sessionId: 30, ownerUserId: 3, workspace: '/ws' }));
+    const service = new DingtalkMessageService({ findConversation, saveConversation } as never, { create }, 10, 120);
+
+    const [first, second] = await Promise.all([
+      service.getOrCreate('7', context({ messageId: 'm1' }), 3),
+      service.getOrCreate('7', context({ messageId: 'm2' }), 3),
+    ]);
+
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(first.sessionId).toBe(30);
+    expect(second.sessionId).toBe(30);
+  });
+});
 
 describe('DingtalkMessageService group context', () => {
   it('labels the window as not the full group chat and omits messages that were not logged', async () => {

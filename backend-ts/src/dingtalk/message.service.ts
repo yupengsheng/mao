@@ -8,6 +8,8 @@ export interface DingtalkSessionFactory {
 const GROUP_CONTEXT_TITLE = '【群内 @ 机器人的最近往来】（不是完整群聊）';
 
 export class DingtalkMessageService {
+  private readonly locks = new Map<string, Promise<void>>();
+
   constructor(
     private readonly repository: MysqlDingtalkMessageRepository,
     private readonly sessionFactory: DingtalkSessionFactory,
@@ -21,31 +23,35 @@ export class DingtalkMessageService {
 
   async getOrCreate(accountId: string, context: DingtalkInboundContext, ownerUserId: number): Promise<DingtalkConversation> {
     const botId = Number(accountId);
-    const existing = await this.repository.findConversation(botId, context.conversationId);
-    if (existing != null) return existing;
-    const created = await this.sessionFactory.create(accountId, context);
-    return this.repository.saveConversation({
-      botId,
-      conversationId: context.conversationId,
-      chatType: context.chatType,
-      sessionId: created.sessionId,
-      ownerUserId,
-      workspace: created.workspace ?? null,
-      title: context.chatType === 'group' ? null : null,
+    return this.withConversationLock(accountId, context.conversationId, async () => {
+      const existing = await this.repository.findConversation(botId, context.conversationId);
+      if (existing != null) return existing;
+      const created = await this.sessionFactory.create(accountId, context);
+      return this.repository.saveConversation({
+        botId,
+        conversationId: context.conversationId,
+        chatType: context.chatType,
+        sessionId: created.sessionId,
+        ownerUserId,
+        workspace: created.workspace ?? null,
+        title: null,
+      });
     });
   }
 
   /** `---` 新建：新 session 行，指针切过去。工作区仍由 factory 按用户固定。 */
   async createP2pSession(accountId: string, context: DingtalkInboundContext, ownerUserId: number): Promise<DingtalkConversation> {
-    const created = await this.sessionFactory.create(accountId, context);
-    return this.repository.saveConversation({
-      botId: Number(accountId),
-      conversationId: context.conversationId,
-      chatType: 'p2p',
-      sessionId: created.sessionId,
-      ownerUserId,
-      workspace: created.workspace ?? null,
-      title: null,
+    return this.withConversationLock(accountId, context.conversationId, async () => {
+      const created = await this.sessionFactory.create(accountId, context);
+      return this.repository.saveConversation({
+        botId: Number(accountId),
+        conversationId: context.conversationId,
+        chatType: 'p2p',
+        sessionId: created.sessionId,
+        ownerUserId,
+        workspace: created.workspace ?? null,
+        title: null,
+      });
     });
   }
 
@@ -103,6 +109,22 @@ export class DingtalkMessageService {
       .reverse();
     if (kept.length === 0) return '';
     return `${GROUP_CONTEXT_TITLE}\n${kept.map(formatLogLine).join('\n')}`;
+  }
+
+  private async withConversationLock<T>(accountId: string, conversationId: string, fn: () => Promise<T>): Promise<T> {
+    const key = `${accountId}:${conversationId}`;
+    const previous = this.locks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    const queued = previous.then(() => current);
+    this.locks.set(key, queued);
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.locks.get(key) === queued) this.locks.delete(key);
+    }
   }
 }
 

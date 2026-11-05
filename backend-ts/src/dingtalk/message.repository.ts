@@ -28,7 +28,9 @@ export class MysqlDingtalkMessageRepository {
 
   findConversation(botId: number, conversationId: string): Promise<DingtalkConversation | null> {
     return this.db.queryOne<DingtalkConversation>(
-      'SELECT * FROM dingtalk_chat WHERE bot_id = ? AND conversation_id = ? LIMIT 1',
+      `SELECT c.* FROM dingtalk_chat c
+       JOIN \`session\` s ON s.id = c.session_id AND s.deleted = 0
+       WHERE c.bot_id = ? AND c.conversation_id = ? LIMIT 1`,
       [botId, conversationId],
     );
   }
@@ -37,7 +39,8 @@ export class MysqlDingtalkMessageRepository {
     await this.db.execute(
       `INSERT INTO dingtalk_chat (bot_id, conversation_id, chat_type, session_id, owner_user_id, workspace, title)
        VALUES (?, ?, ?, ?, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE session_id = VALUES(session_id), title = COALESCE(VALUES(title), title)`,
+       ON DUPLICATE KEY UPDATE chat_type = VALUES(chat_type), session_id = VALUES(session_id),
+         owner_user_id = VALUES(owner_user_id), workspace = VALUES(workspace), title = COALESCE(VALUES(title), title)`,
       [row.botId, row.conversationId, row.chatType, row.sessionId, row.ownerUserId, row.workspace ?? null, row.title ?? null],
     );
     const saved = await this.findConversation(row.botId, row.conversationId);

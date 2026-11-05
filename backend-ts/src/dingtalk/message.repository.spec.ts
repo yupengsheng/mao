@@ -3,12 +3,43 @@ import type mysql from 'mysql2/promise';
 import { Db } from '../db/db.js';
 import { MysqlDingtalkMessageRepository } from './message.repository.js';
 
-function setup() {
-  const query = vi.fn(async () => [[], []]);
+function setup(rows: Record<string, unknown>[] = []) {
+  const query = vi.fn(async () => [rows, []]);
   const execute = vi.fn(async () => [{ affectedRows: 7 }, []]);
   const db = new Db({ query, execute } as unknown as mysql.Pool);
-  return { repo: new MysqlDingtalkMessageRepository(db), execute };
+  return { repo: new MysqlDingtalkMessageRepository(db), query, execute };
 }
+
+describe('MysqlDingtalkMessageRepository active conversation pointer', () => {
+  it('only returns a pointer whose session still exists', async () => {
+    const { repo, query } = setup([{
+      id: 1, bot_id: 7, conversation_id: 'cid', chat_type: 'group', session_id: 9, owner_user_id: 3,
+    }]);
+
+    await expect(repo.findConversation(7, 'cid')).resolves.toMatchObject({ sessionId: 9 });
+    expect(query).toHaveBeenCalledWith(
+      expect.stringContaining('JOIN `session` s ON s.id = c.session_id AND s.deleted = 0'),
+      [7, 'cid'],
+    );
+  });
+
+  it('refreshes chat type, owner and workspace when switching the active session', async () => {
+    const { repo, execute } = setup([{
+      id: 1, bot_id: 7, conversation_id: 'cid', chat_type: 'p2p', session_id: 10, owner_user_id: 3,
+    }]);
+
+    await repo.saveConversation({
+      botId: 7, conversationId: 'cid', chatType: 'p2p', sessionId: 10, ownerUserId: 3, workspace: '/ws', title: null,
+    });
+
+    const sql = execute.mock.calls[0][0] as string;
+    expect(sql).toContain('chat_type = VALUES(chat_type)');
+    expect(sql).toContain('session_id = VALUES(session_id)');
+    expect(sql).toContain('owner_user_id = VALUES(owner_user_id)');
+    expect(sql).toContain('workspace = VALUES(workspace)');
+    expect(sql).toContain('title = COALESCE(VALUES(title), title)');
+  });
+});
 
 describe('MysqlDingtalkMessageRepository inbound event cleanup', () => {
   it('deletes expired rows in id order with a clamped limit', async () => {
