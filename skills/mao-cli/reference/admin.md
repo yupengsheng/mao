@@ -189,7 +189,7 @@ CLI：`mao llm-call list`（见 [llm-call.md](llm-call.md)）。
 
 ## 自定义工具
 
-「运行 → 自定义工具」（读需 `http_tool:read`，写需 `http_tool:write`）管理自定义 HTTP 工具：清单表按关键字 / 启用态筛选（工具名、展示名、端点、只读 / 可写、超时），支持新建 / 编辑 / 启停 / 删除与「测试调用」抽屉（草稿实调一次、不落库）；统计表按工具名聚合并调用次数、失败次数、失败率、调用用户数与首次 / 最近调用时间（数据来自运行轨迹中的 `http_call` 记录，仅交互会话产生）。工具由管理员统一配置，在 Agent 编辑表单的「自定义 HTTP 工具」多选里关联到具体 Agent（0.0.327 起不再由用户在客户端配置）。
+「运行 → 自定义工具」（读需 `http_tool:read`，写需 `http_tool:write`）管理自定义 HTTP 工具：清单表按关键字 / 启用态筛选（工具名、展示名、端点、只读 / 可写、超时），支持新建 / 编辑 / 启停 / 删除与「测试调用」抽屉（草稿实调一次、不落库）；统计表按工具名聚合并调用次数、失败次数、失败率、调用用户数与首次 / 最近调用时间（数据来自运行轨迹中的 `http_call` 记录，仅交互会话产生；只统计仍保留的 `session_activity`，默认 180 天、最低 90 天）。工具由管理员统一配置，在 Agent 编辑表单的「自定义 HTTP 工具」多选里关联到具体 Agent（0.0.327 起不再由用户在客户端配置）。
 
 工具定义与调用口径见 [http-tool.md](http-tool.md)；内网放行网段在「系统设置 → 工具与终端 → 自定义 HTTP 工具」配置。
 
@@ -208,7 +208,7 @@ CLI：`mao http-tool list|enabled|stats|create|update|delete|set-enabled|test`�
 - **模型任务**（各功能的默认模型，留空则跟随会话/系统默认）：会话（`session.titleModelId` 标题生成）、代码（`git.commitMessageModelId` Git 提交信息）、记忆（`memory.extractionModelId` 记忆自动抽取）
 - **工具与终端**：网络工具（Tavily / TinyFish 搜索实现切换与各自 API Key，0.0.83 新增双实现）、网页抓取、Shell 会话、云端终端、审批（审批模型与 Jev 前置决策；「测试连接」用当前表单探测 Jev 端点与 API Key，可未保存）、自定义 HTTP 工具（`tools.http.privateAllowlist` 内网放行 CIDR 清单，见 [http-tool.md](http-tool.md)）
 - **通知与消息**：任务通知（0.0.88 迁入，即时生效）、微信（`weixin.agentId` / `weixin.modelId` 微信通道 Agent 与模型）
-- **平台与运维**：分享（匿名分享链接开关）、审计（日志保留天数，后台每小时据此自动清理）、用量（LLM 调用流水保留天数，默认 180 天、最低 90 天，后台每小时据此自动清理）、运行环境（工作区与 Skill 目录，只读展示）
+- **平台与运维**：分享（匿名分享链接开关）、审计（日志保留天数，后台每小时据此自动清理）、用量（LLM 调用流水保留天数、会话活动保留天数，均默认 180 天、最低 90 天，后台每小时据此自动清理）、运行环境（工作区与 Skill 目录，只读展示）
 
 读写需 `settings:read` / `settings:write` 权限；页面左侧目录按上述分两级展示（默认折叠为分组标题行，点击分组或滚动到该组内容时自动展开），可快速跳转分组；滚动右侧配置时目录固定不跟随页面滚走。CLI：`mao settings list|set`（见 [settings.md](settings.md)）。
 

@@ -33,6 +33,7 @@ import type { TaskExecutionRetentionService } from './task/task-execution-retent
 import type { AuditLogCleanup } from './audit/audit-log-cleanup.js';
 import type { InboundEventCleanup } from './channel/inbound-event-cleanup.js';
 import type { LlmCallCleanup } from './usage/llm-call-cleanup.js';
+import type { SessionActivityCleanup } from './session/session-activity-cleanup.js';
 
 /** 停机时需要优雅关闭的所有组件。 */
 export interface ShutdownDeps {
@@ -72,6 +73,7 @@ export interface ShutdownDeps {
   taskExecutionRetention: TaskExecutionRetentionService;
   auditLogCleanup: AuditLogCleanup;
   llmCallCleanup: LlmCallCleanup;
+  sessionActivityCleanup: SessionActivityCleanup;
   inboundEventCleanup: InboundEventCleanup;
 }
 
@@ -87,6 +89,7 @@ export function createShutdownHandler(deps: ShutdownDeps): () => Promise<void> {
     shellManager, terminalManager, ptyChannelHubs, ptyHubGeneration,
     containerRegistry, channelServer, runtimeCleanup, activityHeartbeat, wsRegistry,
     agentLoop, wsHandler, sessionService, taskRecordRepair, taskExecutionRetention, auditLogCleanup, llmCallCleanup,
+    sessionActivityCleanup,
     inboundEventCleanup,
   } = deps;
 
@@ -129,6 +132,7 @@ export function createShutdownHandler(deps: ShutdownDeps): () => Promise<void> {
       taskExecutionRetention.stop();
       auditLogCleanup.stop();
       llmCallCleanup.stop();
+      sessionActivityCleanup.stop();
       inboundEventCleanup.stop();
       weixinMonitor.shutdown();
       feishuMonitor.shutdown();

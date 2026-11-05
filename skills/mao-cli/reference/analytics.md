@@ -47,6 +47,7 @@
 - 按半开区间 `[start 00:00:00, end+1 00:00:00)` 过滤 `created_at`
 - 除 `overview` 中的实时运行态外，所有数字均为**窗口内新增**，不是全表累计
 - LLM 调用相关指标只统计仍在保留期内的 `llm_call` 流水：后台默认保留 180 天、最低 90 天并按小时清理（设置项 `usage.llmCallRetentionDays`）。查询超过保留期的历史窗口不会报错，但超出部分按 0/空数据处理；会话、消息等非 `llm_call` 指标不受影响。
+- 运行轨迹工具明细来自 `session_activity`，单独按 `usage.sessionActivityRetentionDays` 保留（默认 180 天、最低 90 天，后台每小时清理）。工具失败率与自定义工具调用统计只聚合仍在保留期内的活动行；超期窗口不报错，但工具明细为空。
 - 环比窗口是紧邻的上一个等长窗口（如 days=7 时为前 7 天；昨日的环比为前日）
 - 环比窗口（已结束区间）的聚合结果在**后端进程内缓存 5 分钟**（0.0.338 起）：过去窗口不再增长，同一份结果供各 Tab 复用，因此`previousTotals` 最多滞后 5 分钟；本期窗口每次实时计算
 - Token 分两类：`chatTokens` 来自 `message.token_count`（对话消耗），`backgroundTokens` 来自 `llm_usage`（后台调用，如会话标题、Git 提交信息生成），`totalTokens` 为两者之和；管理后台 UI 紧凑展示用 K/M/B（千/百万/十亿）
@@ -150,7 +151,7 @@
 
 ### run-trace
 
-运行轨迹三个榜，直接聚合 `llm_call` 与 `session_activity`，不返回单次调用列表。可选查询参数：`scene`（默认 `agent`，只统计 Agent 主循环的轮，排除边路/后台调用）、`scope`（`agent` 或 `user`，前两个榜的排行维度，默认 `agent`）。
+运行轨迹三个榜，直接聚合 `llm_call` 与 `session_activity`，不返回单次调用列表。可选查询参数：`scene`（默认 `agent`，只统计 Agent 主循环的轮，排除边路/后台调用）、`scope`（`agent` 或 `user`，前两个榜的排行维度，默认 `agent`）。`session_activity` 默认保留 180 天、最低 90 天并按小时清理（设置项 `usage.sessionActivityRetentionDays`），工具失败率只统计保留期内的活动。
 
 | 字段 | 说明 |
 |------|------|

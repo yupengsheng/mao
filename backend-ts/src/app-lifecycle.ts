@@ -30,6 +30,8 @@ import { MysqlAuditLogRepository } from './audit/audit.repository.js';
 import { AuditLogCleanup } from './audit/audit-log-cleanup.js';
 import { InboundEventCleanup } from './channel/inbound-event-cleanup.js';
 import { LlmCallCleanup } from './usage/llm-call-cleanup.js';
+import { SessionActivityCleanup } from './session/session-activity-cleanup.js';
+import { SessionActivityRepository } from './session/activity.repository.js';
 import { MysqlFeishuMessageRepository } from './feishu/message.repository.js';
 import { MysqlDingtalkMessageRepository } from './dingtalk/message.repository.js';
 
@@ -124,6 +126,11 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
     () => d.settingService.getLlmCallRetentionDays(),
   );
   llmCallCleanup.start();
+  const sessionActivityCleanup = new SessionActivityCleanup(
+    new SessionActivityRepository(db),
+    () => d.settingService.getSessionActivityRetentionDays(),
+  );
+  sessionActivityCleanup.start();
   const feishuMessageRepo = new MysqlFeishuMessageRepository(db);
   const dingtalkMessageRepo = new MysqlDingtalkMessageRepository(db);
   const inboundEventCleanup = new InboundEventCleanup([
@@ -239,7 +246,7 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
     containerRegistry: d.containerRegistry, channelServer: d.channelServer, runtimeCleanup,
     activityHeartbeat: d.activityHeartbeat, wsRegistry: d.wsRegistry,
     agentLoop: d.agentLoop, wsHandler: d.wsHandler, sessionService: d.sessionService,
-    taskRecordRepair, taskExecutionRetention, auditLogCleanup, llmCallCleanup, inboundEventCleanup,
+    taskRecordRepair, taskExecutionRetention, auditLogCleanup, llmCallCleanup, sessionActivityCleanup, inboundEventCleanup,
   });
   drainWatcher.start();
 

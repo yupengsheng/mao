@@ -403,8 +403,8 @@ function unmarkSecretClear(key: string) {
 }
 
 /** 数值类配置键：渲染为数字输入。 */
-const NUMERIC_KEYS = new Set(['audit.retentionDays', 'usage.llmCallRetentionDays', 'agent.threadPoolSize', 'agent.threadPoolMax', 'agent.threadPoolQueue', 'ws.idleTimeoutMs', 'notify.workerDelayMs', 'notify.batchSize', 'notify.maxAttempts', 'file.maxSizeMb', 'openapi.callLogRetentionDays', 'openapi.tokenAutoDisableThreshold', 'notify.email.smtpPort'])
-const NUMERIC_MINIMUMS: Record<string, number> = { 'usage.llmCallRetentionDays': 90 }
+const NUMERIC_KEYS = new Set(['audit.retentionDays', 'usage.llmCallRetentionDays', 'usage.sessionActivityRetentionDays', 'agent.threadPoolSize', 'agent.threadPoolMax', 'agent.threadPoolQueue', 'ws.idleTimeoutMs', 'notify.workerDelayMs', 'notify.batchSize', 'notify.maxAttempts', 'file.maxSizeMb', 'openapi.callLogRetentionDays', 'openapi.tokenAutoDisableThreshold', 'notify.email.smtpPort'])
+const NUMERIC_MINIMUMS: Record<string, number> = { 'usage.llmCallRetentionDays': 90, 'usage.sessionActivityRetentionDays': 90 }
 
 /** 布尔开关 key：默认按 *.enabled 后缀判定；notify.email.smtpSecure（TLS 开关）同款渲染。 */
 const BOOLEAN_KEYS = new Set(['notify.email.smtpSecure'])

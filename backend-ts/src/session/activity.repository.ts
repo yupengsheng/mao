@@ -37,6 +37,16 @@ export class SessionActivityRepository {
       [sessionId],
     );
   }
+
+  /** 按创建时间分批删除过期活动，走 idx_session_activity_created。 */
+  async deleteBatch(cutoff: string, limit: number): Promise<number> {
+    const safeLimit = Math.max(1, Math.min(5000, Math.floor(limit)));
+    const result = await this.db.execute(
+      `DELETE FROM session_activity WHERE created_at < ? ORDER BY created_at, id LIMIT ${safeLimit}`,
+      [cutoff],
+    );
+    return result.affectedRows;
+  }
 }
 
 export class SessionTodoRepository {
