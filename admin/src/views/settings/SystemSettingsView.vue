@@ -183,7 +183,7 @@
                         <el-input-number
                           v-else-if="isNumericKey(row.settingKey)"
                           :model-value="toNumberOrNull(plainModel[row.settingKey])"
-                          :min="1"
+                          :min="numericMin(row.settingKey)"
                           :step="1"
                           step-strictly
                           controls-position="right"
@@ -357,6 +357,7 @@ const TOC_GROUPS: Array<{ label: string; sections: Array<{ kind: 'company-sso' |
     sections: [
       { kind: 'category', name: '分享' },
       { kind: 'category', name: '审计' },
+      { kind: 'category', name: '用量' },
       { kind: 'category', name: '运行环境' },
       // 容器域名解析注入（V176）：宿主机 hosts 继承 + 自定义规则；下方为容器管理（列表/重建）
       { kind: 'container-hosts', name: 'container-hosts' },
@@ -402,13 +403,18 @@ function unmarkSecretClear(key: string) {
 }
 
 /** 数值类配置键：渲染为数字输入。 */
-const NUMERIC_KEYS = new Set(['audit.retentionDays', 'agent.threadPoolSize', 'agent.threadPoolMax', 'agent.threadPoolQueue', 'ws.idleTimeoutMs', 'notify.workerDelayMs', 'notify.batchSize', 'notify.maxAttempts', 'file.maxSizeMb', 'openapi.callLogRetentionDays', 'openapi.tokenAutoDisableThreshold', 'notify.email.smtpPort'])
+const NUMERIC_KEYS = new Set(['audit.retentionDays', 'usage.llmCallRetentionDays', 'agent.threadPoolSize', 'agent.threadPoolMax', 'agent.threadPoolQueue', 'ws.idleTimeoutMs', 'notify.workerDelayMs', 'notify.batchSize', 'notify.maxAttempts', 'file.maxSizeMb', 'openapi.callLogRetentionDays', 'openapi.tokenAutoDisableThreshold', 'notify.email.smtpPort'])
+const NUMERIC_MINIMUMS: Record<string, number> = { 'usage.llmCallRetentionDays': 90 }
 
 /** 布尔开关 key：默认按 *.enabled 后缀判定；notify.email.smtpSecure（TLS 开关）同款渲染。 */
 const BOOLEAN_KEYS = new Set(['notify.email.smtpSecure'])
 
 function isNumericKey(key: string): boolean {
   return NUMERIC_KEYS.has(key)
+}
+
+function numericMin(key: string): number {
+  return NUMERIC_MINIMUMS[key] ?? 1
 }
 
 function toNumberOrNull(raw: string | undefined): number | undefined {

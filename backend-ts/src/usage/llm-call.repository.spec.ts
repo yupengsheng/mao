@@ -151,6 +151,37 @@ describe('LlmCallRepository 用户维度聚合', () => {
   });
 });
 
+describe('LlmCallRepository.deleteBatch', () => {
+  function build(affectedRows: number = 0) {
+    const execute = vi.fn(async () => ({ affectedRows }));
+    const repo = new LlmCallRepository({ execute } as never);
+    return { repo, execute };
+  }
+
+  it('按 created_at 截止时刻删除，返回 affectedRows', async () => {
+    const { repo, execute } = build(37);
+
+    await expect(repo.deleteBatch('2026-05-09 12:00:00', 5000)).resolves.toBe(37);
+
+    expect(execute).toHaveBeenCalledWith(
+      'DELETE FROM llm_call WHERE created_at < ? ORDER BY id LIMIT 5000',
+      ['2026-05-09 12:00:00'],
+    );
+  });
+
+  it('LIMIT 钳制在 1~5000，非法小数向下取整', async () => {
+    const { repo, execute } = build();
+
+    await repo.deleteBatch('2026-05-09 12:00:00', 0);
+    await repo.deleteBatch('2026-05-09 12:00:00', 99999);
+    await repo.deleteBatch('2026-05-09 12:00:00', 12.9);
+
+    expect(execute.mock.calls[0][0]).toContain('LIMIT 1');
+    expect(execute.mock.calls[1][0]).toContain('LIMIT 5000');
+    expect(execute.mock.calls[2][0]).toContain('LIMIT 12');
+  });
+});
+
 describe('LlmCallRepository 列表筛选（成败 + 取消第三态）', () => {
   function build(rows: Record<string, unknown>[] = [], one: Record<string, unknown> | null = null) {
     const query = vi.fn(async () => rows);

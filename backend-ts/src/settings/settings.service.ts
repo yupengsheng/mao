@@ -35,6 +35,9 @@ export const APPROVAL_MODEL_ID_KEY = 'approval.modelId';
 export const MEMORY_EXTRACTION_MODEL_ID_KEY = 'memory.extractionModelId';
 /** 哨兵轮询记录保留天数（V148，默认 90）。 */
 export const SIGNAL_CHECK_RETENTION_DAYS_KEY = 'signal.checkRetentionDays';
+/** LLM 调用流水保留天数（V182，默认 180，最低 90 以覆盖管理后台 90 天分析窗口）。 */
+export const USAGE_LLM_CALL_RETENTION_DAYS_KEY = 'usage.llmCallRetentionDays';
+export const USAGE_LLM_CALL_MIN_RETENTION_DAYS = 90;
 export const COMPACTION_MODEL_ID_KEY = 'compaction.modelId';
 export const JEV_ENDPOINT_KEY = 'approval.jev.endpoint';
 export const JEV_MODEL_KEY = 'approval.jev.model';
@@ -721,6 +724,14 @@ export class SystemSettingService {
     return Number.isInteger(n) && n > 0 ? n : 180;
   }
 
+  /** LLM 调用流水保留天数（usage.llmCallRetentionDays，V182；默认 180，最低 90）。 */
+  async getLlmCallRetentionDays(): Promise<number> {
+    const raw = await this.getOpt(USAGE_LLM_CALL_RETENTION_DAYS_KEY);
+    const n = raw == null ? NaN : Number(raw);
+    if (!Number.isInteger(n) || n <= 0) return 180;
+    return Math.max(USAGE_LLM_CALL_MIN_RETENTION_DAYS, n);
+  }
+
   /**
    * 自定义 HTTP 工具内网放行清单（V163）：CIDR JSON 数组 → 合法 CIDR 列表。
    * 非法/缺失按空数组处理（=一律按私网拒绝，失败即拒绝不放开）。
@@ -764,6 +775,9 @@ export class SystemSettingService {
     }
     if (!hasText(value)) {
       return;
+    }
+    if (key === USAGE_LLM_CALL_RETENTION_DAYS_KEY && Number(value) < USAGE_LLM_CALL_MIN_RETENTION_DAYS) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, 'LLM 调用流水保留天数不能少于 90 天');
     }
     if (key.endsWith('Days') || key.endsWith('Size') || key.endsWith('SizeMb')
       || key === OSS_STS_EXPIRE_KEY || key.endsWith('TimeoutMs') || key.endsWith('DelayMs')

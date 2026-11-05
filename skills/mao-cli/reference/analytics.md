@@ -46,6 +46,7 @@
 - 默认窗口以「今天」结尾，取最近 `days` 天；`--end-offset 1 --days 1` 即「昨日」
 - 按半开区间 `[start 00:00:00, end+1 00:00:00)` 过滤 `created_at`
 - 除 `overview` 中的实时运行态外，所有数字均为**窗口内新增**，不是全表累计
+- LLM 调用相关指标只统计仍在保留期内的 `llm_call` 流水：后台默认保留 180 天、最低 90 天并按小时清理（设置项 `usage.llmCallRetentionDays`）。查询超过保留期的历史窗口不会报错，但超出部分按 0/空数据处理；会话、消息等非 `llm_call` 指标不受影响。
 - 环比窗口是紧邻的上一个等长窗口（如 days=7 时为前 7 天；昨日的环比为前日）
 - 环比窗口（已结束区间）的聚合结果在**后端进程内缓存 5 分钟**（0.0.338 起）：过去窗口不再增长，同一份结果供各 Tab 复用，因此`previousTotals` 最多滞后 5 分钟；本期窗口每次实时计算
 - Token 分两类：`chatTokens` 来自 `message.token_count`（对话消耗），`backgroundTokens` 来自 `llm_usage`（后台调用，如会话标题、Git 提交信息生成），`totalTokens` 为两者之和；管理后台 UI 紧凑展示用 K/M/B（千/百万/十亿）

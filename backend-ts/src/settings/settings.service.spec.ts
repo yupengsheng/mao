@@ -85,6 +85,26 @@ describe('SystemSettingService', () => {
     await expect(service().getAuditRetentionDays()).resolves.toBe(180);
   });
 
+  it('getLlmCallRetentionDays 默认 180 天，低于 90 天按 90 天钳制', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue({ ...setting('usage.llmCallRetentionDays', '用量', 1), value: '365' });
+    await expect(service().getLlmCallRetentionDays()).resolves.toBe(365);
+
+    vi.mocked(mapper.findByKey).mockResolvedValue({ ...setting('usage.llmCallRetentionDays', '用量', 1), value: '30' });
+    await expect(service().getLlmCallRetentionDays()).resolves.toBe(90);
+
+    vi.mocked(mapper.findByKey).mockResolvedValue({ ...setting('usage.llmCallRetentionDays', '用量', 1), value: '0' });
+    await expect(service().getLlmCallRetentionDays()).resolves.toBe(180);
+
+    vi.mocked(mapper.findByKey).mockResolvedValue(null);
+    await expect(service().getLlmCallRetentionDays()).resolves.toBe(180);
+  });
+
+  it('updateRejectsLlmCallRetentionBelowMinimum', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting('usage.llmCallRetentionDays', '用量', 1));
+    await expect(service().update('usage.llmCallRetentionDays', '89')).rejects.toThrow(/不能少于 90 天/);
+    await expect(service().update('usage.llmCallRetentionDays', '90')).resolves.toMatchObject({ value: '90' });
+  });
+
   it('updateAllowsEmptyWeixinAgentId', async () => {
     const row = setting(SystemSettingService.WEIXIN_AGENT_ID_KEY, '微信', 1);
     vi.mocked(mapper.findByKey).mockResolvedValue(row);

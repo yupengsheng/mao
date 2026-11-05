@@ -166,6 +166,16 @@ const DECODE_AGGS = `COALESCE(SUM(CASE WHEN first_token_ms IS NOT NULL AND first
 export class LlmCallRepository {
   constructor(private readonly db: Db) {}
 
+  /** 按结束时刻分批删除过期调用流水，返回实际删除行数；LIMIT 钳制在 1~5000。 */
+  async deleteBatch(cutoff: string, limit: number): Promise<number> {
+    const safeLimit = Math.max(1, Math.min(5000, Math.floor(limit)));
+    const result = await this.db.execute(
+      `DELETE FROM llm_call WHERE created_at < ? ORDER BY id LIMIT ${safeLimit}`,
+      [cutoff],
+    );
+    return Number(result.affectedRows ?? 0);
+  }
+
   /** 聚合 WHERE：半开窗口 + 场景 + 成败（userId 由各聚合方法强制注入，不走这里）。 */
   private aggWhere(filter: LlmCallAggFilter & { scene?: string | null; success?: boolean | null }): { sql: string; params: unknown[] } {
     const clauses: string[] = [];
