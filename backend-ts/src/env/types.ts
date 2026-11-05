@@ -30,6 +30,11 @@ export interface EnvVariablePatch {
   note?: string | null;
 }
 
+export interface EnvVariablePage {
+  records: EnvVariable[];
+  total: number;
+}
+
 export interface EnvVariableRepository {
   listSystem(): Promise<EnvVariable[]>;
   findSystemById(id: number): Promise<EnvVariable | null>;
@@ -50,6 +55,8 @@ export interface EnvVariableRepository {
   listWorkspace(userId: number, workspacePath: string): Promise<EnvVariable[]>;
   /** 管理端只读：某用户全部工作区变量（按 workspace_path 分组展示）。 */
   listWorkspaceByUser(userId: number): Promise<EnvVariable[]>;
+  /** 管理端只读：用户全局变量与全部工作区变量合并后分页。 */
+  listCombinedForAdminPaged(userId: number, pageNum: number, pageSize: number): Promise<EnvVariablePage>;
   findWorkspaceById(userId: number, id: number): Promise<EnvVariable | null>;
   findWorkspaceByKey(userId: number, workspacePath: string, envKey: string): Promise<EnvVariable | null>;
   countWorkspace(userId: number, workspacePath: string): Promise<number>;

@@ -17,6 +17,11 @@ export interface GitCredential {
   updatedAt?: string | null;
 }
 
+export interface GitCredentialPage {
+  records: GitCredential[];
+  total: number;
+}
+
 export function assertGitCredentialSecret(secret: string | null | undefined): void {
   if (secret != null && secret.trim() !== '') return;
   console.error('============================================================');
@@ -41,6 +46,21 @@ export class GitCredentialService {
       'SELECT * FROM user_git_credential WHERE user_id = ? ORDER BY updated_at DESC',
       [userId],
     );
+  }
+
+  async listByUserIdPaged(userId: number, pageNum: number, pageSize: number): Promise<GitCredentialPage> {
+    const totalRow = await this.db.queryOne<{ c: number }>(
+      'SELECT COUNT(*) AS c FROM user_git_credential WHERE user_id = ?',
+      [userId],
+    );
+    const records = await this.db.query<GitCredential>(
+      `SELECT * FROM user_git_credential
+       WHERE user_id = ?
+       ORDER BY updated_at DESC, id DESC
+       LIMIT ? OFFSET ?`,
+      [userId, pageSize, (pageNum - 1) * pageSize],
+    );
+    return { records, total: Number(totalRow?.c ?? 0) };
   }
 
   /** 管理端：删除指定用户的凭证（不校验归属，调用方负责权限）。 */

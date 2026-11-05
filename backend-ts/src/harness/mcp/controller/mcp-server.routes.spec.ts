@@ -22,6 +22,7 @@ function buildApp(overrides: Partial<McpServerRouteDeps> = {}) {
       listPaged: vi.fn(async () => ({ records: [], total: 0 })),
       listEnabled: vi.fn(async () => []),
       listMine: vi.fn(async () => []),
+      listMinePaged: vi.fn(async () => ({ records: [], total: 0 })),
       validatePreferenceTarget: vi.fn(async () => undefined),
     } as never,
     mcpClientManager: {} as never,
@@ -122,6 +123,31 @@ describe('MCP server list routes', () => {
     const res = await app.inject({ method: 'GET', url: '/v1/mcp-servers?pageNum=0&pageSize=999' });
     expect(res.statusCode).toBe(200);
     expect(listPaged).toHaveBeenCalledWith(1, 200, undefined, undefined);
+    await app.close();
+  });
+});
+
+describe('MCP admin user server routes', () => {
+  it('keeps the legacy full list when no page params are passed', async () => {
+    const listMine = vi.fn(async () => [{ id: 1, name: 'mine' }]);
+    const { app } = buildApp({ mcpServerService: { listMine } as never });
+    const res = await app.inject({ method: 'GET', url: '/v1/admin/users/9/mcp-servers' });
+    expect(JSON.parse(res.body)).toMatchObject({ code: 0, data: [{ id: 1 }] });
+    expect(res.headers['x-total-count']).toBeUndefined();
+    expect(listMine).toHaveBeenCalledWith(9);
+    await app.close();
+  });
+
+  it('paginates a user server list and exposes the total header', async () => {
+    const listMinePaged = vi.fn(async () => ({ records: [{ id: 2, name: 'github' }], total: 3 }));
+    const { app } = buildApp({ mcpServerService: { listMinePaged } as never });
+    const res = await app.inject({
+      method: 'GET',
+      url: '/v1/admin/users/9/mcp-servers?pageNum=2&pageSize=5',
+    });
+    expect(JSON.parse(res.body)).toMatchObject({ code: 0, data: [{ id: 2 }] });
+    expect(res.headers['x-total-count']).toBe('3');
+    expect(listMinePaged).toHaveBeenCalledWith(9, 2, 5);
     await app.close();
   });
 });

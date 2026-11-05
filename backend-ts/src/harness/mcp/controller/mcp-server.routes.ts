@@ -179,7 +179,18 @@ export function registerMcpServerRoutes(app: FastifyInstance, deps: McpServerRou
     if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
       throw new BusinessException(ErrorCode.PARAM_INVALID, '无效的用户 ID');
     }
-    return sendOk(reply, await mcpServerService.listMine(targetUserId));
+    const pageNum = queryOptInt(request, 'pageNum');
+    const pageSize = queryOptInt(request, 'pageSize');
+    if (pageNum == null && pageSize == null) {
+      return sendOk(reply, await mcpServerService.listMine(targetUserId));
+    }
+    const page = await mcpServerService.listMinePaged(
+      targetUserId,
+      Math.max(1, pageNum ?? 1),
+      Math.min(200, Math.max(1, pageSize ?? 20)),
+    );
+    reply.header('x-total-count', String(page.total));
+    return sendOk(reply, page.records);
   });
 
   app.get('/v1/mcp-servers/enabled', async (request, reply) => {

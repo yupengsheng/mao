@@ -163,6 +163,15 @@
               </template>
             </el-table-column>
           </el-table>
+          <div class="tab-footer">
+            <el-pagination
+              v-model:current-page="gitPage"
+              layout="prev, pager, next, total"
+              :total="gitTotal"
+              :page-size="TAB_PAGE_SIZE"
+              @current-change="loadGitCredentials"
+            />
+          </div>
         </el-tab-pane>
 
         <!-- 环境变量（需求变更 c：管理员只读可见，键名明文 + 值掩码） -->
@@ -188,6 +197,15 @@
             </el-table-column>
             <el-table-column prop="updatedAt" label="更新时间" width="160" :formatter="formatDateTimeColumn" />
           </el-table>
+          <div class="tab-footer">
+            <el-pagination
+              v-model:current-page="envPage"
+              layout="prev, pager, next, total"
+              :total="envTotal"
+              :page-size="TAB_PAGE_SIZE"
+              @current-change="loadEnvVariables"
+            />
+          </div>
         </el-tab-pane>
 
         <!-- MCP 服务器 -->
@@ -208,6 +226,15 @@
               </template>
             </el-table-column>
           </el-table>
+          <div class="tab-footer">
+            <el-pagination
+              v-model:current-page="mcpPage"
+              layout="prev, pager, next, total"
+              :total="mcpTotal"
+              :page-size="TAB_PAGE_SIZE"
+              @current-change="loadMcpServers"
+            />
+          </div>
         </el-tab-pane>
       </el-tabs>
     </div>
@@ -305,8 +332,14 @@ const skills = ref<any[]>([])
 const skillsPage = ref(1)
 const skillsTotal = ref(0)
 const gitCredentials = ref<any[]>([])
+const gitPage = ref(1)
+const gitTotal = ref(0)
 const envVariables = ref<any[]>([])
+const envPage = ref(1)
+const envTotal = ref(0)
 const mcpServers = ref<any[]>([])
+const mcpPage = ref(1)
+const mcpTotal = ref(0)
 
 function phaseTagType(phase: string, pendingQuestionCount?: number): 'primary' | 'success' | 'danger' | 'warning' | 'info' {
   if (phase === 'RUNNING' && (pendingQuestionCount ?? 0) > 0) return 'warning'
@@ -355,6 +388,9 @@ function handleOpen() {
   tasksPage.value = 1
   commandsPage.value = 1
   skillsPage.value = 1
+  gitPage.value = 1
+  envPage.value = 1
+  mcpPage.value = 1
   // 抽屉复用同一组件实例：先清空上一位用户的数据，避免加载期间透出旧明细
   sessions.value = []
   tasks.value = []
@@ -367,6 +403,9 @@ function handleOpen() {
   tasksTotal.value = 0
   commandsTotal.value = 0
   skillsTotal.value = 0
+  gitTotal.value = 0
+  envTotal.value = 0
+  mcpTotal.value = 0
   void loadSessions()
   void loadTasks()
   void loadCommands()
@@ -438,8 +477,12 @@ async function loadGitCredentials() {
   if (!props.user) return
   loadingTabs['git'] = true
   try {
-    const { data } = await api.get(`/admin/users/${props.user.id}/git-credentials`)
-    gitCredentials.value = data || []
+    const { result, headers } = await apiGetWithHeaders<any[]>(`/admin/users/${props.user.id}/git-credentials`, {
+      params: { pageNum: gitPage.value, pageSize: TAB_PAGE_SIZE }
+    })
+    gitCredentials.value = result.data || []
+    const headerTotal = readTotalCount(headers)
+    gitTotal.value = Number.isFinite(headerTotal) ? headerTotal : gitCredentials.value.length
   } catch { /* 拦截器已提示失败 */ } finally {
     loadingTabs['git'] = false
   }
@@ -449,12 +492,13 @@ async function loadEnvVariables() {
   if (!props.user) return
   loadingTabs['env'] = true
   try {
-    // 用户层 + 全部工作区层（只读）：合并展示，workspacePath 为空即用户全局
-    const [userResp, workspaceResp] = await Promise.all([
-      api.get(`/admin/users/${props.user.id}/env-variables`),
-      api.get(`/admin/users/${props.user.id}/workspace-env-variables`)
-    ])
-    envVariables.value = [...(userResp.data || []), ...(workspaceResp.data || [])]
+    // 用户层 + 全部工作区层（只读）在服务端合并分页，workspacePath 为空即用户全局
+    const { result, headers } = await apiGetWithHeaders<any[]>(`/admin/users/${props.user.id}/all-env-variables`, {
+      params: { pageNum: envPage.value, pageSize: TAB_PAGE_SIZE }
+    })
+    envVariables.value = result.data || []
+    const headerTotal = readTotalCount(headers)
+    envTotal.value = Number.isFinite(headerTotal) ? headerTotal : envVariables.value.length
   } catch { /* 拦截器已提示失败 */ } finally {
     loadingTabs['env'] = false
   }
@@ -464,8 +508,12 @@ async function loadMcpServers() {
   if (!props.user) return
   loadingTabs['mcp'] = true
   try {
-    const { data } = await api.get(`/admin/users/${props.user.id}/mcp-servers`)
-    mcpServers.value = data || []
+    const { result, headers } = await apiGetWithHeaders<any[]>(`/admin/users/${props.user.id}/mcp-servers`, {
+      params: { pageNum: mcpPage.value, pageSize: TAB_PAGE_SIZE }
+    })
+    mcpServers.value = result.data || []
+    const headerTotal = readTotalCount(headers)
+    mcpTotal.value = Number.isFinite(headerTotal) ? headerTotal : mcpServers.value.length
   } catch { /* 拦截器已提示失败 */ } finally {
     loadingTabs['mcp'] = false
   }
@@ -485,6 +533,7 @@ async function handleDeleteGitCredential(row: any) {
   try {
     await api.delete(`/admin/users/${props.user.id}/git-credentials/${row.id}`)
     ElMessage.success('已删除')
+    if (gitPage.value > 1 && gitCredentials.value.length === 1) gitPage.value -= 1
     loadGitCredentials()
   } catch { /* 拦截器已提示失败 */ }
 }

@@ -76,3 +76,25 @@ describe('McpServerMapper.listPaged', () => {
     expect(db.query.mock.calls[0]![1]).toEqual([20, 0]);
   });
 });
+
+describe('McpServerMapper.listMinePaged', () => {
+  it('filters by owner and returns a page with the total', async () => {
+    const db = {
+      query: vi.fn(async () => [{ id: 4, userId: 7 }]),
+      queryOne: vi.fn(async () => ({ c: 9 })),
+    };
+    const mapper = new McpServerMapper(db as never);
+
+    const page = await mapper.listMinePaged(7, 2, 5);
+
+    expect(page).toEqual({ records: [{ id: 4, userId: 7 }], total: 9 });
+    const countSql = String(db.queryOne.mock.calls[0]![0]);
+    expect(countSql).toContain('user_id = ?');
+    expect(countSql).toContain('deleted = 0');
+    expect(db.queryOne.mock.calls[0]![1]).toEqual([7]);
+    const listSql = String(db.query.mock.calls[0]![0]);
+    expect(listSql).toContain('user_id = ?');
+    expect(listSql).toMatch(/ORDER BY id ASC LIMIT \? OFFSET \?/);
+    expect(db.query.mock.calls[0]![1]).toEqual([7, 5, 5]);
+  });
+});

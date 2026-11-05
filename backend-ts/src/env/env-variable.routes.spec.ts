@@ -53,6 +53,16 @@ class MemoryRepo implements EnvVariableRepository {
     return this.workspaces.filter((r) => r.userId === userId && r.workspacePath === workspacePath);
   }
   async listWorkspaceByUser(userId: number) { return this.workspaces.filter((r) => r.userId === userId); }
+  async listCombinedForAdminPaged(userId: number, pageNum: number, pageSize: number) {
+    const rows = [
+      ...this.users.filter((r) => r.userId === userId),
+      ...this.workspaces.filter((r) => r.userId === userId),
+    ].sort((a, b) => (b.id ?? 0) - (a.id ?? 0));
+    return {
+      records: rows.slice((pageNum - 1) * pageSize, pageNum * pageSize),
+      total: rows.length,
+    };
+  }
   async findWorkspaceById(userId: number, id: number) {
     return this.workspaces.find((r) => r.userId === userId && r.id === id) ?? null;
   }
@@ -220,6 +230,35 @@ describe('env variable routes', () => {
       payload: { envKey: 'X', envValue: 'y' },
     });
     expect(attempted.statusCode).toBe(404);
+  });
+
+  it('paginates merged user and workspace variables for admins', async () => {
+    const { app, repo } = buildApp();
+    repo.seedUser(42, 'USER_KEY', encryptAesCbc('user-secret', SECRET));
+    repo.seedWorkspace(42, ROOT, 'WS_KEY_1', encryptAesCbc('ws-secret-1', SECRET));
+    repo.seedWorkspace(42, ROOT, 'WS_KEY_2', encryptAesCbc('ws-secret-2', SECRET));
+
+    const first = await app.inject({
+      method: 'GET',
+      url: '/v1/admin/users/42/all-env-variables?pageNum=1&pageSize=2',
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.headers['x-total-count']).toBe('3');
+    const firstRows = first.json().data as Array<Record<string, unknown>>;
+    expect(firstRows.map((row) => row.envKey)).toEqual(['WS_KEY_2', 'WS_KEY_1']);
+    expect(firstRows[0]).toMatchObject({ userId: 42, username: 'user42', workspacePath: ROOT });
+    expect(firstRows[0].maskedValue).toMatch(/^\*\*\*\* \(\d+ chars\)$/);
+    expect(firstRows[0].envValue).toBeUndefined();
+    expect(JSON.stringify(firstRows)).not.toContain('ws-secret');
+
+    const second = await app.inject({
+      method: 'GET',
+      url: '/v1/admin/users/42/all-env-variables?pageNum=2&pageSize=2',
+    });
+    expect(second.headers['x-total-count']).toBe('3');
+    const secondRows = second.json().data as Array<Record<string, unknown>>;
+    expect(secondRows.map((row) => row.envKey)).toEqual(['USER_KEY']);
+    expect(secondRows[0].workspacePath).toBeUndefined();
   });
 
   it('rejects reserved keys through the API with a clear code', async () => {

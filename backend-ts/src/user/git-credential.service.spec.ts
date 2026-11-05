@@ -28,6 +28,21 @@ describe('GitCredentialService', () => {
     expect(GitCredentialService.envVarNameForDomain('git.example.com')).toBe('GIT_TOKEN_git_example_com');
   });
 
+  it('listByUserIdPaged returns the total and a sorted page', async () => {
+    vi.mocked(db.queryOne).mockResolvedValueOnce({ c: 12 });
+    vi.mocked(db.query).mockResolvedValueOnce([{ id: 3, userId: 5 }]);
+
+    const page = await service.listByUserIdPaged(5, 2, 5);
+
+    expect(page).toEqual({ records: [{ id: 3, userId: 5 }], total: 12 });
+    const [countSql, countParams] = vi.mocked(db.queryOne).mock.calls.at(-1)!;
+    expect(String(countSql)).toContain('FROM user_git_credential WHERE user_id = ?');
+    expect(countParams).toEqual([5]);
+    const [listSql, listParams] = vi.mocked(db.query).mock.calls.at(-1)!;
+    expect(String(listSql)).toMatch(/ORDER BY updated_at DESC, id DESC\s+LIMIT \? OFFSET \?/);
+    expect(listParams).toEqual([5, 5, 5]);
+  });
+
   it('assertGitCredentialSecret rejects blank keys', async () => {
     const { assertGitCredentialSecret } = await import('./git-credential.service.js');
     expect(() => assertGitCredentialSecret('')).toThrow(/APP_GIT_CREDENTIAL_SECRET/);

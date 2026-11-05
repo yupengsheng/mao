@@ -88,6 +88,16 @@ class FakeRepo implements EnvVariableRepository {
   async listWorkspaceByUser(userId: number) {
     return this.workspaces.filter((r) => r.userId === userId).map((r) => ({ ...r }));
   }
+  async listCombinedForAdminPaged(userId: number, pageNum: number, pageSize: number) {
+    const rows = [
+      ...this.users.filter((r) => r.userId === userId),
+      ...this.workspaces.filter((r) => r.userId === userId),
+    ].sort((a, b) => b.id - a.id);
+    return {
+      records: rows.slice((pageNum - 1) * pageSize, pageNum * pageSize).map((r) => ({ ...r })),
+      total: rows.length,
+    };
+  }
   async findWorkspaceById(userId: number, id: number) {
     return this.workspaces.find((r) => r.userId === userId && r.id === id) ?? null;
   }

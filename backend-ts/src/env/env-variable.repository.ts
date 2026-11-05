@@ -1,5 +1,5 @@
 import type { Db } from '../db/db.js';
-import type { EnvVariable, EnvVariablePatch, EnvVariableRepository } from './types.js';
+import type { EnvVariable, EnvVariablePage, EnvVariablePatch, EnvVariableRepository } from './types.js';
 
 const USER_TABLE = 'user_env_variable';
 const WORKSPACE_TABLE = 'workspace_env_variable';
@@ -133,6 +133,28 @@ export class MysqlEnvVariableRepository implements EnvVariableRepository {
 
   listWorkspaceByUser(userId: number): Promise<EnvVariable[]> {
     return this.listBy(WORKSPACE_TABLE, 'user_id = ?', [userId]);
+  }
+
+  async listCombinedForAdminPaged(userId: number, pageNum: number, pageSize: number): Promise<EnvVariablePage> {
+    const unionSql = `
+      SELECT id, user_id, NULL AS workspace_path, env_key, env_value, note,
+             created_at, updated_at, 0 AS source_rank
+      FROM user_env_variable WHERE user_id = ?
+      UNION ALL
+      SELECT id, user_id, workspace_path, env_key, env_value, note,
+             created_at, updated_at, 1 AS source_rank
+      FROM workspace_env_variable WHERE user_id = ?`;
+    const totalRow = await this.db.queryOne<{ c: number }>(
+      `SELECT COUNT(*) AS c FROM (${unionSql}) AS combined`,
+      [userId, userId],
+    );
+    const records = await this.db.query<EnvVariable>(
+      `SELECT * FROM (${unionSql}) AS combined
+       ORDER BY updated_at DESC, id DESC, source_rank ASC
+       LIMIT ? OFFSET ?`,
+      [userId, userId, pageSize, (pageNum - 1) * pageSize],
+    );
+    return { records, total: Number(totalRow?.c ?? 0) };
   }
 
   findWorkspaceById(userId: number, id: number): Promise<EnvVariable | null> {

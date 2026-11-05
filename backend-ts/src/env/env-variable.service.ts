@@ -6,7 +6,9 @@ import { harnessLog } from '../harness/log.js';
 import {
   MAX_ENV_NOTE_LENGTH, MAX_ENV_VALUE_LENGTH, MAX_ENV_VARS_PER_SCOPE, assertConfiguredEnvKey,
 } from './reserved-env-keys.js';
-import type { EnvVariable, EnvVariablePatch, EnvVariableRepository, EnvVariableSource } from './types.js';
+import type {
+  EnvVariable, EnvVariablePage, EnvVariablePatch, EnvVariableRepository, EnvVariableSource,
+} from './types.js';
 import { normalizeWorkspaceKey } from './workspace-key.js';
 
 /** 进程内缓存 TTL：与 docker-tool-router 的运行时模式缓存同量级（§3.3）。 */
@@ -226,6 +228,10 @@ export class EnvVariableService {
       return this.repo.listWorkspace(userId, this.workspaceKey(workspace));
     }
     return this.repo.listWorkspaceByUser(userId);
+  }
+
+  listCombinedForAdminPaged(userId: number, pageNum: number, pageSize: number): Promise<EnvVariablePage> {
+    return this.repo.listCombinedForAdminPaged(userId, pageNum, pageSize);
   }
 
   // ------------------------------------------------------------ 合并与生效

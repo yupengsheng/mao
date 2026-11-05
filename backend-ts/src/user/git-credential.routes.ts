@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { requirePermission, requireUserId, sendOk } from '../common/http-error.js';
-import { bodyOf, pathId } from '../common/request.js';
+import { bodyOf, pathId, queryOptInt } from '../common/request.js';
 import type { GitCredential, GitCredentialService } from './git-credential.service.js';
 
 export function registerGitCredentialRoutes(app: FastifyInstance, service: GitCredentialService): void {
@@ -43,7 +43,20 @@ export function registerAdminGitCredentialRoutes(app: FastifyInstance, deps: Adm
   app.get('/v1/admin/users/:id/git-credentials', async (request, reply) => {
     const adminId = requireUserId(request);
     await requirePermission(permissionService, adminId, 'user:read');
-    const list = await gitCredentialService.listByUserId(pathId(request));
+    const targetUserId = pathId(request);
+    const pageNum = queryOptInt(request, 'pageNum');
+    const pageSize = queryOptInt(request, 'pageSize');
+    if (pageNum == null && pageSize == null) {
+      const list = await gitCredentialService.listByUserId(targetUserId);
+      return sendOk(reply, list.map(toVO));
+    }
+    const page = await gitCredentialService.listByUserIdPaged(
+      targetUserId,
+      Math.max(1, pageNum ?? 1),
+      Math.min(200, Math.max(1, pageSize ?? 20)),
+    );
+    reply.header('x-total-count', String(page.total));
+    const list = page.records;
     return sendOk(reply, list.map(toVO));
   });
 

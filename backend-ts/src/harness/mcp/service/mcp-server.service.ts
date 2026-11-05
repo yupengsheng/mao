@@ -65,6 +65,17 @@ export class McpServerService {
     return servers;
   }
 
+  async listMinePaged(
+    userId: number | null | undefined,
+    pageNum: number,
+    pageSize: number,
+  ): Promise<{ records: McpServer[]; total: number }> {
+    if (userId == null) return { records: [], total: 0 };
+    const page = await this.mapper.listMinePaged(userId, pageNum, pageSize);
+    for (const s of page.records) s.envJson = null;
+    return page;
+  }
+
   async get(id: number): Promise<McpServer> {
     const server = await this.mapper.selectById(id);
     if (!server) throw new BusinessException(ErrorCode.PARAM_INVALID, 'MCP 服务器不存在');

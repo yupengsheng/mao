@@ -69,6 +69,19 @@ export class McpServerMapper {
     );
   }
 
+  async listMinePaged(userId: number, pageNum: number, pageSize: number): Promise<{ records: McpServer[]; total: number }> {
+    const whereSql = `user_id = ? AND ${notDeleted()}`;
+    const totalRow = await this.db.queryOne<{ c: number }>(
+      `SELECT COUNT(*) AS c FROM mcp_server WHERE ${whereSql}`,
+      [userId],
+    );
+    const records = await this.db.query<McpServer>(
+      `SELECT * FROM mcp_server WHERE ${whereSql} ORDER BY id ASC LIMIT ? OFFSET ?`,
+      [userId, pageSize, (pageNum - 1) * pageSize],
+    );
+    return { records, total: Number(totalRow?.c ?? 0) };
+  }
+
   selectById(id: number): Promise<McpServer | null> {
     return this.db.queryOne<McpServer>(
       `SELECT * FROM mcp_server WHERE id = ? AND ${notDeleted()}`,

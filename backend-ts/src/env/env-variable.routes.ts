@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { BusinessException } from '../common/business-exception.js';
 import { ErrorCode } from '../common/error-code.js';
 import { requirePermission, requireUserId, sendOk } from '../common/http-error.js';
-import { bodyOf, pathId, queryOptStr } from '../common/request.js';
+import { bodyOf, pathId, queryOptInt, queryOptStr } from '../common/request.js';
 import { maskEnvValueForAdmin, type EnvVariableService } from './env-variable.service.js';
 import type { EnvVariable } from './types.js';
 
@@ -163,6 +163,27 @@ export function registerAdminEnvVariableRoutes(app: FastifyInstance, deps: Admin
     const workspace = queryOptStr(request, 'workspace');
     const list = await envVariableService.listWorkspaceForAdmin(targetUserId, workspace);
     return sendOk(reply, list.map((row) => toAdminVO(row, targetUserId, username, row.workspacePath ?? null)));
+  });
+
+  // 管理端合并视图：用户全局变量 + 全部工作区变量统一分页，避免前端分别取页后拼接错位。
+  app.get('/v1/admin/users/:id/all-env-variables', async (request, reply) => {
+    await requirePermission(permissionService, requireUserId(request), 'user:read');
+    const targetUserId = requireId(request);
+    const username = await usernameOf(userLookup, targetUserId);
+    const pageNum = queryOptInt(request, 'pageNum');
+    const pageSize = queryOptInt(request, 'pageSize');
+    const page = await envVariableService.listCombinedForAdminPaged(
+      targetUserId,
+      Math.max(1, pageNum ?? 1),
+      Math.min(200, Math.max(1, pageSize ?? 20)),
+    );
+    reply.header('x-total-count', String(page.total));
+    return sendOk(reply, page.records.map((row) => toAdminVO(
+      row,
+      targetUserId,
+      username,
+      row.workspacePath ?? null,
+    )));
   });
 }
 

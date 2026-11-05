@@ -18,6 +18,7 @@ describe('McpServerService', () => {
     listPaged: vi.fn(),
     listEnabledGlobal: vi.fn(),
     listMine: vi.fn(),
+    listMinePaged: vi.fn(),
   } as unknown as McpServerMapper & Record<string, ReturnType<typeof vi.fn>>;
   const secretCipher = new McpSecretCipher('test-secret');
   const preferenceService = { deleteByServer: vi.fn() } as unknown as UserMcpPreferenceService;
@@ -118,6 +119,21 @@ describe('McpServerService', () => {
     expect(mapper.listPaged).toHaveBeenCalledWith(3, 10, 'a', STATUS_ENABLED);
     expect(page.total).toBe(42);
     expect(page.records[0].envJson).toBeNull();
+  });
+
+  it('lists a user page and strips secrets from records', async () => {
+    mapper.listMinePaged.mockResolvedValue({
+      records: [{ id: 2, userId: 9, name: 'mine', envJson: 'secret' }],
+      total: 11,
+    });
+
+    const page = await service.listMinePaged(9, 2, 10);
+
+    expect(mapper.listMinePaged).toHaveBeenCalledWith(9, 2, 10);
+    expect(page.total).toBe(11);
+    expect(page.records[0].envJson).toBeNull();
+    expect(await service.listMinePaged(null, 1, 10)).toEqual({ records: [], total: 0 });
+    expect(mapper.listMinePaged).toHaveBeenCalledTimes(1);
   });
 
   it('lists get update status delete and decrypt', async () => {
