@@ -126,4 +126,19 @@ export class MessageQueueRepository {
       [sessionId],
     );
   }
+
+  /**
+   * 分批删除已消费 / 已移除的队列行，返回实际删除行数。
+   * 业务只读取 PENDING 行，终态行仅保留一段时间供排障；LIMIT 钳制在 1~5000。
+   */
+  async deleteTerminalBatch(cutoff: string, limit: number): Promise<number> {
+    const safeLimit = Number.isFinite(limit)
+      ? Math.max(1, Math.min(5000, Math.floor(limit)))
+      : 1;
+    const result = await this.db.execute(
+      `DELETE FROM message_queue WHERE status = 'DELETED' AND updated_at < ? ORDER BY updated_at, id LIMIT ${safeLimit}`,
+      [cutoff],
+    );
+    return Number(result.affectedRows ?? 0);
+  }
 }
