@@ -24,6 +24,7 @@ import type { WebhookDeliveryScheduler } from './notification/task/delivery.sche
 import type { OpenApiCallLogService } from './openapi/open-api-call-log.service.js';
 import type { OpenApiCallLogCleanup } from './openapi/open-api-call-log.cleanup.js';
 import type { OpenApiCallLogRepairService } from './openapi/open-api-call-log.repair.service.js';
+import type { OutboundDeliveryCleanup } from './openapi/outbound-delivery.cleanup.js';
 import type { WatcherScheduler } from './signal/watcher-scheduler.js';
 import type { SignalCheckCleanup } from './signal/signal-check-cleanup.js';
 import type { EcpRenewScheduler } from './auth/ecp-renew.scheduler.js';
@@ -44,6 +45,7 @@ export interface ShutdownDeps {
   feishuInboundProcessor: FeishuInboundProcessor;
   scheduler: ScheduledTaskScheduler;
   deliveryScheduler: WebhookDeliveryScheduler;
+  outboundDeliveryCleanup: OutboundDeliveryCleanup;
   callLogService: OpenApiCallLogService;
   callLogCleanup: OpenApiCallLogCleanup;
   callLogRepair: OpenApiCallLogRepairService;
@@ -72,7 +74,7 @@ export function createShutdownHandler(deps: ShutdownDeps): () => Promise<void> {
   const {
     app, db, cfg, ctx, crash, drainWatcher,
     weixinMonitor, feishuMonitor, dingtalk, weixinInboundHandler, feishuInboundProcessor,
-    scheduler, deliveryScheduler, callLogService, callLogCleanup, callLogRepair,
+    scheduler, deliveryScheduler, outboundDeliveryCleanup, callLogService, callLogCleanup, callLogRepair,
     watcherScheduler, signalCheckCleanup, ecpRenewScheduler,
     shellManager, terminalManager, ptyChannelHubs, ptyHubGeneration,
     containerRegistry, channelServer, runtimeCleanup, activityHeartbeat, wsRegistry,
@@ -124,6 +126,7 @@ export function createShutdownHandler(deps: ShutdownDeps): () => Promise<void> {
       await settleInFlightExecutions(isDrainingForDeploy() ? drainGraceMs() : 0);
       scheduler.stop();
       deliveryScheduler.stop();
+      outboundDeliveryCleanup.stop();
       callLogRepair.stop();
       callLogService.stop();
       callLogCleanup.stop();

@@ -10,6 +10,7 @@ import { WebhookDeliveryScheduler, DeliverySchedulerDbStore } from './notificati
 import { userMessagePreviewOf } from './notification/task/user-message-preview.js';
 import { createSessionDetailUrlResolver } from './feishu/progress-card.js';
 import { OutboundDeliveryScheduler } from './openapi/outbound-delivery.scheduler.js';
+import { OutboundDeliveryCleanup } from './openapi/outbound-delivery.cleanup.js';
 import { GenericHttpWebhookSender } from './openapi/generic-webhook-sender.js';
 import { InboxCleanupScheduler } from './inbox/inbox.cleanup.js';
 import { ScheduledTaskRunCleanupScheduler } from './schedule/run-cleanup.js';
@@ -96,6 +97,8 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
     execute: (fn: any) => d.agentExecutor.submit(fn),
   });
   outboundDeliveryScheduler.start();
+  const outboundDeliveryCleanup = new OutboundDeliveryCleanup(d.outboundDeliveryRepo);
+  outboundDeliveryCleanup.start();
   const inboxCleanupScheduler = new InboxCleanupScheduler(d.inboxCleanupStore);
   inboxCleanupScheduler.start();
   const scheduledRunCleanup = new ScheduledTaskRunCleanupScheduler(d.scheduledStore);
@@ -203,6 +206,7 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
     weixinMonitor: d.weixinMonitor, feishuMonitor: d.feishuMonitor, dingtalk: d.dingtalk,
     weixinInboundHandler: d.weixinInboundHandler, feishuInboundProcessor: d.feishuInboundProcessor,
     scheduler, deliveryScheduler, callLogService: d.callLogService, callLogCleanup: d.callLogCleanup, callLogRepair: d.callLogRepair,
+    outboundDeliveryCleanup,
     watcherScheduler: d.watcherScheduler, signalCheckCleanup: d.signalCheckCleanup, ecpRenewScheduler,
     shellManager: d.shellManager, terminalManager: d.terminalManager,
     ptyChannelHubs: d.ptyChannelHubs, ptyHubGeneration: d.ptyHubGeneration,

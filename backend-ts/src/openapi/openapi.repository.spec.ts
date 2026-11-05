@@ -1,7 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { Db } from '../db/db.js';
 import { toCamel } from '../common/case.js';
-import { MysqlWebhookTriggerRepository } from './openapi.repository.js';
+import { MysqlOutboundDeliveryRepository, MysqlWebhookTriggerRepository } from './openapi.repository.js';
 
 const DISABLE_AFTER = 5;
 const NOW = '2026-10-05 12:00:00';
@@ -189,5 +189,30 @@ describe('MysqlWebhookTriggerRepository.recordOutcome', () => {
     expect(fake.row).toMatchObject({ consecutiveFailures: 5, enabled: 0 });
     expect([first, second].filter((r) => r != null)).toHaveLength(1);
     expect(first?.consecutiveFailures ?? second?.consecutiveFailures).toBe(5);
+  });
+});
+
+describe('MysqlOutboundDeliveryRepository.deleteHistory', () => {
+  it('只删终态记录，按 cutoff 和受限批量执行', async () => {
+    const execute = vi.fn(async () => ({ affectedRows: 37 }));
+    const repo = new MysqlOutboundDeliveryRepository({ execute } as unknown as Db);
+
+    await expect(repo.deleteHistory('2026-08-07 12:00:00', 5000)).resolves.toBe(37);
+
+    const [sql, params] = execute.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain("status IN ('SUCCEEDED', 'FAILED')");
+    expect(sql).toContain('created_at < ?');
+    expect(sql).toContain('ORDER BY id LIMIT 5000');
+    expect(sql).not.toContain('LIMIT ?');
+    expect(params).toEqual(['2026-08-07 12:00:00']);
+  });
+
+  it('非法批量回退为 5000，避免拼出无效或过大的 LIMIT', async () => {
+    const execute = vi.fn(async () => ({ affectedRows: 0 }));
+    const repo = new MysqlOutboundDeliveryRepository({ execute } as unknown as Db);
+
+    await repo.deleteHistory('2026-08-07 12:00:00', 0);
+
+    expect((execute.mock.calls[0] as [string])[0]).toContain('LIMIT 5000');
   });
 });

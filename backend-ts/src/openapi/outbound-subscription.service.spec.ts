@@ -25,7 +25,7 @@ function makeRepos(subscriptions: OutboundSubscription[] = []) {
     markFailed: vi.fn(async () => undefined),
     scheduleRetry: vi.fn(async () => undefined),
     findById: vi.fn(async () => null),
-    deleteHistory: vi.fn(async () => undefined),
+    deleteHistory: vi.fn(async () => 0),
   };
   return { subscriptionRepo, deliveryRepo };
 }

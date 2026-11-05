@@ -29,6 +29,7 @@ describe('开放接口内嵌文档', () => {
     expect(doc).toContain('task.completed')
     expect(doc).toContain('task.failed')
     expect(doc).toContain('question.pending')
+    expect(doc).toContain('投递记录保留 90 天')
   })
 
   it('错误码与后端 error-code 对齐', () => {

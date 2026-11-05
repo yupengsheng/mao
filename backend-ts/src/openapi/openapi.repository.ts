@@ -336,11 +336,15 @@ export class MysqlOutboundDeliveryRepository {
     return this.db.queryOne<OutboundDelivery>('SELECT * FROM outbound_delivery WHERE id = ?', [id]);
   }
 
-  /** 终态历史清理（90 天，对齐任务通知投递的清理口径）。 */
-  async deleteHistory(cutoff: string): Promise<void> {
-    await this.db.execute(
-      "DELETE FROM outbound_delivery WHERE status IN ('SUCCEEDED', 'FAILED') AND created_at < ?",
+  /** 终态历史分批清理（90 天，对齐任务通知投递的清理口径）。 */
+  async deleteHistory(cutoff: string, limit: number): Promise<number> {
+    const safeLimit = Number.isInteger(limit) && limit > 0 ? limit : 5000;
+    const result = await this.db.execute(
+      `DELETE FROM outbound_delivery
+        WHERE status IN ('SUCCEEDED', 'FAILED') AND created_at < ?
+        ORDER BY id LIMIT ${safeLimit}`,
       [cutoff],
     );
+    return result.affectedRows;
   }
 }
