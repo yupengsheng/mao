@@ -16,12 +16,20 @@
 
 ## 命令：skill-docs list
 
-无参数。`GET /skill-docs`
+| 参数 | 必填 | 类型 | 含义 |
+|------|------|------|------|
+| `--page-num` | 否 | 数字 | 页码，从 1 开始；默认返回全量 |
+| `--page-size` | 否 | 数字 | 每页条数，默认 20，范围 1–200 |
+| `--keyword` | 否 | 字符串 | 按技能名称、描述过滤，忽略大小写 |
 
-返回数组，项含 `name`、`description`、`folderPath`、`filePath`。
+`GET /skill-docs`
+
+不传 `--page-num` / `--page-size` / `--keyword` 时返回全量数组，项含 `name`、`description`、`folderPath`、`filePath`。传任一参数时返回当前页数组，并在响应头 `x-total-count` 返回匹配总数。
 
 ```bash
 mao skill-docs list
+mao skill-docs list --page-num 2 --page-size 20
+mao skill-docs list --keyword bigdata
 ```
 
 ## 命令：skill-docs get

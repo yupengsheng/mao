@@ -61,25 +61,43 @@ export function registerAdminUserSkillRoutes(
   const { userSkillService, permissionService, userLookup } = deps;
 
   // 列表：不传 userId 返回全部用户技能；传 userId 时仅返回该用户的技能（用户详情视图用）。
+  // 支持 pageNum/pageSize/keyword 服务端分页；userId 单独传入时保持全量数组兼容。
   app.get('/v1/admin/user-skills', async (request, reply) => {
     const userId = requireUserId(request);
     await requirePermission(permissionService, userId, 'skill:read');
     const targetUserId = queryOptInt(request, 'userId');
-    if (targetUserId != null) {
+    const pageNum = queryOptInt(request, 'pageNum');
+    const pageSize = queryOptInt(request, 'pageSize');
+    const keyword = queryOptStr(request, 'keyword');
+    const filtered = pageNum != null || pageSize != null || keyword != null;
+    if (targetUserId != null && !filtered) {
       return sendJson(reply, 200, ok(userSkillService.listUserSkills(targetUserId)));
     }
-    const skills = userSkillService.listAllUserSkills();
+    const skills = targetUserId != null
+      ? userSkillService.listUserSkills(targetUserId).map((skill) => ({ ...skill, userId: targetUserId }))
+      : userSkillService.listAllUserSkills();
     const userIds = [...new Set(skills.map((s) => s.userId))];
     const users = userIds.length > 0 ? await userLookup.findByIds(userIds) : [];
     const userMap = new Map(users.map((u) => [u.id, u]));
-    return sendJson(reply, 200, ok(skills.map((skill) => {
+    const enriched = skills.map((skill) => {
       const user = userMap.get(skill.userId);
       return {
         ...skill,
         username: user?.username ?? null,
         displayName: user?.displayName ?? null,
       };
-    })));
+    });
+    if (!filtered) {
+      return sendJson(reply, 200, ok(enriched));
+    }
+    const kw = keyword?.trim().toLowerCase();
+    const matched = kw
+      ? enriched.filter((skill) => `${skill.name || ''} ${skill.description || ''} ${skill.username || ''} ${skill.displayName || ''} ${skill.userId}`
+        .toLowerCase().includes(kw))
+      : enriched;
+    const page = paginate(matched, pageNum, pageSize);
+    reply.header('x-total-count', String(page.total));
+    return sendJson(reply, 200, ok(page.records));
   });
 
   app.get('/v1/admin/user-skills/options/users', async (request, reply) => {
@@ -172,7 +190,21 @@ export function registerSkillDocRoutes(
 
   app.get('/v1/skill-docs', async (request, reply) => {
     requireUserId(request);
-    return sendJson(reply, 200, ok(skillDocService.listSkillDocs()));
+    const pageNum = queryOptInt(request, 'pageNum');
+    const pageSize = queryOptInt(request, 'pageSize');
+    const keyword = queryOptStr(request, 'keyword');
+    const filtered = pageNum != null || pageSize != null || keyword != null;
+    const docs = skillDocService.listSkillDocs().sort((a, b) => a.name.localeCompare(b.name));
+    if (!filtered) {
+      return sendJson(reply, 200, ok(docs));
+    }
+    const kw = keyword?.trim().toLowerCase();
+    const matched = kw
+      ? docs.filter((doc) => `${doc.name || ''} ${doc.description || ''}`.toLowerCase().includes(kw))
+      : docs;
+    const page = paginate(matched, pageNum, pageSize);
+    reply.header('x-total-count', String(page.total));
+    return sendJson(reply, 200, ok(page.records));
   });
 
   app.get('/v1/skill-docs/:name', async (request, reply) => {
@@ -246,6 +278,13 @@ export function registerSkillRoutes(app: FastifyInstance, deps: SkillRouteDeps):
 }
 
 const MAX_ASSIGN_USERS = 100;
+
+function paginate<T>(items: T[], pageNum?: number, pageSize?: number): { records: T[]; total: number } {
+  const page = Math.max(1, pageNum ?? 1);
+  const size = Math.min(200, Math.max(1, pageSize ?? 20));
+  const start = (page - 1) * size;
+  return { records: items.slice(start, start + size), total: items.length };
+}
 
 export function parseAssignUserIds(values: string[]): { ok: true; ids: number[] } | { ok: false; message: string } {
   const ids: number[] = [];

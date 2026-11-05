@@ -1,3 +1,14 @@
+## 0.0.463 (2026-11-05)
+
+### 后端
+- **Skills 列表支持服务端分页与搜索**：`GET /v1/skill-docs` 与 `GET /v1/admin/user-skills` 新增 `pageNum` / `pageSize` / `keyword`，系统技能按名称、描述匹配，个人技能额外支持按用户名、显示名、用户 ID 匹配，并通过 `x-total-count` 返回总数；不传新参数时保持原全量数组行为。
+
+### 管理后台
+- **Skills 管理改为服务端分页**：系统 Skills 与个人 Skills 的搜索、翻页、每页条数及用户筛选均走服务端查询，关键词输入 300ms 防抖；删除末页最后一条后自动回退到有效页码。
+
+### 终端 CLI（mao-cli）
+- **`mao skill-docs list` 支持 `--page-num` / `--page-size` / `--keyword`**：可按页拉取并搜索全局技能，不传分页参数时仍返回全量。
+
 ## 0.0.462 (2026-11-05)
 
 ### 后端

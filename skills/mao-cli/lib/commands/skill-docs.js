@@ -2,7 +2,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { requireFlag, hasFlag } = require('../args');
+const { requireFlag, hasFlag, optionalNumber, optionalString } = require('../args');
 const { get, del, walkFiles, uploadMultipart } = require('../http');
 const { emitResult, printError } = require('../output');
 
@@ -10,7 +10,7 @@ function help() {
   return `skill-docs — 全局 Skill 文档，以及把技能写入指定用户的个人技能
 
 命令:
-  mao skill-docs list
+  mao skill-docs list [--page-num N] [--page-size N] [--keyword <关键词>]
   mao skill-docs get --name
   mao skill-docs upload --dir PATH
   mao skill-docs delete --name
@@ -28,7 +28,11 @@ async function run(ctx, subcommand, _rest, flags) {
 
   switch (subcommand) {
     case 'list': {
-      const result = await get(ctx, '/skill-docs');
+      const result = await get(ctx, '/skill-docs', {
+        pageNum: optionalNumber(flags, 'page-num'),
+        pageSize: optionalNumber(flags, 'page-size'),
+        keyword: optionalString(flags, 'keyword'),
+      });
       emitResult(result, { raw: ctx.raw });
       return;
     }

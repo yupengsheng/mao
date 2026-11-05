@@ -64,6 +64,95 @@ describe('skill routes', () => {
     await app.close();
   });
 
+  it('paginatesAndSearchesSystemSkillDocsWithoutChangingFullListBehavior', async () => {
+    const skillsDir = useTmpDir('mao-sdoc-');
+    const userDir = useTmpDir('mao-user-s-');
+    for (const [folder, name, description] of [
+      ['alpha', 'alpha', 'Alpha exporter'],
+      ['beta', 'beta', 'Beta helper'],
+      ['gamma', 'gamma', 'Gamma exporter'],
+    ]) {
+      mkdirSync(join(skillsDir, folder), { recursive: true });
+      writeFileSync(join(skillsDir, folder, 'SKILL.md'), `---\nname: ${name}\ndescription: ${description}\n---\nBody\n`);
+    }
+    const app = await createSkillApp(skillsDir, userDir);
+
+    const all = await app.inject({ method: 'GET', url: '/v1/skill-docs' });
+    expect(JSON.parse(all.body).data.map((doc: { name: string }) => doc.name)).toEqual(['alpha', 'beta', 'gamma']);
+    expect(all.headers['x-total-count']).toBeUndefined();
+
+    const paged = await app.inject({ method: 'GET', url: '/v1/skill-docs?pageNum=2&pageSize=2' });
+    expect(JSON.parse(paged.body).data.map((doc: { name: string }) => doc.name)).toEqual(['gamma']);
+    expect(paged.headers['x-total-count']).toBe('3');
+
+    const searched = await app.inject({ method: 'GET', url: '/v1/skill-docs?keyword=EXPORTER&pageNum=1&pageSize=1' });
+    expect(JSON.parse(searched.body).data.map((doc: { name: string }) => doc.name)).toEqual(['alpha']);
+    expect(searched.headers['x-total-count']).toBe('2');
+    await app.close();
+  });
+
+  it('paginatesPersonalSkillsAndSearchesByUser', async () => {
+    const skillsDir = useTmpDir('mao-sdoc-');
+    const userDir = useTmpDir('mao-user-s-');
+    for (const [userId, folder, name, description] of [
+      [7, 'mine', 'mine', 'Mine personal'],
+      [7, 'zeta', 'zeta', 'Zeta personal'],
+      [8, 'team', 'team', 'Team skill'],
+      [9, 'other', 'other', 'Other skill'],
+    ] as const) {
+      mkdirSync(join(userDir, String(userId), folder), { recursive: true });
+      writeFileSync(join(userDir, String(userId), folder, 'SKILL.md'), `---\nname: ${name}\ndescription: ${description}\n---\nBody\n`);
+    }
+    const loader = new SkillLoader(new PathSandbox(skillsDir), skillsDir, 1);
+    const app = Fastify();
+    app.setErrorHandler(handleError);
+    app.addHook('preHandler', (req, _r, done) => { req.userId = 1; done(); });
+    registerSkillRoutes(app, {
+      userSkillService: new UserSkillService(userDir, noSystemSkillNames),
+      skillDocService: new SkillDocService(loader),
+      skillSyncService: {
+        writeSyncZip: vi.fn(async (_a, _s, out) => { out.end(); }),
+      } as unknown as SkillSyncService,
+      sessionService: {
+        getSession: vi.fn(async () => ({ id: 1, userId: 1, agentId: 9 })),
+      } as unknown as SessionService,
+      agentService: {
+        removeSkillNameFromAll: vi.fn(async () => 0),
+      } as never,
+      agentLookup: {
+        findById: vi.fn(async () => ({ id: 9, name: 'A' })),
+      } as unknown as AgentLookup,
+      permissionService: { hasPermission: vi.fn(async () => true) },
+      userLookup: {
+        findByIds: vi.fn(async (ids: number[]) => [
+          { id: 7, username: 'u7', displayName: 'User Seven' },
+          { id: 8, username: 'u8', displayName: 'User Eight' },
+          { id: 9, username: 'u9', displayName: 'User Nine' },
+        ].filter((user) => ids.includes(user.id))),
+        listOptions: vi.fn(async () => []),
+      },
+    });
+
+    const userOnly = await app.inject({ method: 'GET', url: '/v1/admin/user-skills?userId=7' });
+    expect(JSON.parse(userOnly.body).data.map((skill: { name: string }) => skill.name)).toEqual(['mine', 'zeta']);
+    expect(userOnly.headers['x-total-count']).toBeUndefined();
+
+    const paged = await app.inject({ method: 'GET', url: '/v1/admin/user-skills?pageNum=2&pageSize=1' });
+    expect(JSON.parse(paged.body).data.map((skill: { name: string }) => skill.name)).toEqual(['zeta']);
+    expect(paged.headers['x-total-count']).toBe('4');
+
+    const searched = await app.inject({ method: 'GET', url: '/v1/admin/user-skills?keyword=Eight' });
+    expect(JSON.parse(searched.body).data).toEqual([
+      expect.objectContaining({ name: 'team', userId: 8, displayName: 'User Eight' }),
+    ]);
+    expect(searched.headers['x-total-count']).toBe('1');
+
+    const filtered = await app.inject({ method: 'GET', url: '/v1/admin/user-skills?userId=8&pageNum=1&pageSize=20' });
+    expect(JSON.parse(filtered.body).data.map((skill: { name: string }) => skill.name)).toEqual(['team']);
+    expect(filtered.headers['x-total-count']).toBe('1');
+    await app.close();
+  });
+
   it('listsAdminUserSkillsWithUsernamesAndChecksPermission', async () => {
     const skillsDir = useTmpDir('mao-sdoc-');
     const userDir = useTmpDir('mao-user-s-');

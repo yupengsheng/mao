@@ -20,6 +20,7 @@
             clearable
             :placeholder="activeTab === 'personal' ? '名称 / 描述 / 用户' : '名称 / 描述'"
             style="width: 220px"
+            @input="onKeywordInput"
           />
         </el-form-item>
         <el-form-item v-if="activeTab === 'personal'" label="用户">
@@ -29,6 +30,7 @@
             filterable
             placeholder="全部用户"
             style="width: 220px"
+            @change="onFilterUserChange"
           >
             <el-option
               v-for="user in personalUserOptions"
@@ -141,7 +143,7 @@
       <!-- System skill table -->
       <el-table
         v-if="activeTab === 'system' && !isMobile"
-        :data="pagedSkillDocs"
+        :data="skillDocs"
         v-loading="loading"
         stripe
         style="margin-top: 16px"
@@ -183,7 +185,7 @@
       <!-- Personal skill table -->
       <el-table
         v-else-if="activeTab === 'personal' && !isMobile"
-        :data="pagedPersonalSkills"
+        :data="personalSkills"
         v-loading="loading"
         stripe
         style="margin-top: 16px"
@@ -281,6 +283,7 @@
         v-model:page-size="pageSize"
         :page-sizes="[10, 20, 50, 100]"
         :total="total"
+        @current-change="handlePageChange"
         @size-change="handleSizeChange"
       />
     </el-card>
@@ -306,10 +309,10 @@
 </template>
 
 <script setup lang="ts">
-import { computed, h, ref, onActivated, onMounted, watch } from 'vue'
+import { computed, h, ref, onActivated, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { UploadFilled } from '@element-plus/icons-vue'
-import { api } from '../../api'
+import { api, apiGetWithHeaders } from '../../api'
 import { useAuthStore } from '../../stores/auth'
 import { useBreakpoint } from '../../composables/useBreakpoint'
 import ResponsiveDialog from '../../components/ResponsiveDialog.vue'
@@ -328,6 +331,7 @@ const keyword = ref('')
 const filterUserId = ref<number | null>(null)
 const currentPage = ref(1)
 const pageSize = ref(10)
+const total = ref(0)
 const detailVisible = ref(false)
 const currentDoc = ref<any>(null)
 const isDragover = ref(false)
@@ -336,31 +340,88 @@ const uploadBusy = ref(false)
 const userOptions = ref<Array<{ id: number; username?: string | null; displayName?: string | null }>>([])
 const assignUserIds = ref<number[]>([])
 
+let loadSeq = 0
+let keywordDebounceTimer: ReturnType<typeof setTimeout> | null = null
+let agentsLoaded = false
+let agentsPromise: Promise<void> | null = null
+
+function readTotalCount(headers: unknown): number {
+  if (!headers || typeof headers !== 'object') return NaN
+  const bag = headers as { get?: (name: string) => unknown } & Record<string, unknown>
+  const raw = typeof bag.get === 'function' ? bag.get('x-total-count') : bag['x-total-count']
+  const value = Array.isArray(raw) ? raw[0] : raw
+  return Number(value)
+}
+
+function ensureAgents(): Promise<void> {
+  if (agentsLoaded) return Promise.resolve()
+  if (agentsPromise) return agentsPromise
+  agentsPromise = api.get('/agents', { params: { includeDisabled: true } })
+    .then(({ data }) => {
+      agents.value = data || []
+      agentsLoaded = true
+    })
+    .finally(() => {
+      agentsPromise = null
+    })
+  return agentsPromise
+}
+
 async function fetchSkillDocs() {
+  const seq = ++loadSeq
   loading.value = true
   try {
-    const [{ data }, agentRes] = await Promise.all([
-      api.get('/skill-docs'),
-      api.get('/agents', { params: { includeDisabled: true } })
+    const [{ result, headers }] = await Promise.all([
+      apiGetWithHeaders<any[]>('/skill-docs', {
+        params: {
+          pageNum: currentPage.value,
+          pageSize: pageSize.value,
+          keyword: keyword.value.trim() || undefined,
+        },
+      }),
+      ensureAgents().catch(() => undefined),
     ])
-    skillDocs.value = data || []
-    agents.value = agentRes.data || []
+    if (seq !== loadSeq) return
+    const headerTotal = readTotalCount(headers)
+    total.value = Number.isFinite(headerTotal) ? headerTotal : (result.data || []).length
+    skillDocs.value = result.data || []
+    const maxPage = Math.max(1, Math.ceil(total.value / pageSize.value))
+    if (currentPage.value > maxPage) {
+      currentPage.value = maxPage
+      void fetchSkillDocs()
+    }
   } catch { /* 拦截器已提示失败，吞掉避免误报页面异常 */ } finally {
-    loading.value = false
+    if (seq === loadSeq) loading.value = false
   }
 }
 
 async function fetchPersonalSkills() {
+  const seq = ++loadSeq
   loading.value = true
   try {
-    const skillsReq = api.get('/admin/user-skills')
-    const usersReq = api.get('/admin/user-skills/options/users').catch(() => null)
-    const skillsRes = await skillsReq
-    personalSkills.value = skillsRes.data || []
-    const usersRes = await usersReq
+    const [{ result, headers }, usersRes] = await Promise.all([
+      apiGetWithHeaders<any[]>('/admin/user-skills', {
+        params: {
+          pageNum: currentPage.value,
+          pageSize: pageSize.value,
+          keyword: keyword.value.trim() || undefined,
+          userId: filterUserId.value ?? undefined,
+        },
+      }),
+      api.get('/admin/user-skills/options/users').catch(() => null),
+    ])
+    if (seq !== loadSeq) return
     if (usersRes) userOptions.value = usersRes.data || []
+    const headerTotal = readTotalCount(headers)
+    total.value = Number.isFinite(headerTotal) ? headerTotal : (result.data || []).length
+    personalSkills.value = result.data || []
+    const maxPage = Math.max(1, Math.ceil(total.value / pageSize.value))
+    if (currentPage.value > maxPage) {
+      currentPage.value = maxPage
+      void fetchPersonalSkills()
+    }
   } catch { /* 拦截器已提示失败 */ } finally {
-    loading.value = false
+    if (seq === loadSeq) loading.value = false
   }
 }
 
@@ -373,69 +434,44 @@ async function fetchActiveTab() {
 }
 
 function handleTabChange(tab: string | number) {
+  if (keywordDebounceTimer) {
+    clearTimeout(keywordDebounceTimer)
+    keywordDebounceTimer = null
+  }
+  currentPage.value = 1
+  total.value = 0
   void (tab === 'personal' ? fetchPersonalSkills() : fetchSkillDocs())
 }
 
-const filteredSkillDocs = computed(() => {
-  const kw = keyword.value.trim().toLowerCase()
-  if (!kw) return skillDocs.value
-  return skillDocs.value.filter(doc =>
-    `${doc.name || ''} ${doc.description || ''}`.toLowerCase().includes(kw))
-})
-
 const personalUserOptions = computed(() => {
-  const seen = new Map<number, { id: number; username?: string | null; displayName?: string | null }>()
-  for (const row of personalSkills.value) {
-    const userId = Number(row.userId)
-    if (!Number.isInteger(userId) || userId <= 0 || seen.has(userId)) continue
-    const known = userOptions.value.find((user) => user.id === userId)
-    seen.set(userId, {
-      id: userId,
-      username: row.username ?? known?.username,
-      displayName: row.displayName ?? known?.displayName,
-    })
-  }
-  return [...seen.values()].sort((a, b) => userOptionLabel(a).localeCompare(userOptionLabel(b), 'zh'))
-})
-
-const filteredPersonalSkills = computed(() => {
-  const kw = keyword.value.trim().toLowerCase()
-  const userId = filterUserId.value
-  return personalSkills.value.filter((row) => {
-    if (userId != null && Number(row.userId) !== userId) return false
-    if (!kw) return true
-    return `${row.name || ''} ${row.description || ''} ${row.username || ''} ${row.displayName || ''} ${row.userId ?? ''}`
-      .toLowerCase().includes(kw)
-  })
-})
-
-const filteredRows = computed(() =>
-  activeTab.value === 'personal' ? filteredPersonalSkills.value : filteredSkillDocs.value)
-
-const total = computed(() => filteredRows.value.length)
-
-const pagedSkillDocs = computed(() => {
-  const start = (currentPage.value - 1) * pageSize.value
-  return filteredSkillDocs.value.slice(start, start + pageSize.value)
-})
-
-const pagedPersonalSkills = computed(() => {
-  const start = (currentPage.value - 1) * pageSize.value
-  return filteredPersonalSkills.value.slice(start, start + pageSize.value)
+  return [...userOptions.value].sort((a, b) => userOptionLabel(a).localeCompare(userOptionLabel(b), 'zh'))
 })
 
 const mobileRows = computed(() => {
-  const start = (currentPage.value - 1) * pageSize.value
-  return filteredRows.value.slice(start, start + pageSize.value)
+  return activeTab.value === 'personal' ? personalSkills.value : skillDocs.value
 })
 
-// 关键词或 tab 变化后回第一页，避免停在已无数据的空页
-watch([keyword, filterUserId, activeTab], () => {
+function onKeywordInput() {
   currentPage.value = 1
-})
+  if (keywordDebounceTimer) clearTimeout(keywordDebounceTimer)
+  keywordDebounceTimer = setTimeout(() => {
+    keywordDebounceTimer = null
+    void fetchActiveTab()
+  }, 300)
+}
+
+function onFilterUserChange() {
+  currentPage.value = 1
+  void fetchPersonalSkills()
+}
+
+function handlePageChange() {
+  void fetchActiveTab()
+}
 
 function handleSizeChange() {
   currentPage.value = 1
+  void fetchActiveTab()
 }
 
 function mobileKey(row: any) {
@@ -776,9 +812,6 @@ async function handleDelete(row: any) {
     }
     ElMessage.success(`Skill「${row.name}」已删除`)
     await fetchActiveTab()
-    // 当前页删空时回退页码，避免停留在空白页
-    const maxPage = Math.max(1, Math.ceil(total.value / pageSize.value))
-    if (currentPage.value > maxPage) currentPage.value = maxPage
   } catch {
     // Error handled by interceptor
   }
@@ -792,7 +825,12 @@ onActivated(() => {
     firstActivation = false
     return
   }
+  agentsLoaded = false
   void fetchActiveTab()
+})
+
+onUnmounted(() => {
+  if (keywordDebounceTimer) clearTimeout(keywordDebounceTimer)
 })
 </script>
 
