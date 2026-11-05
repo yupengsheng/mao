@@ -6,8 +6,9 @@ import { MysqlFeishuMessageRepository } from './message.repository.js';
 // 只替换驱动层，保留真实 Db 的 snake_case → camelCase 转换契约。
 function setup(rows: Record<string, unknown>[]) {
   const query = vi.fn(async () => [rows, []]);
-  const db = new Db({ query } as unknown as mysql.Pool);
-  return { repo: new MysqlFeishuMessageRepository(db), query };
+  const execute = vi.fn(async () => [{ affectedRows: 3 }, []]);
+  const db = new Db({ query, execute } as unknown as mysql.Pool);
+  return { repo: new MysqlFeishuMessageRepository(db), query, execute };
 }
 
 describe('MysqlFeishuMessageRepository p2p mapping', () => {
@@ -76,5 +77,26 @@ describe('MysqlFeishuMessageRepository pending enrichment rows', () => {
     const { repo, query } = setup([]);
     await repo.listPendingGroupMessages('1', 'oc_group', null, 0);
     expect(query).toHaveBeenCalledWith(expect.stringContaining('LIMIT 1'), ['1', 'oc_group', 1]);
+  });
+});
+
+describe('MysqlFeishuMessageRepository inbound event cleanup', () => {
+  it('deletes expired rows in id order with a clamped limit', async () => {
+    const { repo, execute } = setup([]);
+
+    await expect(repo.deleteInboundBatch('2026-10-05 00:00:00', 999999)).resolves.toBe(3);
+
+    expect(execute).toHaveBeenCalledWith(
+      'DELETE FROM feishu_inbound_event WHERE created_at < ? ORDER BY id LIMIT 5000',
+      ['2026-10-05 00:00:00'],
+    );
+  });
+
+  it('keeps at least one row per batch for a non-positive limit', async () => {
+    const { repo, execute } = setup([]);
+
+    await repo.deleteInboundBatch('2026-10-05 00:00:00', 0);
+
+    expect(execute).toHaveBeenCalledWith(expect.stringContaining('LIMIT 1'), ['2026-10-05 00:00:00']);
   });
 });

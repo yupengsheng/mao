@@ -52,6 +52,8 @@ export interface FeishuMessageRepository {
   claimInboundMessage(appId: string, messageId: string, eventId: string | null, chatId: string | null): Promise<boolean>;
   releaseInboundMessage(appId: string, messageId: string): Promise<void>;
   completeInboundMessage(appId: string, messageId: string): Promise<void>;
+  /** 按创建时间分批删除过期入站幂等记录，走 idx_feishu_inbound_created。 */
+  deleteInboundBatch(cutoff: string, limit: number): Promise<number>;
   appendGroupMessage(message: FeishuGroupMessage): Promise<number>;
   listGroupMessages(appId: string, chatId: string, limit: number, maxMinutes?: number, threadId?: string | null): Promise<FeishuGroupMessage[]>;
   /** 追溯注入窗口之前被丢弃的未注入普通消息（id > watermark 且 id < beforeId，不限时间），供溢出摘要。 */
@@ -163,6 +165,15 @@ export class MysqlFeishuMessageRepository implements FeishuMessageRepository {
       `UPDATE feishu_inbound_event SET status = 'DONE' WHERE app_id = ? AND message_id = ?`,
       [appId, messageId],
     );
+  }
+
+  async deleteInboundBatch(cutoff: string, limit: number): Promise<number> {
+    const safeLimit = Math.max(1, Math.min(5000, Math.floor(limit)));
+    const result = await this.db.execute(
+      `DELETE FROM feishu_inbound_event WHERE created_at < ? ORDER BY id LIMIT ${safeLimit}`,
+      [cutoff],
+    );
+    return result.affectedRows;
   }
 
   async appendGroupMessage(message: FeishuGroupMessage): Promise<number> {

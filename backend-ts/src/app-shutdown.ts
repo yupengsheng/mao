@@ -31,6 +31,7 @@ import type { EcpRenewScheduler } from './auth/ecp-renew.scheduler.js';
 import type { TaskRecordRepairService } from './task/task-record-repair.service.js';
 import type { TaskExecutionRetentionService } from './task/task-execution-retention.service.js';
 import type { AuditLogCleanup } from './audit/audit-log-cleanup.js';
+import type { InboundEventCleanup } from './channel/inbound-event-cleanup.js';
 
 /** 停机时需要优雅关闭的所有组件。 */
 export interface ShutdownDeps {
@@ -69,6 +70,7 @@ export interface ShutdownDeps {
   taskRecordRepair: TaskRecordRepairService;
   taskExecutionRetention: TaskExecutionRetentionService;
   auditLogCleanup: AuditLogCleanup;
+  inboundEventCleanup: InboundEventCleanup;
 }
 
 /**
@@ -83,6 +85,7 @@ export function createShutdownHandler(deps: ShutdownDeps): () => Promise<void> {
     shellManager, terminalManager, ptyChannelHubs, ptyHubGeneration,
     containerRegistry, channelServer, runtimeCleanup, activityHeartbeat, wsRegistry,
     agentLoop, wsHandler, sessionService, taskRecordRepair, taskExecutionRetention, auditLogCleanup,
+    inboundEventCleanup,
   } = deps;
 
   const isDrainingForDeploy = (): boolean => isDrainingInstance(cfg.app.harness.runtimeDir, cfg.server.port);
@@ -123,6 +126,7 @@ export function createShutdownHandler(deps: ShutdownDeps): () => Promise<void> {
       taskRecordRepair.stop();
       taskExecutionRetention.stop();
       auditLogCleanup.stop();
+      inboundEventCleanup.stop();
       weixinMonitor.shutdown();
       feishuMonitor.shutdown();
       dingtalk.shutdown();
