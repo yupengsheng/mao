@@ -41,6 +41,20 @@ export class TaskRepository {
     await this.db.execute('UPDATE agent_task SET updated_at = CURRENT_TIMESTAMP WHERE id = ?', [id]);
   }
 
+  /**
+   * 回收会话任务域：任务主档逻辑删除，执行与入口记录物理删除。
+   * 三张表都以 session_id 归属，直接按会话清理可同时覆盖历史孤儿；
+   * 调用方必须放在事务内，避免只删掉部分子记录。
+   */
+  async deleteBySessionId(sessionId: number): Promise<void> {
+    await this.db.execute('DELETE FROM agent_task_trigger WHERE session_id = ?', [sessionId]);
+    await this.db.execute('DELETE FROM agent_task_execution WHERE session_id = ?', [sessionId]);
+    await this.db.execute(
+      'UPDATE agent_task SET deleted = 1, updated_at = CURRENT_TIMESTAMP WHERE session_id = ? AND deleted = 0',
+      [sessionId],
+    );
+  }
+
   async count(filter: TaskPageFilter): Promise<number> {
     const { where, params } = this.where(filter);
     const row = await this.db.queryOne<{ total: number }>(`SELECT COUNT(*) AS total FROM agent_task WHERE ${where}`, params);

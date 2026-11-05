@@ -324,6 +324,31 @@ describe('SessionService archive', () => {
     );
   });
 
+  it('promotesSideTaskAndDeletesItsTaskRecords', async () => {
+    // 边路任务同样会登记执行；提升后旧边路会话不再可达，任务主档与子记录须在同一事务内回收。
+    const { service, sessionRepo, txDb } = makeService();
+    vi.mocked(sessionRepo.findById).mockResolvedValue({
+      id: 20,
+      userId: 7,
+      title: '边路任务',
+      sessionType: 'SIDE_TASK',
+      phase: 'COMPLETED',
+      executionMode: 'CLOUD',
+      workspace: '/tmp/w',
+    });
+    vi.mocked(sessionRepo.list).mockResolvedValue([]);
+
+    await service.promoteSideTaskToMainSession(20, 7);
+
+    for (const sql of [
+      'DELETE FROM agent_task_trigger WHERE session_id = ?',
+      'DELETE FROM agent_task_execution WHERE session_id = ?',
+      'UPDATE agent_task SET deleted = 1',
+    ]) {
+      expect(txDb.execute).toHaveBeenCalledWith(expect.stringContaining(sql), [20]);
+    }
+  });
+
   it('rejectsDeleteWhenSessionRunning', async () => {
     const { service, sessionRepo } = makeService();
     vi.mocked(sessionRepo.findById).mockResolvedValue({ id: 11, userId: 7, phase: 'RUNNING' });

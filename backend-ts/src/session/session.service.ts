@@ -40,6 +40,7 @@ import type { SessionCompactionService } from './session-compaction.service.js';
 import type { SessionCompactionEventService } from './session-compaction-event.service.js';
 import { FileChangeRepository, isSessionSource, MessageRepository, SessionRepository, type SessionListFilter, type SessionSource } from './session.repository.js';
 import { SessionTodoRepository } from './activity.repository.js';
+import { TaskRepository } from '../task/task.repository.js';
 import type {
   AgentLookup,
   AgentRef,
@@ -781,6 +782,8 @@ export class SessionService {
       await tx.execute('DELETE FROM weixin_session_peer WHERE session_id = ?', [sideSessionId]);
       await tx.execute('DELETE FROM feishu_thread_session WHERE session_id = ?', [sideSessionId]);
       await tx.execute('DELETE FROM feishu_session_channel WHERE session_id = ?', [sideSessionId]);
+      // 边路会话提升后旧会话逻辑删除，任务域不再可达；与主会话删除采用同一回收语义。
+      await new TaskRepository(tx).deleteBySessionId(sideSessionId);
       await txMessageRepo.logicalDeleteBySession(sideSessionId);
       // 提升是「插入新主会话 + 逻辑删除旧边路会话」：直接子会话的 parent 仍指向旧 id，
       // 不重挂则整棵边路子树在新旧两棵树上都不可达（BFS / 树信号 / 搜索全部失联）。

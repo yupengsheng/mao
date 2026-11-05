@@ -34,7 +34,7 @@ QUEUED 为事务内初始化状态。WORKING 表示执行中，BLOCKED 表示等
 
 - `GET /api/v1/tasks?stage=WORKING&page=1&size=20`，返回 Result.data：`{ items, total, page, size }`。参数与 CLI 相同，Agent/Session 参数名为 agentId、sessionId。按更新时间、ID 倒序。
 - `GET /api/v1/tasks/:id`，返回 Result.data：`{ task, latestExecution, executions, triggers }`。执行和入口各最多最近 50 条。
-- 不存在/他人任务按既有 Result 业务错误返回 code=404。查询不接受用 userId 切换所有者。关联 Session 删除或转交后旧任务不可见。
+- 不存在/他人任务按既有 Result 业务错误返回 code=404。查询不接受用 userId 切换所有者。关联 Session 删除或转交后旧任务不可见。删除会话时会回收该会话的任务主档、执行与入口记录；边路任务提升为普通会话时，在同一事务内回收旧边路会话的任务记录。清理失败只记录日志，不阻断会话删除；任务历史不会迁移到提升后的新会话。
 
 Task.source 是首次来源；triggers 中的 source 是对应执行实际来源。当前 sourceEventId 等于 executionId，仅对同一次执行登记去重，不能据此识别上游重新投递的同一消息。
 
@@ -42,8 +42,8 @@ Task.source 是首次来源；triggers 中的 source 是对应执行实际来源
 
 没有任务创建、取消、重试、改派命令；执行仍走原有会话功能。当前无跨渠道归并。后台修复 Job 每分钟扫描终态超过 2 分钟的会话：若任务仍有未完成尝试或 Task 指针不一致，会把最新未完成尝试收敛为会话终态、更早尝试标记为 FAILED，并写入结束时间与固定原因「执行已结束但任务记录未收口，已自动修复」，不会新增尝试；没有执行记录时会将 Task 阶段收敛到会话终态并清空无效执行 ID。修复幂等，完全缺失的任务记录无法重建。崩溃恢复登记新尝试时仍会把该任务处于 WORKING / BLOCKED 的旧尝试标记为 FAILED 并写入恢复专用原因。任务持久化失败会记录日志并保留原有执行；收到重复终态时会再尝试结算。仅在终态补建的尝试 startedAt 为空，编号代表登记顺序。
 
-执行历史清理 Job 每小时运行一次：只删除超过 90 天的 COMPLETED / FAILED / CANCELLED 尝试，每个 Task 至少保留最近 200 次，并同步删除 sourceEventId 等于该 executionId 的 Trigger；WORKING / BLOCKED 永不清理。单批 500 条、单轮最多 20 批，清理幂等，多实例重复执行安全，异常只记录日志。详情接口仍只返回最近 50 条执行和入口。
+执行历史清理 Job 每小时运行一次：只删除超过 90 天的 COMPLETED / FAILED / CANCELLED 尝试，每个 Task 至少保留最近 200 次，并同步删除 sourceEventId 等于该 executionId 的 Trigger；WORKING / BLOCKED 永不清理。单批 500 条、单轮最多 20 批，清理幂等，多实例重复执行安全，异常只记录日志。详情接口仍只返回最近 50 条执行和入口。删除会话或边路会话提升时另按 session_id 立即回收任务域记录。
 
 飞书、钉钉在无内存循环但会话仍执行中时补写取消，优先使用在途 ID，再查询本人 Task 最新未结算的执行 ID，以取消原尝试。只有没有可用记录或查询失败时才使用新的随机 ID，已结束会话不生成取消尝试。崩溃恢复登记新一次执行时，会在同一事务内把该任务尚处于 WORKING / BLOCKED 的旧尝试标为 FAILED，结束时间取恢复登记时间，原因固定为「执行因进程中断未完成，已自动恢复」；相同恢复 executionId 幂等。恢复来源优先沿用最高编号旧尝试的 Trigger，取不到时按 Session 推断。多实例并发仍依赖部署排空与静默阈值，不是数据库租约。
 
-部署需应用 V179 迁移；正常使用现有 `FLYWAY_ENABLED` 迁移流程即可。
+部署需应用 V179 / V195 迁移；V195 只新增 `agent_task_trigger(session_id)` 索引，正常使用现有 `FLYWAY_ENABLED` 迁移流程即可。

@@ -32,6 +32,7 @@ function fixture() {
     triggerByExecutionId: async (id: string) => triggers.find((item) => item.sourceEventId === id) ?? null,
     triggers: async () => triggers,
     executions: async () => executions,
+    deleteBySessionId: vi.fn(async () => undefined),
   };
   const service = new TaskService(repo as unknown as TaskRepository);
   return { service, session, repo, executions, triggers, task: () => task };
@@ -45,6 +46,23 @@ describe('Task execution lifecycle', () => {
     expect(result?.task).not.toHaveProperty('userId');
     expect(result?.task).toMatchObject({ id: 1, sessionId: 11, lastExecutionId: 'public', createdAt: null, updatedAt: null });
     expect(result?.latestExecution).toMatchObject({ executionId: 'public', finishedAt: null, createdAt: null });
+  });
+
+  it('deletes the session task aggregate in one transaction', async () => {
+    const setup = fixture();
+
+    await setup.service.deleteBySessionId(11);
+
+    expect(setup.repo.deleteBySessionId).toHaveBeenCalledWith(11);
+  });
+
+  it('ignores invalid session ids when deleting task records', async () => {
+    const setup = fixture();
+
+    await setup.service.deleteBySessionId(0);
+    await setup.service.deleteBySessionId(Number.NaN);
+
+    expect(setup.repo.deleteBySessionId).not.toHaveBeenCalled();
   });
 
   it('stamps the admission policy version for programmatic runs and keeps it across later manual runs', async () => {

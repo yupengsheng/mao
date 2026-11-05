@@ -552,6 +552,12 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
       } catch (e) {
         console.warn(`Failed to clear webhook trigger bindings for session ${sessionId}: ${(e as Error).message}`);
       }
+      // 任务主档随会话逻辑删除，执行 / 入口记录物理回收；失败不阻断其他会话资源清理。
+      try {
+        await taskService.deleteBySessionId(sessionId);
+      } catch (e) {
+        console.warn(`Failed to delete agent task records for session ${sessionId}: ${(e as Error).message}`);
+      }
     },
     (sessionId) => approvalRuleRepo.deleteBySessionId(sessionId),
     experienceMountService,

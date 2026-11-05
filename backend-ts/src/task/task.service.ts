@@ -106,6 +106,12 @@ export class TaskService {
     return execution.executionId;
   }
 
+  /** 会话删除 / 边路提升后的任务域回收；主档保留逻辑删除标记，子记录物理清理。 */
+  async deleteBySessionId(sessionId: number): Promise<void> {
+    if (!Number.isSafeInteger(sessionId) || sessionId <= 0) return;
+    await this.repo.transaction((repo) => repo.deleteBySessionId(sessionId));
+  }
+
   async settleExecution(session: Session, executionId: string, phase: TaskStage, failureReason?: string | null, source?: TaskSource): Promise<void> {
     this.validate(session, executionId);
     if (!TERMINAL.has(phase)) throw new BusinessException(ErrorCode.PARAM_INVALID, '只接受执行终态');

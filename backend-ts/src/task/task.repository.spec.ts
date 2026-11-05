@@ -109,4 +109,29 @@ describe('TaskRepository', () => {
 
     expect(tx.execute).not.toHaveBeenCalled();
   });
+
+  it('purges the session task aggregate and logically deletes its task', async () => {
+    const db = {
+      execute: vi.fn(async () => ({ affectedRows: 1 })),
+    };
+    const repo = new TaskRepository(db as unknown as Db);
+
+    await repo.deleteBySessionId(42);
+
+    expect(db.execute).toHaveBeenNthCalledWith(
+      1,
+      'DELETE FROM agent_task_trigger WHERE session_id = ?',
+      [42],
+    );
+    expect(db.execute).toHaveBeenNthCalledWith(
+      2,
+      'DELETE FROM agent_task_execution WHERE session_id = ?',
+      [42],
+    );
+    expect(db.execute).toHaveBeenNthCalledWith(
+      3,
+      'UPDATE agent_task SET deleted = 1, updated_at = CURRENT_TIMESTAMP WHERE session_id = ? AND deleted = 0',
+      [42],
+    );
+  });
 });
