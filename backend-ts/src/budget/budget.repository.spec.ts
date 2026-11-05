@@ -48,3 +48,28 @@ describe('BudgetRepository.listApplicableToUser', () => {
     expect(await repo.listApplicableToUser(7)).toEqual([row]);
   });
 });
+
+describe('BudgetRepository.listPage', () => {
+  it('SQL：分页查询复用 scope/action 过滤，返回总数', async () => {
+    const calls: Array<{ sql: string; params: unknown[] }> = [];
+    const db = {
+      queryOne: vi.fn(async () => ({ c: 12 })),
+      query: vi.fn(async (sql: string, params: unknown[]) => {
+        calls.push({ sql, params });
+        return [{ id: 4, scope: 'USER' }];
+      }),
+      execute: vi.fn(async () => ({ affectedRows: 0, insertId: 0 })),
+    };
+    const repo = new BudgetRepository(db as never);
+
+    await expect(repo.listPage({ scope: 'USER', action: 'BLOCK' }, 2, 10)).resolves.toEqual({
+      records: [{ id: 4, scope: 'USER' }],
+      total: 12,
+    });
+    expect(String(db.queryOne.mock.calls[0]?.[0])).toContain('SELECT COUNT(*) AS c FROM usage_budget');
+    expect(String(db.queryOne.mock.calls[0]?.[0])).toContain('scope = ? AND action = ?');
+    expect(db.queryOne).toHaveBeenCalledWith(expect.any(String), ['USER', 'BLOCK']);
+    expect(calls[0].sql).toContain('ORDER BY id ASC LIMIT ? OFFSET ?');
+    expect(calls[0].params).toEqual(['USER', 'BLOCK', 10, 10]);
+  });
+});

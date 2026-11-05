@@ -47,7 +47,16 @@ BLOCK 的准入点有 5 个：WebSocket 手动发送、消息编辑重发、排�
 
 ### 用途
 
-列出全部预算行，含当期已用与上限。需 `budget:read`。
+列出预算行，含当期已用与上限。需 `budget:read`。
+
+支持按作用域 / 动作筛选与服务端分页。不传任何参数时仍返回全量数组，兼容旧脚本；传筛选或分页参数时返回当前页数组，匹配总数在响应头 `x-total-count`。
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| `--scope` | 否 | `GLOBAL` / `USER` / `AGENT` |
+| `--action` | 否 | `WARN` / `BLOCK` |
+| `--page-num` | 否 | 页码，从 1 开始，默认 1 |
+| `--page-size` | 否 | 每页条数，默认 20，最大 200 |
 
 返回字段：`id`、`scope`（GLOBAL / USER / AGENT）、`scopeId`、`period`（固定 `MONTHLY`）、`limitType`（COST / TOKENS）、`limitValue`（微单位整数：COST = 成本×1e6，TOKENS = token 原值）、`action`（WARN / BLOCK）、`enabled`、`targetName`（目标名，已删除的目标为 null）、`periodSpend`（当期累计；查询失败时为 null，`COST` 为成本单位、`TOKENS` 为 token 原值）。
 
@@ -57,6 +66,9 @@ BLOCK 的准入点有 5 个：WebSocket 手动发送、消息编辑重发、排�
 
 ```bash
 mao budget list --json
+
+# 只看用户级拦截预算，第 1 页，每页 20 条
+mao budget list --scope USER --action BLOCK --page-num 1 --page-size 20 --json
 ```
 
 ---

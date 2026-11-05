@@ -36,6 +36,31 @@ export class BudgetRepository {
   constructor(private readonly db: Db) {}
 
   async list(filter: BudgetListFilter): Promise<UsageBudgetRow[]> {
+    const { whereSql, params } = this.buildFilter(filter);
+    return this.db.query<UsageBudgetRow>(
+      `SELECT * FROM usage_budget WHERE ${whereSql} ORDER BY id ASC`,
+      params,
+    );
+  }
+
+  async listPage(
+    filter: BudgetListFilter,
+    pageNum: number,
+    pageSize: number,
+  ): Promise<{ records: UsageBudgetRow[]; total: number }> {
+    const { whereSql, params } = this.buildFilter(filter);
+    const totalRow = await this.db.queryOne<{ c: number }>(
+      `SELECT COUNT(*) AS c FROM usage_budget WHERE ${whereSql}`,
+      params,
+    );
+    const records = await this.db.query<UsageBudgetRow>(
+      `SELECT * FROM usage_budget WHERE ${whereSql} ORDER BY id ASC LIMIT ? OFFSET ?`,
+      [...params, pageSize, (pageNum - 1) * pageSize],
+    );
+    return { records, total: Number(totalRow?.c ?? 0) };
+  }
+
+  private buildFilter(filter: BudgetListFilter): { whereSql: string; params: unknown[] } {
     const where: string[] = ['1=1'];
     const params: unknown[] = [];
     if (filter.scope != null && filter.scope.trim() !== '') {
@@ -49,10 +74,7 @@ export class BudgetRepository {
     if (filter.enabledOnly) {
       where.push('enabled = 1');
     }
-    return this.db.query<UsageBudgetRow>(
-      `SELECT * FROM usage_budget WHERE ${where.join(' AND ')} ORDER BY id ASC`,
-      params,
-    );
+    return { whereSql: where.join(' AND '), params };
   }
 
   async findById(id: number): Promise<UsageBudgetRow | null> {

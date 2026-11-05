@@ -189,6 +189,19 @@ export class BudgetService {
 
   async list(filter: { scope?: string | null; action?: string | null } = {}): Promise<BudgetListItem[]> {
     const rows = await this.repo.list(filter);
+    return this.decorate(rows);
+  }
+
+  async listPage(
+    filter: { scope?: string | null; action?: string | null },
+    pageNum: number,
+    pageSize: number,
+  ): Promise<{ records: BudgetListItem[]; total: number }> {
+    const page = await this.repo.listPage(filter, pageNum, pageSize);
+    return { records: await this.decorate(page.records), total: page.total };
+  }
+
+  private async decorate(rows: UsageBudgetRow[]): Promise<BudgetListItem[]> {
     const since = monthStartLocal();
     const items: BudgetListItem[] = [];
     for (const row of rows) {

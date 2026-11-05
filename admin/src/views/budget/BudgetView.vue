@@ -14,9 +14,28 @@
         </div>
       </template>
 
+      <el-form :inline="true" class="filter-form">
+        <el-form-item label="作用域">
+          <el-select v-model="scopeFilter" clearable placeholder="全部" style="width: 120px" @change="handleFilterChange">
+            <el-option label="全局" value="GLOBAL" />
+            <el-option label="用户" value="USER" />
+            <el-option label="Agent" value="AGENT" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="动作">
+          <el-select v-model="actionFilter" clearable placeholder="全部" style="width: 120px" @change="handleFilterChange">
+            <el-option label="WARN" value="WARN" />
+            <el-option label="BLOCK" value="BLOCK" />
+          </el-select>
+        </el-form-item>
+      </el-form>
+
       <el-table :data="rows" v-loading="loading" stripe>
         <template #empty>
-          <el-empty description="暂无预算，点击右上角新增" :image-size="60" />
+          <el-empty
+            :description="scopeFilter || actionFilter ? '没有匹配的预算' : '暂无预算，点击右上角新增'"
+            :image-size="60"
+          />
         </template>
         <el-table-column label="作用域" width="110">
           <template #default="{ row }">
@@ -69,6 +88,16 @@
           </template>
         </el-table-column>
       </el-table>
+
+      <ResponsivePagination
+        class="pagination"
+        v-model:current-page="currentPage"
+        v-model:page-size="pageSize"
+        :page-sizes="[10, 20, 50, 100]"
+        :total="total"
+        @current-change="fetchRows"
+        @size-change="handleSizeChange"
+      />
     </el-card>
 
     <ResponsiveDialog v-if="dialogVisible" v-model="dialogVisible" :title="editing ? '编辑预算' : '新增预算'" width="520px">
@@ -125,9 +154,10 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import type { FormInstance, FormRules } from 'element-plus'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
-import { api } from '../../api'
+import { api, apiGetWithHeaders } from '../../api'
 import { useAuthStore } from '../../stores/auth'
 import ResponsiveDialog from '../../components/ResponsiveDialog.vue'
+import ResponsivePagination from '../../components/ResponsivePagination.vue'
 import { formatCost } from '../../utils/llmCallLabels'
 
 interface BudgetRow {
@@ -149,6 +179,11 @@ const canWrite = computed(() => authStore.hasPermission('budget:write'))
 
 const loading = ref(false)
 const rows = ref<BudgetRow[]>([])
+const scopeFilter = ref('')
+const actionFilter = ref('')
+const currentPage = ref(1)
+const pageSize = ref(10)
+const total = ref(0)
 const dialogVisible = ref(false)
 const editing = ref<BudgetRow | null>(null)
 const submitting = ref(false)
@@ -225,14 +260,49 @@ function progressColor(row: BudgetRow): string {
   return '#67c23a'
 }
 
+function readTotalCount(headers: unknown): number {
+  if (!headers || typeof headers !== 'object') return NaN
+  const bag = headers as { get?: (name: string) => unknown } & Record<string, unknown>
+  const raw = typeof bag.get === 'function' ? bag.get('x-total-count') : bag['x-total-count']
+  const value = Array.isArray(raw) ? raw[0] : raw
+  return Number(value)
+}
+
+let fetchRowsSeq = 0
 async function fetchRows() {
+  const seq = ++fetchRowsSeq
   loading.value = true
   try {
-    const { data } = await api.get('/admin/budgets')
-    rows.value = data || []
+    const { result, headers } = await apiGetWithHeaders<BudgetRow[]>('/admin/budgets', {
+      params: {
+        scope: scopeFilter.value || undefined,
+        action: actionFilter.value || undefined,
+        pageNum: currentPage.value,
+        pageSize: pageSize.value,
+      },
+    })
+    if (seq !== fetchRowsSeq) return
+    rows.value = result.data || []
+    const headerTotal = readTotalCount(headers)
+    total.value = Number.isFinite(headerTotal) ? headerTotal : rows.value.length
+    const maxPage = Math.max(1, Math.ceil(total.value / pageSize.value))
+    if (currentPage.value > maxPage) {
+      currentPage.value = maxPage
+      void fetchRows()
+    }
   } catch { /* 拦截器已提示 */ } finally {
-    loading.value = false
+    if (seq === fetchRowsSeq) loading.value = false
   }
+}
+
+function handleFilterChange() {
+  currentPage.value = 1
+  void fetchRows()
+}
+
+function handleSizeChange() {
+  currentPage.value = 1
+  void fetchRows()
 }
 
 function resetForm() {
@@ -297,6 +367,7 @@ async function handleSubmit() {
     } else {
       await api.post('/admin/budgets', buildPayload())
       ElMessage.success('预算已创建')
+      currentPage.value = 1
     }
     dialogVisible.value = false
     await fetchRows()
@@ -370,6 +441,9 @@ onMounted(() => {
   align-items: center;
   gap: 12px;
 }
+
+.filter-form { margin-bottom: 12px; }
+.pagination { margin-top: 20px; justify-content: flex-end; }
 
 .card-hint {
   font-size: 12px;

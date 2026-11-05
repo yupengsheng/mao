@@ -8,6 +8,7 @@ describe('budget routes', () => {
   function build(granted: string[]) {
     const hasPermission = vi.fn(async (_userId: number, code: string) => granted.includes(code));
     const list = vi.fn(async () => [{ id: 1, scope: 'GLOBAL', limitType: 'COST', limitValue: 100_000_000, action: 'BLOCK', enabled: 1 }]);
+    const listPage = vi.fn(async () => ({ records: [{ id: 2, scope: 'USER' }], total: 1 }));
     const myBudgets = vi.fn(async () => ({ items: [] }));
     const create = vi.fn(async (input: Record<string, unknown>) => ({ id: 42, ...input }));
     const update = vi.fn(async (id: number, input: Record<string, unknown>) => ({ id, ...input }));
@@ -16,10 +17,10 @@ describe('budget routes', () => {
     app.setErrorHandler(handleError);
     app.addHook('preHandler', (req, _r, done) => { req.userId = 7; done(); });
     registerBudgetRoutes(app, {
-      budgetService: { list, myBudgets, create, update, remove } as unknown as BudgetService,
+      budgetService: { list, listPage, myBudgets, create, update, remove } as unknown as BudgetService,
       permissionService: { hasPermission },
     });
-    return { app, hasPermission, list, myBudgets, create, update, remove };
+    return { app, hasPermission, list, listPage, myBudgets, create, update, remove };
   }
 
   it('budget:read 缺失 → 403，且不触达 service', async () => {
@@ -37,6 +38,22 @@ describe('budget routes', () => {
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).code).toBe(0);
     expect(h.list).toHaveBeenCalledTimes(1);
+  });
+
+  it('分页参数走 listPage，保留 legacy 全量响应并回传总数', async () => {
+    const h = build(['budget:read']);
+    const paged = await h.app.inject({
+      method: 'GET',
+      url: '/v1/admin/budgets?pageNum=2&pageSize=10&scope=USER&action=BLOCK',
+    });
+    expect(paged.statusCode).toBe(200);
+    expect(paged.headers['x-total-count']).toBe('1');
+    expect(JSON.parse(paged.body).data).toEqual([{ id: 2, scope: 'USER' }]);
+    expect(h.listPage).toHaveBeenCalledWith({ scope: 'USER', action: 'BLOCK' }, 2, 10);
+    expect(h.list).not.toHaveBeenCalled();
+
+    await h.app.inject({ method: 'GET', url: '/v1/admin/budgets?pageNum=0&pageSize=999' });
+    expect(h.listPage).toHaveBeenLastCalledWith({ scope: null, action: null }, 1, 200);
   });
 
   it('写操作（POST/PUT/DELETE）缺 budget:write → 403，零副作用', async () => {

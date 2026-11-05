@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { requireRequestPermission, requireUserId, sendOk } from '../common/http-error.js';
-import { bodyOf, pathId } from '../common/request.js';
+import { bodyOf, pathId, queryOptInt, queryOptStr } from '../common/request.js';
 import type { BudgetService } from './budget.service.js';
 
 export interface BudgetRouteDeps {
@@ -26,7 +26,21 @@ export function registerBudgetRoutes(app: FastifyInstance, deps: BudgetRouteDeps
 
   app.get('/v1/admin/budgets', async (request, reply) => {
     await requireRequestPermission(deps.permissionService, request, 'budget:read');
-    return sendOk(reply, await deps.budgetService.list());
+    const pageNum = queryOptInt(request, 'pageNum');
+    const pageSize = queryOptInt(request, 'pageSize');
+    const scope = queryOptStr(request, 'scope')?.trim() || null;
+    const action = queryOptStr(request, 'action')?.trim() || null;
+    const filter = { scope, action };
+    if (pageNum == null && pageSize == null && scope == null && action == null) {
+      return sendOk(reply, await deps.budgetService.list());
+    }
+    const page = await deps.budgetService.listPage(
+      filter,
+      Math.max(1, pageNum ?? 1),
+      Math.min(200, Math.max(1, pageSize ?? 20)),
+    );
+    reply.header('x-total-count', String(page.total));
+    return sendOk(reply, page.records);
   });
 
   app.post('/v1/admin/budgets', async (request, reply) => {

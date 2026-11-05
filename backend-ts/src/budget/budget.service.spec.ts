@@ -25,6 +25,18 @@ function makeHarness(options: HarnessOptions = {}) {
       if (filter.enabledOnly && r.enabled !== 1) return false;
       return true;
     })),
+    listPage: vi.fn(async (filter: BudgetListFilter, pageNum: number, pageSize: number) => {
+      const matched = rows.filter((r) => {
+        if (filter.scope != null && filter.scope.trim() !== '' && r.scope !== filter.scope) return false;
+        if (filter.action != null && filter.action.trim() !== '' && r.action !== filter.action) return false;
+        if (filter.enabledOnly && r.enabled !== 1) return false;
+        return true;
+      });
+      return {
+        records: matched.slice((pageNum - 1) * pageSize, pageNum * pageSize),
+        total: matched.length,
+      };
+    }),
     findById: vi.fn(async (id: number) => rows.find((r) => r.id === id) ?? null),
     // 按 SQL 语义 mock：enabled=1 且（GLOBAL 或 scope_id=本人的 USER 行）
     listApplicableToUser: vi.fn(async (userId: number) => rows.filter((r) =>
@@ -406,6 +418,20 @@ describe('BudgetService.list', () => {
     const h = makeHarness({ rows: [row({ id: 1 })] });
     await h.service.list({});
     expect(h.spendStore.sumCostSince).toHaveBeenCalledWith('GLOBAL', null, monthStartLocal());
+  });
+
+  it('listPage：仅装饰当前页并返回过滤后的总数', async () => {
+    const h = makeHarness({ rows: [
+      row({ id: 1, scope: 'GLOBAL' }),
+      row({ id: 2, scope: 'USER', scopeId: 7 }),
+      row({ id: 3, scope: 'USER', scopeId: 8 }),
+    ] });
+    const page = await h.service.listPage({ scope: 'USER' }, 2, 1);
+    expect(page.total).toBe(2);
+    expect(page.records).toHaveLength(1);
+    expect(page.records[0]).toMatchObject({ id: 3, targetName: 'user-8' });
+    expect(h.repo.listPage).toHaveBeenCalledWith({ scope: 'USER' }, 2, 1);
+    expect(h.spendStore.sumCostSince).toHaveBeenCalledTimes(1);
   });
 });
 

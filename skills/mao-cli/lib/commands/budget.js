@@ -13,13 +13,14 @@ const { request } = require('../http');
 const { outputResult } = require('../output');
 
 const HELP = `用法:
-  mao budget list
+  mao budget list [--scope GLOBAL|USER|AGENT] [--action WARN|BLOCK] [--page-num <n>] [--page-size <n>]
   mao budget create --scope GLOBAL|USER|AGENT --limit-type COST|TOKENS --limit-value <n> --action WARN|BLOCK [--scope-id <id>] [--enabled 0|1]
   mao budget update --id <id> [--scope GLOBAL|USER|AGENT] [--limit-type COST|TOKENS] [--limit-value <n>] [--action WARN|BLOCK] [--scope-id <id>] [--enabled 0|1]
   mao budget delete --id <id>
 
 说明:
   列表需 budget:read 权限；增改删需 budget:write 权限。
+  列表可按 scope / action 过滤；传 page-num 或 page-size 时返回当前页，未传时保持全量数组。
   scope：
     GLOBAL  整站预算，scope-id 忽略，且全局仅允许一条；
     USER    按用户设预算，scope-id 为该用户 id；
@@ -122,7 +123,17 @@ async function handle(ctx) {
 
   switch (subcommand) {
     case 'list': {
-      const result = await request({ ...common, method: 'GET', path: '/admin/budgets' });
+      const result = await request({
+        ...common,
+        method: 'GET',
+        path: '/admin/budgets',
+        query: {
+          scope: optionalChoice(flags, 'scope', SCOPES),
+          action: optionalChoice(flags, 'action', ACTIONS),
+          pageNum: optionalNumber(flags, 'page-num'),
+          pageSize: optionalNumber(flags, 'page-size'),
+        },
+      });
       outputResult(result, globals);
       return;
     }
