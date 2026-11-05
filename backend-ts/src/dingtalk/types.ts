@@ -24,6 +24,7 @@ export interface DingtalkBotView extends Omit<DingtalkBot, 'clientSecret'> {
 
 export interface DingtalkBotRepository {
   list(): Promise<DingtalkBot[]>;
+  listPage(pageNum: number, pageSize: number, keyword?: string | null): Promise<{ records: DingtalkBot[]; total: number }>;
   findById(id: number): Promise<DingtalkBot | null>;
   findByAppKey(appKey: string): Promise<DingtalkBot | null>;
   create(bot: DingtalkBot): Promise<number>;

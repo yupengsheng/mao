@@ -56,7 +56,7 @@
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/v1/admin/dingtalk-bots` | 列表。不返回 `clientSecret`，只返回 `clientSecretConfigured` |
+| GET | `/v1/admin/dingtalk-bots` | 列表。支持 `pageNum` / `pageSize` / `keyword`（名称、Client ID、Robot Code），分页时总数在 `x-total-count`；不传新参数时返回全量数组。不返回 `clientSecret`，只返回 `clientSecretConfigured` |
 | GET | `/v1/admin/dingtalk-bots/:id` | 单个 |
 | POST | `/v1/admin/dingtalk-bots` | 创建：`appKey`、`name`、`clientId`、`clientSecret`、`robotCode`、`agentId?`、`modelId?`、`progressCardTemplateId?`、`queueCardTemplateId?`、`enabled?` |
 | PUT | `/v1/admin/dingtalk-bots/:id` | 更新。`clientSecret` 空串表示不改 |

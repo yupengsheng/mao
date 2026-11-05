@@ -14,9 +14,23 @@
         </div>
       </template>
 
+      <el-form :inline="true" class="search-form">
+        <el-form-item label="关键词">
+          <el-input
+            v-model="keyword"
+            clearable
+            placeholder="搜索名称 / Client ID / Robot Code"
+            style="width: 280px"
+            @input="onKeywordInput"
+          >
+            <template #prefix><el-icon><Search /></el-icon></template>
+          </el-input>
+        </el-form-item>
+      </el-form>
+
       <el-table v-if="!isMobile" :data="bots" v-loading="loading" stripe>
         <template #empty>
-          <el-empty description="暂无钉钉机器人" :image-size="60" />
+          <el-empty :description="keyword.trim() ? '没有匹配的机器人' : '暂无钉钉机器人'" :image-size="60" />
         </template>
         <el-table-column prop="name" label="名称" min-width="140" />
         <el-table-column prop="clientId" label="Client ID" min-width="180" show-overflow-tooltip />
@@ -81,8 +95,21 @@
             <el-button type="danger" link @click="handleDelete(row)">删除</el-button>
           </div>
         </el-card>
-        <el-empty v-if="!loading && bots.length === 0" description="暂无钉钉机器人" />
+        <el-empty
+          v-if="!loading && bots.length === 0"
+          :description="keyword.trim() ? '没有匹配的机器人' : '暂无钉钉机器人'"
+        />
       </div>
+
+      <ResponsivePagination
+        class="pagination"
+        v-model:current-page="currentPage"
+        v-model:page-size="pageSize"
+        :page-sizes="[10, 20, 50, 100]"
+        :total="total"
+        @current-change="fetchBots"
+        @size-change="handleSizeChange"
+      />
     </el-card>
 
     <ResponsiveDialog v-if="formVisible" v-model="formVisible" :title="isEdit ? '编辑钉钉机器人' : '添加钉钉机器人'" width="560px">
@@ -128,13 +155,15 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onActivated, reactive, ref } from 'vue'
+import { computed, onActivated, onUnmounted, reactive, ref } from 'vue'
 import type { FormInstance, FormRules } from 'element-plus'
+import { Search } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { api } from '../../api'
+import { api, apiGetWithHeaders } from '../../api'
 import { useBreakpoint } from '../../composables/useBreakpoint'
 import { useAuthStore } from '../../stores/auth'
 import ResponsiveDialog from '../../components/ResponsiveDialog.vue'
+import ResponsivePagination from '../../components/ResponsivePagination.vue'
 
 interface DingtalkBot {
   id: number
@@ -156,6 +185,10 @@ const canWrite = computed(() => authStore.hasPermission('dingtalk-bot:write'))
 const loading = ref(false)
 const submitting = ref(false)
 const bots = ref<DingtalkBot[]>([])
+const keyword = ref('')
+const currentPage = ref(1)
+const pageSize = ref(10)
+const total = ref(0)
 const runtimeStatusMap = ref<Record<number, { status?: string; lastFailureReason?: string }>>({})
 const agents = ref<any[]>([])
 const models = ref<any[]>([])
@@ -183,20 +216,68 @@ const formRules: FormRules = {
   }],
 }
 
-async function loadData() {
+function readTotalCount(headers: unknown): number {
+  if (!headers || typeof headers !== 'object') return NaN
+  const bag = headers as { get?: (name: string) => unknown } & Record<string, unknown>
+  const raw = typeof bag.get === 'function' ? bag.get('x-total-count') : bag['x-total-count']
+  const value = Array.isArray(raw) ? raw[0] : raw
+  return Number(value)
+}
+
+let fetchBotsSeq = 0
+async function fetchBots() {
+  const seq = ++fetchBotsSeq
   loading.value = true
   try {
-    const [{ data: botData }, { data: agentData }, { data: modelData }] = await Promise.all([
-      api.get('/admin/dingtalk-bots'),
+    const { result, headers } = await apiGetWithHeaders<DingtalkBot[]>('/admin/dingtalk-bots', {
+      params: {
+        keyword: keyword.value.trim() || undefined,
+        pageNum: currentPage.value,
+        pageSize: pageSize.value,
+      },
+    })
+    if (seq !== fetchBotsSeq) return
+    bots.value = result.data || []
+    const headerTotal = readTotalCount(headers)
+    total.value = Number.isFinite(headerTotal) ? headerTotal : bots.value.length
+    const maxPage = Math.max(1, Math.ceil(total.value / pageSize.value))
+    if (currentPage.value > maxPage) {
+      currentPage.value = maxPage
+      void fetchBots()
+    }
+  } catch { /* 拦截器已提示 */ } finally {
+    if (seq === fetchBotsSeq) loading.value = false
+  }
+}
+
+async function loadOptions() {
+  try {
+    const [{ data: agentData }, { data: modelData }] = await Promise.all([
       api.get('/agents', { params: { includeDisabled: true } }),
       api.get('/models/active'),
     ])
-    bots.value = botData || []
     agents.value = agentData || []
     models.value = modelData || []
-  } catch { /* 拦截器已提示 */ } finally {
-    loading.value = false
-  }
+  } catch { /* 拦截器已提示；保留已有选项 */ }
+}
+
+function loadData() {
+  return Promise.all([fetchBots(), loadOptions()])
+}
+
+let keywordDebounceTimer: ReturnType<typeof setTimeout> | null = null
+function onKeywordInput() {
+  currentPage.value = 1
+  if (keywordDebounceTimer) clearTimeout(keywordDebounceTimer)
+  keywordDebounceTimer = setTimeout(() => {
+    keywordDebounceTimer = null
+    void fetchBots()
+  }, 300)
+}
+
+function handleSizeChange() {
+  currentPage.value = 1
+  void fetchBots()
 }
 
 async function loadRuntimeStatus() {
@@ -280,6 +361,7 @@ async function handleSubmit() {
     else await api.post('/admin/dingtalk-bots', payload)
     ElMessage.success(isEdit.value ? '机器人更新成功' : '机器人添加成功')
     formVisible.value = false
+    if (!isEdit.value) currentPage.value = 1
     await loadData()
   } catch { /* 拦截器已提示 */ } finally {
     submitting.value = false
@@ -317,12 +399,18 @@ onActivated(() => {
   loadData()
   loadRuntimeStatus()
 })
+
+onUnmounted(() => {
+  if (keywordDebounceTimer) clearTimeout(keywordDebounceTimer)
+})
 </script>
 
 <style scoped>
 .card-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .card-title { font-size: 15px; font-weight: 600; color: var(--mao-ink); }
 .card-hint { margin-top: 4px; font-size: 13px; color: var(--mao-muted); }
+.search-form { margin-bottom: 12px; }
+.pagination { margin-top: 20px; justify-content: flex-end; }
 .form-select { width: 100%; }
 .mobile-card-list { display: flex; flex-direction: column; gap: 12px; }
 .mobile-card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }

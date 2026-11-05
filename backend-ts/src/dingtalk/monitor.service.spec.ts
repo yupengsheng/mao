@@ -44,6 +44,7 @@ function makeClientFactory() {
 function makeRepo(bots: DingtalkBot[]) {
   return {
     list: vi.fn(async () => bots),
+    listPage: vi.fn(async () => ({ records: bots, total: bots.length })),
     findById: vi.fn(async (id: number) => bots.find((b) => b.id === id) ?? null),
     findByAppKey: vi.fn(async () => null),
     create: vi.fn(async () => 0),
