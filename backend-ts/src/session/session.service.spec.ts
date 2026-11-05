@@ -397,6 +397,32 @@ describe('SessionService archive', () => {
     }
   });
 
+  it('promotesSideTaskAndRebindsApprovalRulesAndWebhookTriggers', async () => {
+    // 会话级审批规则与绑定该会话的 Webhook 触发器都应以 targetId 继续生效，不能指向已删除边路会话。
+    const { service, sessionRepo, txDb } = makeService();
+    vi.mocked(sessionRepo.findById).mockResolvedValue({
+      id: 20,
+      userId: 7,
+      title: '边路任务',
+      sessionType: 'SIDE_TASK',
+      phase: 'COMPLETED',
+      executionMode: 'CLOUD',
+      workspace: '/tmp/w',
+    });
+    vi.mocked(sessionRepo.list).mockResolvedValue([]);
+
+    await service.promoteSideTaskToMainSession(20, 7);
+
+    expect(txDb.execute).toHaveBeenCalledWith(
+      "UPDATE approval_rule SET session_id = ? WHERE scope = 'SESSION' AND session_id = ?",
+      [99, 20],
+    );
+    expect(txDb.execute).toHaveBeenCalledWith(
+      'UPDATE webhook_trigger SET session_id = ? WHERE session_id = ?',
+      [99, 20],
+    );
+  });
+
   it('promotesSideTaskAndSuppressesItsPendingNotifications', async () => {
     // 提升不走 onSessionDeleted；旧边路会话的未发送提醒须在同一事务内抑制。
     const { service, sessionRepo, txDb } = makeService();

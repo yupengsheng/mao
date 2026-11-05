@@ -791,6 +791,18 @@ export class SessionService {
         'UPDATE scheduled_task SET session_id = ? WHERE session_id = ? AND deleted = 0',
         [targetId, sideSessionId],
       );
+      // 会话级审批放行规则以 session_id 为归属：提升后旧 id 不可达，改绑新主会话，
+      // 让用户此前「总是允许」的选择在同一任务上继续生效（新会话尚无规则，不会撞唯一性）。
+      await tx.execute(
+        "UPDATE approval_rule SET session_id = ? WHERE scope = 'SESSION' AND session_id = ?",
+        [targetId, sideSessionId],
+      );
+      // 入站 Webhook 触发器若绑定旧边路会话，后续触发应继续推进同一任务，改绑新主会话；
+      // 否则会指向已删除会话，只能等触发失败后的自愈逻辑解绑。
+      await tx.execute(
+        'UPDATE webhook_trigger SET session_id = ? WHERE session_id = ?',
+        [targetId, sideSessionId],
+      );
       // 旧边路会话随后逻辑删除，未发出的完成 / 提问 / 审批提醒不应再外推；
       // 与 onSessionDeleted 的存储层抑制保持同一语义，仅命中非终态行。
       await tx.execute(
