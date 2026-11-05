@@ -67,4 +67,14 @@ export class MysqlDingtalkPendingBindingRepository {
       status: 'CLAIMED',
     };
   }
+
+  /** 按过期时间分批删除历史待绑定消息，走 idx_dingtalk_pending_binding_expires。 */
+  async deleteBatch(cutoff: string, limit: number): Promise<number> {
+    const safeLimit = Math.max(1, Math.min(5000, Math.floor(limit)));
+    const result = await this.db.execute(
+      `DELETE FROM dingtalk_pending_binding_message WHERE expires_at < ? ORDER BY id LIMIT ${safeLimit}`,
+      [cutoff],
+    );
+    return result.affectedRows;
+  }
 }

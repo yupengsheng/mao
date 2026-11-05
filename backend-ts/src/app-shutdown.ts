@@ -34,6 +34,7 @@ import type { AuditLogCleanup } from './audit/audit-log-cleanup.js';
 import type { InboundEventCleanup } from './channel/inbound-event-cleanup.js';
 import type { LlmCallCleanup } from './usage/llm-call-cleanup.js';
 import type { SessionActivityCleanup } from './session/session-activity-cleanup.js';
+import type { AuthStateCleanup } from './auth/auth-state-cleanup.js';
 
 /** 停机时需要优雅关闭的所有组件。 */
 export interface ShutdownDeps {
@@ -75,6 +76,7 @@ export interface ShutdownDeps {
   llmCallCleanup: LlmCallCleanup;
   sessionActivityCleanup: SessionActivityCleanup;
   inboundEventCleanup: InboundEventCleanup;
+  authStateCleanup: AuthStateCleanup;
 }
 
 /**
@@ -91,6 +93,7 @@ export function createShutdownHandler(deps: ShutdownDeps): () => Promise<void> {
     agentLoop, wsHandler, sessionService, taskRecordRepair, taskExecutionRetention, auditLogCleanup, llmCallCleanup,
     sessionActivityCleanup,
     inboundEventCleanup,
+    authStateCleanup,
   } = deps;
 
   const isDrainingForDeploy = (): boolean => isDrainingInstance(cfg.app.harness.runtimeDir, cfg.server.port);
@@ -134,6 +137,7 @@ export function createShutdownHandler(deps: ShutdownDeps): () => Promise<void> {
       llmCallCleanup.stop();
       sessionActivityCleanup.stop();
       inboundEventCleanup.stop();
+      authStateCleanup.stop();
       weixinMonitor.shutdown();
       feishuMonitor.shutdown();
       dingtalk.shutdown();

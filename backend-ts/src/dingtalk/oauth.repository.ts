@@ -61,4 +61,14 @@ export class MysqlDingtalkOauthStateRepository {
       [state],
     );
   }
+
+  /** 按过期时间分批删除历史 state，走 idx_dingtalk_oauth_state_expires，避免长事务。 */
+  async deleteBatch(cutoff: string, limit: number): Promise<number> {
+    const safeLimit = Math.max(1, Math.min(5000, Math.floor(limit)));
+    const result = await this.db.execute(
+      `DELETE FROM dingtalk_oauth_state WHERE expires_at < ? ORDER BY id LIMIT ${safeLimit}`,
+      [cutoff],
+    );
+    return result.affectedRows;
+  }
 }

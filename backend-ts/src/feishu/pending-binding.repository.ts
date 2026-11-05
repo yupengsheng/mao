@@ -114,4 +114,14 @@ export class MysqlFeishuPendingBindingRepository {
       event: JSON.parse(String(row.eventJson)) as FeishuNormalizedMessage, status: 'CLAIMED',
     };
   }
+
+  /** 待绑定消息只对短时绑定链接有效，按更新时间分批删除历史行，避免启动时重放陈旧消息。 */
+  async deleteBatch(cutoff: string, limit: number): Promise<number> {
+    const safeLimit = Math.max(1, Math.min(5000, Math.floor(limit)));
+    const result = await this.db.execute(
+      `DELETE FROM feishu_pending_binding_message WHERE updated_at < ? ORDER BY id LIMIT ${safeLimit}`,
+      [cutoff],
+    );
+    return result.affectedRows;
+  }
 }

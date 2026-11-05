@@ -32,6 +32,12 @@ import { InboundEventCleanup } from './channel/inbound-event-cleanup.js';
 import { LlmCallCleanup } from './usage/llm-call-cleanup.js';
 import { SessionActivityCleanup } from './session/session-activity-cleanup.js';
 import { SessionActivityRepository } from './session/activity.repository.js';
+import { AuthStateCleanup } from './auth/auth-state-cleanup.js';
+import { MysqlFeishuOauthStateRepository } from './auth/feishu-oauth.repository.js';
+import { MysqlEcpOauthStateRepository } from './auth/ecp-oauth.repository.js';
+import { MysqlDingtalkOauthStateRepository } from './dingtalk/oauth.repository.js';
+import { MysqlFeishuPendingBindingRepository } from './feishu/pending-binding.repository.js';
+import { MysqlDingtalkPendingBindingRepository } from './dingtalk/pending-binding.repository.js';
 import { MysqlFeishuMessageRepository } from './feishu/message.repository.js';
 import { MysqlDingtalkMessageRepository } from './dingtalk/message.repository.js';
 
@@ -138,6 +144,19 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
     { name: 'dingtalk', deleteBatch: (cutoff, limit) => dingtalkMessageRepo.deleteInboundBatch(cutoff, limit) },
   ]);
   inboundEventCleanup.start();
+  const feishuOauthStateRepo = new MysqlFeishuOauthStateRepository(db);
+  const ecpOauthStateRepo = new MysqlEcpOauthStateRepository(db);
+  const dingtalkOauthStateRepo = new MysqlDingtalkOauthStateRepository(db);
+  const feishuPendingBindingRepo = new MysqlFeishuPendingBindingRepository(db);
+  const dingtalkPendingBindingRepo = new MysqlDingtalkPendingBindingRepository(db);
+  const authStateCleanup = new AuthStateCleanup([
+    { name: 'feishu_oauth_state', deleteBatch: (cutoff, limit) => feishuOauthStateRepo.deleteBatch(cutoff, limit) },
+    { name: 'ecp_oauth_state', deleteBatch: (cutoff, limit) => ecpOauthStateRepo.deleteBatch(cutoff, limit) },
+    { name: 'dingtalk_oauth_state', deleteBatch: (cutoff, limit) => dingtalkOauthStateRepo.deleteBatch(cutoff, limit) },
+    { name: 'feishu_pending_binding_message', deleteBatch: (cutoff, limit) => feishuPendingBindingRepo.deleteBatch(cutoff, limit) },
+    { name: 'dingtalk_pending_binding_message', deleteBatch: (cutoff, limit) => dingtalkPendingBindingRepo.deleteBatch(cutoff, limit) },
+  ]);
+  authStateCleanup.start();
   d.callLogService.start();
   d.callLogCleanup.start();
   d.callLogRepair.start();
@@ -247,6 +266,7 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
     activityHeartbeat: d.activityHeartbeat, wsRegistry: d.wsRegistry,
     agentLoop: d.agentLoop, wsHandler: d.wsHandler, sessionService: d.sessionService,
     taskRecordRepair, taskExecutionRetention, auditLogCleanup, llmCallCleanup, sessionActivityCleanup, inboundEventCleanup,
+    authStateCleanup,
   });
   drainWatcher.start();
 

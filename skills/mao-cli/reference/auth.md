@@ -153,6 +153,8 @@ mao auth features
 mao auth feishu-qrcode --json
 ```
 
+登录 `state` 只在授权窗口内有效。服务端每小时清理一次超过 30 天的飞书 / ECP / 钉钉登录 `state`，单批 5000 条、单轮最多 20 批；过期 `state` 无法再轮询或回调，重新发起登录即可。
+
 ---
 
 ## 命令：mao auth feishu-status
