@@ -14,9 +14,22 @@
         </div>
       </template>
 
-      <el-table v-if="!isMobile" :data="bots" v-loading="loading" stripe>
+      <el-form :inline="true" class="search-form">
+        <el-form-item label="关键词">
+          <el-input
+            v-model="keyword"
+            clearable
+            placeholder="搜索名称 / App ID"
+            style="width: 240px"
+          >
+            <template #prefix><el-icon><Search /></el-icon></template>
+          </el-input>
+        </el-form-item>
+      </el-form>
+
+      <el-table v-if="!isMobile" :data="filteredBots" v-loading="loading" stripe>
         <template #empty>
-          <el-empty description="暂无飞书机器人" :image-size="60" />
+          <el-empty :description="keyword.trim() ? '没有匹配的机器人' : '暂无飞书机器人'" :image-size="60" />
         </template>
         <el-table-column prop="name" label="名称" min-width="140" />
         <el-table-column prop="appId" label="App ID" min-width="180" show-overflow-tooltip />
@@ -79,7 +92,7 @@
       </el-table>
 
       <div v-else class="mobile-card-list" v-loading="loading">
-        <el-card v-for="row in bots" :key="row.id" shadow="hover">
+        <el-card v-for="row in filteredBots" :key="row.id" shadow="hover">
           <div class="mobile-card-head">
             <span class="mobile-card-title">{{ row.name }}</span>
             <el-tag :type="row.enabled ? 'success' : 'info'" size="small">
@@ -160,6 +173,7 @@
 <script setup lang="ts">
 import { computed, onActivated, reactive, ref } from 'vue'
 import type { FormInstance, FormRules } from 'element-plus'
+import { Search } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../../api'
 import { useBreakpoint } from '../../composables/useBreakpoint'
@@ -190,6 +204,7 @@ const canWrite = computed(() => authStore.hasPermission('feishu-bot:write'))
 const loading = ref(false)
 const submitting = ref(false)
 const bots = ref<FeishuBot[]>([])
+const keyword = ref('')
 /** botId → 运行连接状态（来自 /admin/feishu-bots/status，内存态，无记录时不显示）。 */
 const runtimeStatusMap = ref<Record<number, FeishuBotRuntimeState>>({})
 const agents = ref<any[]>([])
@@ -200,6 +215,11 @@ const editingId = ref<number | null>(null)
 const formRef = ref<FormInstance>()
 
 const textModels = computed(() => models.value.filter(model => !model.modelType || model.modelType === 'text'))
+const filteredBots = computed(() => {
+  const kw = keyword.value.trim().toLowerCase()
+  if (!kw) return bots.value
+  return bots.value.filter((bot) => `${bot.name} ${bot.appId}`.toLowerCase().includes(kw))
+})
 
 const form = reactive({
   name: '',
@@ -405,6 +425,7 @@ onActivated(() => {
 .card-hint { margin-top: 4px; font-size: 13px; color: var(--mao-muted); }
 .form-hint { margin-top: 4px; font-size: 12px; color: var(--mao-muted); }
 .form-select { width: 100%; }
+.search-form { margin-bottom: 12px; }
 .mobile-card-list { display: flex; flex-direction: column; gap: 12px; }
 .mobile-card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
 .mobile-card-title { font-size: 15px; font-weight: 600; color: var(--mao-ink); }

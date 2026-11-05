@@ -300,7 +300,6 @@ interface CommandRow {
 
 interface TabState {
   rows: CommandRow[]
-  filtered: CommandRow[]
   keyword: string
   currentPage: number
   pageSize: number
@@ -309,7 +308,6 @@ interface TabState {
 function createTabState(): TabState {
   return reactive<TabState>({
     rows: [],
-    filtered: [],
     keyword: '',
     currentPage: 1,
     pageSize: 10,
@@ -326,21 +324,10 @@ const state = computed(() => tabStates[activeTab.value])
 const loading = ref(false)
 const emptyText = computed(() => activeTab.value === 'personal' ? '暂无个人指令' : '暂无系统指令')
 
-/**
- * 个人指令为服务端分页（keyword/pageNum/pageSize，总数在 x-total-count 响应头）；
- * 系统指令为全量加载 + 前端过滤分页。serverTotal 仅在个人 tab 有值。
- */
+/** 两个 tab 均为服务端分页（keyword/pageNum/pageSize），总数在 x-total-count 响应头。 */
 const serverTotal = ref<number | null>(null)
-const paginationTotal = computed(() =>
-  activeTab.value === 'personal' ? (serverTotal.value ?? 0) : state.value.filtered.length
-)
-
-const pagedRows = computed(() => {
-  const s = state.value
-  if (activeTab.value === 'personal') return s.rows
-  const start = (s.currentPage - 1) * s.pageSize
-  return s.filtered.slice(start, start + s.pageSize)
-})
+const paginationTotal = computed(() => serverTotal.value ?? 0)
+const pagedRows = computed(() => state.value.rows)
 
 const formVisible = ref(false)
 const isEdit = ref(false)
@@ -378,21 +365,6 @@ const formRules: FormRules = {
   content: [{ required: true, message: '请输入指令内容', trigger: 'blur' }],
 }
 
-function applyFilter() {
-  const s = state.value
-  const kw = s.keyword.trim().toLowerCase()
-  if (!kw) {
-    s.filtered = s.rows
-  } else {
-    s.filtered = s.rows.filter((row) => {
-      const userPart = `${row.username || ''} ${row.displayName || ''} ${row.userId ?? ''}`
-      return `${row.name || ''} ${row.content || ''} ${userPart}`.toLowerCase().includes(kw)
-    })
-  }
-  const maxPage = Math.max(1, Math.ceil(s.filtered.length / s.pageSize))
-  if (s.currentPage > maxPage) s.currentPage = maxPage
-}
-
 function readTotalCount(headers: unknown): number {
   if (!headers || typeof headers !== 'object') return NaN
   const bag = headers as { get?: (name: string) => unknown } & Record<string, unknown>
@@ -407,25 +379,20 @@ async function loadActiveTab() {
   const tab = activeTab.value
   loading.value = true
   try {
-    if (tab === 'personal') {
-      // 服务端分页 + keyword 过滤（后端对 name/content 做 LIKE），总数在 x-total-count 响应头
-      const { result, headers } = await apiGetWithHeaders<any[]>('/admin/user-commands', {
-        params: {
-          pageNum: tabStates.personal.currentPage,
-          pageSize: tabStates.personal.pageSize,
-          keyword: tabStates.personal.keyword.trim() || undefined,
-        },
-      })
-      if (seq !== fetchSeq) return
-      const headerTotal = readTotalCount(headers)
-      serverTotal.value = Number.isFinite(headerTotal) ? headerTotal : (result.data || []).length
-      tabStates.personal.rows = result.data || []
-    } else {
-      const { data } = await api.get('/admin/system-commands')
-      if (seq !== fetchSeq) return
-      tabStates.system.rows = data || []
-      applyFilter()
-    }
+    const tabState = tabStates[tab]
+    const endpoint = tab === 'personal' ? '/admin/user-commands' : '/admin/system-commands'
+    // 服务端分页 + keyword 过滤（后端对 name/content 做 LIKE），总数在 x-total-count 响应头
+    const { result, headers } = await apiGetWithHeaders<any[]>(endpoint, {
+      params: {
+        pageNum: tabState.currentPage,
+        pageSize: tabState.pageSize,
+        keyword: tabState.keyword.trim() || undefined,
+      },
+    })
+    if (seq !== fetchSeq) return
+    const headerTotal = readTotalCount(headers)
+    serverTotal.value = Number.isFinite(headerTotal) ? headerTotal : (result.data || []).length
+    tabState.rows = result.data || []
   } catch {
     // interceptor handles toast
   } finally {
@@ -450,35 +417,25 @@ function loadPersonal() {
 
 function handleSearch() {
   state.value.currentPage = 1
-  if (activeTab.value === 'personal') {
-    serverTotal.value = null
-    loadActiveTab()
-  } else {
-    applyFilter()
-  }
+  serverTotal.value = null
+  loadActiveTab()
 }
 
 function handleReset() {
   state.value.keyword = ''
   state.value.currentPage = 1
-  if (activeTab.value === 'personal') {
-    serverTotal.value = null
-    loadActiveTab()
-  } else {
-    applyFilter()
-  }
+  serverTotal.value = null
+  loadActiveTab()
 }
 
 function handleSizeChange() {
   state.value.currentPage = 1
-  if (activeTab.value === 'personal') {
-    serverTotal.value = null
-    loadActiveTab()
-  }
+  serverTotal.value = null
+  loadActiveTab()
 }
 
 function handlePageChange() {
-  if (activeTab.value === 'personal') loadActiveTab()
+  loadActiveTab()
 }
 
 function userLabel(row: CommandRow) {

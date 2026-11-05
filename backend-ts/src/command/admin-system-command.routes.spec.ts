@@ -10,6 +10,7 @@ function createRepo(overrides: Partial<UserCommandRepository> = {}): UserCommand
   return {
     listByUserId: vi.fn(async () => []),
     listPersonalAll: vi.fn(async () => []),
+    listSystemPaged: vi.fn(async () => ({ records: [], total: 0 })),
     listPersonalFiltered: vi.fn(async () => []),
     listPersonalPaged: vi.fn(async () => ({ records: [], total: 0 })),
     findByIdAndUserId: vi.fn(async () => null),
@@ -38,6 +39,11 @@ async function createApp(options: {
   const commandRepo = options.commandRepo ?? createRepo({
     listByUserId: vi.fn(async (userId: number) => (userId === 0 ? system : [])),
     listPersonalAll: vi.fn(async () => personal),
+    listSystemPaged: vi.fn(async (pageNum: number, pageSize: number, keyword?: string) => {
+      const filtered = system.filter((c) => !keyword || c.name.includes(keyword) || c.content.includes(keyword));
+      const start = (pageNum - 1) * pageSize;
+      return { records: filtered.slice(start, start + pageSize), total: filtered.length };
+    }),
     listPersonalPaged: vi.fn(async (pageNum: number, pageSize: number, keyword?: string, userId?: number) => {
       const filtered = personal.filter((c) =>
         (!keyword || c.name.includes(keyword) || c.content.includes(keyword))
@@ -107,6 +113,37 @@ describe('admin system/user command routes', () => {
     })).body);
     expect(badName.code).toBeGreaterThan(0);
 
+    await app.close();
+  });
+
+  it('filtersAndPaginatesSystemCommandsWhenParamsPresent', async () => {
+    const system: UserCommand[] = [
+      { id: 1, userId: 0, name: 'build_project', content: '构建项目' },
+      { id: 2, userId: 0, name: 'test_all', content: '运行测试' },
+      { id: 3, userId: 0, name: 'build_doc', content: '生成文档' },
+    ];
+    const { app, commandRepo } = await createApp({ commands: { system } });
+
+    const legacy = await app.inject({ method: 'GET', url: '/v1/admin/system-commands' });
+    const legacyBody = JSON.parse(legacy.body);
+    expect(legacyBody.data).toHaveLength(3);
+    expect(legacy.headers['x-total-count']).toBeUndefined();
+    expect(commandRepo.listSystemPaged).not.toHaveBeenCalled();
+
+    const paged = await app.inject({
+      method: 'GET',
+      url: '/v1/admin/system-commands?keyword=build&pageNum=1&pageSize=1',
+    });
+    const body = JSON.parse(paged.body);
+    expect(body.data.map((c: { name: string }) => c.name)).toEqual(['build_project']);
+    expect(paged.headers['x-total-count']).toBe('2');
+    expect(commandRepo.listSystemPaged).toHaveBeenCalledWith(1, 1, 'build');
+
+    const secondPage = await app.inject({
+      method: 'GET',
+      url: '/v1/admin/system-commands?keyword=build&pageNum=2&pageSize=1',
+    });
+    expect(JSON.parse(secondPage.body).data.map((c: { name: string }) => c.name)).toEqual(['build_doc']);
     await app.close();
   });
 
@@ -358,5 +395,12 @@ describe('admin system/user command routes', () => {
     const [sql, params] = query.mock.calls[0];
     expect(String(sql)).toContain('LIKE ?');
     expect(params).toContain('%100\\%\\_off%');
+
+    query.mockClear();
+    await repo.listSystemPaged(1, 10, '100%_off');
+    const [systemSql, systemParams] = query.mock.calls[0];
+    expect(String(systemSql)).toContain('LIKE ?');
+    expect(systemParams).toContain(0);
+    expect(systemParams).toContain('%100\\%\\_off%');
   });
 });

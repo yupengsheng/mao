@@ -36,11 +36,25 @@ interface PromotePersonalCommandRequest {
 export function registerAdminSystemCommandRoutes(app: FastifyInstance, deps: AdminSystemCommandRouteDeps): void {
   const { commandRepo, permissionService, userLookup } = deps;
 
-  // 列表：查询所有系统指令
+  // 列表：查询系统指令。支持 pageNum/pageSize/keyword（keyword 匹配指令名/内容，LIKE 已转义）。
+  // 不传任何新参数时保持旧的全量数组行为；分页/搜索时总数通过响应头 x-total-count 透出。
   app.get('/v1/admin/system-commands', async (request, reply) => {
     await requireRequestPermission(permissionService, request, 'command:read');
-    const commands = await commandRepo.listByUserId(SYSTEM_USER_ID);
-    return sendOk(reply, commands.map(toAdminVO));
+    const pageNum = queryOptInt(request, 'pageNum');
+    const pageSize = queryOptInt(request, 'pageSize');
+    const keyword = queryOptStr(request, 'keyword');
+    const filtered = pageNum != null || pageSize != null || keyword != null;
+    if (!filtered) {
+      const commands = await commandRepo.listByUserId(SYSTEM_USER_ID);
+      return sendOk(reply, commands.map(toAdminVO));
+    }
+    const page = await commandRepo.listSystemPaged(
+      Math.max(1, pageNum ?? 1),
+      Math.min(200, Math.max(1, pageSize ?? 20)),
+      keyword,
+    );
+    reply.header('x-total-count', String(page.total));
+    return sendOk(reply, page.records.map(toAdminVO));
   });
 
   // 详情：查询单条系统指令

@@ -23,6 +23,24 @@ export class MysqlUserCommandRepository implements UserCommandRepository {
     );
   }
 
+  async listSystemPaged(pageNum: number, pageSize: number, keyword?: string): Promise<{ records: UserCommand[]; total: number }> {
+    const clauses = ['user_id = ?', notDeleted()];
+    const params: unknown[] = [0];
+    const trimmed = keyword?.trim();
+    if (trimmed) {
+      const escaped = escapeLike(trimmed);
+      clauses.push('(name LIKE ? OR content LIKE ?)');
+      params.push(`%${escaped}%`, `%${escaped}%`);
+    }
+    const whereSql = clauses.join(' AND ');
+    const totalRow = await this.db.queryOne<{ c: number }>(`SELECT COUNT(*) AS c FROM user_command WHERE ${whereSql}`, params);
+    const records = await this.db.query<UserCommand>(
+      `SELECT * FROM user_command WHERE ${whereSql} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+      [...params, pageSize, (pageNum - 1) * pageSize],
+    );
+    return { records, total: Number(totalRow?.c ?? 0) };
+  }
+
   private buildPersonalWhere(keyword?: string, userId?: number): { whereSql: string; params: unknown[] } {
     const clauses = ['user_id > 0', notDeleted()];
     const params: unknown[] = [];
