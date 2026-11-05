@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { BusinessException } from '../../../common/business-exception.js';
 import { ErrorCode } from '../../../common/error-code.js';
 import { requireAnyPermission, requireUserId, sendJson, sendOk } from '../../../common/http-error.js';
-import { bodyOf, pathId, queryOptStr } from '../../../common/request.js';
+import { bodyOf, pathId, queryOptInt, queryOptStr } from '../../../common/request.js';
 import { fail } from '../../../common/result.js';
 import type { McpClientManager } from '../mcp-client-manager.js';
 import type { UserMcpPreferenceService } from '../preference/service/user-mcp-preference.service.js';
@@ -148,10 +148,27 @@ export function registerMcpServerRoutes(app: FastifyInstance, deps: McpServerRou
     }
   });
 
+  // 列表：支持 pageNum/pageSize/keyword/status。分页/搜索时返回数组 + x-total-count 头；
+  // 不传任何新参数时保持旧的全量数组行为，兼容已有调用方。
   app.get('/v1/mcp-servers', async (request, reply) => {
     const userId = requireUserId(request);
     await requireAnyPermission(permissionService, userId, ['mcp:read']);
-    return sendOk(reply, await mcpServerService.list(queryOptStr(request, 'keyword'), queryOptStr(request, 'status')));
+    const pageNum = queryOptInt(request, 'pageNum');
+    const pageSize = queryOptInt(request, 'pageSize');
+    const keyword = queryOptStr(request, 'keyword');
+    const status = queryOptStr(request, 'status');
+    const filtered = pageNum != null || pageSize != null || keyword != null || status != null;
+    if (!filtered) {
+      return sendOk(reply, await mcpServerService.list());
+    }
+    const page = await mcpServerService.listPaged(
+      Math.max(1, pageNum ?? 1),
+      Math.min(200, Math.max(1, pageSize ?? 20)),
+      keyword,
+      status,
+    );
+    reply.header('x-total-count', String(page.total));
+    return sendOk(reply, page.records);
   });
 
   // 管理端：查看指定用户创建的个人 MCP 服务器（env 不透出）。

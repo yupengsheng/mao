@@ -37,3 +37,42 @@ describe('McpServerMapper', () => {
     await pref.updateById(1, { enabled: 1 });
   });
 });
+
+describe('McpServerMapper.listPaged', () => {
+  function pagedDb(rows: unknown[] = [], total = rows.length) {
+    return {
+      query: vi.fn(async () => rows),
+      queryOne: vi.fn(async () => ({ c: total })),
+    };
+  }
+
+  it('paginates with escaped keyword and status filter', async () => {
+    const db = pagedDb([{ id: 3, name: 'git_server' }], 11);
+    const mapper = new McpServerMapper(db as never);
+
+    const page = await mapper.listPaged(2, 10, ' git_50% ', 'ENABLED');
+
+    expect(page.total).toBe(11);
+    expect(page.records).toHaveLength(1);
+    const countSql = String(db.queryOne.mock.calls[0]![0]);
+    const listSql = String(db.query.mock.calls[0]![0]);
+    expect(countSql).toContain('name LIKE ? OR description LIKE ?');
+    expect(countSql).toContain('status = ?');
+    expect(listSql).toMatch(/ORDER BY user_id ASC, id ASC LIMIT \? OFFSET \?/);
+    expect(db.query.mock.calls[0]![1]).toEqual([
+      '%git\\_50\\%%', '%git\\_50\\%%', 'ENABLED', 10, 10,
+    ]);
+  });
+
+  it('omits optional filters when not provided', async () => {
+    const db = pagedDb();
+    const mapper = new McpServerMapper(db as never);
+
+    await mapper.listPaged(1, 20);
+
+    const countSql = String(db.queryOne.mock.calls[0]![0]);
+    expect(countSql).not.toContain('LIKE');
+    expect(countSql).not.toContain('status = ?');
+    expect(db.query.mock.calls[0]![1]).toEqual([20, 0]);
+  });
+});

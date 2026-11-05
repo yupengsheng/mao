@@ -173,7 +173,7 @@
             </template>
           </div>
         </el-card>
-        <el-empty v-if="!loading && servers.length === 0" description="暂无数据" />
+        <el-empty v-if="!loading && total === 0" description="暂无数据" />
       </div>
 
       <ResponsivePagination
@@ -181,8 +181,9 @@
         v-model:current-page="currentPage"
         v-model:page-size="pageSize"
         :page-sizes="[10, 20, 50, 100]"
-        :total="servers.length"
-        @size-change="currentPage = 1"
+        :total="total"
+        @current-change="onPageChange"
+        @size-change="onPageSizeChange"
       />
     </el-card>
 
@@ -322,7 +323,7 @@
 import { computed, reactive, ref, onActivated, onMounted, onUnmounted } from 'vue'
 import type { FormInstance, FormRules } from 'element-plus'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { api } from '../../api'
+import { api, apiGetWithHeaders } from '../../api'
 import { useAuthStore } from '../../stores/auth'
 import { useBreakpoint } from '../../composables/useBreakpoint'
 import ResponsiveDialog from '../../components/ResponsiveDialog.vue'
@@ -343,13 +344,19 @@ const servers = ref<any[]>([])
 const keyword = ref('')
 const statusFilter = ref('')
 
-// 后端 /mcp-servers 返回全量数组（无分页参数），前端做客户端分页
+// 服务端分页：keyword/status 与页码一起下发，总数从 x-total-count 响应头读取。
 const currentPage = ref(1)
 const pageSize = ref(20)
-const pagedServers = computed(() => {
-  const start = (currentPage.value - 1) * pageSize.value
-  return servers.value.slice(start, start + pageSize.value)
-})
+const total = ref(0)
+const pagedServers = computed(() => servers.value)
+
+function readTotalCount(headers: unknown): number {
+  if (!headers || typeof headers !== 'object') return NaN
+  const bag = headers as { get?: (name: string) => unknown } & Record<string, unknown>
+  const raw = typeof bag.get === 'function' ? bag.get('x-total-count') : bag['x-total-count']
+  const value = Array.isArray(raw) ? raw[0] : raw
+  return Number(value)
+}
 
 const formVisible = ref(false)
 const isEdit = ref(false)
@@ -402,13 +409,23 @@ async function loadData() {
   const seq = ++loadDataSeq
   loading.value = true
   try {
-    const { data } = await api.get('/mcp-servers', {
-      params: { keyword: keyword.value || undefined, status: statusFilter.value || undefined }
+    const { result, headers } = await apiGetWithHeaders<any[]>('/mcp-servers', {
+      params: {
+        keyword: keyword.value.trim() || undefined,
+        status: statusFilter.value || undefined,
+        pageNum: currentPage.value,
+        pageSize: pageSize.value,
+      }
     })
     if (seq !== loadDataSeq) return
-    servers.value = data || []
-    const maxPage = Math.max(1, Math.ceil(servers.value.length / pageSize.value))
-    if (currentPage.value > maxPage) currentPage.value = maxPage
+    const headerTotal = readTotalCount(headers)
+    total.value = Number.isFinite(headerTotal) ? headerTotal : (result.data || []).length
+    servers.value = result.data || []
+    const maxPage = Math.max(1, Math.ceil(total.value / pageSize.value))
+    if (currentPage.value > maxPage) {
+      currentPage.value = maxPage
+      void loadData()
+    }
   } catch { /* 拦截器已提示失败，吞掉避免误报页面异常 */ } finally {
     if (seq === loadDataSeq) loading.value = false
   }
@@ -426,6 +443,15 @@ function onKeywordInput() {
 }
 
 function onStatusFilterChange() {
+  currentPage.value = 1
+  loadData()
+}
+
+function onPageChange() {
+  loadData()
+}
+
+function onPageSizeChange() {
   currentPage.value = 1
   loadData()
 }

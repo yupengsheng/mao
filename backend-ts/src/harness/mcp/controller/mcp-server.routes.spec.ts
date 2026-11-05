@@ -18,6 +18,8 @@ function buildApp(overrides: Partial<McpServerRouteDeps> = {}) {
   });
   const deps: McpServerRouteDeps = {
     mcpServerService: {
+      list: vi.fn(async () => []),
+      listPaged: vi.fn(async () => ({ records: [], total: 0 })),
       listEnabled: vi.fn(async () => []),
       listMine: vi.fn(async () => []),
       validatePreferenceTarget: vi.fn(async () => undefined),
@@ -85,6 +87,41 @@ describe('MCP load-mode routes', () => {
     expect(JSON.parse(res.body).code).toBe(0);
     const loadMode = await app.inject({ method: 'GET', url: '/v1/mcp-servers/load-mode' });
     expect(JSON.parse(loadMode.body).data.loadMode).toBe('WORKING_SET');
+    await app.close();
+  });
+});
+
+
+describe('MCP server list routes', () => {
+  it('keeps the legacy full-list response when no query params are passed', async () => {
+    const list = vi.fn(async () => [{ id: 1, name: 'filesystem' }]);
+    const { app } = buildApp({ mcpServerService: { list } as never });
+    const res = await app.inject({ method: 'GET', url: '/v1/mcp-servers' });
+    expect(JSON.parse(res.body)).toMatchObject({ code: 0, data: [{ id: 1 }] });
+    expect(res.headers['x-total-count']).toBeUndefined();
+    expect(list).toHaveBeenCalledWith();
+    await app.close();
+  });
+
+  it('paginates with keyword and status and exposes the total header', async () => {
+    const listPaged = vi.fn(async () => ({ records: [{ id: 2, name: 'github' }], total: 7 }));
+    const { app } = buildApp({ mcpServerService: { listPaged } as never });
+    const res = await app.inject({
+      method: 'GET',
+      url: '/v1/mcp-servers?keyword=git&status=ENABLED&pageNum=2&pageSize=5',
+    });
+    expect(JSON.parse(res.body)).toMatchObject({ code: 0, data: [{ id: 2 }] });
+    expect(res.headers['x-total-count']).toBe('7');
+    expect(listPaged).toHaveBeenCalledWith(2, 5, 'git', 'ENABLED');
+    await app.close();
+  });
+
+  it('clamps out-of-range page values and defaults to 20 records', async () => {
+    const listPaged = vi.fn(async () => ({ records: [], total: 0 }));
+    const { app } = buildApp({ mcpServerService: { listPaged } as never });
+    const res = await app.inject({ method: 'GET', url: '/v1/mcp-servers?pageNum=0&pageSize=999' });
+    expect(res.statusCode).toBe(200);
+    expect(listPaged).toHaveBeenCalledWith(1, 200, undefined, undefined);
     await app.close();
   });
 });

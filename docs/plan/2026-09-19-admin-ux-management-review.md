@@ -1,7 +1,7 @@
 # 管理后台 UX 与管理功能评审
 
 - 日期：2026-09-19
-- 状态：**主体已修复**（2026-09-19 起分批发布；2026-11-05 已完成 #8、#18、#22、#28、#35、#38、#39、#40、#41）。其余条目继续分批推进；#7 / #6 的后端依赖已补齐。
+- 状态：**主体已修复**（2026-09-19 起分批发布；2026-11-05 已完成 #1、#8、#10、#18、#22、#28、#35、#38、#39、#40、#41）。其余条目继续分批推进；#7 / #6 的后端依赖已补齐。
 - 范围：`admin/src/views/` 全部 15 个路由页面（含子组件/对话框）+ 全局 Layout/SideMenu，并交叉对照 `backend-ts/src/` 对应路由与服务能力。
 - 方法：逐页通读源码，标注问题；重点识别「后端已有能力、前端未暴露」与「前后端双重不一致」两类高价值缺陷。所有条目均有代码位置佐证，无臆测项。
 
@@ -23,6 +23,7 @@
 - 位置：`admin/src/views/skill/SkillListView.vue:111` + `backend-ts/src/skill/skill.routes.ts:110-135`
 - 问题：后端 `DELETE /v1/skill-docs/:name`、`POST /v1/skill-docs/upload` 只做 `requireUserId`，未校验任何权限码；对比同文件注册的个人 Skill 路由删除需 `agent:write`。即**任何登录用户都能删除或覆盖系统级技能**，且删除时级联从所有 Agent 中清理 `skillName`（`skill.routes.ts:122-135`），破坏面大。前端佐证：系统 tab 的删除按钮没有 `:disabled="!canWrite"`，而个人 tab 的删除按钮有，前后端双重不一致。
 - 建议：后端给 skill-docs 写接口加 `agent:write`（或专用 `skill:write`）；前端系统 tab 删除按钮补 `canWrite` 守卫，与个人 tab 对齐。
+- 状态：**已闭环**（2026-11-05 复核）。系统 Skill 上传/删除均要求 `skill:write`，系统 Tab 桌面与移动端删除按钮均受 `canWrite` 控制。
 
 ---
 
@@ -86,6 +87,7 @@
 - 位置：`admin/src/views/mcp/McpServerListView.vue:394-405`（loadData）
 - 问题：`GET /mcp-servers` 一次返回全量，前端无分页控件；服务器数量增长后首屏传输与渲染线性膨胀，与其他列表页的分页规范（ResponsivePagination）不一致。
 - 建议：后端补分页参数，前端接入 ResponsivePagination。
+- 状态：**已闭环**（2026-11-05）。`GET /v1/mcp-servers` 支持 `pageNum` / `pageSize` / `keyword` / `status` 并返回 `x-total-count`；前端改为服务端分页，LIMIT/OFFSET 与总数在数据库侧计算。
 
 ### 11. 定时任务缺「立即执行」与执行历史查看，且 sessionId 无跳转
 

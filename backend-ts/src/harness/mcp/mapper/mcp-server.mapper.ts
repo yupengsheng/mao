@@ -3,6 +3,11 @@ import { notDeleted } from '../../../db/db.js';
 import { hasText } from '../../../common/case.js';
 import { GLOBAL_USER_ID, STATUS_ENABLED, type McpServer, type UserMcpPreference } from '../entity/mcp-server.js';
 
+/** 转义 LIKE 通配符，配合 MySQL 默认反斜杠转义，避免 keyword 中的 %/_ 被当作通配符。 */
+function escapeLike(keyword: string): string {
+  return keyword.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+}
+
 export class McpServerMapper {
   constructor(private readonly db: Db) {}
 
@@ -19,6 +24,35 @@ export class McpServerMapper {
     }
     sql += ' ORDER BY user_id ASC, id ASC';
     return this.db.query<McpServer>(sql, params);
+  }
+
+  async listPaged(
+    pageNum: number,
+    pageSize: number,
+    keyword?: string | null,
+    status?: string | null,
+  ): Promise<{ records: McpServer[]; total: number }> {
+    const clauses = [notDeleted()];
+    const params: unknown[] = [];
+    if (hasText(keyword)) {
+      const escaped = escapeLike(keyword!.trim());
+      clauses.push('(name LIKE ? OR description LIKE ?)');
+      params.push(`%${escaped}%`, `%${escaped}%`);
+    }
+    if (hasText(status)) {
+      clauses.push('status = ?');
+      params.push(status);
+    }
+    const whereSql = clauses.join(' AND ');
+    const totalRow = await this.db.queryOne<{ c: number }>(
+      `SELECT COUNT(*) AS c FROM mcp_server WHERE ${whereSql}`,
+      params,
+    );
+    const records = await this.db.query<McpServer>(
+      `SELECT * FROM mcp_server WHERE ${whereSql} ORDER BY user_id ASC, id ASC LIMIT ? OFFSET ?`,
+      [...params, pageSize, (pageNum - 1) * pageSize],
+    );
+    return { records, total: Number(totalRow?.c ?? 0) };
   }
 
   listEnabledGlobal(): Promise<McpServer[]> {

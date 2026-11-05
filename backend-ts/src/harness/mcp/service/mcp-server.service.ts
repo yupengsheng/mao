@@ -40,6 +40,18 @@ export class McpServerService {
     return servers;
   }
 
+  async listPaged(
+    pageNum: number,
+    pageSize: number,
+    keyword?: string | null,
+    status?: string | null,
+  ): Promise<{ records: McpServer[]; total: number }> {
+    const page = await this.mapper.listPaged(pageNum, pageSize, keyword, status);
+    await this.fillOwnerNames(page.records);
+    for (const s of page.records) s.envJson = null;
+    return page;
+  }
+
   async listEnabled(): Promise<McpServer[]> {
     const servers = await this.mapper.listEnabledGlobal();
     for (const s of servers) s.envJson = null;
