@@ -107,6 +107,15 @@
             <el-table-column prop="content" label="内容" min-width="240" show-overflow-tooltip />
             <el-table-column prop="createdAt" label="创建时间" width="160" :formatter="formatDateTimeColumn" />
           </el-table>
+          <div class="tab-footer">
+            <el-pagination
+              v-model:current-page="commandsPage"
+              layout="prev, pager, next, total"
+              :total="commandsTotal"
+              :page-size="TAB_PAGE_SIZE"
+              @current-change="loadCommands"
+            />
+          </div>
         </el-tab-pane>
 
         <!-- 个人技能 -->
@@ -119,6 +128,15 @@
             </el-table-column>
             <el-table-column prop="folderPath" label="目录" min-width="160" show-overflow-tooltip />
           </el-table>
+          <div class="tab-footer">
+            <el-pagination
+              v-model:current-page="skillsPage"
+              layout="prev, pager, next, total"
+              :total="skillsTotal"
+              :page-size="TAB_PAGE_SIZE"
+              @current-change="loadSkills"
+            />
+          </div>
         </el-tab-pane>
 
         <!-- Git 凭证 -->
@@ -200,7 +218,7 @@
 import { ref, reactive, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { api } from '../../api'
+import { api, apiGetWithHeaders } from '../../api'
 import { resolveAvatarUrl } from '../../utils/avatar'
 import { formatDateTime, formatDateTimeColumn } from '../../utils/datetime'
 // 复用全站统一的阶段文案（含 IDLE / WAITING_APPROVAL），勿在本页自造映射
@@ -281,7 +299,11 @@ const tasksPage = ref(1)
 const tasksTotal = ref(0)
 
 const commands = ref<any[]>([])
+const commandsPage = ref(1)
+const commandsTotal = ref(0)
 const skills = ref<any[]>([])
+const skillsPage = ref(1)
+const skillsTotal = ref(0)
 const gitCredentials = ref<any[]>([])
 const envVariables = ref<any[]>([])
 const mcpServers = ref<any[]>([])
@@ -319,10 +341,20 @@ function execStatusLabel(status: string): string {
   return labels[status] || status
 }
 
+function readTotalCount(headers: unknown): number {
+  if (!headers || typeof headers !== 'object') return NaN
+  const bag = headers as { get?: (name: string) => unknown } & Record<string, unknown>
+  const raw = typeof bag.get === 'function' ? bag.get('x-total-count') : bag['x-total-count']
+  const value = Array.isArray(raw) ? raw[0] : raw
+  return Number(value)
+}
+
 function handleOpen() {
   activeTab.value = 'sessions'
   sessionsPage.value = 1
   tasksPage.value = 1
+  commandsPage.value = 1
+  skillsPage.value = 1
   // 抽屉复用同一组件实例：先清空上一位用户的数据，避免加载期间透出旧明细
   sessions.value = []
   tasks.value = []
@@ -333,6 +365,8 @@ function handleOpen() {
   mcpServers.value = []
   sessionsTotal.value = 0
   tasksTotal.value = 0
+  commandsTotal.value = 0
+  skillsTotal.value = 0
   void loadSessions()
   void loadTasks()
   void loadCommands()
@@ -374,8 +408,12 @@ async function loadCommands() {
   if (!props.user) return
   loadingTabs['commands'] = true
   try {
-    const { data } = await api.get('/admin/user-commands', { params: { userId: props.user.id } })
-    commands.value = data || []
+    const { result, headers } = await apiGetWithHeaders<any[]>('/admin/user-commands', {
+      params: { userId: props.user.id, pageNum: commandsPage.value, pageSize: TAB_PAGE_SIZE }
+    })
+    commands.value = result.data || []
+    const headerTotal = readTotalCount(headers)
+    commandsTotal.value = Number.isFinite(headerTotal) ? headerTotal : commands.value.length
   } catch { /* 拦截器已提示失败 */ } finally {
     loadingTabs['commands'] = false
   }
@@ -385,8 +423,12 @@ async function loadSkills() {
   if (!props.user) return
   loadingTabs['skills'] = true
   try {
-    const { data } = await api.get('/admin/user-skills', { params: { userId: props.user.id } })
-    skills.value = data || []
+    const { result, headers } = await apiGetWithHeaders<any[]>('/admin/user-skills', {
+      params: { userId: props.user.id, pageNum: skillsPage.value, pageSize: TAB_PAGE_SIZE }
+    })
+    skills.value = result.data || []
+    const headerTotal = readTotalCount(headers)
+    skillsTotal.value = Number.isFinite(headerTotal) ? headerTotal : skills.value.length
   } catch { /* 拦截器已提示失败 */ } finally {
     loadingTabs['skills'] = false
   }
