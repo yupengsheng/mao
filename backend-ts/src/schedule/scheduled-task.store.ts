@@ -123,6 +123,7 @@ export class ScheduledTaskDbStore implements ScheduledTaskStore {
     return this.db.insert('scheduled_task_run', {
       taskId: run.taskId,
       fireTime: run.fireTime,
+      triggerType: run.triggerType ?? 'SCHEDULED',
       attempt: run.attempt,
       status: run.status,
       sessionId: run.sessionId,

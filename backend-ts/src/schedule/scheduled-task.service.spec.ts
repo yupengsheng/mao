@@ -1,7 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
 import { BusinessException } from '../common/business-exception.js';
 import { ErrorCode } from '../common/error-code.js';
-import { isOneShotCron, normalizeSpringCron, ScheduledTaskScheduler, ScheduledTaskService, type ScheduledTaskStore } from './scheduled-task.service.js';
+import {
+  isOneShotCron,
+  normalizeSpringCron,
+  ScheduledTaskScheduler,
+  ScheduledTaskService,
+  type ScheduledTask,
+  type ScheduledTaskRun,
+  type ScheduledTaskStore,
+} from './scheduled-task.service.js';
 
 describe('ScheduledTaskService', () => {
   const store: ScheduledTaskStore = {
@@ -1187,3 +1195,165 @@ function stubStore() {
     listDue: vi.fn(async () => []),
   };
 }
+
+function manualRunHarness(opts?: { sessionPhase?: string; gate?: Promise<void> }) {
+  const state: ScheduledTask = {
+    id: 1,
+    userId: 7,
+    sessionId: 11,
+    name: 'daily',
+    prompt: 'hello',
+    cronExpression: '0 0 9 * * *',
+    status: 'ACTIVE',
+    once: 0,
+    fireCount: 0,
+    nextFireTime: '2026-11-06 09:00:00',
+  };
+  const runs: ScheduledTaskRun[] = [];
+  const store: ScheduledTaskStore = {
+    insert: vi.fn(),
+    updateById: vi.fn(async (patch) => { Object.assign(state, patch); }),
+    deleteById: vi.fn(),
+    selectById: vi.fn(async () => ({ ...state })),
+    listByUser: vi.fn(async () => []),
+    listAll: vi.fn(async () => ({ records: [], total: 0 })),
+    listDue: vi.fn(async () => []),
+    selectRunById: vi.fn(async (id) => runs.find((run) => run.id === id) ?? null),
+    selectRunByFire: vi.fn(async (taskId, fireTime) => runs.find((run) => run.taskId === taskId && run.fireTime === fireTime) ?? null),
+    insertRun: vi.fn(async (run) => {
+      const id = runs.length + 1;
+      runs.push({ ...run, id });
+      return id;
+    }),
+    updateRun: vi.fn(async (patch) => {
+      const run = runs.find((item) => item.id === patch.id);
+      if (run != null) Object.assign(run, patch);
+    }),
+    deleteUnstartedRun: vi.fn(async (taskId, fireTime) => {
+      const index = runs.findIndex((run) => run.taskId === taskId && run.fireTime === fireTime && run.status === 'RUNNING' && run.startedAt == null);
+      if (index >= 0) runs.splice(index, 1);
+    }),
+  };
+  const stubs = {
+    getSession: vi.fn(async () => ({ id: 11, phase: opts?.sessionPhase ?? 'IDLE' })),
+    updatePhase: vi.fn(),
+    saveMessage: vi.fn(async () => ({ id: 88, content: 'hello' })),
+    getMessages: vi.fn(async () => []),
+  };
+  let chain = Promise.resolve();
+  const svc = new ScheduledTaskService(
+    store,
+    stubs as never,
+    { enqueue: vi.fn() },
+    { executeFromEvent: vi.fn(async () => undefined) },
+    { finishExecution: vi.fn() },
+    { sendText: vi.fn() } as never,
+    { findByUserId: vi.fn(async () => null) } as never,
+    { findByAccountId: vi.fn(async () => []) } as never,
+    (fn) => {
+      chain = chain.then(() => (opts?.gate == null ? fn() : opts.gate.then(fn)));
+    },
+  );
+  return { state, runs, store, stubs, svc, flush: () => chain };
+}
+
+describe('ScheduledTaskService manual run', () => {
+  it('records a MANUAL run without changing the next cron slot or prompt envelope', async () => {
+    const h = manualRunHarness();
+    const nextFireTime = h.state.nextFireTime;
+
+    await h.svc.runNow(1, 7);
+    await h.flush();
+
+    expect(h.runs).toHaveLength(1);
+    expect(h.runs[0].triggerType).toBe('MANUAL');
+    expect(h.runs[0].status).toBe('COMPLETED');
+    expect(h.state.nextFireTime).toBe(nextFireTime);
+    expect(h.state.fireCount).toBe(1);
+    expect(h.state.lastExecutionStatus).toBe('COMPLETED');
+    expect(String(h.stubs.saveMessage.mock.calls[0][2])).toContain('由管理员手动触发');
+  });
+
+  it('allows a paused task to run manually and keeps it paused', async () => {
+    const h = manualRunHarness();
+    h.state.status = 'PAUSED';
+
+    await h.svc.runNow(1, 7);
+    await h.flush();
+
+    expect(h.runs[0].status).toBe('COMPLETED');
+    expect(h.state.status).toBe('PAUSED');
+    expect(h.state.finished ?? 0).toBe(0);
+  });
+
+  it('rejects a finished task before scheduling anything', async () => {
+    const h = manualRunHarness();
+    h.state.finished = 1;
+
+    await expect(h.svc.runNow(1, 7)).rejects.toBeInstanceOf(BusinessException);
+    expect(h.runs).toHaveLength(0);
+  });
+
+  it('rejects a second manual run while the first is still in flight', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const h = manualRunHarness({ gate });
+
+    await h.svc.runNow(1, 7);
+    await expect(h.svc.runNow(1, 7)).rejects.toThrow('任务正在执行中');
+
+    release();
+    await h.flush();
+  });
+
+  it('cancels a manual run without counting it or finishing a one-shot task when the session is busy', async () => {
+    const h = manualRunHarness({ sessionPhase: 'RUNNING' });
+    h.state.once = 1;
+    h.state.fireCount = 5;
+
+    await h.svc.runNow(1, 7);
+    await h.flush();
+
+    expect(h.runs[0].status).toBe('CANCELLED');
+    expect(h.runs[0].errorSummary).toBe('会话正在执行，本次未执行');
+    expect(h.state.fireCount).toBe(5);
+    expect(h.state.finished ?? 0).toBe(0);
+    expect(h.state.lastExecutionStatus).toBe('CANCELLED');
+  });
+
+  it('finishes a one-shot task after a successful manual run', async () => {
+    const h = manualRunHarness();
+    h.state.once = 1;
+
+    await h.svc.runNow(1, 7);
+    await h.flush();
+
+    expect(h.state.finished).toBe(1);
+    expect(h.state.nextFireTime).toBeNull();
+  });
+
+  it('rejects a duplicate manual trigger in the same second', async () => {
+    const h = manualRunHarness();
+    const fireTime = '2026-11-05 12:00:00';
+    const task = { ...h.state };
+
+    await h.svc.executeTask(task, { manual: true, fireTime });
+    await h.flush();
+    await expect(h.svc.executeTask({ ...h.state }, { manual: true, fireTime })).rejects.toThrow('该任务刚刚已触发');
+    expect(h.runs).toHaveLength(1);
+  });
+
+  it('cleans up the unstarted run when the task disappears before the session lock is acquired', async () => {
+    const h = manualRunHarness();
+    const fireTime = '2026-11-05 12:00:00';
+    vi.mocked(h.store.selectById)
+      .mockResolvedValueOnce({ ...h.state })
+      .mockResolvedValue(null);
+
+    await h.svc.executeTask({ ...h.state }, { manual: true, fireTime });
+    await h.flush();
+
+    expect(h.store.deleteUnstartedRun).toHaveBeenCalledWith(1, fireTime);
+    expect(h.runs).toHaveLength(0);
+  });
+});

@@ -31,6 +31,8 @@ export interface ScheduledTaskRun {
   id: number
   taskId: number
   fireTime: string
+  /** MANUAL=手动立即执行；SCHEDULED/空=按 cron 计划触发 */
+  triggerType?: string | null
   attempt: number
   status: string
   sessionId: number
@@ -44,6 +46,8 @@ const tasks = ref<ScheduledTask[]>([])
 const loading = ref(false)
 /** 启停请求 in-flight 的任务 id 集合：el-switch 据此禁用/显示 loading，防连点且互不影响其他任务 */
 const togglingIds = ref<Set<number>>(new Set())
+/** 立即执行请求 in-flight 的任务 id 集合，防连点。 */
+const runningIds = ref<Set<number>>(new Set())
 
 // 进行中 / 已完结 分组
 const activeTasks = computed(() => tasks.value.filter(t => !t.finished))
@@ -102,6 +106,27 @@ export function useScheduledTasks() {
       tasks.value = tasks.value.filter(t => t.id !== id)
     } catch {
       // interceptor handles toast
+    }
+  }
+
+  /** 手动立即执行一次；成功后刷新列表和已展开的运行历史。 */
+  async function runNow(id: number): Promise<boolean> {
+    if (runningIds.value.has(id)) return false
+    const next = new Set(runningIds.value)
+    next.add(id)
+    runningIds.value = next
+    try {
+      await api.post(`/scheduled-tasks/${id}/run`)
+      await fetchTasks()
+      if (runsByTask.value[id] != null) await fetchRuns(id)
+      return true
+    } catch {
+      // interceptor handles toast
+      return false
+    } finally {
+      const settled = new Set(runningIds.value)
+      settled.delete(id)
+      runningIds.value = settled
     }
   }
 
@@ -215,9 +240,11 @@ export function useScheduledTasks() {
     finishedTasks,
     loading,
     togglingIds,
+    runningIds,
     fetchTasks,
     toggleStatus,
     deleteTask,
+    runNow,
     fetchTaskDetail,
     updateTask,
     formatNextFire,

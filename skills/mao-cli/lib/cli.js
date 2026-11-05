@@ -61,7 +61,7 @@ const GLOBAL_HELP = `mao-cli — Mao 用户端与管理后台统一 CLI
   oss             OSS STS
   upload-config   上传配置
   pref            偏好（任务面板/任务通知/微信语音回复）
-  scheduled-task  定时任务列表、详情、更新、删除
+  scheduled-task  定时任务列表、详情、更新、立即执行、删除
   open            开放接口：API Token / 入站 Webhook 触发器 / 出站订阅 CRUD，以及以 mao_ Token 触发运行
   signal-watcher  信号哨兵：探测外部接口、变化触发 Agent（本人 CRUD / 启停 / 轮询记录 / 试运行；admin-list 为只读清单，需 signal:read）
   weixin          微信 Bot 绑定与二维码状态

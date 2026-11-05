@@ -54,6 +54,9 @@
       <div v-else-if="runs.length === 0" class="prompt-hint">还没有运行记录</div>
       <el-table v-else :data="runs" size="small">
         <el-table-column prop="fireTime" label="触发时间" min-width="150" />
+        <el-table-column label="触发方式" width="90">
+          <template #default="{ row }">{{ runTriggerLabel(row.triggerType) }}</template>
+        </el-table-column>
         <el-table-column label="状态" width="90">
           <template #default="{ row }">{{ runStatusLabel(row.status) }}</template>
         </el-table-column>
@@ -75,12 +78,19 @@
       </div>
       <pre class="prompt-body">{{ task.prompt || '（空）' }}</pre>
       <div class="prompt-hint">
-        触发时系统会在该内容前自动附加「本消息由定时任务《{{ task.name }}》按计划触发」的说明；此处是任务本体原文。
+        触发时系统会在该内容前自动附加「本消息由定时任务《{{ task.name }}》按计划触发」的说明；手动立即执行会标注为手动触发。此处是任务本体原文。
       </div>
     </div>
 
     <template #footer>
       <el-button @click="emit('update:modelValue', false)">关闭</el-button>
+      <el-button
+        v-if="canEdit && !task.finished"
+        type="success"
+        :loading="running"
+        :disabled="running"
+        @click="runNow"
+      >立即执行</el-button>
       <el-button v-if="canEdit" type="primary" @click="emit('edit', task)">编辑</el-button>
     </template>
   </ResponsiveDialog>
@@ -89,7 +99,7 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../../api'
 import ResponsiveDialog from '../../components/ResponsiveDialog.vue'
 import { formatDateTime } from '../../utils/datetime'
@@ -98,6 +108,7 @@ import type { ScheduledTaskRow, ScheduledTaskRunRow } from './types'
 
 const runs = ref<ScheduledTaskRunRow[]>([])
 const runsLoading = ref(false)
+const running = ref(false)
 
 const props = defineProps<{
   modelValue: boolean
@@ -110,6 +121,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'update:modelValue', value: boolean): void
   (e: 'edit', task: ScheduledTaskRow): void
+  (e: 'ran'): void
 }>()
 
 const router = useRouter()
@@ -143,6 +155,34 @@ function runStatusLabel(status: string): string {
     case 'QUEUED': return '排队'
     case 'RUNNING': return '运行中'
     default: return status
+  }
+}
+
+function runTriggerLabel(triggerType?: string | null): string {
+  return triggerType === 'MANUAL' ? '手动' : '计划'
+}
+
+async function runNow() {
+  if (!props.task || running.value || props.task.finished) return
+  try {
+    await ElMessageBox.confirm(
+      `确定要立即执行定时任务「${props.task.name}」吗？本次执行不会改变下一次计划触发时间。`,
+      '立即执行',
+      { type: 'info', confirmButtonText: '执行' },
+    )
+  } catch {
+    return
+  }
+  running.value = true
+  try {
+    await api.post(`/scheduled-tasks/${props.task.id}/run`)
+    ElMessage.success('已提交执行')
+    await loadRuns(props.task.id)
+    emit('ran')
+  } catch {
+    // interceptor handles toast
+  } finally {
+    running.value = false
   }
 }
 

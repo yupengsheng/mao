@@ -76,6 +76,7 @@
                 @click="openRunSession(run.sessionId)"
               >
                 <span>{{ formatNextFire(run.fireTime) }}</span>
+                <span v-if="run.triggerType === 'MANUAL'" class="run-manual">手动</span>
                 <span>{{ runBadge(run) }}</span>
                 <span v-if="run.attempt > 1">第 {{ run.attempt }} 次尝试</span>
                 <span>{{ formatDuration(run.durationMs) }}</span>
@@ -91,6 +92,12 @@
               :disabled="task.finished || togglingIds.has(task.id)"
               @change="toggleStatus(task)"
             />
+            <button
+              type="button"
+              class="runs-toggle action-run"
+              :disabled="!!task.finished || runningIds.has(task.id)"
+              @click="runTaskNow(task)"
+            >{{ runningIds.has(task.id) ? '执行中…' : '立即执行' }}</button>
             <button type="button" class="runs-toggle action-edit" @click="openEdit(task)">编辑</button>
             <el-popconfirm title="确认删除此定时任务？" @confirm="removeTask(task.id)">
               <template #reference>
@@ -109,7 +116,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { useScheduledTasks } from '../composables/useScheduledTasks'
 import type { ScheduledTask } from '../composables/useScheduledTasks'
 import { summarizeReliability, reactivatedAfterSave } from '../utils/scheduledTaskEdit'
@@ -117,7 +124,7 @@ import ScheduledTaskEditDialog from './ScheduledTaskEditDialog.vue'
 import { useSessionStore } from '../stores/session'
 
 const {
-  tasks, activeTasks, finishedTasks, loading, togglingIds, fetchTasks, toggleStatus, deleteTask,
+  tasks, activeTasks, finishedTasks, loading, togglingIds, runningIds, fetchTasks, toggleStatus, deleteTask, runNow,
   formatNextFire, formatFinishedAt, statusLabel, runsByTask, runsLoading, fetchRuns, runBadge, formatDuration, formatCost
 } = useScheduledTasks()
 
@@ -178,6 +185,20 @@ async function openRunSession(sessionId: number) {
   }
   sessionStore.setActiveSession(String(sessionId))
   await router.push(`/tasks/${sessionId}`)
+}
+
+async function runTaskNow(task: ScheduledTask) {
+  if (task.finished || runningIds.value.has(task.id)) return
+  try {
+    await ElMessageBox.confirm(
+      `确定要立即执行定时任务「${task.name}」吗？本次执行不会改变下一次计划触发时间。`,
+      '立即执行',
+      { type: 'info', confirmButtonText: '执行' },
+    )
+  } catch {
+    return
+  }
+  if (await runNow(task.id)) ElMessage.success('已提交执行')
 }
 
 onMounted(fetchTasks)
@@ -309,9 +330,19 @@ onMounted(fetchTasks)
   cursor: pointer;
 }
 
-/* 行内编辑入口复用 runs-toggle 朴素按钮样式，仅去掉与 switch/删除不对齐的上边距 */
-.task-actions .runs-toggle.action-edit {
+/* 行内操作入口复用 runs-toggle 朴素按钮样式，仅去掉与 switch/删除不对齐的上边距 */
+.task-actions .runs-toggle.action-edit,
+.task-actions .runs-toggle.action-run {
   margin-top: 0;
+}
+
+.task-actions .runs-toggle.action-run {
+  color: var(--el-color-success);
+}
+
+.task-actions .runs-toggle.action-run:disabled {
+  color: var(--aw-ink-muted-40);
+  cursor: not-allowed;
 }
 
 .policy-sep {
@@ -352,6 +383,13 @@ onMounted(fetchTasks)
 
 .run-row:hover {
   background: var(--aw-surface-sunken, rgba(0, 0, 0, 0.03));
+}
+
+.run-manual {
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--el-color-success-light-9);
+  color: var(--el-color-success);
 }
 
 .cron {

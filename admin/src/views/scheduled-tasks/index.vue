@@ -101,7 +101,7 @@
         <el-table-column prop="lastFireTime" label="上次触发" width="180" :formatter="formatDateTimeColumn" />
         <el-table-column prop="nextFireTime" label="下次触发" width="180" :formatter="formatDateTimeColumn" />
         <el-table-column prop="createdAt" label="创建时间" width="180" :formatter="formatDateTimeColumn" />
-        <el-table-column label="操作" width="300" fixed="right">
+        <el-table-column label="操作" width="380" fixed="right">
           <template #default="{ row }">
             <el-switch
               :model-value="row.status"
@@ -117,6 +117,15 @@
             />
             <el-button type="primary" link size="small" @click="openDetail(row)">查看</el-button>
             <template v-if="canModify(row)">
+              <el-divider direction="vertical" />
+              <el-button
+                type="success"
+                link
+                size="small"
+                :loading="runningIds.has(row.id)"
+                :disabled="!!row.finished || runningIds.has(row.id)"
+                @click="handleRunNow(row)"
+              >立即执行</el-button>
               <el-divider direction="vertical" />
               <el-button type="primary" link size="small" @click="openEdit(row)">编辑</el-button>
               <el-divider direction="vertical" />
@@ -176,6 +185,14 @@
             <el-button type="primary" link @click="openDetail(row)">查看</el-button>
             <template v-if="canModify(row)">
               <el-divider direction="vertical" />
+              <el-button
+                type="success"
+                link
+                :loading="runningIds.has(row.id)"
+                :disabled="!!row.finished || runningIds.has(row.id)"
+                @click="handleRunNow(row)"
+              >立即执行</el-button>
+              <el-divider direction="vertical" />
               <el-button type="primary" link @click="openEdit(row)">编辑</el-button>
               <el-divider direction="vertical" />
               <el-popconfirm title="确认删除此定时任务？" @confirm="handleDelete(row.id)">
@@ -207,6 +224,7 @@
       :agent-name="currentTask ? agentName(currentTask.agentId) : ''"
       :can-edit="currentTask ? canModify(currentTask) : false"
       @edit="openEdit"
+      @ran="fetchTasks"
     />
 
     <ScheduledTaskFormDialog
@@ -256,6 +274,8 @@ onUnmounted(() => {
 
 const tasks = ref<ScheduledTaskRow[]>([])
 const loading = ref(false)
+/** 立即执行请求中的任务 id，防连点并给按钮 loading。 */
+const runningIds = ref<Set<number>>(new Set())
 const pageNum = ref(1)
 const pageSize = ref(20)
 const total = ref(0)
@@ -358,6 +378,33 @@ async function handleDelete(id: number) {
     fetchTasks()
   } catch {
     // interceptor handles toast
+  }
+}
+
+async function handleRunNow(task: ScheduledTaskRow) {
+  if (runningIds.value.has(task.id) || task.finished) return
+  try {
+    await ElMessageBox.confirm(
+      `确定要立即执行定时任务「${task.name}」吗？本次执行不会改变下一次计划触发时间。`,
+      '立即执行',
+      { type: 'info', confirmButtonText: '执行' },
+    )
+  } catch {
+    return
+  }
+  const next = new Set(runningIds.value)
+  next.add(task.id)
+  runningIds.value = next
+  try {
+    await api.post(`/scheduled-tasks/${task.id}/run`)
+    ElMessage.success('已提交执行')
+    fetchTasks()
+  } catch {
+    // interceptor handles toast
+  } finally {
+    const settled = new Set(runningIds.value)
+    settled.delete(task.id)
+    runningIds.value = settled
   }
 }
 

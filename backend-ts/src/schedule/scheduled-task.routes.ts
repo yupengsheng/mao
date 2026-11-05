@@ -125,6 +125,14 @@ export function registerScheduledTaskRoutes(app: FastifyInstance, deps: Schedule
     })));
   });
 
+  app.post('/v1/scheduled-tasks/:id/run', async (req, reply) => {
+    const userId = requireUserId(req, deps.jwt);
+    const id = Number((req.params as { id: string }).id);
+    const allowNonOwner = await hasPermission(userId, WRITE_PERMISSION);
+    await deps.service.runNow(id, userId, { allowNonOwner });
+    sendJson(reply, 200, ok(null));
+  });
+
   app.delete('/v1/scheduled-tasks/:id', async (req, reply) => {
     const userId = requireUserId(req, deps.jwt);
     const id = Number((req.params as { id: string }).id);

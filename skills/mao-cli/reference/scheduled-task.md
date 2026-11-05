@@ -2,7 +2,7 @@
 
 ## 模块职责
 
-查询和维护定时任务：列表、详情、更新名称/提示词/cron/状态/一次性开关、删除。默认仅操作当前用户任务；持 `scheduled-task:read` 的管理端可跨用户查看（`list-all` / 详情），持 `scheduled-task:write` 的管理端可跨用户更新/删除/启停。
+查询和维护定时任务：列表、详情、更新名称/提示词/cron/状态/一次性开关、立即执行、删除。默认仅操作当前用户任务；持 `scheduled-task:read` 的管理端可跨用户查看（`list-all` / 详情），持 `scheduled-task:write` 的管理端可跨用户更新/删除/启停/立即执行。
 
 任务名称上限 200 字符，提示词上限 10000 字符，均不允许为空（服务端校验，超限返回参数错误）。
 
@@ -28,6 +28,7 @@
 | 全量列表（跨用户） | `scheduled-task list-all` |
 | 查看详情 | `scheduled-task get` |
 | 更新任务 | `scheduled-task update` |
+| 立即执行一次 | `scheduled-task run-now` |
 | 删除任务 | `scheduled-task delete` |
 
 ---
@@ -123,11 +124,33 @@ mao scheduled-task update --id 3 --cron-expression '0 0 9 * * *'
 
 ---
 
+## 命令：mao scheduled-task run-now
+
+### 用途
+
+立即执行一次任务，不等待下一次 cron 档期。本次执行使用当前时间作为运行记录触发时间，**不会推进或改写** `nextFireTime`；一次性任务成功执行后照常完结。
+
+任务正在执行或会话正忙时不会排队：前者返回参数错误，后者在运行历史中记一条 `CANCELLED`（错误摘要「会话正在执行，本次未执行」），且不增加触发次数。
+
+### 参数说明
+
+| 参数 | 必填 | 类型 | 含义 |
+|------|------|------|------|
+| `--id` | 是 | 数字 | 定时任务 ID |
+
+### 示例
+
+```bash
+mao scheduled-task run-now --id 3 --json
+```
+
+---
+
 ## 命令：mao scheduled-task runs
 
 ### 用途
 
-查看某个定时任务最近的运行记录（触发时间、状态、第几次尝试、耗时、成本、错误摘要）。默认 20 条，最多 50 条。
+查看某个定时任务最近的运行记录（触发时间、触发方式、状态、第几次尝试、耗时、成本、错误摘要）。`triggerType=MANUAL` 表示手动立即执行，`SCHEDULED` 或空表示按计划触发。默认 20 条，最多 50 条。
 
 ### 参数说明
 
@@ -176,4 +199,4 @@ mao scheduled-task delete --id 3
 
 常见字段：`id`、`userId`、`agentId`、`sessionId`、`name`、`prompt`、`cronExpression`、`status`、`lastFireTime`、`lastExecutionStatus`、`nextFireTime`、`fireCount`、`createdAt`、`updatedAt`。
 
-执行状态取值：任务 `status` 为 `ACTIVE` / `PAUSED`；运行记录与 `lastExecutionStatus` 为 `RUNNING` / `QUEUED` / `COMPLETED` / `FAILED` / `CANCELLED` / `MISSED`。前端（桌面与管理后台）对这几个值都有汉化，出现其它值会原样展示。
+执行状态取值：任务 `status` 为 `ACTIVE` / `PAUSED`；运行记录与 `lastExecutionStatus` 为 `RUNNING` / `QUEUED` / `COMPLETED` / `FAILED` / `CANCELLED` / `MISSED`。运行记录另有 `triggerType`：`SCHEDULED`=计划触发、`MANUAL`=手动立即执行。前端（桌面与管理后台）对这几个值都有汉化，出现其它值会原样展示。

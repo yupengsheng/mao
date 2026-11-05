@@ -27,6 +27,8 @@ export interface ScheduledTaskRow {
 export interface ScheduledTaskRunRow {
   id: number
   fireTime: string
+  /** MANUAL=手动立即执行；SCHEDULED/空=按 cron 计划触发 */
+  triggerType?: string | null
   attempt: number
   status: string
   durationMs: number | null

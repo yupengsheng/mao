@@ -46,6 +46,8 @@ export interface ScheduledTaskRun {
   id?: number;
   taskId: number;
   fireTime: string;
+  /** SCHEDULED=按 cron 档期触发；MANUAL=管理后台立即执行。存量行按 SCHEDULED 处理。 */
+  triggerType?: string | null;
   attempt: number;
   status: string;
   sessionId: number;
@@ -301,9 +303,14 @@ export async function withSessionLock<T>(sessionId: number, fn: () => Promise<T>
 }
 
 /** Trigger envelope injected around task.prompt so the agent executes the task itself instead of re-creating it. */
-export function buildScheduledPrompt(task: Pick<ScheduledTask, 'name'>, prompt: string): string {
+export function buildScheduledPrompt(
+  task: Pick<ScheduledTask, 'name'>,
+  prompt: string,
+  trigger: 'scheduled' | 'manual' = 'scheduled',
+): string {
+  const triggerText = trigger === 'manual' ? '由管理员手动触发' : '按 cron 计划自动触发';
   return [
-    `[系统提示：本消息由定时任务「${task.name}」按 cron 计划自动触发，当前时间 ${formatDateTime(new Date())}。`,
+    `[系统提示：本消息由定时任务「${task.name}」${triggerText}，当前时间 ${formatDateTime(new Date())}。`,
     '请直接执行下面分隔线之后的任务内容本身；除非用户在任务内容中明确要求，不要创建、修改、暂停或删除任何定时任务，也不要重新调度自己。',
     '---',
     prompt,
@@ -492,6 +499,15 @@ export class ScheduledTaskService {
     void task;
   }
 
+  /** 手动立即执行一次：不推进 cron 档期，结束后仍按原计划等待下一次触发。 */
+  async runNow(taskId: number, userId: number, opts?: { allowNonOwner?: boolean }): Promise<void> {
+    const task = await this.getTaskOwnedByUser(taskId, userId, opts?.allowNonOwner);
+    if (Number(task.finished ?? 0) === 1) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '任务已完结，不能立即执行');
+    }
+    await this.executeTask(task, { manual: true });
+  }
+
   listByUser(userId: number): Promise<ScheduledTask[]> {
     return this.store.listByUser(userId);
   }
@@ -512,17 +528,21 @@ export class ScheduledTaskService {
     return this.store.listRuns(taskId, size);
   }
 
-  async executeTask(task: ScheduledTask, ctx?: { isRetry?: boolean; fireTime?: string; runId?: number }): Promise<void> {
+  async executeTask(task: ScheduledTask, ctx?: { isRetry?: boolean; manual?: boolean; fireTime?: string; runId?: number }): Promise<void> {
     const isRetry = ctx?.isRetry === true;
+    const isManual = ctx?.manual === true;
     // 在飞守卫：提交后直到异步执行结束都占住，避免 cron 再次扫描时连环补发与 fireCount 竞态。
-    // 重试撞上在飞时直接返回，不清 next_retry_at，下轮再试。
+    // 重试撞上在飞时直接返回，不清 next_retry_at，下轮再试；手动执行需要明确告诉用户稍后再点。
     if (task.id != null && this.inFlight.has(task.id)) {
+      if (isManual) throw new BusinessException(ErrorCode.PARAM_INVALID, '任务正在执行中，请稍后再试');
       return;
     }
     if (task.id != null) this.inFlight.add(task.id);
     let submitted = false;
     const previousNextFireTime = task.nextFireTime ?? null;
-    const dueFireTime = isRetry ? (ctx?.fireTime ?? null) : previousNextFireTime;
+    const dueFireTime = isManual
+      ? (ctx?.fireTime ?? formatDateTime(new Date()))
+      : isRetry ? (ctx?.fireTime ?? null) : previousNextFireTime;
     let cronUsedForAdvance = task.cronExpression!;
     let advancedNext: string | null = null;
     let runId: number | null = isRetry ? (ctx?.runId ?? null) : null;
@@ -531,9 +551,13 @@ export class ScheduledTaskService {
       // 推进下一档之前先读库。扫描快照上的 cron 可能已被用户改掉；
       // 已暂停的任务还没开跑，不能先把本次档期吃掉。
       const beforeRun = task.id != null ? await this.store.selectById(task.id) : null;
-      if (beforeRun != null && beforeRun.status != null && beforeRun.status !== 'ACTIVE') {
+      if (isManual && task.id != null && beforeRun == null) return;
+      if (beforeRun != null && beforeRun.status != null && beforeRun.status !== 'ACTIVE' && !isManual) {
         if (isRetry && runId != null) await this.store.clearRunRetry?.(runId);
         return;
+      }
+      if (isManual && beforeRun != null && Number(beforeRun.finished ?? 0) === 1) {
+        throw new BusinessException(ErrorCode.PARAM_INVALID, '任务已完结，不能立即执行');
       }
       if (isRetry && (beforeRun == null || beforeRun.finished === 1)) {
         if (runId != null) await this.store.clearRunRetry?.(runId);
@@ -549,15 +573,18 @@ export class ScheduledTaskService {
       if (beforeRun?.retryMax != null) task.retryMax = beforeRun.retryMax;
       if (beforeRun?.retryIntervalMinutes != null) task.retryIntervalMinutes = beforeRun.retryIntervalMinutes;
       if (!isRetry) {
-        // M-5 同类约束：此处仅增量写 nextFireTime，禁止用 listDue 的 T0 快照整行回写，
-        // 否则会覆盖扫描到执行之间用户对 name/prompt/cron/status 的修改。
-        const nextFireTime = this.calculateNextFireTime(cronUsedForAdvance);
-        advancedNext = nextFireTime;
-        task.nextFireTime = nextFireTime;
-        await this.store.updateById({ id: task.id!, nextFireTime });
+        if (!isManual) {
+          // M-5 同类约束：此处仅增量写 nextFireTime，禁止用 listDue 的 T0 快照整行回写，
+          // 否则会覆盖扫描到执行之间用户对 name/prompt/cron/status 的修改。
+          const nextFireTime = this.calculateNextFireTime(cronUsedForAdvance);
+          advancedNext = nextFireTime;
+          task.nextFireTime = nextFireTime;
+          await this.store.updateById({ id: task.id!, nextFireTime });
+        }
         if (dueFireTime != null && task.id != null && task.sessionId != null) {
-          const claimed = await this.claimRun(task.id, task.sessionId, dueFireTime);
+          const claimed = await this.claimRun(task.id, task.sessionId, dueFireTime, isManual ? 'MANUAL' : 'SCHEDULED');
           if (!claimed.ok) {
+            if (isManual) throw new BusinessException(ErrorCode.PARAM_INVALID, '该任务刚刚已触发，请稍后再试');
             await this.restoreNextFireIfUnchanged(task.id, advancedNext, previousNextFireTime);
             return;
           }
@@ -581,6 +608,15 @@ export class ScheduledTaskService {
               // 拿到锁后重读最新任务状态，排队期间可能已被更新/暂停/删除
               const latest = task.id != null ? await this.store.selectById(task.id) : null;
               if (latest == null) {
+                if (isManual && task.id != null && dueFireTime != null) {
+                  await this.store.deleteUnstartedRun?.(task.id, dueFireTime);
+                }
+                return;
+              }
+              if (isManual && Number(latest.finished ?? 0) === 1) {
+                await this.finishRun(runId, 'CANCELLED', {
+                  retryable: false, error: '任务已完结，本次未执行', task, countOutcome: false,
+                });
                 return;
               }
               task.name = latest.name;
@@ -591,7 +627,7 @@ export class ScheduledTaskService {
               task.fireCount = latest.fireCount ?? task.fireCount;
               task.retryMax = latest.retryMax ?? task.retryMax;
               task.retryIntervalMinutes = latest.retryIntervalMinutes ?? task.retryIntervalMinutes;
-              if (task.status != null && task.status !== 'ACTIVE') {
+              if (task.status != null && task.status !== 'ACTIVE' && !(isManual && task.status === 'PAUSED')) {
                 if (isRetry) {
                   if (runId != null) await this.store.clearRunRetry?.(runId);
                 } else {
@@ -623,11 +659,17 @@ export class ScheduledTaskService {
               const phase = session.phase;
               const busy = this.isSessionBusy?.(task.sessionId!) === true || isActivePhase(phase);
               if (busy) {
+                if (isManual) {
+                  // 手动执行不排队：队列终态会按 once 任务收口，可能误清下一次 cron 档期。
+                  await this.finishRun(runId, 'CANCELLED', { retryable: false, error: '会话正在执行，本次未执行', task, countOutcome: false });
+                  await this.markTaskResult(task, 'CANCELLED');
+                  return;
+                }
                 // 仅入队未真正执行：不进入 finally 的 fireCount 收尾（countThisRun 保持 false），
                 // 但本次 cron 触发已发生——入队成功即累加 fireCount/lastFireTime。
                 // 绑定 scheduledTaskId：队列消费侧完成后回写 lastExecutionStatus QUEUED→COMPLETED/FAILED。
                 await this.messageQueueService.enqueue(
-                  task.sessionId!, userId, buildScheduledPrompt(task, task.prompt!), null, task.id ?? null,
+                  task.sessionId!, userId, buildScheduledPrompt(task, task.prompt!, isManual ? 'manual' : 'scheduled'), null, task.id ?? null,
                 );
                 const enqueuedAt = formatDateTime(new Date());
                 const patch: Partial<ScheduledTask> & { id: number } = {
@@ -641,7 +683,7 @@ export class ScheduledTaskService {
                   task.fireCount = patch.fireCount;
                 }
                 // once 只看锁内重读。入队先不标完结，失败后还要能重试；清空下一档挡住 listDue 再开一档。
-                if (!isRetry && latest.once === 1) {
+                if (!isRetry && !isManual && latest.once === 1) {
                   patch.nextFireTime = null;
                   task.nextFireTime = null;
                 }
@@ -676,7 +718,7 @@ export class ScheduledTaskService {
               if (runId != null) await this.store.updateRun?.({ id: runId, status: 'RUNNING', startedAt });
               let savedMessage: Message;
               try {
-                savedMessage = await this.sessionService.saveMessage(task.sessionId!, 'USER', buildScheduledPrompt(task, task.prompt!), null, null, null, 0, null);
+                savedMessage = await this.sessionService.saveMessage(task.sessionId!, 'USER', buildScheduledPrompt(task, task.prompt!, isManual ? 'manual' : 'scheduled'), null, null, null, 0, null);
               } catch (saveError) {
                 await this.sessionService.updatePhase(task.sessionId!, 'IDLE');
                 countThisRun = true;
@@ -1225,13 +1267,32 @@ export class ScheduledTaskService {
     return this.queueTick;
   }
 
-  private async claimRun(taskId: number, sessionId: number, fireTime: string): Promise<{ ok: boolean; runId: number | null }> {
+  private async claimRun(
+    taskId: number,
+    sessionId: number,
+    fireTime: string,
+    triggerType: 'SCHEDULED' | 'MANUAL' = 'SCHEDULED',
+  ): Promise<{ ok: boolean; runId: number | null }> {
     if (this.store.selectRunByFire == null || this.store.insertRun == null) return { ok: true, runId: null };
     const existing = await this.store.selectRunByFire(taskId, fireTime);
+    if (triggerType === 'MANUAL') {
+      // 手动执行使用当前秒作为 fire_time；同一秒重复点击或与计划档期撞车都视为已触发，
+      // 不能复用已有的 MISSED / 未开跑行，否则会吞掉另一次独立触发。
+      if (existing != null) return { ok: false, runId: existing.id ?? null };
+      try {
+        const id = await this.store.insertRun({
+          taskId, fireTime, triggerType, attempt: 1, status: 'RUNNING', sessionId, startedAt: null,
+        });
+        return { ok: true, runId: id };
+      } catch (e) {
+        if (!isDupKey(e)) throw e;
+        return { ok: false, runId: null };
+      }
+    }
     if (existing == null) {
       try {
         const id = await this.store.insertRun({
-          taskId, fireTime, attempt: 1, status: 'RUNNING', sessionId, startedAt: null,
+          taskId, fireTime, triggerType, attempt: 1, status: 'RUNNING', sessionId, startedAt: null,
         });
         return { ok: true, runId: id };
       } catch (e) {
@@ -1282,7 +1343,7 @@ export class ScheduledTaskService {
   private async finishRun(
     runId: number | null,
     phase: 'COMPLETED' | 'FAILED' | 'CANCELLED',
-    opts: { retryable?: boolean; error?: string | null; messageId?: number | null; startedAt?: string | null; task: ScheduledTask },
+    opts: { retryable?: boolean; error?: string | null; messageId?: number | null; startedAt?: string | null; task: ScheduledTask; countOutcome?: boolean },
   ): Promise<{ willRetry: boolean }> {
     if (runId == null || this.store.selectRunById == null || this.store.updateRun == null) return { willRetry: false };
     const run = await this.store.selectRunById(runId);
@@ -1326,7 +1387,7 @@ export class ScheduledTaskService {
     } catch (e) {
       console.error(`定时任务运行记录回写失败, runId=${runId}`, e);
     }
-    if (!willRetry && (phase === 'FAILED' || phase === 'COMPLETED') && task.id != null && this.store.recordTaskOutcome != null) {
+    if (opts.countOutcome !== false && !willRetry && (phase === 'FAILED' || phase === 'COMPLETED') && task.id != null && this.store.recordTaskOutcome != null) {
       try {
         const outcome = await this.store.recordTaskOutcome(task.id, phase, TASK_PAUSE_AFTER_FAILURES, finishedAt);
         if (outcome?.paused) {
