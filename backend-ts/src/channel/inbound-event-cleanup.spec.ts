@@ -12,18 +12,24 @@ function store(name: string, deleteBatch: ReturnType<typeof vi.fn>): InboundEven
 }
 
 describe('InboundEventCleanup', () => {
-  it('按 30 天保留期分批清理飞书与钉钉记录', async () => {
+  it('按 30 天保留期分批清理飞书、钉钉与微信记录', async () => {
     const feishu = vi.fn().mockResolvedValueOnce(5000).mockResolvedValueOnce(12);
     const dingtalk = vi.fn().mockResolvedValueOnce(3);
-    const cleanup = new InboundEventCleanup([store('feishu', feishu), store('dingtalk', dingtalk)]);
+    const weixin = vi.fn().mockResolvedValueOnce(2);
+    const cleanup = new InboundEventCleanup([
+      store('feishu', feishu),
+      store('dingtalk', dingtalk),
+      store('weixin', weixin),
+    ]);
     const now = Date.UTC(2026, 10, 5, 12, 0, 0);
     const cutoff = formatDateTime(now - INBOUND_EVENT_RETENTION_DAYS * 24 * 60 * 60 * 1000);
 
-    await expect(cleanup.cleanupOnce(now)).resolves.toBe(5015);
+    await expect(cleanup.cleanupOnce(now)).resolves.toBe(5017);
 
     expect(feishu).toHaveBeenNthCalledWith(1, cutoff, INBOUND_EVENT_CLEANUP_BATCH_SIZE);
     expect(feishu).toHaveBeenNthCalledWith(2, cutoff, INBOUND_EVENT_CLEANUP_BATCH_SIZE);
     expect(dingtalk).toHaveBeenCalledWith(cutoff, INBOUND_EVENT_CLEANUP_BATCH_SIZE);
+    expect(weixin).toHaveBeenCalledWith(cutoff, INBOUND_EVENT_CLEANUP_BATCH_SIZE);
   });
 
   it('单表最多 20 批，剩余记录留到下一小时', async () => {

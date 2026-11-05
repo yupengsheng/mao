@@ -11,7 +11,7 @@ export interface InboundEventStore {
   deleteBatch(cutoff: string, limit: number): Promise<number>;
 }
 
-/** 飞书 / 钉钉入站幂等记录清理：每小时按同一保留期分批删除，单表失败不影响另一张表。 */
+/** 飞书 / 钉钉 / 微信入站幂等记录清理：每小时按同一保留期分批删除，单表失败不影响其它表。 */
 export class InboundEventCleanup {
   private timer: ReturnType<typeof setInterval> | null = null;
   private stopped = false;

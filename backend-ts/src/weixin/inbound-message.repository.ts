@@ -140,12 +140,17 @@ export class WeixinInboundMessageRepository {
     return Date.now() - ts < WeixinInboundMessageRepository.DONE_DEDUP_WINDOW_MS;
   }
 
-  /** 合法重发相同内容（DONE 超窗口）时把既有行重新置回 CLAIMED，进入处理。 */
+  /**
+   * 合法重发相同内容（DONE 超窗口）时把既有行重新置回 CLAIMED，进入处理。
+   * 用 upsert 而非纯 UPDATE：清理 Job 可能刚删掉超期 DONE 行，
+   * 此时重发仍应留下新的 CLAIMED 记录，避免后续服务端重投失去幂等保护。
+   */
   async reclaimForResend(accountId: string, messageKey: string, payload: string): Promise<void> {
     await this.db.execute(
-      `UPDATE weixin_inbound_message SET status = 'CLAIMED', payload = ?, updated_at = CURRENT_TIMESTAMP
-       WHERE account_id = ? AND message_key = ?`,
-      [payload, accountId, messageKey],
+      `INSERT INTO weixin_inbound_message (account_id, message_key, payload, status, updated_at)
+       VALUES (?, ?, ?, 'CLAIMED', CURRENT_TIMESTAMP)
+       ON DUPLICATE KEY UPDATE status = 'CLAIMED', payload = VALUES(payload), updated_at = CURRENT_TIMESTAMP`,
+      [accountId, messageKey, payload],
     );
   }
 
@@ -162,5 +167,21 @@ export class WeixinInboundMessageRepository {
        WHERE account_id = ? AND message_key = ? AND status = 'CLAIMED'`,
       [accountId, messageKey],
     );
+  }
+
+  /**
+   * 分批删除已进入终态且超过保留期的幂等记录。
+   * 只删 DONE / FAILED：CLAIMED 可能因进程中断等待重放，不能按时间误删。
+   * 使用 updated_at 作为终态时间，DONE 去重窗口与重放超时都远短于保留期。
+   */
+  async deleteTerminalBatch(cutoff: string, limit: number): Promise<number> {
+    const safeLimit = Math.max(1, Math.min(5000, Math.floor(limit)));
+    const result = await this.db.execute(
+      `DELETE FROM weixin_inbound_message
+       WHERE status IN ('DONE', 'FAILED') AND updated_at < ?
+       ORDER BY updated_at, id LIMIT ${safeLimit}`,
+      [cutoff],
+    );
+    return result.affectedRows;
   }
 }

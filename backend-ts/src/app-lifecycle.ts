@@ -40,6 +40,7 @@ import { MysqlFeishuPendingBindingRepository } from './feishu/pending-binding.re
 import { MysqlDingtalkPendingBindingRepository } from './dingtalk/pending-binding.repository.js';
 import { MysqlFeishuMessageRepository } from './feishu/message.repository.js';
 import { MysqlDingtalkMessageRepository } from './dingtalk/message.repository.js';
+import { WeixinInboundMessageRepository } from './weixin/inbound-message.repository.js';
 
 export interface LifecycleDeps {
   app: FastifyInstance;
@@ -139,9 +140,11 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
   sessionActivityCleanup.start();
   const feishuMessageRepo = new MysqlFeishuMessageRepository(db);
   const dingtalkMessageRepo = new MysqlDingtalkMessageRepository(db);
+  const weixinMessageRepo = new WeixinInboundMessageRepository(db);
   const inboundEventCleanup = new InboundEventCleanup([
     { name: 'feishu', deleteBatch: (cutoff, limit) => feishuMessageRepo.deleteInboundBatch(cutoff, limit) },
     { name: 'dingtalk', deleteBatch: (cutoff, limit) => dingtalkMessageRepo.deleteInboundBatch(cutoff, limit) },
+    { name: 'weixin', deleteBatch: (cutoff, limit) => weixinMessageRepo.deleteTerminalBatch(cutoff, limit) },
   ]);
   inboundEventCleanup.start();
   const feishuOauthStateRepo = new MysqlFeishuOauthStateRepository(db);
