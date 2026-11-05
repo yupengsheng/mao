@@ -100,3 +100,39 @@ describe('MysqlFeishuMessageRepository inbound event cleanup', () => {
     expect(execute).toHaveBeenCalledWith(expect.stringContaining('LIMIT 1'), ['2026-10-05 00:00:00']);
   });
 });
+
+describe('MysqlFeishuMessageRepository group message log cleanup', () => {
+  it('deletes only enriched rows ordered by created_at and id', async () => {
+    const { repo, execute } = setup([]);
+
+    await expect(repo.deleteEnrichedGroupMessageBatch('2026-10-06 00:00:00', 999999)).resolves.toBe(3);
+
+    expect(execute).toHaveBeenCalledWith(
+      `DELETE FROM feishu_group_message_log
+       WHERE enrich_pending = 0 AND created_at < ?
+       ORDER BY created_at, id LIMIT 5000`,
+      ['2026-10-06 00:00:00'],
+    );
+  });
+
+  it('deletes only stale pending rows ordered by created_at and id', async () => {
+    const { repo, execute } = setup([]);
+
+    await repo.deleteStalePendingGroupMessageBatch('2026-08-07 00:00:00', 10);
+
+    expect(execute).toHaveBeenCalledWith(
+      `DELETE FROM feishu_group_message_log
+       WHERE enrich_pending = 1 AND created_at < ?
+       ORDER BY created_at, id LIMIT 10`,
+      ['2026-08-07 00:00:00'],
+    );
+  });
+
+  it('keeps at least one row per batch for a non-positive limit', async () => {
+    const { repo, execute } = setup([]);
+
+    await repo.deleteEnrichedGroupMessageBatch('2026-10-06 00:00:00', 0);
+
+    expect(execute).toHaveBeenCalledWith(expect.stringContaining('LIMIT 1'), ['2026-10-06 00:00:00']);
+  });
+});

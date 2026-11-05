@@ -29,6 +29,11 @@ import { TaskExecutionRetentionService } from './task/task-execution-retention.s
 import { MysqlAuditLogRepository } from './audit/audit.repository.js';
 import { AuditLogCleanup } from './audit/audit-log-cleanup.js';
 import { InboundEventCleanup } from './channel/inbound-event-cleanup.js';
+import {
+  GROUP_MESSAGE_LOG_PENDING_RETENTION_DAYS,
+  GROUP_MESSAGE_LOG_RETENTION_DAYS,
+  GroupMessageLogCleanup,
+} from './channel/group-message-log-cleanup.js';
 import { LlmCallCleanup } from './usage/llm-call-cleanup.js';
 import { SessionActivityCleanup } from './session/session-activity-cleanup.js';
 import { SessionActivityRepository } from './session/activity.repository.js';
@@ -147,6 +152,24 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
     { name: 'weixin', deleteBatch: (cutoff, limit) => weixinMessageRepo.deleteTerminalBatch(cutoff, limit) },
   ]);
   inboundEventCleanup.start();
+  const groupMessageLogCleanup = new GroupMessageLogCleanup([
+    {
+      name: 'feishu_enriched',
+      retentionDays: GROUP_MESSAGE_LOG_RETENTION_DAYS,
+      deleteBatch: (cutoff, limit) => feishuMessageRepo.deleteEnrichedGroupMessageBatch(cutoff, limit),
+    },
+    {
+      name: 'feishu_pending',
+      retentionDays: GROUP_MESSAGE_LOG_PENDING_RETENTION_DAYS,
+      deleteBatch: (cutoff, limit) => feishuMessageRepo.deleteStalePendingGroupMessageBatch(cutoff, limit),
+    },
+    {
+      name: 'dingtalk',
+      retentionDays: GROUP_MESSAGE_LOG_RETENTION_DAYS,
+      deleteBatch: (cutoff, limit) => dingtalkMessageRepo.deleteGroupMessageBatch(cutoff, limit),
+    },
+  ]);
+  groupMessageLogCleanup.start();
   const feishuOauthStateRepo = new MysqlFeishuOauthStateRepository(db);
   const ecpOauthStateRepo = new MysqlEcpOauthStateRepository(db);
   const dingtalkOauthStateRepo = new MysqlDingtalkOauthStateRepository(db);
@@ -269,7 +292,7 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
     activityHeartbeat: d.activityHeartbeat, wsRegistry: d.wsRegistry,
     agentLoop: d.agentLoop, wsHandler: d.wsHandler, sessionService: d.sessionService,
     taskRecordRepair, taskExecutionRetention, auditLogCleanup, llmCallCleanup, sessionActivityCleanup, inboundEventCleanup,
-    authStateCleanup,
+    authStateCleanup, groupMessageLogCleanup,
   });
   drainWatcher.start();
 

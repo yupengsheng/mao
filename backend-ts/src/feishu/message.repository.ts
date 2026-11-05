@@ -54,6 +54,10 @@ export interface FeishuMessageRepository {
   completeInboundMessage(appId: string, messageId: string): Promise<void>;
   /** 按创建时间分批删除过期入站幂等记录，走 idx_feishu_inbound_created。 */
   deleteInboundBatch(cutoff: string, limit: number): Promise<number>;
+  /** 分批删除超过保留期且已完成富化的群消息日志。 */
+  deleteEnrichedGroupMessageBatch(cutoff: string, limit: number): Promise<number>;
+  /** 分批删除长期卡在 enrich_pending=1 的群消息日志，恢复后续上下文水位线推进。 */
+  deleteStalePendingGroupMessageBatch(cutoff: string, limit: number): Promise<number>;
   appendGroupMessage(message: FeishuGroupMessage): Promise<number>;
   listGroupMessages(appId: string, chatId: string, limit: number, maxMinutes?: number, threadId?: string | null): Promise<FeishuGroupMessage[]>;
   /** 追溯注入窗口之前被丢弃的未注入普通消息（id > watermark 且 id < beforeId，不限时间），供溢出摘要。 */
@@ -192,6 +196,28 @@ export class MysqlFeishuMessageRepository implements FeishuMessageRepository {
     );
     if (saved?.id == null) throw new Error('Failed to record Feishu group message');
     return Number(saved.id);
+  }
+
+  async deleteEnrichedGroupMessageBatch(cutoff: string, limit: number): Promise<number> {
+    const safeLimit = clampDeleteLimit(limit);
+    const result = await this.db.execute(
+      `DELETE FROM feishu_group_message_log
+       WHERE enrich_pending = 0 AND created_at < ?
+       ORDER BY created_at, id LIMIT ${safeLimit}`,
+      [cutoff],
+    );
+    return result.affectedRows;
+  }
+
+  async deleteStalePendingGroupMessageBatch(cutoff: string, limit: number): Promise<number> {
+    const safeLimit = clampDeleteLimit(limit);
+    const result = await this.db.execute(
+      `DELETE FROM feishu_group_message_log
+       WHERE enrich_pending = 1 AND created_at < ?
+       ORDER BY created_at, id LIMIT ${safeLimit}`,
+      [cutoff],
+    );
+    return result.affectedRows;
   }
 
   async addGroupMember(appId: string, chatId: string, userId: number, openId: string, displayName: string): Promise<void> {
@@ -373,4 +399,8 @@ export class MysqlFeishuMessageRepository implements FeishuMessageRepository {
     );
     return row?.rootMessageId ?? null;
   }
+}
+
+function clampDeleteLimit(limit: number): number {
+  return Math.max(1, Math.min(5000, Math.floor(limit)));
 }

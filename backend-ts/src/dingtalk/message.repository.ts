@@ -92,6 +92,17 @@ export class MysqlDingtalkMessageRepository {
     return result.affectedRows;
   }
 
+  async deleteGroupMessageBatch(cutoff: string, limit: number): Promise<number> {
+    const safeLimit = Math.max(1, Math.min(5000, Math.floor(limit)));
+    const result = await this.db.execute(
+      `DELETE FROM dingtalk_group_message_log
+       WHERE created_at < ?
+       ORDER BY created_at, id LIMIT ${safeLimit}`,
+      [cutoff],
+    );
+    return result.affectedRows;
+  }
+
   async appendGroupMessage(message: DingtalkGroupLog): Promise<number> {
     if (message.messageId != null && message.messageId !== '' && message.direction === 'IN') {
       const existing = await this.db.queryOne<{ id: number }>(
