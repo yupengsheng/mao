@@ -57,3 +57,9 @@ export interface TaskPage {
   page: number;
   size: number;
 }
+
+export interface TaskRepairCandidate {
+  taskId: number;
+  userId: number;
+  sessionId: number;
+}

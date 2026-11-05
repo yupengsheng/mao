@@ -47,4 +47,21 @@ describe('TaskRepository', () => {
     const repo = new TaskRepository(db as unknown as Db);
     await expect(repo.transaction((locked) => locked.insertTrigger({ taskId: 4, sessionId: 5, source: 'API', sourceEventId: 'run-1' }))).rejects.toBe(failure);
   });
+
+  it('queries only stale terminal sessions with an unfinished or inconsistent task record', async () => {
+    const db = { query: vi.fn().mockResolvedValue([]) };
+    const repo = new TaskRepository(db as unknown as Db);
+
+    await repo.listRepairCandidates('2026-11-05 11:58:00', 100);
+
+    const [sql, params] = db.query.mock.calls[0]!;
+    expect(sql).toContain("s.phase IN ('COMPLETED', 'FAILED', 'CANCELLED')");
+    expect(sql).toContain('COALESCE(s.last_activity_at, s.updated_at, s.created_at) <= ?');
+    expect(sql).toContain("e.status IN ('WORKING', 'BLOCKED')");
+    expect(sql).toContain('e.execution_id = t.last_execution_id');
+    expect(sql).toContain('e.status = t.stage');
+    expect(sql).toContain('t.stage <> s.phase OR t.last_execution_id IS NOT NULL');
+    expect(sql).toContain('LIMIT ?');
+    expect(params).toEqual(['2026-11-05 11:58:00', 100]);
+  });
 });

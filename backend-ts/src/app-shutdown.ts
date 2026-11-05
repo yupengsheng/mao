@@ -26,6 +26,7 @@ import type { OpenApiCallLogCleanup } from './openapi/open-api-call-log.cleanup.
 import type { WatcherScheduler } from './signal/watcher-scheduler.js';
 import type { SignalCheckCleanup } from './signal/signal-check-cleanup.js';
 import type { EcpRenewScheduler } from './auth/ecp-renew.scheduler.js';
+import type { TaskRecordRepairService } from './task/task-record-repair.service.js';
 
 /** 停机时需要优雅关闭的所有组件。 */
 export interface ShutdownDeps {
@@ -59,6 +60,7 @@ export interface ShutdownDeps {
   agentLoop: AgentLoop;
   wsHandler: StreamingWsHandler;
   sessionService: SessionService;
+  taskRecordRepair: TaskRecordRepairService;
 }
 
 /**
@@ -72,7 +74,7 @@ export function createShutdownHandler(deps: ShutdownDeps): () => Promise<void> {
     watcherScheduler, signalCheckCleanup, ecpRenewScheduler,
     shellManager, terminalManager, ptyChannelHubs, ptyHubGeneration,
     containerRegistry, channelServer, runtimeCleanup, activityHeartbeat, wsRegistry,
-    agentLoop, wsHandler, sessionService,
+    agentLoop, wsHandler, sessionService, taskRecordRepair,
   } = deps;
 
   const isDrainingForDeploy = (): boolean => isDrainingInstance(cfg.app.harness.runtimeDir, cfg.server.port);
@@ -110,6 +112,7 @@ export function createShutdownHandler(deps: ShutdownDeps): () => Promise<void> {
     ctx.closing = (async () => {
       crash.stopPeriodicSweep();
       drainWatcher.stop();
+      taskRecordRepair.stop();
       weixinMonitor.shutdown();
       feishuMonitor.shutdown();
       dingtalk.shutdown();

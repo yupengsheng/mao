@@ -1,7 +1,7 @@
 import type { Db } from '../db/db.js';
 import { notDeleted } from '../db/db.js';
 import type { Session } from '../session/types.js';
-import type { AgentTask, TaskExecution, TaskPage, TaskPageFilter, TaskTrigger } from './types.js';
+import type { AgentTask, TaskExecution, TaskPage, TaskPageFilter, TaskRepairCandidate, TaskTrigger } from './types.js';
 
 export class TaskRepository {
   constructor(private readonly db: Db) {}
@@ -68,6 +68,44 @@ export class TaskRepository {
     return this.db.queryOne<TaskExecution>(
       'SELECT * FROM agent_task_execution WHERE execution_id = ? LIMIT 1',
       [executionId],
+    );
+  }
+
+  /**
+   * 终态会话下仍可能未收口的任务。只返回超过宽限期的会话，避免与正在执行的
+   * finishExecution 竞争；具体归属与状态会在修复事务中重新锁定校验。
+   */
+  listRepairCandidates(staleBefore: string, limit: number): Promise<TaskRepairCandidate[]> {
+    return this.db.query<TaskRepairCandidate>(
+      `SELECT t.id AS task_id, t.user_id, t.session_id
+         FROM agent_task t
+         JOIN \`session\` s ON s.id = t.session_id AND s.user_id = t.user_id
+        WHERE t.deleted = 0 AND s.deleted = 0
+          AND s.phase IN ('COMPLETED', 'FAILED', 'CANCELLED')
+          AND COALESCE(s.last_activity_at, s.updated_at, s.created_at) <= ?
+          AND (
+            EXISTS (
+              SELECT 1 FROM agent_task_execution e
+               WHERE e.task_id = t.id AND e.status IN ('WORKING', 'BLOCKED')
+            )
+            OR (
+              EXISTS (SELECT 1 FROM agent_task_execution e WHERE e.task_id = t.id)
+              AND NOT EXISTS (
+                SELECT 1 FROM agent_task_execution e
+                 WHERE e.task_id = t.id
+                   AND e.id = (SELECT MAX(x.id) FROM agent_task_execution x WHERE x.task_id = t.id)
+                   AND e.execution_id = t.last_execution_id
+                   AND e.status = t.stage
+              )
+            )
+            OR (
+              NOT EXISTS (SELECT 1 FROM agent_task_execution e WHERE e.task_id = t.id)
+              AND (t.stage <> s.phase OR t.last_execution_id IS NOT NULL)
+            )
+          )
+        ORDER BY COALESCE(s.last_activity_at, s.updated_at, s.created_at) ASC, t.id ASC
+        LIMIT ?`,
+      [staleBefore, limit],
     );
   }
 

@@ -22,6 +22,8 @@ import { CrashRecoveryRunner } from './harness/core/crash-recovery-runner.js';
 import { FeishuCardProgressListener } from './feishu/card-progress-listener.js';
 import { DeployDrainWatcher } from './harness/core/deploy-drain-watcher.js';
 import { createShutdownHandler } from './app-shutdown.js';
+import { TaskRepository } from './task/task.repository.js';
+import { TaskRecordRepairService } from './task/task-record-repair.service.js';
 
 export interface LifecycleDeps {
   app: FastifyInstance;
@@ -98,6 +100,8 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
   inboxCleanupScheduler.start();
   const scheduledRunCleanup = new ScheduledTaskRunCleanupScheduler(d.scheduledStore);
   scheduledRunCleanup.start();
+  const taskRecordRepair = new TaskRecordRepairService(new TaskRepository(db));
+  taskRecordRepair.start();
   d.callLogService.start();
   d.callLogCleanup.start();
   const ecpRenewScheduler = new EcpRenewScheduler(
@@ -204,6 +208,7 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
     containerRegistry: d.containerRegistry, channelServer: d.channelServer, runtimeCleanup,
     activityHeartbeat: d.activityHeartbeat, wsRegistry: d.wsRegistry,
     agentLoop: d.agentLoop, wsHandler: d.wsHandler, sessionService: d.sessionService,
+    taskRecordRepair,
   });
   drainWatcher.start();
 
