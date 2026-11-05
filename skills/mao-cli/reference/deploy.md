@@ -400,13 +400,23 @@ FROM message WHERE deleted = 0;
 2. **运行时镜像**：构建 `mao-runtime` 镜像（Node + bash + git + coreutils + 与镜像 Node ABI 匹配的 `sharp`/`node-pty`）：
 
    ```bash
-   bash scripts/build-runtime-image.sh        # 产出 mao-runtime:latest
+   bash scripts/restart-backend.sh            # 构建后端并自动对齐镜像，然后蓝绿重启
+   bash scripts/align-runtime-image.sh        # 只对齐镜像（可独立运行，幂等）
+   bash scripts/align-runtime-image.sh --force   # 强制重建（如宿主机 Node 升级）
    bash scripts/build-runtime-image.sh --print-deps-hash   # 只打印当前 lock 指纹
    ```
 
-   镜像依赖来源是 `backend-ts/package.json` + `package-lock.json`（`npm ci --omit=dev`），不再维护手写包清单。**宿主机 Node 升级后必须同步重建镜像**，否则容器内读图（sharp）与终端（node-pty）静默失败。
+   镜像依赖来源是 `backend-ts/package.json` + `package-lock.json`（`npm ci --omit=dev`），不再维护手写包清单。**宿主机 Node 升级后必须同步重建镜像**（`align-runtime-image.sh --force`），否则容器内读图（sharp）与终端（node-pty）静默失败。
 
-   构建脚本会把 `package-lock.json` 的 sha256 前 16 位写入镜像 label `org.mao.runtime.deps-hash`。后端预检会比对当前 lock 与镜像 label，但**加载冒烟仍是硬闸门**：预检用当前 dist 在镜像内实际加载一次 runtime-agent 与 sharp / node-pty，能加载时指纹不一致只告警，加载失败才拒绝切换并提示重建。因此 lock 变化（新增 / 升级依赖）后应重建镜像；忘记重建时，后台切换 docker 会以明确错误拒绝，而不是让每个用户任务等满 15 秒后报「容器运行时通道连接超时」。
+   对齐脚本把 `package-lock.json` 的 sha256 前 16 位与 `mao-runtime:latest` 的 `org.mao.runtime.deps-hash` label 比对：一致时直接退出，不构建、不重启；不一致时先构建临时 tag，用当前 `backend-ts/dist` 在镜像内加载 runtime-agent / sharp / node-pty 冒烟，通过后才创建 `YYYY-MM-DD-<sha>` dated tag 并把 `latest` 指向新镜像。构建或冒烟失败会非零退出，旧 `latest` 保持不变，部署脚本应随之中止。dated tag 默认保留最近 2 个（`MAO_RUNTIME_ALIGN_KEEP` 可调），用于回滚。
+
+   外部自建部署脚本（如 `/data/deploy-mao.sh`，不在本仓库内）需在「构建 backend」之后、「后端蓝绿切换」之前插入：
+
+   ```bash
+   bash /opt/mao/scripts/align-runtime-image.sh
+   ```
+
+   后端预检会比对当前 lock 与镜像 label，但**加载冒烟仍是硬闸门**：预检用当前 dist 在镜像内实际加载一次 runtime-agent 与 sharp / node-pty，能加载时指纹不一致只告警，加载失败才拒绝切换并提示重建。因此 lock 变化（新增 / 升级依赖）后应重建镜像；忘记重建时，后台切换 docker 会以明确错误拒绝，而不是让每个用户任务等满 15 秒后报「容器运行时通道连接超时」。
 
    容器侧依赖闭包由 `container-dependency-closure.spec.ts` 在 CI 中守门：运行时 bare import 必须属于生产依赖，`import type` 不要求镜像内存在；非字面量动态 import 会被拒绝。
 3. **数据目录**：`/opt/mao-data/runtime/channels`（socket 根）与 `/opt/mao-data/deps`（持久依赖）需存在且后端进程可写（首次启动预检会校验，不满足直接启动失败，不静默降级）。
@@ -422,6 +432,8 @@ FROM message WHERE deleted = 0;
 | `MAO_CONTAINER_MAX_LIFETIME_HOURS` | `72` | 强制重建阈值 |
 | `MAO_CONTAINER_MEMORY_MB` / `MAO_CONTAINER_CPUS` / `MAO_CONTAINER_PIDS_LIMIT` | 2048 / 2 / 512 | 单容器资源上限 |
 | `MAO_CONTAINER_IMAGE` | `mao-runtime:latest` | 运行时镜像 |
+| `MAO_CONTAINER_DIST_DIR` | `/opt/mao/backend-ts/dist` | 当前后端构建产物绝对路径；`align-runtime-image.sh` 用它做部署前冒烟 |
+| `MAO_RUNTIME_ALIGN_KEEP` | `2` | `align-runtime-image.sh` 保留的 dated tag 数量 |
 | `MAO_CONTAINER_CHANNEL_DIR` | `/opt/mao-data/runtime/channels` | socket 根目录（每用户子目录） |
 | `MAO_CONTAINER_DEPS_DIR` | `/opt/mao-data/deps` | 持久依赖目录（npm -g / pip 安装位置，容器重建不丢） |
 | `MAO_CONTAINER_TMP_DIR` | `/opt/mao-data/tmp` | 每用户 /tmp 持久根：`{tmpDir}/{userId}` 挂到容器 `/tmp`（stop/重建不丢），目录权限 1777 |

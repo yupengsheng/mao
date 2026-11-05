@@ -10,5 +10,8 @@ echo "==> 构建后端（tsc）..."
 cd "$BACKEND_DIR"
 npm run build
 
+echo "==> 对齐运行时镜像（mao-runtime:latest）..."
+bash "${SCRIPT_DIR}/align-runtime-image.sh"
+
 echo "==> 蓝绿重启后端..."
 exec bash "${BACKEND_DIR}/restart.sh"

@@ -1,3 +1,9 @@
+## 0.0.448 (2026-11-05)
+
+### 部署
+- **部署自动对齐运行时镜像**：新增 `scripts/align-runtime-image.sh`，并在 `scripts/restart-backend.sh` 构建后端之后、蓝绿切换之前调用。脚本比对 `mao-runtime:latest` 的 `org.mao.runtime.deps-hash` label：一致时零成本跳过；不一致时先构建临时 tag，用当前 `backend-ts/dist` 在镜像内加载 runtime-agent / sharp / node-pty 冒烟，通过后才创建 dated tag（`YYYY-MM-DD-<sha>`）并把 `latest` 指向新镜像。构建或冒烟失败即中止部署，旧 `latest` 保持不变；`--force` 可强制重建，dated tag 默认保留最近 2 个。
+- **构建脚本不再隐式改写 latest**：`bash scripts/build-runtime-image.sh <tag>` 只构建指定 tag，需要同步 `latest` 时显式加 `--tag-latest`（不带 tag 时仍默认构建 `latest`），避免临时构建在冒烟前提前切流。外部 `/data/deploy-mao.sh` 需在「构建代码」与「后端蓝绿切换」之间插入 `bash scripts/align-runtime-image.sh`。
+
 ## 0.0.447 (2026-11-05)
 
 ### 后端
