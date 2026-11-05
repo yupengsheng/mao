@@ -7,6 +7,16 @@
           <div class="header-actions">
             <span class="auto-refresh">
               <span class="auto-refresh-label">自动刷新</span>
+              <el-select
+                v-model="autoRefreshSeconds"
+                size="small"
+                style="width: 84px"
+                :disabled="!autoRefresh"
+                @change="handleAutoRefreshIntervalChange"
+              >
+                <el-option label="30 秒" :value="30" />
+                <el-option label="60 秒" :value="60" />
+              </el-select>
               <el-switch v-model="autoRefresh" @change="handleAutoRefreshChange" />
             </span>
             <el-button @click="fetchLogs">
@@ -182,8 +192,8 @@ const currentLog = ref<any | null>(null)
 const userOptions = ref<Array<{ id: number; username: string; displayName?: string | null }>>([])
 const dateRange = ref<[string, string] | null>(null)
 const autoRefresh = ref(false)
+const autoRefreshSeconds = ref(60)
 let autoRefreshTimer: ReturnType<typeof setInterval> | null = null
-const AUTO_REFRESH_INTERVAL_MS = 60_000
 
 const filters = reactive({
   action: '',
@@ -214,7 +224,11 @@ function handleAutoRefreshChange(enabled: string | number | boolean) {
 
 function startAutoRefresh() {
   stopAutoRefresh()
-  autoRefreshTimer = setInterval(() => fetchLogs(), AUTO_REFRESH_INTERVAL_MS)
+  autoRefreshTimer = setInterval(() => fetchLogs(), autoRefreshSeconds.value * 1000)
+}
+
+function handleAutoRefreshIntervalChange() {
+  if (autoRefresh.value) startAutoRefresh()
 }
 
 function stopAutoRefresh() {
