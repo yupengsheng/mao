@@ -316,6 +316,28 @@ describe('SessionService archive', () => {
     }
   });
 
+  it('promotesSideTaskAndRevokesItsShareLinks', async () => {
+    // 边路会话提升不走 onSessionDeleted：旧边路会话的分享链接须在同一事务内撤销。
+    const { service, sessionRepo, txDb } = makeService();
+    vi.mocked(sessionRepo.findById).mockResolvedValue({
+      id: 20,
+      userId: 7,
+      title: '边路任务',
+      sessionType: 'SIDE_TASK',
+      phase: 'COMPLETED',
+      executionMode: 'CLOUD',
+      workspace: '/tmp/w',
+    });
+    vi.mocked(sessionRepo.list).mockResolvedValue([]);
+
+    await service.promoteSideTaskToMainSession(20, 7);
+
+    expect(txDb.execute).toHaveBeenCalledWith(
+      'UPDATE session_share SET revoked_at = ? WHERE session_id = ? AND revoked_at IS NULL',
+      [expect.any(String), 20],
+    );
+  });
+
   it('promotesSideTaskAndDeletesItsSessionTodos', async () => {
     // 边路会话提升会先把待办复制到新主会话；旧边路会话不再可达，原行须在同一事务内回收。
     const { service, sessionRepo, txDb } = makeService();

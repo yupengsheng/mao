@@ -71,6 +71,7 @@ import { SessionCompactionEventService } from './session/session-compaction-even
 import { GitOperationService } from './session/git-operation.service.js';
 import { SessionService } from './session/session.service.js';
 import { SessionChannelMappingRepository } from './session/session-channel-mapping.repository.js';
+import { MysqlSessionShareRepository } from './session/session-share.repository.js';
 import { SessionTitleService } from './session/session-title.service.js';
 import { ActivityService } from './session/activity.service.js';
 import { RunTraceService } from './session/run-trace.service.js';
@@ -522,6 +523,8 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
   // 通道会话映射（微信对端 / 飞书话题 / 飞书通道绑定）随会话删除回收。仓库无状态，
   // 与按小时孤儿修复共用同一套 SQL 语义。
   const sessionChannelMappingRepo = new SessionChannelMappingRepository(db);
+  // 分享链接随会话删除显式撤销；同一无状态仓库实例也交给路由层构造 SessionShareService。
+  const sessionShareRepo = new MysqlSessionShareRepository(db);
   // 团队经验库（技术方案 2026-10-24）：索引/挂载服务，纯文件系统无 DB 依赖。
   const experienceIndexService = new ExperienceIndexService(join(shareDir, EXPERIENCE_ROOT_SUBDIR));
   const experienceMountService = new ExperienceMountService(experienceIndexService);
@@ -546,6 +549,12 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
       await workspaceRulesSnapshotService.deleteBySessionId(sessionId);
       // 通道映射是会话级资源：会话已逻辑删除，映射不可再被合法使用。
       await sessionChannelMappingRepo.deleteBySessionId(sessionId);
+      // 读取侧已按会话存在性拒绝，这里仍显式撤销，避免留下“未撤销”的孤儿分享行。
+      try {
+        await sessionShareRepo.revokeBySession(sessionId);
+      } catch (e) {
+        console.warn(`Failed to revoke shares for deleted session ${sessionId}: ${(e as Error).message}`);
+      }
       // Webhook 触发器绑定会话失效后回退为“每次触发新建会话”；清理失败不阻断会话删除。
       try {
         await ctx.clearWebhookTriggerSessionBindings?.(sessionId);
@@ -948,7 +957,7 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     restToolService,
     auditService,
     llmCallService,
-    sessionService, activityService, messageQueueService,
+    sessionService, sessionShareRepo, activityService, messageQueueService,
     agentRepo, modelRepo, todoRepo, pathSandbox, subagentExecutionRepo,
     sessionCompactionEventService, sessionCompactionService, runTraceService, runTraceRecordService,
     approvalRegistry, askUserQuestionsRegistry, inFlightToolRegistry, treeSignalPublisher,

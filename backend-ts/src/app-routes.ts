@@ -236,6 +236,7 @@ export interface RouteDeps {
 
   // session
   sessionService: SessionService;
+  sessionShareRepo: MysqlSessionShareRepository;
   activityService: ActivityService;
   messageQueueService: MessageQueueService;
   agentRepo: MysqlAgentRepository;
@@ -350,7 +351,7 @@ export async function registerAllRoutes(deps: RouteDeps): Promise<void> {
     restToolService,
     auditService,
     llmCallService,
-    sessionService, activityService, messageQueueService,
+    sessionService, sessionShareRepo, activityService, messageQueueService,
     agentRepo, modelRepo, todoRepo, pathSandbox, subagentExecutionRepo,
     sessionCompactionEventService, sessionCompactionService, runTraceService, runTraceRecordService,
     approvalRegistry, askUserQuestionsRegistry, inFlightToolRegistry, treeSignalPublisher,
@@ -504,7 +505,7 @@ export async function registerAllRoutes(deps: RouteDeps): Promise<void> {
     });
     registerTaskRoutes(api, taskService);
     const sessionShareService = new SessionShareService(
-      new MysqlSessionShareRepository(db),
+      sessionShareRepo,
       sessionService,
       userRepo,
       {

@@ -832,6 +832,11 @@ export class SessionService {
       await new MessageQueueRepository(tx).clearPending(sideSessionId);
       // 边路会话提升后旧会话逻辑删除，任务域不再可达；与主会话删除采用同一回收语义。
       await new TaskRepository(tx).deleteBySessionId(sideSessionId);
+      // 旧边路会话的分享链接随逻辑删除显式撤销，避免留下“未撤销”的孤儿分享行。
+      await tx.execute(
+        'UPDATE session_share SET revoked_at = ? WHERE session_id = ? AND revoked_at IS NULL',
+        [nowSql(), sideSessionId],
+      );
       await txMessageRepo.logicalDeleteBySession(sideSessionId);
       // 提升是「插入新主会话 + 逻辑删除旧边路会话」：直接子会话的 parent 仍指向旧 id，
       // 不重挂则整棵边路子树在新旧两棵树上都不可达（BFS / 树信号 / 搜索全部失联）。

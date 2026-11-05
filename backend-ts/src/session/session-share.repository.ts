@@ -99,6 +99,15 @@ export class MysqlSessionShareRepository implements SessionShareStore {
     );
   }
 
+  /** 会话删除 / 边路提升时撤销该会话全部未撤销链接，返回受影响行数。 */
+  async revokeBySession(sessionId: number): Promise<number> {
+    const result = await this.db.execute(
+      'UPDATE session_share SET revoked_at = ? WHERE session_id = ? AND revoked_at IS NULL',
+      [nowSql(), sessionId],
+    );
+    return result.affectedRows;
+  }
+
   async incrementView(id: number, viewedAt: string): Promise<void> {
     await this.db.execute(
       'UPDATE session_share SET view_count = view_count + 1, last_viewed_at = ? WHERE id = ?',

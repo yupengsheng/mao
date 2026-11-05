@@ -450,6 +450,16 @@ describe('session share routes', () => {
     expect(calls[0]).toContain('FOR UPDATE');
     expect(calls[0]).toContain('session_id');
   });
+
+  it('会话删除时撤销该会话全部未撤销分享行', async () => {
+    const execute = vi.fn(async () => ({ affectedRows: 2 }));
+    const repo = new MysqlSessionShareRepository({ execute } as never);
+    await expect(repo.revokeBySession(11)).resolves.toBe(2);
+    expect(execute).toHaveBeenCalledWith(
+      'UPDATE session_share SET revoked_at = ? WHERE session_id = ? AND revoked_at IS NULL',
+      [expect.any(String), 11],
+    );
+  });
 });
 
 describe('session jsonl export', () => {
