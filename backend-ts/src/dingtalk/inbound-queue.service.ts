@@ -1,6 +1,9 @@
 import type { DingtalkCardActionPort, DingtalkInboundQueueRow, DingtalkTaskQueuePort } from './types.js';
 import type { DingtalkInboundQueueRepository } from './inbound-queue.repository.js';
 
+const RECOVERY_ORPHAN_BATCH_SIZE = 5000;
+const RECOVERY_ORPHAN_MAX_BATCHES = 20;
+
 export class DingtalkTaskQueueService implements DingtalkTaskQueuePort, DingtalkCardActionPort {
   constructor(private readonly repo: DingtalkInboundQueueRepository) {}
 
@@ -77,6 +80,11 @@ export class DingtalkTaskQueueService implements DingtalkTaskQueuePort, Dingtalk
   }
 
   async hydrate(): Promise<number[]> {
+    try {
+      await this.deleteOrphanedRows();
+    } catch (error) {
+      console.warn('钉钉队列孤儿行清理失败，继续恢复存活会话的队列', error);
+    }
     const running = await this.repo.listRunning();
     for (const row of running) {
       const persisted = await this.repo.findPersistedMessageByQueueId(row.sessionId, row.id);
@@ -86,5 +94,12 @@ export class DingtalkTaskQueueService implements DingtalkTaskQueuePort, Dingtalk
     await this.repo.deleteTerminal();
     const rows = await this.repo.listRecoverable();
     return [...new Set(rows.map((r) => r.sessionId))];
+  }
+
+  private async deleteOrphanedRows(): Promise<void> {
+    for (let i = 0; i < RECOVERY_ORPHAN_MAX_BATCHES; i += 1) {
+      const removed = await this.repo.deleteOrphanedBatch(RECOVERY_ORPHAN_BATCH_SIZE);
+      if (removed < RECOVERY_ORPHAN_BATCH_SIZE) return;
+    }
   }
 }
