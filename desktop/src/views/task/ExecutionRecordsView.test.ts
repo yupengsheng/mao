@@ -27,6 +27,7 @@ const record: TaskDetailVO = {
     id: 1, taskId: 1, sessionId: 41, source: 'WEBHOOK', sourceEventId: 'run-1',
     externalEventId: 'evt-42', externalEventScope: 'trigger:7', createdAt: null,
   }],
+  pendingWait: null,
 }
 const apps: ReturnType<typeof createApp>[] = []
 

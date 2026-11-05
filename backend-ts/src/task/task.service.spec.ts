@@ -76,6 +76,7 @@ describe('Task execution lifecycle', () => {
     expect(result?.task).not.toHaveProperty('userId');
     expect(result?.task).toMatchObject({ id: 1, sessionId: 11, lastExecutionId: 'public', createdAt: null, updatedAt: null });
     expect(result?.latestExecution).toMatchObject({ executionId: 'public', finishedAt: null, createdAt: null });
+    expect(result?.pendingWait).toBeNull();
   });
 
   it('deletes the session task aggregate in one transaction', async () => {

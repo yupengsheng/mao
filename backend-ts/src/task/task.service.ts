@@ -211,6 +211,7 @@ export class TaskService {
       latestExecution: latest == null ? null : this.executionVO(latest),
       executions: executions.map((execution) => this.executionVO(execution)),
       triggers: triggers.map((trigger) => this.triggerVO(trigger)),
+      pendingWait: null,
     };
   }
 

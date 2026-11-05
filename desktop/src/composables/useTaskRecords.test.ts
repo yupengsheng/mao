@@ -16,7 +16,7 @@ function list(id: number): TaskPageVO {
 }
 
 function detail(id: number): TaskDetailVO {
-  return { task: task(id), latestExecution: null, executions: [], triggers: [] }
+  return { task: task(id), latestExecution: null, executions: [], triggers: [], pendingWait: null }
 }
 
 function deferred<Value>() {
