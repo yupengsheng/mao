@@ -47,6 +47,7 @@
 | `APP_MCP_SECRET` | MCP 时建议 | MCP 环境变量加密 |
 | `APP_SIGNAL_SECRET` | 哨兵时建议 | 信号哨兵请求头 / 请求体加密。未配置时回退内置默认密钥，生产建议显式设置；轮换后已存哨兵需重新填写请求头与请求体 |
 | `APP_USER_TOOL_SECRET` | 自定义工具时建议 | 自定义 HTTP 工具请求头敏感值加密。未配置时回退内置默认密钥，生产建议显式设置；轮换后已存工具的敏感请求头需重新填写 |
+| `EXECUTION_WAIT_PERSISTENCE_ENABLED` | 否 | 任务域二期等待态双写，默认 false。开启后仅将提问 / 工具审批写入 `execution_wait`，不改变现有审批与回答流程；恢复扫描和执行租约尚未启用 |
 | `WORKSPACE_ROOT` | **是** | 工作区根 |
 | `SKILLS_DIR` / `USER_SKILLS_DIR` | **是** | 技能目录 |
 | `FILE_UPLOAD_DIR` | **是** | 本地上传目录 |

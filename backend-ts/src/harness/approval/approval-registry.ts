@@ -2,7 +2,8 @@ import type { SessionMapper, SessionService, StreamingWsRegistry } from '../deps
 import { wsEvent } from '../deps.js';
 import { harnessLog } from '../log.js';
 import type { ApprovalHint } from './approval-hint.js';
-import type { TaskWaitObserver } from '../core/task-wait-observer.js';
+import type { TaskWaitObserver, TaskWaitReleaseReason } from '../core/task-wait-observer.js';
+import { hiddenWaitPayload, type TaskWaitPayload } from '../../task/wait-payload.js';
 
 export class ApprovalRegistry {
   private readonly pending = new Map<number, Set<string>>();
@@ -16,7 +17,12 @@ export class ApprovalRegistry {
     private readonly taskWaitObserver?: TaskWaitObserver,
   ) {}
 
-  async register(sessionId: number | null, requestId: string | null, hint?: ApprovalHint | null): Promise<void> {
+  async register(
+    sessionId: number | null,
+    requestId: string | null,
+    hint?: ApprovalHint | null,
+    summary?: TaskWaitPayload | null,
+  ): Promise<void> {
     if (sessionId == null || requestId == null) return;
     if (hint != null) {
       // 同 requestId 重发场景下后写覆盖前写；unregister/takeHint 时清除
@@ -30,7 +36,16 @@ export class ApprovalRegistry {
     const first = ids.size === 0;
     const added = !ids.has(requestId);
     ids.add(requestId);
-    if (added) this.taskWaitObserver?.started(sessionId, 'APPROVAL', requestId);
+    if (added) {
+      const payload = summary ?? hiddenWaitPayload();
+      this.taskWaitObserver?.started({
+        sessionId,
+        kind: 'APPROVAL',
+        requestId,
+        payloadSummary: payload.payloadSummary,
+        payloadDigest: payload.payloadDigest,
+      });
+    }
     if (first) {
       const entered = await this.sessionService.enterWaitingApproval(sessionId);
       if (entered) await this.publishPhase(sessionId, 'WAITING_APPROVAL');
@@ -38,14 +53,18 @@ export class ApprovalRegistry {
     }
   }
 
-  async unregister(sessionId: number | null, requestId: string | null): Promise<void> {
+  async unregister(
+    sessionId: number | null,
+    requestId: string | null,
+    reason: TaskWaitReleaseReason = 'CANCELLED',
+  ): Promise<void> {
     if (sessionId == null || requestId == null) return;
     // 双 unregister 清理点之一（本处 + LocalToolExecutor finally）：hint 必须同步清除，
     // 否则超时/断连后陈旧帧仍可消费出规则
     this.hints.delete(`${sessionId}:${requestId}`);
     const ids = this.pending.get(sessionId);
     if (!ids?.delete(requestId)) return;
-    this.taskWaitObserver?.finished(sessionId, 'APPROVAL', requestId);
+    this.taskWaitObserver?.finished(sessionId, 'APPROVAL', requestId, reason);
     const empty = ids.size === 0;
     if (empty) this.pending.delete(sessionId);
     if (empty) {

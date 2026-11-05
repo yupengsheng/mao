@@ -6,6 +6,7 @@ import type { ExternalEventRef } from '../../task/types.js';
 import { imageUrlFromPart } from '../session-vo.js';
 import { stripImageUrlLines } from '../util/image-url-annotation.js';
 import { queueWaitMsOf } from '../../openapi/open-api-call-log.logic.js';
+import type { TaskWaitReleaseReason } from '../../harness/core/task-wait-observer.js';
 
 /** 轻量读取入站帧类型：鉴权窗口排队只关心是否为 auth，解析失败按未知类型处理。 */
 function peekFrameType(payload: string): string | null {
@@ -141,7 +142,11 @@ export interface WsHandlerDeps {
     publishForSession(sessionId: number): void | Promise<void>;
   };
   approvalRegistry: {
-    unregister(sessionId: number | null, requestId: string | null): void | Promise<void>;
+    unregister(
+      sessionId: number | null,
+      requestId: string | null,
+      reason?: TaskWaitReleaseReason,
+    ): void | Promise<void>;
     /** alwaysAllow 消费服务端 hint（恰好一次）；缺省场景（旧测试桩）返回 null 即可。 */
     takeHint?(sessionId: number, requestId: string): ApprovalHint | null;
   };
@@ -1062,7 +1067,11 @@ export class StreamingWsHandler {
         }
       }
     }
-    await Promise.resolve(this.deps.approvalRegistry.unregister(sessionId, requestId));
+    await Promise.resolve(this.deps.approvalRegistry.unregister(
+      sessionId,
+      requestId,
+      root.approved === true ? 'APPROVED' : 'DENIED',
+    ));
     await Promise.resolve(this.deps.treeSignalPublisher.publishForSession(sessionId));
     // 批准后命令还要跑。抑制必须发生在这一帧，不能等 tool_result，否则长命令会在人已经点过之后仍被提醒。
     if (this.deps.approvalEscalationSuppressor) {

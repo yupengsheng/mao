@@ -11,6 +11,16 @@ describe('ApprovalRegistry', () => {
     return new ApprovalRegistry(sessionService, sessionMapper, ws);
   }
 
+  function observedRegistry(taskWaitObserver: { started: ReturnType<typeof vi.fn>; finished: ReturnType<typeof vi.fn> }) {
+    const sessionService = {
+      enterWaitingApproval: vi.fn().mockResolvedValue(true),
+      restoreRunningAfterApproval: vi.fn().mockResolvedValue(true),
+    } as unknown as SessionService;
+    const sessionMapper = { selectById: vi.fn().mockResolvedValue(session(10)) } as unknown as SessionMapper;
+    const ws = { send: vi.fn() } as unknown as StreamingWsRegistry;
+    return new ApprovalRegistry(sessionService, sessionMapper, ws, taskWaitObserver);
+  }
+
   it('firstRegistrationEntersWaitingApprovalAndPublishes', async () => {
     const sessionMapper = { selectById: vi.fn().mockResolvedValue(session(10)) } as unknown as SessionMapper;
     const sessionService = {
@@ -158,5 +168,37 @@ describe('ApprovalRegistry', () => {
     await reg.register(10, 'r1');
     expect(reg.takeHint(10, 'r1')).toBeNull();
     expect(reg.takeHint(10, 'missing')).toBeNull();
+  });
+
+  it('reports a masked summary once and the first release reason', async () => {
+    const observer = { started: vi.fn(), finished: vi.fn() };
+    const reg = observedRegistry(observer);
+    const summary = { payloadSummary: '{"toolName":"shell"}', payloadDigest: 'abc' };
+    await reg.register(10, 'r1', null, summary);
+    await reg.register(10, 'r1', null, { payloadSummary: 'other', payloadDigest: 'def' });
+    expect(observer.started).toHaveBeenCalledTimes(1);
+    expect(observer.started).toHaveBeenCalledWith({
+      sessionId: 10,
+      kind: 'APPROVAL',
+      requestId: 'r1',
+      payloadSummary: summary.payloadSummary,
+      payloadDigest: summary.payloadDigest,
+    });
+
+    await reg.unregister(10, 'r1', 'APPROVED');
+    expect(observer.finished).toHaveBeenCalledWith(10, 'APPROVAL', 'r1', 'APPROVED');
+    await reg.unregister(10, 'r1', 'DENIED');
+    expect(observer.finished).toHaveBeenCalledTimes(1);
+  });
+
+  it('defaults the release reason to cancelled', async () => {
+    const observer = { started: vi.fn(), finished: vi.fn() };
+    const reg = observedRegistry(observer);
+    await reg.register(10, 'r1');
+    expect(observer.started).toHaveBeenCalledWith(expect.objectContaining({
+      payloadSummary: expect.stringContaining('参数已隐藏'),
+    }));
+    await reg.unregister(10, 'r1');
+    expect(observer.finished).toHaveBeenCalledWith(10, 'APPROVAL', 'r1', 'CANCELLED');
   });
 });

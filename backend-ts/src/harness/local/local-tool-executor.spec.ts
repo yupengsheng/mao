@@ -56,8 +56,10 @@ describe('LocalToolExecutor', () => {
       sendToolRequest: vi.fn().mockResolvedValue({ requestId: 'req-1', future: Promise.resolve('{"ok":true}') }),
     } as unknown as LocalToolSessionRegistry;
     await executor(registry, 900).execute(7, 'shell', '{}', 'workspace', true, 'reason');
-    expect(approvalRegistry.register).toHaveBeenCalledWith(7, 'req-1');
-    expect(approvalRegistry.unregister).toHaveBeenCalledWith(7, 'req-1');
+    expect(approvalRegistry.register).toHaveBeenCalledWith(
+      7, 'req-1', undefined, expect.objectContaining({ payloadDigest: expect.stringMatching(/^[a-f0-9]{64}$/) }),
+    );
+    expect(approvalRegistry.unregister).toHaveBeenCalledWith(7, 'req-1', 'CANCELLED');
     expect(treeSignalPublisher.publishForSession).toHaveBeenCalledTimes(2);
   });
 
@@ -85,7 +87,7 @@ describe('LocalToolExecutor', () => {
     expect(result).toContain('timed out');
     expect(registry.completeToolRequestError).toHaveBeenCalledWith(7, 'req-timeout', 'Local tool execution timed out after 1 seconds');
     expect(registry.failAllForSession).not.toHaveBeenCalled();
-    expect(approvalRegistry.unregister).toHaveBeenCalledWith(7, 'req-timeout');
+    expect(approvalRegistry.unregister).toHaveBeenCalledWith(7, 'req-timeout', 'TIMEOUT');
     expect(treeSignalPublisher.publishForSession).toHaveBeenCalledTimes(2);
   });
 
@@ -164,7 +166,7 @@ describe('LocalToolExecutor', () => {
     ).execute(7, 'shell', '{}', 'workspace', true, null);
     expect(result).toContain('timed out');
     await settle();
-    expect(approvalRegistry.unregister).toHaveBeenCalledWith(7, 'req-timeout');
+    expect(approvalRegistry.unregister).toHaveBeenCalledWith(7, 'req-timeout', 'TIMEOUT');
     expect(recorder.resolveApprovalPending).toHaveBeenCalledWith(7, 'req-timeout');
   });
 
@@ -191,7 +193,9 @@ describe('LocalToolExecutor', () => {
     vi.clearAllMocks();
     await expect(executor(null).execute(7, 'shell', '{}', 'workspace', true, 'reason'))
       .resolves.toBe('{"ok":true}');
-    expect(approvalRegistry.register).toHaveBeenCalledWith(7, 'req-inbox');
+    expect(approvalRegistry.register).toHaveBeenCalledWith(
+      7, 'req-inbox', undefined, expect.objectContaining({ payloadSummary: expect.stringContaining('shell') }),
+    );
   });
 
   describe('审批升级外推', () => {
@@ -317,10 +321,12 @@ describe('LocalToolExecutor', () => {
     const hint = { ruleType: 'SHELL_PREFIX' as const, ruleValue: 'npm run', label: '本会话总是允许以 npm run 开头的命令' };
     await executor(null, reg).execute(7, 'shell', '{"command":"npm run build"}', 'workspace', true, null, hint);
     expect(reg.sendToolRequest).toHaveBeenCalledWith(7, 'shell', '{"command":"npm run build"}', 'workspace', true, null, hint);
-    expect(approvalRegistry.register).toHaveBeenCalledWith(7, 'req-hint', hint);
+    expect(approvalRegistry.register).toHaveBeenCalledWith(
+      7, 'req-hint', hint, expect.objectContaining({ payloadSummary: expect.stringContaining('npm run build') }),
+    );
   });
 
-  it('无 approvalHint 时保持旧签名（6 参 register / 6 参 sendToolRequest）', async () => {
+  it('无 approvalHint 时仍传脱敏摘要（sendToolRequest 保持 6 参）', async () => {
     vi.clearAllMocks();
     const reg = {
       isConnected: vi.fn().mockResolvedValue(true),
@@ -328,7 +334,9 @@ describe('LocalToolExecutor', () => {
     } as unknown as LocalToolSessionRegistry;
     await executor(null, reg).execute(7, 'shell', '{}', 'workspace', true, 'reason');
     expect(reg.sendToolRequest).toHaveBeenCalledWith(7, 'shell', '{}', 'workspace', true, 'reason');
-    expect(approvalRegistry.register).toHaveBeenCalledWith(7, 'req-nohint');
+    expect(approvalRegistry.register).toHaveBeenCalledWith(
+      7, 'req-nohint', undefined, expect.objectContaining({ payloadDigest: expect.any(String) }),
+    );
   });
 });
 

@@ -1,6 +1,6 @@
 # Super-agent 任务域技术方案（第二期）
 
-> 状态：实施中（2026-11-05）。共享契约与 `V200` 基础表已落地；等待持久化、执行租约与恢复扫描尚未启用，运行时行为暂不变。
+> 状态：实施中（2026-11-05）。共享契约、`V200` 基础表与第 3 步等待态持久化双写已落地；双写由 `EXECUTION_WAIT_PERSISTENCE_ENABLED` 控制且默认关闭。执行租约与恢复扫描尚未启用，默认运行时行为不变。
 
 ## 1. 目标
 
@@ -426,6 +426,8 @@ export interface TaskDetailVO {
 - `execution_wait_recovered` 通知与 `pendingWait` 使用同一 `TaskWaitVO` 字段集，避免前后端两套结构。
 
 ## 10. 开发顺序
+
+> 实施进度（2026-11-05）：第 1–3 步已完成；第 3 步默认关闭，开启后只旁路写库，不改变原有审批 / 提问语义。下一步为第 4 步执行租约。
 
 1. 契约：`shared/contracts/src/task.ts` 增加 `TaskWaitKind` / `TaskWaitStatus` / `TaskWaitReleaseReason` / `TaskWaitVO` 与 `TaskDetailVO.pendingWait`；导出到 index；三端 tsc 先绿。
 2. 迁移 `V200`：两张表、`execution_wait.fencing_token`、唯一键与查询索引；补 SQL 结构测试。

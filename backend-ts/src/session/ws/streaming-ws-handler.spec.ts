@@ -749,7 +749,7 @@ describe('StreamingWsHandler', () => {
     expect(messageQueueService.moveToIndex).toHaveBeenCalledWith(4, 0);
     expect(localToolSessionRegistry.completeToolRequest).toHaveBeenCalledWith(11, 'req', 'ok');
     expect(localToolSessionRegistry.completeToolRequestError).toHaveBeenCalledWith(11, 'req', 'bad');
-    expect(approvalRegistry.unregister).toHaveBeenCalledWith(11, 'req');
+    expect(approvalRegistry.unregister).toHaveBeenCalledWith(11, 'req', 'APPROVED');
     expect(treeSignalPublisher.publishForSession).toHaveBeenCalledWith(11);
     expect(askUserQuestionsRegistry.complete).toHaveBeenCalledWith(11, 'q', '{"answers":[{"id":"a"}]}');
   });
@@ -2059,7 +2059,7 @@ describe('StreamingWsHandler tool_approval.alwaysAllow（V135）', () => {
     }));
     expect(suppressByRequest).toHaveBeenCalledWith(11, 'req-esc');
     expect(localToolSessionRegistry.completeToolRequest).not.toHaveBeenCalled();
-    expect(approvalRegistry.unregister).toHaveBeenCalledWith(11, 'req-esc');
+    expect(approvalRegistry.unregister).toHaveBeenCalledWith(11, 'req-esc', 'APPROVED');
   });
 
   it('deniedApprovalAlsoSuppressesEscalation', async () => {
@@ -2081,7 +2081,7 @@ describe('StreamingWsHandler tool_approval.alwaysAllow（V135）', () => {
     await buildHandler({ approvalEscalationSuppressor: { suppressByRequest } }).handleTextMessage(ws, JSON.stringify({
       type: 'tool_approval', sessionId: 11, requestId: 'req-err', approved: true,
     }));
-    expect(approvalRegistry.unregister).toHaveBeenCalledWith(11, 'req-err');
+    expect(approvalRegistry.unregister).toHaveBeenCalledWith(11, 'req-err', 'APPROVED');
   });
 
   it('approvedAlwaysAllowConsumesHintAndCreatesSessionRule', async () => {
@@ -2095,7 +2095,7 @@ describe('StreamingWsHandler tool_approval.alwaysAllow（V135）', () => {
     }));
     expect(takeHint).toHaveBeenCalledWith(11, 'req-1');
     expect(createSessionRuleFromAlwaysAllow).toHaveBeenCalledWith(7, 11, hint);
-    expect(approvalRegistry.unregister).toHaveBeenCalledWith(11, 'req-1');
+    expect(approvalRegistry.unregister).toHaveBeenCalledWith(11, 'req-1', 'APPROVED');
   });
 
   it('denyFrameNeverCreatesRuleEvenWithAlwaysAllow', async () => {
@@ -2108,7 +2108,7 @@ describe('StreamingWsHandler tool_approval.alwaysAllow（V135）', () => {
     }));
     expect(takeHint).not.toHaveBeenCalled();
     expect(createSessionRuleFromAlwaysAllow).not.toHaveBeenCalled();
-    expect(approvalRegistry.unregister).toHaveBeenCalledWith(11, 'req-2');
+    expect(approvalRegistry.unregister).toHaveBeenCalledWith(11, 'req-2', 'DENIED');
   });
 
   it('missingHintOrMissingRuleServiceFallsBackToPlainExecution', async () => {
@@ -2121,7 +2121,7 @@ describe('StreamingWsHandler tool_approval.alwaysAllow（V135）', () => {
       type: 'tool_approval', sessionId: 11, requestId: 'req-3', approved: true, alwaysAllow: true,
     }));
     expect(createSessionRuleFromAlwaysAllow).not.toHaveBeenCalled();
-    expect(approvalRegistry.unregister).toHaveBeenCalledWith(11, 'req-3');
+    expect(approvalRegistry.unregister).toHaveBeenCalledWith(11, 'req-3', 'APPROVED');
   });
 
   it('ruleCreationFailureDoesNotBlockUnregister', async () => {
@@ -2133,6 +2133,6 @@ describe('StreamingWsHandler tool_approval.alwaysAllow（V135）', () => {
     await buildHandler().handleTextMessage(ws, JSON.stringify({
       type: 'tool_approval', sessionId: 11, requestId: 'req-4', approved: true, alwaysAllow: true,
     }));
-    expect(approvalRegistry.unregister).toHaveBeenCalledWith(11, 'req-4');
+    expect(approvalRegistry.unregister).toHaveBeenCalledWith(11, 'req-4', 'APPROVED');
   });
 });

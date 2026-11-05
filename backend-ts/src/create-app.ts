@@ -212,6 +212,7 @@ import { assembleSessionServices } from './app-session-services.js';
 import { TaskRepository } from './task/task.repository.js';
 import { TaskService } from './task/task.service.js';
 import { TaskWaitService } from './task/task-wait.service.js';
+import { ExecutionWaitRepository } from './task/execution-wait.repository.js';
 
 export interface MaoApp {
   app: FastifyInstance;
@@ -734,7 +735,10 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
   const subagentMapper = new SubagentExecutionMapper(db);
   const subagentInvocation = new SubagentInvocationService(db);
   const subagentResultDelivery = new SubagentResultDeliveryService(db, fileChangeRepo as never, inboxService);
-  const taskWaitService = new TaskWaitService(taskService, sessionService, wsRegistry);
+  const taskWaitService = new TaskWaitService(taskService, sessionService, wsRegistry, {
+    enabled: cfg.app.task.waitPersistenceEnabled,
+    store: new ExecutionWaitRepository(db),
+  });
   const askUserQuestionsRegistry = new AskUserQuestionsRegistry(undefined, taskWaitService);
   const inFlightToolRegistry = new InFlightToolRegistry();
   const feishuAskFormStore = new FeishuAskFormStore();

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { harnessLog } from '../log.js';
 import type { TaskWaitObserver } from '../core/task-wait-observer.js';
+import { questionWaitPayload } from '../../task/wait-payload.js';
 
 const DEFAULT_TIMEOUT_MILLIS = 900_000;
 
@@ -38,7 +39,14 @@ export class AskUserQuestionsRegistry {
     let resolve!: (v: string) => void;
     const promise = new Promise<string>((r) => { resolve = r; });
     this.pending.set(this.key(sessionId, requestId), { future: { resolve, promise }, questions, metadata });
-    this.taskWaitObserver?.started(sessionId, 'QUESTION', requestId);
+    const summary = questionWaitPayload(questions, metadata);
+    this.taskWaitObserver?.started({
+      sessionId,
+      kind: 'QUESTION',
+      requestId,
+      payloadSummary: summary.payloadSummary,
+      payloadDigest: summary.payloadDigest,
+    });
     harnessLog('debug', `Registered ask_user_questions request ${requestId} for session ${sessionId}`);
     return requestId;
   }
@@ -61,7 +69,7 @@ export class AskUserQuestionsRegistry {
       return { answered: true, cancelled, resultJson };
     } catch {
       if (this.pending.delete(this.key(sessionId, requestId))) {
-        this.taskWaitObserver?.finished(sessionId, 'QUESTION', requestId);
+        this.taskWaitObserver?.finished(sessionId, 'QUESTION', requestId, 'TIMEOUT');
       }
       harnessLog('warn', `ask_user_questions timeout for session ${sessionId}, requestId ${requestId}`);
       return { answered: false, cancelled: false, resultJson: JSON.stringify({ error: 'User did not respond within timeout' }) };
@@ -73,7 +81,7 @@ export class AskUserQuestionsRegistry {
     const entry = this.pending.get(k);
     if (entry) {
       this.pending.delete(k);
-      this.taskWaitObserver?.finished(sessionId, 'QUESTION', requestId);
+      this.taskWaitObserver?.finished(sessionId, 'QUESTION', requestId, 'ANSWERED');
       entry.future.resolve(result);
       return true;
     }
@@ -113,7 +121,7 @@ export class AskUserQuestionsRegistry {
         // 结果内容仍以 {"error": ...} 传给 LLM，不靠内容猜语义
         entry.future.resolve(JSON.stringify({ error: 'Session cancelled', cancelled: true }));
         this.pending.delete(key);
-        this.taskWaitObserver?.finished(sessionId, 'QUESTION', key.slice(prefix.length));
+        this.taskWaitObserver?.finished(sessionId, 'QUESTION', key.slice(prefix.length), 'CANCELLED');
       }
     }
   }

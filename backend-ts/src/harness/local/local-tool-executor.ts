@@ -3,6 +3,8 @@ import type { ApprovalRegistry } from '../approval/approval-registry.js';
 import type { SessionTreeSignalPublisher } from '../approval/session-tree-signal-publisher.js';
 import type { LocalToolSessionRegistry } from './local-tool-session-registry.js';
 import type { ApprovalHint } from '../approval/approval-hint.js';
+import type { TaskWaitReleaseReason } from '../core/task-wait-observer.js';
+import { approvalWaitPayload } from '../../task/wait-payload.js';
 
 /** 站内收件箱写入能力（可选注入；接口化避免 harness 反向依赖 inbox 域实现）。 */
 export interface ApprovalInboxRecorder {
@@ -54,6 +56,7 @@ export class LocalToolExecutor {
     let approvalRegistered = false;
     let escalation: ApprovalEscalationDelivery | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let releaseReason: TaskWaitReleaseReason = 'CANCELLED';
     try {
       pending = await this.sessionRegistry.sendToolRequest(
         sessionId, toolName, argumentsJson, workspace, needApproval, dangerReason,
@@ -64,7 +67,10 @@ export class LocalToolExecutor {
         // hint 随签存入 registry（V135）：alwaysAllow 回包时按 requestId 取回服务端自己生成的 hint；
         // 本 finally 与 handleToolApproval 双 unregister 都会清 hint，保证恰好一次消费
         await Promise.resolve(this.approvalRegistry.register(
-          sessionId, pending.requestId, ...(approvalHint ? [approvalHint] : []),
+          sessionId,
+          pending.requestId,
+          approvalHint ?? undefined,
+          approvalWaitPayload(toolName, argumentsJson, dangerReason),
         ));
         await Promise.resolve(this.treeSignalPublisher.publishForSession(sessionId));
         // 站内收件箱：审批待办（userId 由 InboxService 内部按 session 兜底解析，
@@ -98,6 +104,7 @@ export class LocalToolExecutor {
     } catch (e) {
       const err = e as Error;
       if (err.message === 'timeout') {
+        releaseReason = 'TIMEOUT';
         const timeoutMsg = `Local tool execution timed out after ${this.timeoutSeconds} seconds`;
         this.failPending(sessionId, pending, timeoutMsg);
         return JSON.stringify({ error: timeoutMsg });
@@ -109,7 +116,7 @@ export class LocalToolExecutor {
       // 不清理定时器的话，工具早已返回，事件循环仍会被挂住最长 timeoutSeconds
       if (timer) clearTimeout(timer);
       if (approvalRegistered && pending?.requestId && sessionId != null) {
-        await Promise.resolve(this.approvalRegistry.unregister(sessionId, pending.requestId));
+        await Promise.resolve(this.approvalRegistry.unregister(sessionId, pending.requestId, releaseReason));
         await Promise.resolve(this.treeSignalPublisher.publishForSession(sessionId));
         // 待办生命周期联动：批准 / 拒绝 / 超时 / 执行异常 / 断连统一在 finally 收敛，
         // 对应收件箱条目自动置已读（保留可查，不计未读徽标）。

@@ -5,6 +5,7 @@ import { ApprovalRegistry } from '../harness/approval/approval-registry.js';
 import { AskUserQuestionsRegistry } from '../harness/tool/ask-user-questions-registry.js';
 import { TaskTerminalService } from '../session/task-terminal.service.js';
 import { OPEN_RUN_ADMISSION_POLICY_VERSION } from '../openapi/admission.js';
+import type { TaskWaitKind } from '../harness/core/task-wait-observer.js';
 import type { TaskRepository } from './task.repository.js';
 import type { AgentTask, TaskExecution, TaskTrigger } from './types.js';
 import type { Session } from '../session/types.js';
@@ -375,6 +376,16 @@ describe('Task execution lifecycle', () => {
 });
 
 describe('Task waiting state projection', () => {
+  function started(tracker: TaskWaitService, sessionId: number, kind: TaskWaitKind, requestId: string) {
+    return tracker.started({
+      sessionId,
+      kind,
+      requestId,
+      payloadSummary: '{"summary":"test"}',
+      payloadDigest: 'digest',
+    });
+  }
+
   function waitingFixture() {
     const setup = fixture();
     const execution = { id: 'current' as string | undefined };
@@ -422,12 +433,12 @@ describe('Task waiting state projection', () => {
   it('waits for both questions and approvals before resuming', async () => {
     const setup = waitingFixture();
     await setup.service.beginExecution(setup.session, 'current');
-    await setup.tracker.started(11, 'QUESTION', 'same-id');
+    await started(setup.tracker, 11, 'QUESTION', 'same-id');
     expect(setup.task()?.stage).toBe('BLOCKED');
-    await setup.tracker.started(11, 'APPROVAL', 'same-id');
-    await setup.tracker.finished(11, 'QUESTION', 'same-id');
+    await started(setup.tracker, 11, 'APPROVAL', 'same-id');
+    await setup.tracker.finished(11, 'QUESTION', 'same-id', 'ANSWERED');
     expect(setup.task()?.stage).toBe('BLOCKED');
-    await setup.tracker.finished(11, 'APPROVAL', 'same-id');
+    await setup.tracker.finished(11, 'APPROVAL', 'same-id', 'APPROVED');
     expect(setup.task()?.stage).toBe('WORKING');
     expect(setup.executions[0]!.status).toBe('WORKING');
   });
@@ -435,12 +446,12 @@ describe('Task waiting state projection', () => {
   it('does not count duplicate starts or release another pending request on duplicate finishes', async () => {
     const setup = waitingFixture();
     await setup.service.beginExecution(setup.session, 'current');
-    await setup.tracker.started(11, 'QUESTION', 'first');
-    await setup.tracker.started(11, 'QUESTION', 'first');
-    await setup.tracker.finished(11, 'QUESTION', 'first');
+    await started(setup.tracker, 11, 'QUESTION', 'first');
+    await started(setup.tracker, 11, 'QUESTION', 'first');
+    await setup.tracker.finished(11, 'QUESTION', 'first', 'ANSWERED');
     expect(setup.task()?.stage).toBe('WORKING');
-    await setup.tracker.started(11, 'QUESTION', 'second');
-    await setup.tracker.finished(11, 'QUESTION', 'first');
+    await started(setup.tracker, 11, 'QUESTION', 'second');
+    await setup.tracker.finished(11, 'QUESTION', 'first', 'ANSWERED');
     expect(setup.task()?.stage).toBe('BLOCKED');
   });
 
@@ -449,9 +460,9 @@ describe('Task waiting state projection', () => {
     await setup.service.beginExecution(setup.session, 'current');
     let release!: (session: Session) => void;
     vi.spyOn(setup.lookup, 'getSession').mockImplementationOnce(() => new Promise<Session>((resolve) => { release = resolve; }));
-    const blocked = setup.tracker.started(11, 'QUESTION', 'fast-answer');
+    const blocked = started(setup.tracker, 11, 'QUESTION', 'fast-answer');
     await Promise.resolve();
-    const resumed = setup.tracker.finished(11, 'QUESTION', 'fast-answer');
+    const resumed = setup.tracker.finished(11, 'QUESTION', 'fast-answer', 'ANSWERED');
     await Promise.resolve();
     release(setup.session);
     await Promise.all([blocked, resumed]);
@@ -462,13 +473,13 @@ describe('Task waiting state projection', () => {
   it('binds the end of an old request to its original execution', async () => {
     const setup = waitingFixture();
     await setup.service.beginExecution(setup.session, 'current');
-    await setup.tracker.started(11, 'QUESTION', 'old-question');
+    await started(setup.tracker, 11, 'QUESTION', 'old-question');
     await setup.service.beginExecution(setup.session, 'next');
     setup.execution.id = 'next';
-    await setup.tracker.started(11, 'APPROVAL', 'new-approval');
-    await setup.tracker.finished(11, 'QUESTION', 'old-question');
+    await started(setup.tracker, 11, 'APPROVAL', 'new-approval');
+    await setup.tracker.finished(11, 'QUESTION', 'old-question', 'ANSWERED');
     expect(setup.task()).toMatchObject({ lastExecutionId: 'next', stage: 'BLOCKED' });
-    await setup.tracker.finished(11, 'APPROVAL', 'new-approval');
+    await setup.tracker.finished(11, 'APPROVAL', 'new-approval', 'APPROVED');
     expect(setup.task()?.stage).toBe('WORKING');
   });
 
@@ -476,10 +487,10 @@ describe('Task waiting state projection', () => {
     const setup = waitingFixture();
     await setup.service.beginExecution(setup.session, 'current');
     setup.execution.id = undefined;
-    await setup.tracker.started(11, 'QUESTION', 'untracked');
+    await started(setup.tracker, 11, 'QUESTION', 'untracked');
     setup.execution.id = 'current';
-    await setup.tracker.started(11, 'APPROVAL', 'tracked');
-    await setup.tracker.finished(11, 'QUESTION', 'untracked');
+    await started(setup.tracker, 11, 'APPROVAL', 'tracked');
+    await setup.tracker.finished(11, 'QUESTION', 'untracked', 'ANSWERED');
     expect(setup.task()?.stage).toBe('BLOCKED');
   });
 
@@ -489,11 +500,11 @@ describe('Task waiting state projection', () => {
     vi.spyOn(setup.repo, 'updateExecution').mockRejectedValueOnce(new Error('storage unavailable'));
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     try {
-      await expect(setup.tracker.started(11, 'QUESTION', 'first')).resolves.toBeUndefined();
-      await setup.tracker.started(11, 'APPROVAL', 'second');
+      await expect(started(setup.tracker, 11, 'QUESTION', 'first')).resolves.toBeUndefined();
+      await started(setup.tracker, 11, 'APPROVAL', 'second');
       expect(setup.task()?.stage).toBe('BLOCKED');
-      await setup.tracker.finished(11, 'QUESTION', 'first');
-      await setup.tracker.finished(11, 'APPROVAL', 'second');
+      await setup.tracker.finished(11, 'QUESTION', 'first', 'ANSWERED');
+      await setup.tracker.finished(11, 'APPROVAL', 'second', 'APPROVED');
       expect(setup.task()?.stage).toBe('WORKING');
     } finally { warning.mockRestore(); }
   });
@@ -501,9 +512,9 @@ describe('Task waiting state projection', () => {
   it('cannot reopen a settled execution when pending requests are cancelled', async () => {
     const setup = waitingFixture();
     await setup.service.beginExecution(setup.session, 'current');
-    await setup.tracker.started(11, 'QUESTION', 'pending');
+    await started(setup.tracker, 11, 'QUESTION', 'pending');
     await setup.service.settleExecution(setup.session, 'current', 'CANCELLED');
-    await setup.tracker.finished(11, 'QUESTION', 'pending');
+    await setup.tracker.finished(11, 'QUESTION', 'pending', 'CANCELLED');
     expect(setup.task()?.stage).toBe('CANCELLED');
     expect(setup.executions[0]!.status).toBe('CANCELLED');
   });
