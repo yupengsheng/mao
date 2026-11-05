@@ -136,3 +136,26 @@ describe('MysqlFeishuMessageRepository group message log cleanup', () => {
     expect(execute).toHaveBeenCalledWith(expect.stringContaining('LIMIT 1'), ['2026-10-06 00:00:00']);
   });
 });
+
+describe('MysqlFeishuMessageRepository p2p message cleanup', () => {
+  it('deletes expired mappings ordered by created_at and id', async () => {
+    const { repo, execute } = setup([]);
+
+    await expect(repo.deleteP2pMessageBatch('2026-05-09 00:00:00', 999999)).resolves.toBe(3);
+
+    expect(execute).toHaveBeenCalledWith(
+      `DELETE FROM feishu_p2p_message
+       WHERE created_at < ?
+       ORDER BY created_at, id LIMIT 5000`,
+      ['2026-05-09 00:00:00'],
+    );
+  });
+
+  it('keeps at least one row per batch for a non-positive limit', async () => {
+    const { repo, execute } = setup([]);
+
+    await repo.deleteP2pMessageBatch('2026-05-09 00:00:00', 0);
+
+    expect(execute).toHaveBeenCalledWith(expect.stringContaining('LIMIT 1'), ['2026-05-09 00:00:00']);
+  });
+});

@@ -34,6 +34,7 @@ import {
   GROUP_MESSAGE_LOG_RETENTION_DAYS,
   GroupMessageLogCleanup,
 } from './channel/group-message-log-cleanup.js';
+import { FeishuP2pMessageCleanup } from './channel/feishu-p2p-message-cleanup.js';
 import { LlmCallCleanup } from './usage/llm-call-cleanup.js';
 import { SessionActivityCleanup } from './session/session-activity-cleanup.js';
 import { SessionActivityRepository } from './session/activity.repository.js';
@@ -170,6 +171,10 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
     },
   ]);
   groupMessageLogCleanup.start();
+  const feishuP2pMessageCleanup = new FeishuP2pMessageCleanup({
+    deleteBatch: (cutoff, limit) => feishuMessageRepo.deleteP2pMessageBatch(cutoff, limit),
+  });
+  feishuP2pMessageCleanup.start();
   const feishuOauthStateRepo = new MysqlFeishuOauthStateRepository(db);
   const ecpOauthStateRepo = new MysqlEcpOauthStateRepository(db);
   const dingtalkOauthStateRepo = new MysqlDingtalkOauthStateRepository(db);
@@ -292,7 +297,7 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
     activityHeartbeat: d.activityHeartbeat, wsRegistry: d.wsRegistry,
     agentLoop: d.agentLoop, wsHandler: d.wsHandler, sessionService: d.sessionService,
     taskRecordRepair, taskExecutionRetention, auditLogCleanup, llmCallCleanup, sessionActivityCleanup, inboundEventCleanup,
-    authStateCleanup, groupMessageLogCleanup,
+    authStateCleanup, groupMessageLogCleanup, feishuP2pMessageCleanup,
   });
   drainWatcher.start();
 
