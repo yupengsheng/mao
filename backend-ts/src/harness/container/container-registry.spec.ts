@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { ContainerRegistry, type DockerCli } from './container-registry.js';
 import { containerHostsFingerprint } from '../../common/container-hosts.js';
 import { useTmpDir } from '../../testing/tmp-dir.js';
+import { depsHashOfLockfile } from './deps-hash.js';
 
 function fakeDocker(log: string[]): DockerCli {
   return {
@@ -54,6 +55,36 @@ function makeRegistry(
     ...overrides,
   }, docker);
   return { registry, waits, listenings, tokens };
+}
+
+/** precheck 假 Docker：区分 version / images / image inspect(label) / 加载冒烟。 */
+function fakePrecheckDocker(
+  log: string[],
+  label: string | null,
+  smokeError?: string,
+): DockerCli {
+  return {
+    async run(args) {
+      log.push(args.join(' '));
+      if (args[0] === 'version') return '27.0.0\n';
+      if (args[0] === 'images') return 'mao-runtime:latest\n';
+      if (args[0] === 'image') return label ?? '';
+      if (args[0] === 'run') {
+        if (smokeError) throw new Error(smokeError);
+        return '';
+      }
+      return 'ok\n';
+    },
+  };
+}
+
+/** precheck 用的临时 base：channels/dist 就绪，package-lock 决定当前期望指纹。 */
+function makePrecheckBase(prefix: string, lockContent = '{"lockfileVersion":3}\n'): string {
+  const base = useTmpDir(prefix);
+  mkdirSync(join(base, 'channels'), { recursive: true });
+  mkdirSync(join(base, 'dist'), { recursive: true });
+  writeFileSync(join(base, 'package-lock.json'), lockContent);
+  return base;
 }
 
 /** 只取 docker 生命周期动作（run -d / rm -f / stop），忽略 listen/token 等宿主机回调。 */
@@ -747,6 +778,58 @@ describe('container registry', () => {
     const { registry } = makeRegistry(base, log, {}, docker);
     const error = await registry.precheck().then(() => null, (e: unknown) => e as Error);
     expect(error?.message).toContain('无法加载当前 dist 的 runtime-agent');
+    expect(error?.message).toContain('build-runtime-image.sh');
+  });
+
+  it('precheckPassesWhenImageLabelMatchesCurrentLock', async () => {
+    const base = makePrecheckBase('mao-registry-precheck-label-ok-');
+    const expected = depsHashOfLockfile(join(base, 'package-lock.json'));
+    const log: string[] = [];
+    const { registry } = makeRegistry(base, log, {}, fakePrecheckDocker(log, expected));
+    await registry.precheck();
+    expect(log.some((l) => l.startsWith('image inspect'))).toBe(true);
+  });
+
+  it('precheckAllowsStaleLabelWhenImageStillLoads', async () => {
+    // 指纹只用于解释 / 部署对齐；实际可加载就不阻断，避免 lock 刚变化时把可用镜像判死
+    const base = makePrecheckBase('mao-registry-precheck-label-stale-ok-');
+    const log: string[] = [];
+    const { registry } = makeRegistry(base, log, {}, fakePrecheckDocker(log, '0000000000000000'));
+    await expect(registry.precheck()).resolves.toBeUndefined();
+  });
+
+  it('precheckExplainsStaleLabelWhenSmokeFails', async () => {
+    const base = makePrecheckBase('mao-registry-precheck-label-stale-bad-');
+    const expected = depsHashOfLockfile(join(base, 'package-lock.json'));
+    const log: string[] = [];
+    const docker = fakePrecheckDocker(log, '0000000000000000', "Cannot find package 'yaml'");
+    const { registry } = makeRegistry(base, log, {}, docker);
+    const error = await registry.precheck().then(() => null, (e: unknown) => e as Error);
+    expect(error?.message).toContain('依赖指纹过期');
+    expect(error?.message).toContain(`0000000000000000 ≠ 当前 ${expected}`);
+    expect(error?.message).toContain("Cannot find package 'yaml'");
+    expect(error?.message).toContain('build-runtime-image.sh');
+  });
+
+  it('precheckExplainsMissingLabelWhenSmokeFails', async () => {
+    const base = makePrecheckBase('mao-registry-precheck-label-missing-');
+    const log: string[] = [];
+    const docker = fakePrecheckDocker(log, null, "Cannot find package 'yaml'");
+    const { registry } = makeRegistry(base, log, {}, docker);
+    const error = await registry.precheck().then(() => null, (e: unknown) => e as Error);
+    expect(error?.message).toContain('缺少依赖指纹');
+    expect(error?.message).toContain('build-runtime-image.sh');
+  });
+
+  it('precheckExplainsCorruptImageWhenLabelMatchesButSmokeFails', async () => {
+    const base = makePrecheckBase('mao-registry-precheck-label-match-bad-');
+    const expected = depsHashOfLockfile(join(base, 'package-lock.json'));
+    const log: string[] = [];
+    const docker = fakePrecheckDocker(log, expected, 'sharp: invalid ELF header');
+    const { registry } = makeRegistry(base, log, {}, docker);
+    const error = await registry.precheck().then(() => null, (e: unknown) => e as Error);
+    expect(error?.message).toContain('依赖指纹匹配');
+    expect(error?.message).toContain('Node ABI');
     expect(error?.message).toContain('build-runtime-image.sh');
   });
 

@@ -401,11 +401,14 @@ FROM message WHERE deleted = 0;
 
    ```bash
    bash scripts/build-runtime-image.sh        # 产出 mao-runtime:latest
+   bash scripts/build-runtime-image.sh --print-deps-hash   # 只打印当前 lock 指纹
    ```
 
-   版本从 `backend-ts/package.json` 读取。**宿主机 Node 升级后必须同步重建镜像**，否则容器内读图（sharp）与终端（node-pty）静默失败。
+   镜像依赖来源是 `backend-ts/package.json` + `package-lock.json`（`npm ci --omit=dev`），不再维护手写包清单。**宿主机 Node 升级后必须同步重建镜像**，否则容器内读图（sharp）与终端（node-pty）静默失败。
 
-   **镜像依赖集必须覆盖 `runtime-agent` 的 import 闭包**（当前为 `sharp` / `node-pty` / `@modelcontextprotocol/sdk` / `minimatch` / `yaml`）：容器只挂载宿主机 `dist`（代码），第三方包全部来自镜像的 `node_modules`。backend-ts 新增进入该闭包的 npm 包后，必须同步加进 `Dockerfile.runtime` 并重建镜像，否则容器内 agent 启动即 `ERR_MODULE_NOT_FOUND` 退出，表现为每个用户的任务等满 15 秒后报「容器运行时通道连接超时」（0.0.379 前的 `yaml` 缺失即此形态）。0.0.379 起预检会用当前 dist 在镜像里实际加载一次 agent，漏依赖会直接拒绝切换并提示重建镜像。
+   构建脚本会把 `package-lock.json` 的 sha256 前 16 位写入镜像 label `org.mao.runtime.deps-hash`。后端预检会比对当前 lock 与镜像 label，但**加载冒烟仍是硬闸门**：预检用当前 dist 在镜像内实际加载一次 runtime-agent 与 sharp / node-pty，能加载时指纹不一致只告警，加载失败才拒绝切换并提示重建。因此 lock 变化（新增 / 升级依赖）后应重建镜像；忘记重建时，后台切换 docker 会以明确错误拒绝，而不是让每个用户任务等满 15 秒后报「容器运行时通道连接超时」。
+
+   容器侧依赖闭包由 `container-dependency-closure.spec.ts` 在 CI 中守门：运行时 bare import 必须属于生产依赖，`import type` 不要求镜像内存在；非字面量动态 import 会被拒绝。
 3. **数据目录**：`/opt/mao-data/runtime/channels`（socket 根）与 `/opt/mao-data/deps`（持久依赖）需存在且后端进程可写（首次启动预检会校验，不满足直接启动失败，不静默降级）。
 4. **上传目录**：图片产物（`generate_image` / `edit_image`）落 `{FILE_UPLOAD_DIR}/{userId}/`（宿主机按用户隔离、同名挂入容器），外网经 Nginx `^~ /uploads/` 与 `^~ /api/uploads/` 两个前缀访问；按用户隔离后请确认 Nginx 配置含这两个 location（见上文 Nginx 片段），否则图片类 `file.url` 会被扩展名正则 location 吞掉变 404。
 5. **公共共享目录**：`/opt/mao-data/share`（`MAO_SHARE_DIR` 可覆盖）由后端启动自动创建，无需手工准备。管理员向其中投放文件后，全体 CLOUD 用户的 Agent 即可读取；其 `agent-experience/` 子目录为 **Agent 团队经验库**（0.0.342 起，按 Agent 分库 `<agentId>/`，Agent 会话可读写沉淀经验，管理后台可维护）。**0.0.342 起容器模式该目录改为 rw 挂载**（经验库需容器内写入；挂载 mode 参与容器指纹，升级后存量容器自动重建），管理员投放内容的防误删从挂载层退化为信任 + 备份兜底。投放即时生效（目录级挂载，新增/修改文件无需重启或重建容器）；建议属主与后端运行用户一致、权限 755。**共享即公开**：请勿向该目录投放敏感内容。目录不计入任何用户配额，占满磁盘影响全体服务，建议纳入 `df` 监控；经验库为 Agent 自动写入且整根可写，建议每日快照兜底（示例：`0 3 * * * tar -czf /opt/mao-data/backup/share-$(date +\%F).tgz -C /opt/mao-data share && find /opt/mao-data/backup -name 'share-*.tgz' -mtime +14 -delete`）。

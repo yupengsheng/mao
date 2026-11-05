@@ -10,6 +10,7 @@ import { containerHostsFingerprint, EMPTY_CONTAINER_HOSTS_FINGERPRINT } from '..
 import type { ContainerHostsResolution } from './container-hosts-resolver.js';
 import type { RuntimeStatus } from './runtime-channel-server.js';
 import { readRuntimeBuildManifest } from './runtime-build.js';
+import { depsHashOfLockfile, RUNTIME_DEPS_HASH_LABEL } from './deps-hash.js';
 
 /**
  * 容器生命周期注册表（宿主机单例，技术方案 §5.2）。
@@ -250,13 +251,80 @@ export class ContainerRegistry {
     if (!existsSync(c.channelDir) || !isWritable(c.channelDir)) {
       throw new ContainerStartError(`socket 根目录不可写: ${c.channelDir}`);
     }
-    // 依赖冒烟（2026-10-30 事故回归）：容器侧 agent 的第三方依赖全部来自镜像的
-    // node_modules、代码来自宿主机只读挂载的 dist。backend-ts 新增 npm 依赖（如团队经验库
-    // 引入的 yaml）后若镜像未重建，容器内 agent 启动即 ERR_MODULE_NOT_FOUND 退出，表现为
-    // 每个用户工具调用等满 startTimeoutMs 后报「容器运行时通道连接超时」。这里用当前 dist
-    // 实际加载一次，把「镜像与 dist 依赖不匹配」拦在切模式（后台保存 runtime.mode）之前。
-    await this.assertImageLoadsRuntimeAgent();
+
+    const expectedDepsHash = this.expectedDepsHash();
+    const imageDepsHash = await this.readImageDepsHash(c.image);
+    // 依赖冒烟是硬闸门（2026-10-30 事故回归）：镜像缺依赖时 agent 启动即
+    // ERR_MODULE_NOT_FOUND，用户侧只会看到 15s 连接超时。label 只负责解释原因与
+    // 决定是否提示重建，不能替代实际加载。
+    let smokeError: Error | null = null;
+    try {
+      await this.assertImageLoadsRuntimeAgent();
+    } catch (e) {
+      smokeError = e as Error;
+    }
+
+    if (smokeError) {
+      throw new ContainerStartError(
+        `容器运行时不可用：运行时镜像 ${c.image} ${this.describeImageDependencyState(expectedDepsHash, imageDepsHash)}，`
+        + `且无法加载当前 dist 的 runtime-agent：${smokeError.message}。`
+        + '处置：在部署机执行 bash scripts/build-runtime-image.sh 重建镜像后重试。',
+      );
+    }
+
+    // 冒烟通过时指纹只做告警，不阻断：旧镜像没有 label 或 lock 刚变化但二进制仍可加载，
+    // 不应把一个能工作的镜像判死；部署对齐（D5）会在下次部署时收敛。
+    if (expectedDepsHash == null) {
+      harnessLog('warn', `[container] precheck: 无法计算当前依赖指纹（缺少 ${this.lockfilePath()}），跳过指纹校验`);
+    } else if (imageDepsHash == null) {
+      harnessLog('warn', `[container] precheck: 镜像 ${c.image} 缺少 ${RUNTIME_DEPS_HASH_LABEL} label（旧镜像），建议执行 scripts/build-runtime-image.sh 重建`);
+    } else if (imageDepsHash !== expectedDepsHash) {
+      harnessLog('warn', `[container] precheck: 镜像 ${c.image} 依赖指纹过期（镜像 ${imageDepsHash} ≠ 当前 ${expectedDepsHash}），当前 dist 可加载；建议执行 scripts/build-runtime-image.sh 重建`);
+    }
     harnessLog('info', `[container] precheck OK: image=${c.image}`);
+  }
+
+  /** 当前 lockfile 的依赖指纹；文件缺失/读取失败返回 null（冒烟仍照常执行）。 */
+  private expectedDepsHash(): string | null {
+    const lockfile = this.lockfilePath();
+    if (!existsSync(lockfile)) {
+      harnessLog('warn', `[container] package-lock.json not found: ${lockfile}`);
+      return null;
+    }
+    try {
+      return depsHashOfLockfile(lockfile);
+    } catch (e) {
+      harnessLog('warn', `[container] failed to hash ${lockfile}: ${(e as Error).message}`);
+      return null;
+    }
+  }
+
+  private lockfilePath(): string {
+    return path.join(path.dirname(path.resolve(this.opts.config.container.distDir)), 'package-lock.json');
+  }
+
+  /** 读取镜像指纹 label；缺失 / 旧格式 / inspect 失败均视为 null（由冒烟兜底）。 */
+  private async readImageDepsHash(image: string): Promise<string | null> {
+    try {
+      const stdout = await this.docker.run([
+        'image', 'inspect', '--format',
+        `{{index .Config.Labels "${RUNTIME_DEPS_HASH_LABEL}"}}`,
+        image,
+      ], 10_000);
+      const hash = stdout.trim();
+      return /^[0-9a-f]{16}$/.test(hash) ? hash : null;
+    } catch (e) {
+      harnessLog('warn', `[container] failed to inspect image dependency label: ${(e as Error).message}`);
+      return null;
+    }
+  }
+
+  /** precheck 失败时的原因段（统一「原因 + 处置」文案）。 */
+  private describeImageDependencyState(expected: string | null, actual: string | null): string {
+    if (expected == null) return '无法计算当前依赖指纹（缺少 backend-ts/package-lock.json）';
+    if (actual == null) return `缺少依赖指纹（${RUNTIME_DEPS_HASH_LABEL}，旧镜像）`;
+    if (actual !== expected) return `依赖指纹过期（镜像 ${actual} ≠ 当前 ${expected}）`;
+    return `依赖指纹匹配（${actual}），但镜像运行时可能损坏或 Node ABI 不符`;
   }
 
   /**
@@ -274,19 +342,13 @@ export class ContainerRegistry {
     const agentEntry = `file://${distDir}/harness/container/runtime-agent.js`;
     const code = `Promise.all([import('${agentEntry}'), import('sharp'), import('node-pty')])`
       + `.catch((e) => { console.error('[precheck]', (e && e.message) || e); process.exit(1); });`;
-    try {
-      await this.docker.run([
-        'run', '--rm',
-        '-w', path.dirname(distDir),
-        '-v', `${distDir}:${distDir}:ro`,
-        c.image,
-        'node', '-e', code,
-      ], 60_000);
-    } catch (e) {
-      throw new ContainerStartError(
-        `运行时镜像 ${c.image} 无法加载当前 dist 的 runtime-agent（容器内依赖与代码不匹配，通常是有新增 npm 依赖或 Node 版本升级后未重建镜像；请执行 scripts/build-runtime-image.sh 后重试）: ${(e as Error).message}`,
-      );
-    }
+    await this.docker.run([
+      'run', '--rm',
+      '-w', path.dirname(distDir),
+      '-v', `${distDir}:${distDir}:ro`,
+      c.image,
+      'node', '-e', code,
+    ], 60_000);
   }
 
   getEntry(userId: number): ContainerEntry | undefined {

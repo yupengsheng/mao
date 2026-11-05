@@ -1,3 +1,13 @@
+## 0.0.447 (2026-11-05)
+
+### 后端
+- **运行时镜像依赖改为 lockfile 派生**：`Dockerfile.runtime` 不再手写 `sharp` / `node-pty` / MCP SDK / `minimatch` / `yaml` 清单，改为 `npm ci --omit=dev` 安装 `backend-ts/package.json` + `package-lock.json` 的全部生产依赖，版本与宿主 lock 严格一致；新增依赖不再需要人工改 Dockerfile。
+- **镜像依赖指纹预检**：构建脚本写入 `org.mao.runtime.deps-hash` label（`package-lock.json` sha256 前 16 位），`ContainerRegistry.precheck()` 读取并比对。加载冒烟仍是硬闸门：可加载但指纹过期 / 缺失只告警，加载失败则拒绝并明确提示重建镜像，错误文案区分「指纹过期」「旧镜像无指纹」「指纹匹配但镜像损坏 / Node ABI 不符」。
+- **新增容器依赖闭包契约测试**：从 `runtime-agent` 递归扫描相对 import，断言运行时 bare import 全部属于生产依赖；`import type` 单独放行，非字面量动态 import 直接失败，失败输出完整闭包清单与缺失包名。
+
+### 部署
+- `scripts/build-runtime-image.sh` 支持 `--print-deps-hash`（不依赖 Docker，供后端单测对拍），构建时自动写入依赖指纹 label；`.dockerignore` 同步说明构建上下文需要 `backend-ts/package.json` 与 `package-lock.json`。lock 变化后需重建镜像。
+
 ## 0.0.446 (2026-11-05)
 
 ### 后端

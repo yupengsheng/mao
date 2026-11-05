@@ -1,22 +1,18 @@
 # Mao 用户运行时容器镜像（技术方案 §4 镜像内容 / §6 部署）
 #
-# 与镜像 Node ABI 匹配的 sharp / node-pty 必须随镜像安装：容器内 read_file 读图走 sharp、
+# 镜像依赖来源 = backend-ts/package.json + package-lock.json：
+# `npm ci --omit=dev` 安装后端全部生产依赖，不再维护手写包清单。容器只读挂载宿主机 dist
+# （代码），第三方包全部来自镜像内 /opt/mao/backend-ts/node_modules；lock 变化后需重建镜像。
+# 构建脚本会写入 org.mao.runtime.deps-hash label（lock sha256 前 16 位），后端 precheck
+# 据此判断镜像依赖是否过期。
+#
+# 与镜像 Node ABI 匹配的 sharp / node-pty 随 npm ci 安装：容器内 read_file 读图走 sharp、
 # 云端终端走 node-pty，两者都是 native 模块，只读挂载宿主机 dist 带不上可用二进制。
-# 宿主机 Node 升级后必须同步重建本镜像（scripts/build-runtime-image.sh），否则容器内
-# 读图/pty 静默失败。
+# 宿主机 Node 升级后必须同步重建本镜像（scripts/build-runtime-image.sh）。
 #
-# 依赖清单 = runtime-agent 的 import 闭包里用到的全部第三方包（dist 只挂代码、不带
-# node_modules）。backend-ts 新增进入该闭包的 npm 包时必须同步加到这里并重建镜像，
-# 否则容器内 agent 启动即 ERR_MODULE_NOT_FOUND（表现为每用户任务连接超时）。
-#
-# 构建：bash scripts/build-runtime-image.sh（自动从 backend-ts/package.json 读取版本）
+# 构建：bash scripts/build-runtime-image.sh
 FROM node:22-bookworm-slim
 
-ARG SHARP_VERSION=latest
-ARG NODE_PTY_VERSION=latest
-ARG MCP_SDK_VERSION=latest
-ARG MINIMATCH_VERSION=latest
-ARG YAML_VERSION=latest
 # Debian 源：默认官方源；构建机访问 deb.debian.org 受限时传
 # --build-arg APT_MIRROR=mirrors.aliyun.com（build-runtime-image.sh 读同名环境变量）。
 ARG APT_MIRROR=deb.debian.org
@@ -30,11 +26,9 @@ RUN sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR
 
 # 原生模块安装到 /opt/mao/backend-ts/node_modules：运行时宿主机 dist 挂载到
 # /opt/mao/backend-ts/dist（ro），ESM 解析从 dist 向上即命中镜像内的 node_modules。
-RUN mkdir -p /opt/mao/backend-ts \
-  && cd /opt/mao/backend-ts \
-  && npm init -y >/dev/null \
-  && npm pkg set type=module \
-  && npm install --no-audit --no-fund "sharp@${SHARP_VERSION}" "node-pty@${NODE_PTY_VERSION}" "@modelcontextprotocol/sdk@${MCP_SDK_VERSION}" "minimatch@${MINIMATCH_VERSION}" "yaml@${YAML_VERSION}" \
+COPY backend-ts/package.json backend-ts/package-lock.json /opt/mao/backend-ts/
+RUN cd /opt/mao/backend-ts \
+  && npm ci --omit=dev --no-audit --no-fund \
   && npm cache clean --force
 
 # 默认以 root 运行（决策 2：容器内 root，隔离靠挂载清单）
