@@ -98,6 +98,8 @@ export class SessionService {
     private readonly deleteSessionApprovalRules?: (sessionId: number) => Promise<void>,
     /** 团队经验库挂载（技术方案 2026-10-24 §3.3）：CLOUD 会话创建时同步 团队经验 符号链接。可选注入。 */
     private readonly experienceMount?: ExperienceMountService | null,
+    /** 会话提升后清理旧边路会话的 CLOUD MCP 内存快照；失败只记日志。 */
+    private readonly clearSessionMcpSnapshot?: (sessionId: number) => void,
   ) {}
 
   /** 同一会话的 context token / manifest 写入按调用顺序串行，避免并发 UPDATE 把旧快照写回去。 */
@@ -660,7 +662,7 @@ export class SessionService {
   }
 
   async promoteSideTaskToMainSession(sideSessionId: number, userId: number): Promise<Session> {
-    return this.sessionRepo.transaction(async (tx) => {
+    const promoted = await this.sessionRepo.transaction(async (tx) => {
       const txSessionRepo = new SessionRepository(tx);
       const txMessageRepo = new MessageRepository(tx);
       const txFileChangeRepo = new FileChangeRepository(tx);
@@ -830,6 +832,26 @@ export class SessionService {
       await txSessionRepo.logicalDelete(sideSessionId);
       return target;
     });
+
+    // 旧边路会话已逻辑删除，但提升不走 deleteSession：其云终端、runtime 临时目录与
+    // CLOUD MCP 快照仍按旧 session_id 持有。新主会话使用新的 session_id，旧资源不再可达，
+    // 必须在此回收；失败只记日志，不回滚已经提交的提升事务。
+    try {
+      this.closeSessionTerminals?.(sideSessionId);
+    } catch (e) {
+      console.error(`Failed to close terminals for promoted side session ${sideSessionId}`, e);
+    }
+    try {
+      this.cleanupRuntimeDir?.(promoted.userId, sideSessionId);
+    } catch (e) {
+      console.error(`Failed to clean runtime dir for promoted side session ${sideSessionId}`, e);
+    }
+    try {
+      this.clearSessionMcpSnapshot?.(sideSessionId);
+    } catch (e) {
+      console.error(`Failed to clear MCP snapshot for promoted side session ${sideSessionId}`, e);
+    }
+    return promoted;
   }
 
   async searchMessages(

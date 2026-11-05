@@ -1,4 +1,4 @@
-# 边路提升会话级资源改绑设计
+# 边路提升会话级资源改绑与回收设计
 
 ## 背景
 
@@ -16,12 +16,23 @@
 - 改绑失败随提升事务整体回滚，不留下半完成状态。
 - 不改动会话删除路径已有的「清空绑定 / 删除规则」语义。
 
+## 旧会话运行时资源回收
+
+提升事务提交后，旧边路会话已逻辑删除，但以下资源仍按旧 `session_id` 持有：
+
+- 云端终端（`TerminalManager` 按会话登记，删除路径会 `closeBySession`）。
+- runtime 临时目录 `{runtimeRoot}/{userId}/{sessionId}`（删除路径会 `runtimeSessionCleanup`）。
+- CLOUD MCP 工具快照（内存 Map，删除路径会 `clearCloudSnapshot`）。
+
+`promoteSideTaskToMainSession()` 在事务提交后复用已有回调关闭终端、删除 runtime 目录，并新增 `clearSessionMcpSnapshot` 回调清理快照。三项各自 `try/catch`，失败只记日志，不影响已提交的提升结果。清理顺序放在事务之后，避免长事务持锁期间做文件系统操作。
+
 ## 非目标
 
 - 不改 USER 级审批规则；它们本就跨会话生效。
 - 不改触发器停用、连续失败计数或限流语义；改绑不重置这些字段。
 - 不复制或清理 MCP 内存快照；新主会话在下一轮执行时按既有逻辑重建。
 - 不新增数据库迁移；`approval_rule(session_id)` 与 V194 的 `webhook_trigger(session_id)` 索引已覆盖条件更新。
+- 不删除旧会话工作区内的用户文件；只回收 runtime 临时目录与会话级内存/终端资源。
 
 ## 实现
 
@@ -50,4 +61,5 @@ WHERE session_id = ?;
 
 - session：提升事务内以 `[targetId, sideSessionId]` 改绑 `SESSION` 审批规则。
 - session：提升事务内以 `[targetId, sideSessionId]` 改绑绑定旧会话的 Webhook 触发器。
+- session：提升后调用旧会话的终端关闭、runtime 目录清理与 MCP 快照清理；回调抛错不影响提升结果。
 - 既有提升用例继续覆盖消息复制、待办、定时任务、通知抑制、任务记录与消息队列回收。

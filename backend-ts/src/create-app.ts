@@ -567,6 +567,7 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     },
     (sessionId) => approvalRuleRepo.deleteBySessionId(sessionId),
     experienceMountService,
+    (sessionId) => { ctx.mcpSyncRef?.clearCloudSnapshot(sessionId); },
   );
   const sessionSvc = sessionService as never;
   const sessionMap = sessionRepo as never;

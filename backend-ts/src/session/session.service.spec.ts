@@ -21,7 +21,16 @@ function message(id: number, sessionId: number, content: string | null): Message
   return { id, sessionId, role: 'USER', content };
 }
 
-function makeService(onSessionDeleted?: (sessionId: number) => Promise<void> | void) {
+interface PromotionHooks {
+  cleanupRuntimeDir?: (userId: number, sessionId: number) => void;
+  closeSessionTerminals?: (sessionId: number) => void;
+  clearSessionMcpSnapshot?: (sessionId: number) => void;
+}
+
+function makeService(
+  onSessionDeleted?: (sessionId: number) => Promise<void> | void,
+  hooks: PromotionHooks = {},
+) {
   const txDb = {
     insert: vi.fn(async (table: string, data: Record<string, unknown>) => {
       if (table === 'session') return 99;
@@ -116,8 +125,12 @@ function makeService(onSessionDeleted?: (sessionId: number) => Promise<void> | v
     sessionCompactionService,
     sessionCompactionEventService,
     todoRepo,
-    undefined,
+    hooks.cleanupRuntimeDir,
+    hooks.closeSessionTerminals,
     onSessionDeleted,
+    undefined,
+    undefined,
+    hooks.clearSessionMcpSnapshot,
   );
   return { service, sessionRepo, messageRepo, fileChangeRepo, agentLookup, todoRepo, txDb };
 }
@@ -443,6 +456,55 @@ describe('SessionService archive', () => {
       expect.stringContaining('UPDATE task_notification_delivery'),
       ['SUPPRESSED_WS', 20, 'WAITING_WS', 'PENDING', 'SENDING'],
     );
+  });
+
+  it('promotesSideTaskAndCleansOldRuntimeResources', async () => {
+    // 提升不走 deleteSession：旧边路会话的云终端、runtime 目录与 MCP 快照不会自动回收。
+    const closeSessionTerminals = vi.fn();
+    const cleanupRuntimeDir = vi.fn();
+    const clearSessionMcpSnapshot = vi.fn();
+    const { service, sessionRepo } = makeService(undefined, {
+      closeSessionTerminals,
+      cleanupRuntimeDir,
+      clearSessionMcpSnapshot,
+    });
+    vi.mocked(sessionRepo.findById).mockResolvedValue({
+      id: 20,
+      userId: 7,
+      title: '边路任务',
+      sessionType: 'SIDE_TASK',
+      phase: 'COMPLETED',
+      executionMode: 'CLOUD',
+      workspace: '/tmp/w',
+    });
+    vi.mocked(sessionRepo.list).mockResolvedValue([]);
+
+    const promoted = await service.promoteSideTaskToMainSession(20, 7);
+
+    expect(promoted.id).toBe(99);
+    expect(closeSessionTerminals).toHaveBeenCalledWith(20);
+    expect(cleanupRuntimeDir).toHaveBeenCalledWith(7, 20);
+    expect(clearSessionMcpSnapshot).toHaveBeenCalledWith(20);
+  });
+
+  it('keepsPromotionSuccessfulWhenRuntimeCleanupFails', async () => {
+    const { service, sessionRepo } = makeService(undefined, {
+      closeSessionTerminals: () => { throw new Error('close failed'); },
+      cleanupRuntimeDir: () => { throw new Error('cleanup failed'); },
+      clearSessionMcpSnapshot: () => { throw new Error('snapshot failed'); },
+    });
+    vi.mocked(sessionRepo.findById).mockResolvedValue({
+      id: 20,
+      userId: 7,
+      title: '边路任务',
+      sessionType: 'SIDE_TASK',
+      phase: 'COMPLETED',
+      executionMode: 'CLOUD',
+      workspace: '/tmp/w',
+    });
+    vi.mocked(sessionRepo.list).mockResolvedValue([]);
+
+    await expect(service.promoteSideTaskToMainSession(20, 7)).resolves.toMatchObject({ id: 99 });
   });
 
   it('rejectsDeleteWhenSessionRunning', async () => {
