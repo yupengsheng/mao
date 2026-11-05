@@ -22,6 +22,7 @@ describe('AgentService', () => {
     }),
     updateById: vi.fn(),
     listPromptVersions: vi.fn(),
+    listPromptVersionsPaged: vi.fn(),
     rollbackPrompt: vi.fn(),
     deleteById: vi.fn(),
     updateEnabled: vi.fn(),
@@ -142,6 +143,19 @@ describe('AgentService', () => {
     vi.mocked(agentRepo.findById).mockResolvedValue(null);
     await expect(service.listPromptVersions(404)).rejects.toMatchObject({ code: ErrorCode.AGENT_NOT_FOUND.code });
     expect(agentRepo.listPromptVersions).not.toHaveBeenCalled();
+  });
+
+  it('pages prompt versions and validates the agent exists', async () => {
+    const versions = [{ id: 2, agentId: 1, version: 2, systemPrompt: 'new', operatorId: 7, sourceVersion: null }];
+    vi.mocked(agentRepo.findById).mockResolvedValue(agent(1, 'a', 0));
+    vi.mocked(agentRepo.listPromptVersionsPaged).mockResolvedValue({ records: versions, total: 6 });
+    expect(await service.listPromptVersionsPaged(1, 2, 5)).toEqual({ records: versions, total: 6 });
+    expect(agentRepo.listPromptVersionsPaged).toHaveBeenCalledWith(1, 2, 5);
+
+    vi.mocked(agentRepo.findById).mockResolvedValue(null);
+    await expect(service.listPromptVersionsPaged(404, 1, 10))
+      .rejects.toMatchObject({ code: ErrorCode.AGENT_NOT_FOUND.code });
+    expect(agentRepo.listPromptVersionsPaged).toHaveBeenCalledTimes(1);
   });
 
   it.each([0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])('rejects invalid rollback version %s', async (version) => {

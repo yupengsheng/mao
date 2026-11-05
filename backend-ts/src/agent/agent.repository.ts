@@ -154,6 +154,20 @@ export class MysqlAgentRepository implements AgentRepository {
     );
   }
 
+  async listPromptVersionsPaged(
+    agentId: number, pageNum: number, pageSize: number,
+  ): Promise<{ records: AgentPromptVersion[]; total: number }> {
+    const totalRow = await this.db.queryOne<{ c: number }>(
+      'SELECT COUNT(*) AS c FROM agent_prompt_versions WHERE agent_id = ?', [agentId],
+    );
+    const records = await this.db.query<AgentPromptVersion>(
+      `SELECT * FROM agent_prompt_versions WHERE agent_id = ?
+       ORDER BY version DESC LIMIT ? OFFSET ?`,
+      [agentId, pageSize, (pageNum - 1) * pageSize],
+    );
+    return { records, total: Number(totalRow?.c ?? 0) };
+  }
+
   private async appendPromptVersion(
     tx: Db, agentId: number, systemPrompt: string,
     operatorId: number | null, sourceVersion: number | null,

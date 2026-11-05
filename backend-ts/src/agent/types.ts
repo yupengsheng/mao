@@ -88,6 +88,9 @@ export interface AgentRepository {
   clearDefaultFlag(): Promise<void>;
   removeSkillName(skillName: string): Promise<number>;
   listPromptVersions(agentId: number): Promise<AgentPromptVersion[]>;
+  listPromptVersionsPaged(
+    agentId: number, pageNum: number, pageSize: number,
+  ): Promise<{ records: AgentPromptVersion[]; total: number }>;
   rollbackPrompt(agentId: number, version: number, operatorId: number): Promise<Agent>;
 }
 

@@ -41,7 +41,7 @@
 
 | 操作 | 接口 | 返回 |
 |------|------|------|
-| 历史列表 | `GET /agents/:id/prompt-versions` | 按版本倒序的数组，包含 `id`、`agentId`、`version`、`systemPrompt`、`operatorId`、`sourceVersion`、`createdAt` |
+| 历史列表 | `GET /agents/:id/prompt-versions` | 按版本倒序的数组，包含 `id`、`agentId`、`version`、`systemPrompt`、`operatorId`、`sourceVersion`、`createdAt`。支持可选 `pageNum` / `pageSize`（默认每页 20，最多 200），分页时通过 `x-total-count` 返回总数；不传分页参数仍返回全量数组 |
 | 回滚 | `POST /agents/:id/prompt-versions/:version/rollback` | 最新 Agent 详情；`:version` 为正整数版本号，无需请求体 |
 
 回滚仅恢复提示词并生成带 `sourceVersion` 的新版本，不删除历史、不改动其他 Agent 配置。目标内容与当前一致时不重复生成版本。普通 `agent create/update` 命令同样触发服务端自动版本记录。

@@ -184,7 +184,21 @@ export function registerAgentRoutes(app: FastifyInstance, deps: AgentRouteDeps):
 
   app.get('/v1/agents/:id/prompt-versions', async (request, reply) => {
     await requireAgentWrite(request);
-    const versions = await agentService.listPromptVersions(pathId(request));
+    const agentId = pathId(request);
+    const pageNum = queryOptInt(request, 'pageNum');
+    const pageSize = queryOptInt(request, 'pageSize');
+    let versions;
+    if (pageNum == null && pageSize == null) {
+      versions = await agentService.listPromptVersions(agentId);
+    } else {
+      const page = await agentService.listPromptVersionsPaged(
+        agentId,
+        Math.max(1, pageNum ?? 1),
+        Math.min(200, Math.max(1, pageSize ?? 20)),
+      );
+      reply.header('x-total-count', String(page.total));
+      versions = page.records;
+    }
     const operatorIds = [...new Set(versions.map((v) => v.operatorId).filter((id): id is number => id != null))];
     const users = await Promise.all(operatorIds.map((id) => userRepo.findById(id)));
     const nameMap = new Map<number, string>();

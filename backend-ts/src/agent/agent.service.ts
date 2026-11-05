@@ -192,6 +192,11 @@ export class AgentService {
     return this.agentRepo.listPromptVersions(id);
   }
 
+  async listPromptVersionsPaged(id: number, pageNum: number, pageSize: number) {
+    await this.getAgent(id);
+    return this.agentRepo.listPromptVersionsPaged(id, pageNum, pageSize);
+  }
+
   async rollbackPrompt(id: number, version: number, operatorId: number): Promise<Agent> {
     if (!Number.isSafeInteger(version) || version <= 0) {
       throw new BusinessException(ErrorCode.PARAM_INVALID, '版本号必须为正整数');

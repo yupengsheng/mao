@@ -59,6 +59,31 @@ describe('CRUD routes', () => {
     }
   });
 
+  it('paginates prompt history and exposes the total header', async () => {
+    const versions = [{ id: 2, agentId: 1, version: 2, systemPrompt: 'new' }];
+    const service = {
+      listPromptVersionsPaged: vi.fn(async () => ({ records: versions, total: 6 })),
+      getAgentExperiences: vi.fn(async () => []),
+      getAgentSuggestedQuestions: vi.fn(async () => []),
+    };
+    const app = await appWithUser(f => registerAgentRoutes(f, {
+      agentService: service as never, experienceService: {} as never,
+      suggestedQuestionService: {} as never,
+      userRepo: {} as never, mcpServerValidator: {} as never, httpToolValidator: {} as never,
+      permissionService: { hasPermission: vi.fn(async () => true) },
+    }));
+    try {
+      const history = await app.inject({
+        method: 'GET', url: '/v1/agents/1/prompt-versions?pageNum=2&pageSize=5',
+      });
+      expect(history.headers['x-total-count']).toBe('6');
+      expect(history.json().data).toEqual(versions);
+      expect(service.listPromptVersionsPaged).toHaveBeenCalledWith(1, 2, 5);
+    } finally {
+      await app.close();
+    }
+  });
+
   it('agent routes list get create update delete and experiences', async () => {
     const agent = { id: 1, name: 'A', systemPrompt: 'p', creatorId: 7, isDefault: 0, avatarUrl: '/uploads/12345678-1234-1234-1234-123456789abc.png' };
     const agentService = {

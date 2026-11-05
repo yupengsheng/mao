@@ -36,6 +36,15 @@
         </el-table-column>
         <template #empty>{{ loadFailed ? '加载失败，请重试' : '暂无版本记录' }}</template>
       </el-table>
+      <div class="history-pagination">
+        <el-pagination
+          v-model:current-page="page"
+          layout="prev, pager, next, total"
+          :total="total"
+          :page-size="pageSize"
+          @current-change="loadVersions"
+        />
+      </div>
       <template v-if="selected">
         <h4>v{{ selected.version }} · 系统提示词预览</h4>
         <el-input :model-value="selected.systemPrompt" type="textarea" :rows="12" readonly aria-label="系统提示词版本预览" />
@@ -55,9 +64,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { api } from '../../api'
+import { api, apiGetWithHeaders } from '../../api'
 import { formatDateTimeColumn } from '../../utils/datetime'
 import ResponsiveDialog from '../../components/ResponsiveDialog.vue'
 
@@ -76,7 +85,10 @@ const props = defineProps<{ agentId: number; agentName: string }>()
 const emit = defineEmits<{ close: []; restored: [] }>()
 const versions = ref<PromptVersion[]>([])
 const selected = ref<PromptVersion | null>(null)
-const currentVersion = computed(() => versions.value[0]?.version)
+const currentVersion = ref<number | null>(null)
+const page = ref(1)
+const pageSize = 10
+const total = ref(0)
 const loading = ref(false)
 const loadFailed = ref(false)
 const rollingBack = ref(false)
@@ -85,15 +97,27 @@ function selectVersion(row: PromptVersion | null) {
   if (row) selected.value = row
 }
 
+function readTotalCount(headers: unknown): number {
+  if (!headers || typeof headers !== 'object') return NaN
+  const bag = headers as { get?: (name: string) => unknown } & Record<string, unknown>
+  const raw = typeof bag.get === 'function' ? bag.get('x-total-count') : bag['x-total-count']
+  return Number(Array.isArray(raw) ? raw[0] : raw)
+}
+
 async function loadVersions() {
   loading.value = true
   loadFailed.value = false
   selected.value = null
   versions.value = []
   try {
-    const { data } = await api.get<PromptVersion[]>(`/agents/${props.agentId}/prompt-versions`)
-    versions.value = data
-    selected.value = data[0] ?? null
+    const { result, headers } = await apiGetWithHeaders<PromptVersion[]>(`/agents/${props.agentId}/prompt-versions`, {
+      params: { pageNum: page.value, pageSize }
+    })
+    versions.value = result.data || []
+    const headerTotal = readTotalCount(headers)
+    total.value = Number.isFinite(headerTotal) ? headerTotal : versions.value.length
+    if (page.value === 1 && versions.value.length > 0) currentVersion.value = versions.value[0].version
+    selected.value = versions.value[0] ?? null
   } catch {
     loadFailed.value = true
   } finally {
@@ -114,6 +138,7 @@ async function rollback() {
     await api.post(`/agents/${props.agentId}/prompt-versions/${target}/rollback`)
     ElMessage.success('系统提示词已恢复')
     emit('restored')
+    page.value = 1
     await loadVersions()
   } catch {
     // 取消不修改数据；请求错误由 API 拦截器提示。
@@ -128,5 +153,11 @@ onMounted(loadVersions)
 <style scoped>
 .history-content {
   margin-top: 16px;
+}
+
+.history-pagination {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 12px;
 }
 </style>

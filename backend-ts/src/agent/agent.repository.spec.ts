@@ -81,6 +81,14 @@ describe('MysqlAgentRepository', () => {
     await repo.deleteById(5);
     await repo.clearDefaultFlag();
     await repo.listPromptVersions(1);
+    const pagedDb = mockDb({ c: 12 }, [{ id: 2, version: 2 }]);
+    const pagedRepo = new MysqlAgentRepository(pagedDb as never);
+    expect(await pagedRepo.listPromptVersionsPaged(1, 2, 5)).toEqual({
+      records: [{ id: 2, version: 2 }], total: 12,
+    });
+    expect(pagedDb.queryOne).toHaveBeenCalledWith(expect.stringContaining('COUNT(*)'), [1]);
+    expect(String(pagedDb.query.mock.calls.at(-1)?.[0])).toMatch(/ORDER BY version DESC LIMIT \? OFFSET \?/);
+    expect(pagedDb.query.mock.calls.at(-1)?.[1]).toEqual([1, 5, 5]);
     const exp = new MysqlAgentExperienceRepository(db as never);
     await exp.listByAgentId(1);
     await exp.listEnabledByAgentId(1);
