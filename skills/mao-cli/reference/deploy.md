@@ -418,6 +418,8 @@ FROM message WHERE deleted = 0;
 
    后端预检会比对当前 lock 与镜像 label，但**加载冒烟仍是硬闸门**：预检用当前 dist 在镜像内实际加载一次 runtime-agent 与 sharp / node-pty，能加载时指纹不一致只告警，加载失败才拒绝切换并提示重建。因此 lock 变化（新增 / 升级依赖）后应重建镜像；忘记重建时，后台切换 docker 会以明确错误拒绝，而不是让每个用户任务等满 15 秒后报「容器运行时通道连接超时」。
 
+   预检结果会缓存在后端内存：成功后在进程生命周期内直接放行；失败后 30 秒内所有容器入口（工具 / 终端 / MCP）立即返回「原因 + 处置」，不再逐次等待 15 秒连接超时；窗口到期自动重新预检，Docker 或镜像恢复后无需重启后端。并发预检共享同一次执行，避免同一时刻重复跑镜像冒烟。管理后台「系统设置 → 运行环境」可查看运行模式、镜像是否可用、依赖指纹是否一致、最近一次预检结果与在线容器连接用户（页面只读查询，不主动触发预检）。
+
    容器侧依赖闭包由 `container-dependency-closure.spec.ts` 在 CI 中守门：运行时 bare import 必须属于生产依赖，`import type` 不要求镜像内存在；非字面量动态 import 会被拒绝。
 3. **数据目录**：`/opt/mao-data/runtime/channels`（socket 根）与 `/opt/mao-data/deps`（持久依赖）需存在且后端进程可写（首次启动预检会校验，不满足直接启动失败，不静默降级）。
 4. **上传目录**：图片产物（`generate_image` / `edit_image`）落 `{FILE_UPLOAD_DIR}/{userId}/`（宿主机按用户隔离、同名挂入容器），外网经 Nginx `^~ /uploads/` 与 `^~ /api/uploads/` 两个前缀访问；按用户隔离后请确认 Nginx 配置含这两个 location（见上文 Nginx 片段），否则图片类 `file.url` 会被扩展名正则 location 吞掉变 404。

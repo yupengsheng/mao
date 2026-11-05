@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ContainerRegistry, type DockerCli } from './container-registry.js';
@@ -833,6 +833,119 @@ describe('container registry', () => {
     expect(error?.message).toContain('build-runtime-image.sh');
   });
 
+  it('sharesSingleInFlightPrecheckAcrossConcurrentCallers', async () => {
+    const base = makePrecheckBase('mao-registry-precheck-single-flight-');
+    const expected = depsHashOfLockfile(join(base, 'package-lock.json'));
+    const log: string[] = [];
+    let releaseSmoke!: () => void;
+    const smokeGate = new Promise<void>((resolve) => { releaseSmoke = resolve; });
+    let smokeCount = 0;
+    const docker: DockerCli = {
+      async run(args) {
+        log.push(args.join(' '));
+        if (args[0] === 'version') return '27.0.0\n';
+        if (args[0] === 'images') return 'mao-runtime:latest\n';
+        if (args[0] === 'image') return expected;
+        if (args[0] === 'run') {
+          smokeCount += 1;
+          await smokeGate;
+          return '';
+        }
+        return 'ok\n';
+      },
+    };
+    const { registry } = makeRegistry(base, log, {}, docker);
+    const first = registry.precheck();
+    const second = registry.precheck();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(smokeCount).toBe(1);
+    releaseSmoke();
+    await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
+    expect(smokeCount).toBe(1);
+  });
+
+  it('assertRuntimeReadyFailsFastWithinBackoffWindow', async () => {
+    const base = makePrecheckBase('mao-registry-precheck-backoff-');
+    const log: string[] = [];
+    const docker = fakePrecheckDocker(log, null, "Cannot find package 'yaml'");
+    const { registry } = makeRegistry(base, log, {}, docker);
+
+    const first = await registry.assertRuntimeReady().then(() => null, (e: unknown) => e as Error);
+    expect(first?.message).toContain('容器运行时不可用');
+    expect(first?.message).toContain('build-runtime-image.sh');
+    expect(registry.getLastPrecheck()?.ok).toBe(false);
+    const smokeRuns = log.filter((line) => line.startsWith('run --rm')).length;
+    expect(smokeRuns).toBe(1);
+
+    // 30s 退避窗口内：立即失败，不再跑任何 Docker 命令（用户不再等满 15s 连接超时）
+    log.length = 0;
+    const second = await registry.assertRuntimeReady().then(() => null, (e: unknown) => e as Error);
+    expect(second?.message).toContain('容器运行时不可用');
+    expect(log).toEqual([]);
+  });
+
+  it('assertRuntimeReadyRetriesPrecheckAfterBackoffWindow', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-11-05T10:00:00Z'));
+    try {
+      const base = makePrecheckBase('mao-registry-precheck-retry-');
+      const log: string[] = [];
+      let failSmoke = true;
+      const docker: DockerCli = {
+        async run(args) {
+          log.push(args.join(' '));
+          if (args[0] === 'version') return '27.0.0\n';
+          if (args[0] === 'images') return 'mao-runtime:latest\n';
+          if (args[0] === 'image') return '';
+          if (args[0] === 'run') {
+            if (failSmoke) throw new Error("Cannot find package 'yaml'");
+            return '';
+          }
+          return 'ok\n';
+        },
+      };
+      const { registry } = makeRegistry(base, log, {}, docker);
+      await expect(registry.assertRuntimeReady()).rejects.toThrow(/容器运行时不可用/);
+      expect(registry.getLastPrecheck()?.ok).toBe(false);
+
+      // 抖动恢复：窗口到期后重新预检，失败状态不被永久缓存
+      failSmoke = false;
+      vi.setSystemTime(Date.now() + 30_000);
+      await expect(registry.assertRuntimeReady()).resolves.toBeUndefined();
+      expect(registry.getLastPrecheck()?.ok).toBe(true);
+      expect(log.filter((line) => line.startsWith('run --rm')).length).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('getRuntimeEnvironmentReportsImageFingerprintPrecheckAndConnections', async () => {
+    const base = makePrecheckBase('mao-registry-runtime-environment-');
+    const expected = depsHashOfLockfile(join(base, 'package-lock.json'));
+    const log: string[] = [];
+    const { registry } = makeRegistry(base, log, { connectedUserIds: () => [8, 16] }, fakePrecheckDocker(log, expected));
+    await registry.precheck();
+
+    const snapshot = await registry.getRuntimeEnvironment();
+    expect(snapshot.image).toBe('mao-runtime:latest');
+    expect(snapshot.imageExists).toBe(true);
+    expect(snapshot.imageDepsHash).toBe(expected);
+    expect(snapshot.expectedDepsHash).toBe(expected);
+    expect(snapshot.connectedUsers).toEqual([8, 16]);
+    expect(snapshot.lastPrecheck?.ok).toBe(true);
+    expect(snapshot.lastPrecheck?.at).toMatch(/Z$/);
+  });
+
+  it('ensureRunningReusesSuccessfulPrecheckResult', async () => {
+    const base = makeBase('mao-registry-precheck-cache-');
+    const log: string[] = [];
+    const { registry } = makeRegistry(base, log);
+    await registry.ensureRunning(7);
+    expect(log.filter((line) => line.startsWith('run --rm')).length).toBe(1);
+    await registry.ensureRunning(7);
+    expect(log.filter((line) => line.startsWith('run --rm')).length).toBe(1);
+  });
+
   it('injectsContainerHostsEntriesIntoDockerRun', async () => {
     // 容器域名解析注入（V176）：宿主机继承 + 后台自定义规则逐条转 --add-host
     const base = useTmpDir('mao-registry-hosts-');
@@ -1144,4 +1257,8 @@ describe('container registry', () => {
     expect(summary.hostRuntimeBuild).toBeNull();
     expect(summary.pendingUpgrade).toBe(false);
   });
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });

@@ -405,7 +405,11 @@ export async function registerAllRoutes(deps: RouteDeps): Promise<void> {
     });
     registerUserRoutes(api, userService, userRepo, permissionService, containerOps);
     if (containerOps) {
-      registerAdminContainerRoutes(api, { containerOps, permissionService });
+      registerAdminContainerRoutes(api, {
+        containerOps,
+        permissionService,
+        runtimeModeOf: () => runtimeModeResolver.resolve(),
+      });
     }
     registerPermissionRoutes(api, permissionService);
     registerGitCredentialRoutes(api, gitCredentials);

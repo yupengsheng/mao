@@ -99,11 +99,30 @@ export interface ContainerEntrySummary {
   pendingUpgrade: boolean;
 }
 
+/** 最近一次运行时预检结果（内存态，用于快速失败与后台展示）。 */
+export interface RuntimePrecheckState {
+  ok: boolean;
+  message: string;
+  atMs: number;
+}
+
+/** 管理后台「运行环境」只读快照（不含运行时模式，由路由层叠加）。 */
+export interface RuntimeEnvironmentSnapshot {
+  image: string;
+  imageExists: boolean;
+  imageDepsHash: string | null;
+  expectedDepsHash: string | null;
+  lastPrecheck: { ok: boolean; message: string; at: string } | null;
+  connectedUsers: number[];
+}
+
 /** 管理后台容器运维依赖（窄接口，路由层用，不暴露生命周期内部细节）。 */
 export interface ContainerOps {
   listEntries(): ContainerEntrySummary[];
   /** 重建单个用户容器；none=当前无在册容器（下次使用时按新配置创建）。 */
   recycleUser(userId: number, opts?: { force?: boolean }): Promise<ContainerRecycleResult>;
+  /** 运行环境只读状态：镜像、依赖指纹、最近预检、在线容器连接。 */
+  getRuntimeEnvironment(): Promise<RuntimeEnvironmentSnapshot>;
 }
 
 /** 容器是否处于忙碌状态（有活跃 shell / 在途任务 / 已连接终端）。 */
@@ -181,9 +200,12 @@ export interface ContainerRegistryOptions {
    * 但漂移判定必须跳过（见 hostsInjectionDrifted），避免瞬时故障误重建存量容器。
    */
   resolveHostsInjection?(): Promise<ContainerHostsResolution>;
+  /** 当前在线容器连接的用户 id（后台运行环境状态展示）；未注入返回空数组。 */
+  connectedUserIds?: () => number[];
 }
 
 const IDLE_CHECK_INTERVAL_MS = 60_000;
+const PRECHECK_RETRY_WINDOW_MS = 30_000;
 
 export class ContainerRegistry {
   private readonly entries = new Map<number, ContainerEntry>();
@@ -205,6 +227,10 @@ export class ContainerRegistry {
   private idleTimer: NodeJS.Timeout | null = null;
   /** 每用户 /tmp 过期清理节流（24h 一次，容器创建 / idle 巡检触发）。 */
   private lastTmpCleanupAtMs = 0;
+  /** 最近一次预检结果；失败只保留 30s 退避窗口，不永久毒化。 */
+  private lastPrecheck: RuntimePrecheckState | null = null;
+  /** 预检 single-flight：并发调用共享同一个进行中的 Promise。 */
+  private precheckInFlight: Promise<void> | null = null;
 
   constructor(
     private readonly opts: ContainerRegistryOptions,
@@ -238,8 +264,35 @@ export class ContainerRegistry {
     return this.planner;
   }
 
-  /** docker 模式启动预检：任一不满足直接抛错，不静默降级（§5.2）。 */
-  async precheck(): Promise<void> {
+  /** 最近一次预检结果（测试 / 诊断只读）。 */
+  getLastPrecheck(): RuntimePrecheckState | null {
+    return this.lastPrecheck ? { ...this.lastPrecheck } : null;
+  }
+
+  /**
+   * docker 模式启动预检：任一不满足直接抛错，不静默降级（§5.2）。
+   * single-flight：并发调用共享同一个进行中的 Promise，避免重复跑 Docker 冒烟。
+   * 成功/失败都会记录 lastPrecheck；失败只作为 30s 退避依据，不做永久缓存。
+   */
+  precheck(): Promise<void> {
+    if (this.precheckInFlight) return this.precheckInFlight;
+    const inFlight = this.runPrecheck().then(
+      () => {
+        this.lastPrecheck = { ok: true, message: '运行时预检通过', atMs: Date.now() };
+      },
+      (e: unknown) => {
+        const message = (e as Error).message || String(e);
+        this.lastPrecheck = { ok: false, message, atMs: Date.now() };
+        throw e;
+      },
+    ).finally(() => {
+      if (this.precheckInFlight === inFlight) this.precheckInFlight = null;
+    });
+    this.precheckInFlight = inFlight;
+    return inFlight;
+  }
+
+  private async runPrecheck(): Promise<void> {
     const c = this.opts.config.container;
     await this.docker.run(['version', '--format', '{{.Server.Version}}'], 10_000);
     const images = await this.docker.run(['images', '--format', '{{.Repository}}:{{.Tag}}', c.image], 10_000);
@@ -328,6 +381,70 @@ export class ContainerRegistry {
   }
 
   /**
+   * 工具 / 终端 / MCP 等所有容器入口的统一健康闸门：
+   * - 从未预检 → 先跑一次；
+   * - 预检成功 → 放行；
+   * - 失败且在 30s 退避窗口内 → 立即抛错（不再让用户等满 15s 连接超时）；
+   * - 窗口到期 → 重新预检，失败继续记录并抛错。
+   */
+  async assertRuntimeReady(): Promise<void> {
+    const last = this.lastPrecheck;
+    if (last?.ok) return;
+    if (last && !last.ok && Date.now() - last.atMs < PRECHECK_RETRY_WINDOW_MS) {
+      throw new ContainerStartError(this.runtimeUnavailableMessage(last.message));
+    }
+    try {
+      await this.precheck();
+    } catch (e) {
+      throw new ContainerStartError(this.runtimeUnavailableMessage((e as Error).message));
+    }
+  }
+
+  /** 统一「原因 + 处置」文案；预检自身已带处置时不重复追加。 */
+  private runtimeUnavailableMessage(reason: string): string {
+    const head = reason.startsWith('容器运行时不可用') ? reason : `容器运行时不可用：${reason}`;
+    if (/处置[：:]/.test(head)) return head;
+    return `${head}。处置：确认 Docker 服务可用且运行时镜像已构建（可在部署机执行 bash scripts/build-runtime-image.sh 重建），或在管理后台「系统设置 → 运行环境」切回 host。`;
+  }
+
+  /** 管理后台「运行环境」只读快照；不触发预检，避免 GET 请求放大 Docker 开销。 */
+  async getRuntimeEnvironment(): Promise<RuntimeEnvironmentSnapshot> {
+    const c = this.opts.config.container;
+    const expectedDepsHash = this.expectedDepsHash();
+    const inspected = await this.inspectImage(c.image);
+    const last = this.lastPrecheck;
+    return {
+      image: c.image,
+      imageExists: inspected.exists,
+      imageDepsHash: inspected.depsHash,
+      expectedDepsHash,
+      lastPrecheck: last
+        ? { ok: last.ok, message: last.message, at: new Date(last.atMs).toISOString() }
+        : null,
+      connectedUsers: this.opts.connectedUserIds?.() ?? [],
+    };
+  }
+
+  /** 镜像存在性与依赖指纹（解析失败时按不存在 / 无指纹返回，不抛错）。 */
+  private async inspectImage(image: string): Promise<{ exists: boolean; depsHash: string | null }> {
+    try {
+      const stdout = await this.docker.run([
+        'image', 'inspect', '--format',
+        `{{.Id}}|{{index .Config.Labels "${RUNTIME_DEPS_HASH_LABEL}"}}`,
+        image,
+      ], 10_000);
+      const hash = stdout.trim().split('|').pop()?.trim();
+      return {
+        exists: true,
+        depsHash: hash && /^[0-9a-f]{16}$/.test(hash) ? hash : null,
+      };
+    } catch (e) {
+      harnessLog('warn', `[container] runtime environment inspect failed: ${(e as Error).message}`);
+      return { exists: false, depsHash: null };
+    }
+  }
+
+  /**
    * 镜像 + 当前 dist 的加载冒烟（precheck 调用）。
    * - 只加载不运行：node -e 下 process.argv[1] 为空，runtime-agent 的 isMainModule 判定为
    *   false，不会真的启动 agent；
@@ -409,6 +526,7 @@ export class ContainerRegistry {
    * 之下，命中已挂载集合，不会触发重建。
    */
   async ensureRunning(userId: number, requiredWorkspace?: string | null): Promise<ContainerEntry> {
+    await this.assertRuntimeReady();
     return this.withUserLock(userId, () => this.ensureRunningLocked(userId, requiredWorkspace));
   }
 

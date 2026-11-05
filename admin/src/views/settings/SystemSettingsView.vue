@@ -118,6 +118,7 @@
                       </div>
                     </div>
                   </template>
+                  <RuntimeEnvironmentPanel v-if="section.name === '运行环境'" />
                   <el-form label-position="top" class="group-form">
                     <el-form-item
                       v-for="row in settingsByCategory[section.name]"
@@ -245,6 +246,7 @@ import EcpConfigPanel from './components/EcpConfigPanel.vue'
 import ShellEnvVarsPanel from './components/ShellEnvVarsPanel.vue'
 import ContainerHostsPanel from './components/ContainerHostsPanel.vue'
 import ContainerRebuildPanel from './components/ContainerRebuildPanel.vue'
+import RuntimeEnvironmentPanel from './components/RuntimeEnvironmentPanel.vue'
 import { COMPANY_SSO_KEY } from './companySsoConfig'
 import { ECP_CONFIG_KEY } from './ecpConfig'
 import { cidrAllowlistError } from './cidrAllowlist'

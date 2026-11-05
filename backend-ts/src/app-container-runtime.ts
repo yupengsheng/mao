@@ -117,6 +117,7 @@ export async function assembleContainerRuntime(deps: ContainerRuntimeDeps): Prom
     // 容器内代码漂移自动收敛（技术方案 §3.4/§3.5）：总开关 + 蓝绿 draining 守卫
     autoUpgradeEnabled: () => containerAutoUpgradeResolver.resolve(),
     isDraining: () => isDrainingInstance(cfg.app.harness.runtimeDir, cfg.server.port),
+    connectedUserIds: () => channelServer.connectedUserIds(),
     sessionWorkspacesOf: async (userId) => {
       const all = await sessionRepo.listWorkspacesByUser(userId).catch((e) => {
         console.debug(`Session workspace lookup skipped for user ${userId}: ${(e as Error).message}`);
