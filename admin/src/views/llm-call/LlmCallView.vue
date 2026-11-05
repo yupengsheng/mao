@@ -171,6 +171,8 @@
           <div class="call-card-row"><span class="call-card-label">时间</span><span>{{ formatDateTime(row.createdAt) }}</span></div>
           <div class="call-card-row"><span class="call-card-label">用户</span><span>{{ row.displayName || row.username || row.userId || '-' }}</span></div>
           <div class="call-card-row"><span class="call-card-label">模型</span><span>{{ row.modelName || '-' }}</span></div>
+          <div class="call-card-row"><span class="call-card-label">协议</span><span>{{ llmCallProtocolLabel(row.protocol) }}</span></div>
+          <div class="call-card-row"><span class="call-card-label">推理强度</span><span>{{ row.effort || '-' }}</span></div>
           <div class="call-card-row"><span class="call-card-label">Token</span><span>{{ formatNumber(row.promptTokens || 0) }} / {{ formatNumber(row.completionTokens || 0) }}</span></div>
           <div class="call-card-row"><span class="call-card-label">成本</span><span>{{ formatCostCell(row.costMicros) }}</span></div>
           <div class="call-card-row"><span class="call-card-label">缓存</span><span>{{ formatCacheHit(row) }}</span></div>
@@ -318,6 +320,7 @@ function applyQueryFilters() {
   filters.modelId = q.modelId != null && q.modelId !== '' && Number.isFinite(modelId) ? modelId : undefined
   filters.startDate = typeof q.startDate === 'string' ? q.startDate : ''
   filters.endDate = typeof q.endDate === 'string' ? q.endDate : ''
+  void ensureSelectedModelOption()
 }
 
 function formatNumber(value: number) {
@@ -497,13 +500,38 @@ async function doExportCsv() {
   }
 }
 
+let modelSearchSeq = 0
+
+/** 搜索或初始化模型下拉时保留当前已选模型，避免选中项不在结果中时回显成数字 ID。 */
+function withSelectedModel(options: Array<{ id: number; name: string; provider?: string | null }>) {
+  const selectedId = filters.modelId
+  if (selectedId == null || options.some((m) => m.id === selectedId)) return options
+  const selected = modelOptions.value.find((m) => m.id === selectedId)
+  return selected ? [selected, ...options] : options
+}
+
+/** 当前筛选模型不在下拉结果中时按 ID 补拉一次，保证回显名称而不是数字。 */
+async function ensureSelectedModelOption() {
+  const id = filters.modelId
+  if (id == null || modelOptions.value.some((m) => m.id === id)) return
+  try {
+    const { data } = await api.get(`/models/${id}`)
+    if (data?.id != null && filters.modelId === id && !modelOptions.value.some((m) => m.id === data.id)) {
+      modelOptions.value = [data, ...modelOptions.value]
+    }
+  } catch { /* 拦截器已提示失败 */ }
+}
+
 async function searchModels(keyword: string) {
+  const seq = ++modelSearchSeq
   modelSearching.value = true
   try {
     const { data } = await api.get('/models', { params: { page: 1, size: 50, keyword: keyword || undefined } })
-    modelOptions.value = data?.records || []
+    if (seq !== modelSearchSeq) return
+    modelOptions.value = withSelectedModel(data?.records || [])
+    void ensureSelectedModelOption()
   } catch { /* 拦截器已提示失败 */ } finally {
-    modelSearching.value = false
+    if (seq === modelSearchSeq) modelSearching.value = false
   }
 }
 
@@ -522,6 +550,7 @@ async function fetchFilterOptions() {
     userOptions.value = usersRes.data || []
     agentOptions.value = agentsRes.data || []
     modelOptions.value = modelsRes.data?.records || []
+    void ensureSelectedModelOption()
   } catch { /* 拦截器已提示失败 */ }
 }
 
@@ -592,7 +621,7 @@ onActivated(() => {
 }
 
 .call-card-label {
-  width: 48px;
+  width: 56px;
   flex-shrink: 0;
   color: var(--mao-muted);
 }
