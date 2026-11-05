@@ -13,6 +13,7 @@ function agent(id: number, name: string, isDefault: number): Agent {
 describe('AgentService', () => {
   const agentRepo: AgentRepository = {
     selectList: vi.fn(),
+    selectPage: vi.fn(),
     findById: vi.fn(),
     findDefault: vi.fn(),
     insert: vi.fn(async (a) => {
@@ -71,6 +72,11 @@ describe('AgentService', () => {
 
     expect(await service.listAgents(7, 'old')).toEqual([existing]);
     expect(agentRepo.selectList).toHaveBeenCalledWith('old', false, false);
+    vi.mocked(agentRepo.selectPage).mockResolvedValue({ records: [existing], total: 12 });
+    expect(await service.listAgentsPage(7, 'old', true, false, 2, 10, false)).toEqual({ records: [existing], total: 12 });
+    expect(agentRepo.selectPage).toHaveBeenCalledWith(2, 10, 'old', true, false, false);
+    await service.listAgentsPage(7, null, false, false, 0, 999);
+    expect(agentRepo.selectPage).toHaveBeenLastCalledWith(1, 200, null, false, false, undefined);
     expect(await service.getAgent(1)).toBe(existing);
 
     const experiences = [experienceInputOf(null, 'tip', 0, true)];

@@ -56,6 +56,15 @@ describe('MysqlAgentRepository', () => {
     expect(db.query).toHaveBeenLastCalledWith(expect.stringContaining('client_visible = 1'), []);
     await repo.selectList(null, false, false);
     expect(String(db.query.mock.calls.at(-1)?.[0])).not.toContain('client_visible = 1');
+    await repo.selectPage(2, 10, 'coder', true, false, false);
+    expect(db.queryOne).toHaveBeenLastCalledWith(
+      expect.stringContaining('enabled = ?'),
+      [0, '%coder%'],
+    );
+    expect(db.query).toHaveBeenLastCalledWith(
+      expect.stringContaining('LIMIT ? OFFSET ?'),
+      [0, '%coder%', 10, 10],
+    );
     await repo.findDefault();
     expect(db.queryOne).toHaveBeenCalledWith(expect.stringContaining('enabled = 1'));
     await repo.updateEnabled(5, 0);

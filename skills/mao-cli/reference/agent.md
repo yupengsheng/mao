@@ -87,13 +87,19 @@
 |------|------|------|------|
 | `--keyword` | 否 | 字符串 | 按名称等关键词过滤，对应查询参数 `keyword` |
 | `--include-disabled` | 否 | 布尔 | 同时列出已停用 Agent。需要 `agent:read` 或 `agent:write`，否则服务端忽略 |
+| `--enabled` | 否 | 布尔 | 按启用状态过滤（`true` / `false`）；显式传入时服务端返回分页数组 |
+| `--page-num` | 否 | 数字 | 页码，从 1 开始；与 `--page-size` 一起使用 |
+| `--page-size` | 否 | 数字 | 每页条数，服务端限制 1–200，默认 20 |
 
 ### 示例
 
 ```bash
 mao agent list --keyword 助手 --json
 mao agent list --include-disabled --json
+mao agent list --include-disabled --enabled false --page-num 2 --page-size 20 --json
 ```
+
+传 `--enabled` / `--page-num` / `--page-size` 任一参数时返回当前页数组，响应头 `x-total-count` 为匹配总数；不传时保持全量数组行为。
 
 返回元素含 `enabled`（布尔）。管理后台列表使用 `includeDisabled=true`。
 

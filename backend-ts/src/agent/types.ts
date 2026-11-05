@@ -70,6 +70,14 @@ export interface SuggestedQuestionInput {
 
 export interface AgentRepository {
   selectList(keyword?: string | null, includeDisabled?: boolean, clientVisibleOnly?: boolean): Promise<Agent[]>;
+  selectPage(
+    pageNum: number,
+    pageSize: number,
+    keyword?: string | null,
+    includeDisabled?: boolean,
+    clientVisibleOnly?: boolean,
+    enabled?: boolean,
+  ): Promise<{ records: Agent[]; total: number }>;
   findById(id: number): Promise<Agent | null>;
   findDefault(): Promise<Agent | null>;
   insert(agent: Agent): Promise<number>;

@@ -29,6 +29,20 @@ export class AgentService {
     return this.agentRepo.selectList(keyword, includeDisabled, clientVisibleOnly);
   }
 
+  listAgentsPage(
+    _userId: number,
+    keyword: string | null | undefined,
+    includeDisabled: boolean,
+    clientVisibleOnly: boolean,
+    pageNum?: number,
+    pageSize?: number,
+    enabled?: boolean,
+  ): Promise<{ records: Agent[]; total: number }> {
+    const page = Math.max(1, pageNum ?? 1);
+    const size = Math.min(200, Math.max(1, pageSize ?? 20));
+    return this.agentRepo.selectPage(page, size, keyword, includeDisabled, clientVisibleOnly, enabled);
+  }
+
   async getAgent(id: number): Promise<Agent> {
     const agent = await this.agentRepo.findById(id);
     if (!agent) {

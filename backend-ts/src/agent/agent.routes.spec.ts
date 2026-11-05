@@ -213,6 +213,49 @@ describe('CRUD routes', () => {
     }
   });
 
+  it('paginates and filters agents without changing the legacy full-list response', async () => {
+    const agent = { id: 1, name: 'coder', systemPrompt: 'p', isDefault: 0, enabled: 1 };
+    const agentService = {
+      listAgents: vi.fn(async () => [agent]),
+      listAgentsPage: vi.fn(async () => ({ records: [agent], total: 12 })),
+      getAgentExperiences: vi.fn(async () => []),
+      getAgentSuggestedQuestions: vi.fn(async () => []),
+    };
+    const app = await appWithUser((f) => registerAgentRoutes(f, {
+      agentService: agentService as never,
+      experienceService: {} as never,
+      suggestedQuestionService: {} as never,
+      userRepo: { findById: vi.fn(async () => null) } as never,
+      mcpServerValidator: {} as never,
+      httpToolValidator: {} as never,
+      permissionService: { hasPermission: vi.fn(async () => true) },
+    }));
+    try {
+      const legacy = await app.inject({ method: 'GET', url: '/v1/agents' });
+      expect(legacy.json().data).toEqual([expect.objectContaining({ name: 'coder' })]);
+      expect(legacy.headers['x-total-count']).toBeUndefined();
+      expect(agentService.listAgents).toHaveBeenCalledWith(7, undefined, false, false);
+      expect(agentService.listAgentsPage).not.toHaveBeenCalled();
+
+      const paged = await app.inject({
+        method: 'GET',
+        url: '/v1/agents?includeDisabled=true&pageNum=2&pageSize=10&enabled=false&keyword=co',
+      });
+      expect(paged.json().data).toEqual([expect.objectContaining({ name: 'coder' })]);
+      expect(paged.headers['x-total-count']).toBe('12');
+      expect(agentService.listAgentsPage).toHaveBeenCalledWith(7, 'co', true, false, 2, 10, false);
+
+      const disabledOnly = await app.inject({
+        method: 'GET',
+        url: '/v1/agents?pageNum=1&pageSize=5&enabled=false',
+      });
+      expect(disabledOnly.json().data).toEqual([expect.objectContaining({ name: 'coder' })]);
+      expect(agentService.listAgentsPage).toHaveBeenLastCalledWith(7, undefined, false, false, 1, 5, false);
+    } finally {
+      await app.close();
+    }
+  });
+
   it('model command user admin and mcp preference routes', async () => {
     const model = { id: 3, name: 'gpt', provider: 'openai', modelId: 'g', status: 1 };
     const modelService = {

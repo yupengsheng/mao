@@ -15,10 +15,18 @@ import type {
 export class MysqlAgentRepository implements AgentRepository {
   constructor(private readonly db: Db) {}
 
-  selectList(keyword?: string | null, includeDisabled = false, clientVisibleOnly = false): Promise<Agent[]> {
+  private buildListWhere(
+    keyword?: string | null,
+    includeDisabled = false,
+    clientVisibleOnly = false,
+    enabled?: boolean,
+  ): { whereSql: string; params: unknown[] } {
     const where: string[] = [notDeleted()];
     const params: unknown[] = [];
-    if (!includeDisabled) {
+    if (enabled != null) {
+      where.push('enabled = ?');
+      params.push(enabled ? 1 : 0);
+    } else if (!includeDisabled) {
       where.push('enabled = 1');
     }
     if (clientVisibleOnly) {
@@ -28,10 +36,35 @@ export class MysqlAgentRepository implements AgentRepository {
       where.push('name LIKE ?');
       params.push(`%${keyword}%`);
     }
+    return { whereSql: where.join(' AND '), params };
+  }
+
+  selectList(keyword?: string | null, includeDisabled = false, clientVisibleOnly = false): Promise<Agent[]> {
+    const { whereSql, params } = this.buildListWhere(keyword, includeDisabled, clientVisibleOnly);
     return this.db.query<Agent>(
-      `SELECT * FROM agent WHERE ${where.join(' AND ')} ORDER BY is_default DESC, created_at DESC`,
+      `SELECT * FROM agent WHERE ${whereSql} ORDER BY is_default DESC, created_at DESC`,
       params,
     );
+  }
+
+  async selectPage(
+    pageNum: number,
+    pageSize: number,
+    keyword?: string | null,
+    includeDisabled = false,
+    clientVisibleOnly = false,
+    enabled?: boolean,
+  ): Promise<{ records: Agent[]; total: number }> {
+    const { whereSql, params } = this.buildListWhere(keyword, includeDisabled, clientVisibleOnly, enabled);
+    const totalRow = await this.db.queryOne<{ c: number }>(
+      `SELECT COUNT(*) AS c FROM agent WHERE ${whereSql}`,
+      params,
+    );
+    const records = await this.db.query<Agent>(
+      `SELECT * FROM agent WHERE ${whereSql} ORDER BY is_default DESC, created_at DESC LIMIT ? OFFSET ?`,
+      [...params, pageSize, (pageNum - 1) * pageSize],
+    );
+    return { records, total: Number(totalRow?.c ?? 0) };
   }
 
   findById(id: number): Promise<Agent | null> {

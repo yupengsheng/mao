@@ -3,7 +3,7 @@ import { BusinessException } from '../common/business-exception.js';
 import { ErrorCode } from '../common/error-code.js';
 import { hasText } from '../common/case.js';
 import { requirePermission, requireUserId, sendOk } from '../common/http-error.js';
-import { bodyOf, pathId, queryOptBool, queryOptStr } from '../common/request.js';
+import { bodyOf, pathId, queryOptBool, queryOptInt, queryOptStr } from '../common/request.js';
 import type { UserRepository } from '../user/types.js';
 import type { HttpToolValidator } from '../http-tool/types.js';
 import { parseHttpToolIds } from '../http-tool/types.js';
@@ -93,6 +93,18 @@ export function registerAgentRoutes(app: FastifyInstance, deps: AgentRouteDeps):
       await permissionService.hasPermission(userId, 'agent:read')
       || await permissionService.hasPermission(userId, 'agent:write')
     );
+    const pageNum = queryOptInt(request, 'pageNum');
+    const pageSize = queryOptInt(request, 'pageSize');
+    const enabled = queryOptBool(request, 'enabled');
+    const paginated = pageNum != null || pageSize != null || enabled != null;
+    if (paginated) {
+      const page = await agentService.listAgentsPage(
+        userId, keyword, includeDisabled, scope === 'client', pageNum, pageSize, enabled,
+      );
+      reply.header('x-total-count', String(page.total));
+      const voList = await Promise.all(page.records.map((agent) => toVO(agent, agentService, userRepo)));
+      return sendOk(reply, voList);
+    }
     const agents = await agentService.listAgents(userId, keyword, includeDisabled, scope === 'client');
     const voList = await Promise.all(agents.map((agent) => toVO(agent, agentService, userRepo)));
     return sendOk(reply, voList);

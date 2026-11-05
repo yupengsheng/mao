@@ -15,7 +15,7 @@ const { request } = require('../http');
 const { outputResult } = require('../output');
 
 const HELP = `用法:
-  mao agent list [--keyword <关键词>] [--include-disabled]
+  mao agent list [--keyword <关键词>] [--include-disabled] [--enabled true|false] [--page-num <页码>] [--page-size <每页条数>]
   mao agent get --id <id>
   mao agent set-enabled --id <id> --enabled true|false
   mao agent create --name <名称> --system-prompt <提示词> [--description] [--tags] [--skill-names] [--experiences-json] [--suggested-questions-json] [--is-default true|false]
@@ -141,6 +141,7 @@ async function handle(ctx) {
   switch (subcommand) {
     case 'list': {
       const includeDisabled = optionalBoolean(flags, 'include-disabled');
+      const enabled = optionalBoolean(flags, 'enabled');
       const result = await request({
         ...common,
         method: 'GET',
@@ -148,6 +149,9 @@ async function handle(ctx) {
         query: {
           keyword: optionalString(flags, 'keyword'),
           includeDisabled: includeDisabled ? true : undefined,
+          enabled,
+          pageNum: optionalNumber(flags, 'page-num'),
+          pageSize: optionalNumber(flags, 'page-size'),
         },
       });
       outputResult(result, globals);

@@ -45,7 +45,7 @@
         description="客户端新建会话将显示「暂无可用智能体」。请在任一 Agent 的编辑页开启「客户端可见」。"
       />
 
-      <el-table v-if="!isMobile" :data="filteredAgents" v-loading="loading" stripe>
+      <el-table v-if="!isMobile" :data="agents" v-loading="loading" stripe>
         <template #empty>
           <el-empty description="暂无数据" :image-size="60" />
         </template>
@@ -111,7 +111,7 @@
       </el-table>
 
       <div v-else class="mobile-card-list" v-loading="loading">
-        <el-card v-for="row in filteredAgents" :key="row.id" shadow="hover">
+        <el-card v-for="row in agents" :key="row.id" shadow="hover">
           <div class="mobile-card-head">
             <el-avatar :size="32" :src="resolveAgentAvatarUrl(row.avatarUrl)" shape="square">{{ row.name?.slice(0, 1) || 'A' }}</el-avatar>
             <span class="mobile-card-title">{{ row.name }}</span>
@@ -154,7 +154,7 @@
             </template>
           </div>
         </el-card>
-        <el-empty v-if="!loading && filteredAgents.length === 0" description="暂无数据" />
+        <el-empty v-if="!loading && agents.length === 0" description="暂无数据" />
       </div>
 
       <ResponsivePagination
@@ -192,7 +192,7 @@
 import { computed, ref, onActivated, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
-import { api } from '../../api'
+import { api, apiGetWithHeaders } from '../../api'
 import { resolveAgentAvatarUrl } from '../../utils/agent-avatar'
 import { formatDateTimeColumn } from '../../utils/datetime'
 import { useBreakpoint } from '../../composables/useBreakpoint'
@@ -207,13 +207,14 @@ const { isMobile } = useBreakpoint()
 
 const loading = ref(false)
 const loadingDetail = ref(false)
-const allAgents = ref<any[]>([])
-/** 全量 Agent（不带 keyword）：只用于客户端可见性提示，避免搜索过滤后误报。 */
-const visibilityAgents = ref<any[]>([])
+const agents = ref<any[]>([])
 const searchQuery = ref('')
 const statusFilter = ref('')
 const currentPage = ref(1)
 const pageSize = ref(10)
+const total = ref(0)
+const allAgentsTotal = ref(0)
+const clientVisibleTotal = ref(0)
 const dialogVisible = ref(false)
 const currentAgent = ref<any>(null)
 const dialogMode = ref<'create' | 'edit' | 'copy'>('create')
@@ -221,52 +222,66 @@ const authStore = useAuthStore()
 const canWrite = computed(() => authStore.hasPermission('agent:write'))
 
 /** 全量视角（不受搜索/状态筛选影响）：全部 Agent 都被设为客户端不可见时给出提示。 */
-const allClientHidden = computed(
-  () => visibilityAgents.value.length > 0 && visibilityAgents.value.every(agent => agent.clientVisible === false),
-)
+const allClientHidden = computed(() => allAgentsTotal.value > 0 && clientVisibleTotal.value === 0)
+
+function readTotalCount(headers: unknown): number {
+  if (!headers || typeof headers !== 'object') return NaN
+  const bag = headers as { get?: (name: string) => unknown } & Record<string, unknown>
+  const raw = typeof bag.get === 'function' ? bag.get('x-total-count') : bag['x-total-count']
+  const value = Array.isArray(raw) ? raw[0] : raw
+  return Number(value)
+}
 
 let fetchAgentsSeq = 0
 async function fetchAgents() {
   const seq = ++fetchAgentsSeq
   loading.value = true
   try {
-    const { data } = await api.get('/agents', {
-      params: { keyword: searchQuery.value, includeDisabled: true }
+    const { result, headers } = await apiGetWithHeaders<any[]>('/agents', {
+      params: {
+        keyword: searchQuery.value.trim() || undefined,
+        includeDisabled: true,
+        pageNum: currentPage.value,
+        pageSize: pageSize.value,
+        enabled: statusFilter.value === 'enabled' ? true : statusFilter.value === 'disabled' ? false : undefined,
+      }
     })
     if (seq !== fetchAgentsSeq) return
-    allAgents.value = data || []
+    agents.value = result.data || []
+    const headerTotal = readTotalCount(headers)
+    total.value = Number.isFinite(headerTotal) ? headerTotal : agents.value.length
+    const maxPage = Math.max(1, Math.ceil(total.value / pageSize.value))
+    if (currentPage.value > maxPage) {
+      currentPage.value = maxPage
+      void fetchAgents()
+    }
   } catch { /* 拦截器已提示失败，吞掉避免误报页面异常 */ } finally {
     if (seq === fetchAgentsSeq) loading.value = false
   }
 }
 
 let fetchVisibilitySeq = 0
-/** 单独拉全量列表：keyword 过滤后的 allAgents 不能用来判断「全局是否都不可见」。 */
-async function fetchVisibilityAgents() {
+/** 两个轻量计数：全量 Agent 与客户端可见 Agent，避免为提示条拉全量列表。 */
+async function fetchVisibilityCounts() {
   const seq = ++fetchVisibilitySeq
   try {
-    const { data } = await api.get('/agents', { params: { includeDisabled: true } })
+    const [allRes, clientRes] = await Promise.all([
+      apiGetWithHeaders<any[]>('/agents', { params: { includeDisabled: true, pageNum: 1, pageSize: 1 } }),
+      apiGetWithHeaders<any[]>('/agents', { params: { includeDisabled: true, scope: 'client', pageNum: 1, pageSize: 1 } }),
+    ])
     if (seq !== fetchVisibilitySeq) return
-    visibilityAgents.value = data || []
+    const all = readTotalCount(allRes.headers)
+    const visible = readTotalCount(clientRes.headers)
+    if (Number.isFinite(all)) allAgentsTotal.value = all
+    if (Number.isFinite(visible)) clientVisibleTotal.value = visible
   } catch { /* 拦截器已提示失败；保留上一次可见性判断 */ }
 }
 
 /** 列表与可见性提示的数据源一起刷新（增删改 / 激活页面时使用）。 */
 function refreshAgentData() {
   fetchAgents()
-  fetchVisibilityAgents()
+  fetchVisibilityCounts()
 }
-
-const matchedAgents = computed(() => {
-  if (statusFilter.value === 'enabled') return allAgents.value.filter((row) => row.enabled !== false)
-  if (statusFilter.value === 'disabled') return allAgents.value.filter((row) => row.enabled === false)
-  return allAgents.value
-})
-const total = computed(() => matchedAgents.value.length)
-const filteredAgents = computed(() => {
-  const start = (currentPage.value - 1) * pageSize.value
-  return matchedAgents.value.slice(start, start + pageSize.value)
-})
 
 function handleSearch() {
   currentPage.value = 1
@@ -275,10 +290,12 @@ function handleSearch() {
 
 function handleStatusFilter() {
   currentPage.value = 1
+  fetchAgents()
 }
 
 function handleSizeChange() {
   currentPage.value = 1
+  fetchAgents()
 }
 
 function handleCreate() {
@@ -344,9 +361,6 @@ async function handleDelete(row: any) {
     })
     await api.delete(`/agents/${row.id}`)
     ElMessage.success('删除成功')
-    // 当前页删空时回退页码，避免停留在空白页
-    const maxPage = Math.max(1, Math.ceil((total.value - 1) / pageSize.value))
-    if (currentPage.value > maxPage) currentPage.value = maxPage
     refreshAgentData()
   } catch {
     // Cancelled
