@@ -37,8 +37,27 @@ export interface TaskTrigger {
   sessionId: number;
   source: TaskSource;
   sourceEventId: string;
+  externalEventId?: string | null;
+  externalEventScope?: string | null;
   createdAt?: string | null;
   updatedAt?: string | null;
+}
+
+/** 外部事件身份：由入口按已认证身份生成，不接受请求体可写字段。 */
+export interface ExternalEventRef {
+  id: string;
+  scope: string;
+}
+
+export interface ExternalEventTrace {
+  sessionId: number;
+  executionId: string;
+  status: TaskStage;
+}
+
+export interface BeginExecutionResult {
+  execution: TaskExecution | null;
+  duplicate: boolean;
 }
 
 export interface TaskPageFilter {

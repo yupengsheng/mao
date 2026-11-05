@@ -46,6 +46,8 @@ export class MessageQueueRepository {
         sourceType: item.sourceType ?? null,
         openTriggerId: item.openTriggerId ?? null,
         openCallLogId: item.openCallLogId ?? null,
+        externalEventId: item.externalEventId ?? null,
+        externalEventScope: item.externalEventScope ?? null,
         deleted: 0,
     });
     item.id = id;

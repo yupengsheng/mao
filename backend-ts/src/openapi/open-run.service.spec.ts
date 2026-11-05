@@ -23,9 +23,13 @@ interface Harness {
     updatePhase: ReturnType<typeof vi.fn>;
     saveMessage: ReturnType<typeof vi.fn>;
     createSession: ReturnType<typeof vi.fn>;
+    deleteMessageById: ReturnType<typeof vi.fn>;
+    deleteSession: ReturnType<typeof vi.fn>;
   };
   enqueue: ReturnType<typeof vi.fn>;
   finishExecution: ReturnType<typeof vi.fn>;
+  beginExecution: ReturnType<typeof vi.fn>;
+  findExternalEvent: ReturnType<typeof vi.fn>;
   liveExecution: ReturnType<typeof vi.fn>;
   isSessionBusy: ReturnType<typeof vi.fn>;
   budgetCheck: ReturnType<typeof vi.fn>;
@@ -37,11 +41,16 @@ function makeHarness(options: {
   agentFound?: boolean;
   budgetCheck?: () => Promise<{ message: string } | null>;
   admission?: () => Promise<void>;
+  liveExecution?: boolean;
+  beginDuplicate?: boolean;
+  externalEventTrace?: ((scope: string, id: string) => Promise<{ sessionId: number; executionId: string; status: 'WORKING' | 'COMPLETED' | 'FAILED' | 'CANCELLED' } | null>) | null;
 } = {}): Harness {
   const sessionService = {
     getSession: vi.fn(async () => session()),
     updatePhase: vi.fn(async () => undefined),
     saveMessage: vi.fn(async () => message(101)),
+    deleteMessageById: vi.fn(async () => undefined),
+    deleteSession: vi.fn(async () => undefined),
     // 位置签名镜像 SessionService.createSession 的 16 参（装配层 as unknown as 强转，
     // 两边不一致编译期不报警）：第 4 参 executionMode、第 16 参 source 是本次断言重点。
     // domain/types.ts 的 Session 没有 source 字段，回传行只取 executionMode。
@@ -52,6 +61,8 @@ function makeHarness(options: {
   };
   const enqueue = vi.fn(async () => undefined);
   const finishExecution = vi.fn(async () => undefined);
+  const beginExecution = vi.fn(async () => ({ duplicate: options.beginDuplicate === true }));
+  const findExternalEvent = vi.fn(options.externalEventTrace ?? (async () => null));
   const liveExecution = vi.fn(async () => undefined);
   const budgetCheck = vi.fn(options.budgetCheck ?? (async () => null));
   const admission = vi.fn(options.admission ?? (async () => undefined));
@@ -59,15 +70,17 @@ function makeHarness(options: {
     sessionService: sessionService as unknown as OpenRunDeps['sessionService'],
     messageQueueService: { enqueue },
     harnessService: { executeFromEvent: vi.fn(async () => undefined) },
-    taskTerminalService: { finishExecution },
+    taskTerminalService: { finishExecution, beginExecution },
     agentLookup: { findById: vi.fn(async () => (options.agentFound === false ? null : { id: 5, name: 'A', enabled: options.agentEnabled ?? 1 })) },
     isSessionBusy: vi.fn(() => false),
-    liveExecution,
+    liveExecution: options.liveExecution === false ? null : liveExecution,
     budgetCheck,
     admission: options.admission === undefined ? undefined : { assertAllowed: admission },
+    findExternalEvent,
   };
   return {
     service: new OpenRunService(deps), sessionService, enqueue, finishExecution, liveExecution,
+    beginExecution, findExternalEvent,
     isSessionBusy: deps.isSessionBusy as unknown as Harness['isSessionBusy'], budgetCheck, admission,
   };
 }
@@ -135,9 +148,65 @@ describe('OpenRunService（P1/P2 共用执行流）', () => {
     h.isSessionBusy.mockReturnValue(true);
     const result = await h.service.run({ userId: 7, agentId: 5, message: 'go', sessionId: 11, source: 'WEBHOOK', triggerId: 3 });
     expect(result).toEqual({ sessionId: 11, messageId: null, queued: true, terminalPhase: 'COMPLETED' });
-    expect(h.enqueue).toHaveBeenCalledWith(11, 7, 'go', null, null, 'WEBHOOK', 3, null);
+    expect(h.enqueue).toHaveBeenCalledWith(11, 7, 'go', null, null, 'WEBHOOK', 3, null, null, null);
     expect(h.sessionService.updatePhase).not.toHaveBeenCalled();
     expect(h.liveExecution).not.toHaveBeenCalled();
+  });
+
+  it('busy：外部事件身份随队列行透传，供消费侧任务域去重', async () => {
+    const h = makeHarness();
+    h.isSessionBusy.mockReturnValue(true);
+    const result = await h.service.run({
+      userId: 7, agentId: 5, message: 'go', sessionId: 11, source: 'API', externalEvent: { scope: 'token:4', id: 'evt-9' },
+    });
+    expect(result).toMatchObject({ sessionId: 11, queued: true, messageId: null });
+    expect(h.enqueue).toHaveBeenCalledWith(11, 7, 'go', null, null, 'API', null, null, 'evt-9', 'token:4');
+  });
+
+  it('已认领的外部事件在预算与会话创建前直接返回原执行', async () => {
+    const h = makeHarness({
+      externalEventTrace: async () => ({ sessionId: 42, executionId: 'first', status: 'FAILED' }),
+    });
+    const result = await h.service.run({
+      userId: 7, agentId: 5, message: 'go', source: 'API', externalEvent: { scope: 'token:4', id: 'evt-9' },
+    });
+    expect(result).toEqual({ sessionId: 42, messageId: null, queued: false, terminalPhase: 'FAILED', deduplicated: true });
+    expect(h.findExternalEvent).toHaveBeenCalledWith('token:4', 'evt-9');
+    expect(h.budgetCheck).not.toHaveBeenCalled();
+    expect(h.sessionService.createSession).not.toHaveBeenCalled();
+    expect(h.liveExecution).not.toHaveBeenCalled();
+  });
+
+  it('兜底直跑路径发现事件已被认领时清理会话与消息且不调用 Harness', async () => {
+    const h = makeHarness({ liveExecution: false, beginDuplicate: true });
+    h.findExternalEvent
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ sessionId: 11, executionId: 'first', status: 'COMPLETED' });
+    const result = await h.service.run({
+      userId: 7, agentId: 5, message: 'go', source: 'WEBHOOK', externalEvent: { scope: 'trigger:3', id: 'evt-9' },
+    });
+    expect(result).toMatchObject({ sessionId: 11, deduplicated: true, terminalPhase: 'COMPLETED' });
+    expect(h.beginExecution).toHaveBeenCalledWith(99, expect.any(String), 'WEBHOOK', { scope: 'trigger:3', id: 'evt-9' });
+    expect(h.sessionService.updatePhase).toHaveBeenCalledWith(99, 'IDLE');
+    expect(h.sessionService.deleteMessageById).toHaveBeenCalledWith(99, 101);
+    expect(h.sessionService.deleteSession).toHaveBeenCalledWith(99);
+  });
+
+  it('直跑期间并发认领发生时回滚本次新建的会话与消息', async () => {
+    const h = makeHarness();
+    h.findExternalEvent
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ sessionId: 42, executionId: 'winner', status: 'FAILED' });
+    const result = await h.service.run({
+      userId: 7, agentId: 5, message: 'go', source: 'API', externalEvent: { scope: 'token:4', id: 'evt-9' },
+    });
+    expect(result).toEqual({ sessionId: 42, messageId: null, queued: false, terminalPhase: 'FAILED', deduplicated: true });
+    expect(h.sessionService.deleteMessageById).toHaveBeenCalledWith(99, 101);
+    expect(h.sessionService.deleteSession).toHaveBeenCalledWith(99);
+    expect(h.liveExecution).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 99 }), 7, expect.any(String), expect.objectContaining({ id: 101 }),
+      expect.any(Number), null, 'API', { scope: 'token:4', id: 'evt-9' },
+    );
   });
 
   it('未指定会话：经 createSession 显式 CLOUD 新建', async () => {

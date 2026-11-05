@@ -29,7 +29,7 @@ describe('Task integration with session terminal', () => {
     const setup = fixture();
     await setup.terminal.beginExecution(11, 'event', 'WEBHOOK');
     await setup.terminal.finishExecution(11, 7, 'FAILED', 'event', 'failed test', 'WEBHOOK');
-    expect(setup.task.beginExecution).toHaveBeenCalledWith(expect.objectContaining({ id: 11 }), 'event', 'WEBHOOK');
+    expect(setup.task.beginExecution).toHaveBeenCalledWith(expect.objectContaining({ id: 11 }), 'event', 'WEBHOOK', undefined);
     expect(setup.task.settleExecution).toHaveBeenCalledWith(expect.objectContaining({ id: 11 }), 'event', 'FAILED', 'failed test', 'WEBHOOK');
     expect(setup.session.phase).toBe('FAILED');
   });
@@ -46,7 +46,7 @@ describe('Task integration with session terminal', () => {
     const setup = fixture();
     setup.active.set(11, 'listener-execution');
     await setup.terminal.beginExecution(11);
-    expect(setup.task.beginExecution).toHaveBeenCalledWith(expect.objectContaining({ id: 11 }), 'listener-execution', undefined);
+    expect(setup.task.beginExecution).toHaveBeenCalledWith(expect.objectContaining({ id: 11 }), 'listener-execution', undefined, undefined);
   });
 
   it('registers explicit execution ids for waits even without a WS listener', async () => {

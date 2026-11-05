@@ -270,6 +270,7 @@ export class WebhookTriggerService {
       triggerId: trigger.id ?? null,
       callLogId: begun?.id ?? null,
       admissionBinding: { kind: 'WEBHOOK_TRIGGER', triggerId: trigger.id! },
+      externalEvent: eventId == null ? null : { id: eventId, scope: `trigger:${trigger.id}` },
       message,
     });
     let result: OpenRunResult;
@@ -302,11 +303,14 @@ export class WebhookTriggerService {
     // （技术方案 §5.4）。排队路径的终态晚于本请求，由 WS 消费侧 handleQueueSettled 回写，
     // 两条路径按 queued 互斥分流，不会对同一次执行重复计数。
     // 回写失败只告警不抛出：触发本身已成功，不应让计数问题把 202 变成 5xx 诱发外部重试。
-    if (!result.queued && trigger.id != null) {
+    if (!result.queued && !result.deduplicated && trigger.id != null) {
       void this.handleDirectOutcome(trigger.id, result.terminalPhase).catch((e) =>
         console.warn(`[openapi] failed to record direct outcome, triggerId=${trigger.id}: ${(e as Error).message}`));
     }
-    return { ok: true, userId: trigger.userId, sessionId: result.sessionId, queued: result.queued };
+    return {
+      ok: true, userId: trigger.userId, sessionId: result.sessionId, queued: result.queued,
+      ...(result.deduplicated ? { deduplicated: true } : {}),
+    };
   }
 
   /**

@@ -141,9 +141,13 @@ export function registerOpenApiRoutes(app: FastifyInstance, deps: OpenApiRouteDe
         source: 'API',
         callLogId: begun?.id ?? null,
         admissionBinding: { kind: 'API_TOKEN', tokenId },
+        externalEvent: idempotencyKey == null ? null : { id: idempotencyKey, scope: `token:${tokenId}` },
       });
       await deps.callLog?.markAccepted(begun?.id ?? null, begun?.startedAt ?? Date.now(), result);
-      sendJson(reply, 202, ok({ sessionId: result.sessionId, messageId: result.messageId, queued: result.queued }));
+      sendJson(reply, 202, ok({
+        sessionId: result.sessionId, messageId: result.messageId, queued: result.queued,
+        ...(result.deduplicated ? { deduplicated: true } : {}),
+      }));
     } catch (e) {
       if (begun != null && !begun.duplicate) {
         await deps.callLog?.markRejected(begun.id, begun.startedAt, e);

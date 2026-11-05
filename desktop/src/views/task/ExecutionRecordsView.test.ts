@@ -23,7 +23,10 @@ const record: TaskDetailVO = {
   task: { id: 1, agentId: 2, sessionId: 41, title: '修复任务', stage: 'FAILED', source: 'API', lastExecutionId: 'run-1', createdAt: null, updatedAt: null },
   latestExecution: null,
   executions: [{ id: 1, taskId: 1, sessionId: 41, executionId: 'run-1', attemptNo: 1, status: 'FAILED', startedAt: null, finishedAt: '2026-11-03 12:00:00', failureReason: '测试命令退出 1', createdAt: null }],
-  triggers: [{ id: 1, taskId: 1, sessionId: 41, source: 'WEBHOOK', sourceEventId: 'run-1', createdAt: null }],
+  triggers: [{
+    id: 1, taskId: 1, sessionId: 41, source: 'WEBHOOK', sourceEventId: 'run-1',
+    externalEventId: 'evt-42', externalEventScope: 'trigger:7', createdAt: null,
+  }],
 }
 const apps: ReturnType<typeof createApp>[] = []
 
@@ -66,6 +69,8 @@ describe('execution records page', () => {
     expect(host.querySelector('.detail-meta')?.textContent).toContain('首次来源：开放接口')
     expect(host.querySelector('.execution-list')?.textContent).toContain('Webhook')
     expect(host.querySelector('.execution-list')?.textContent).toContain('未记录')
+    expect(host.querySelector('.execution-list')?.textContent).toContain('evt-42')
+    expect(host.querySelector('.execution-list')?.textContent).toContain('trigger:7')
   })
 
   it('renders failed requests as an error with a working retry action', async () => {

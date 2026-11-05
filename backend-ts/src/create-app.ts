@@ -920,7 +920,7 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
   });
 
   const openApiServices = assembleOpenApiServices({
-    db, cfg, sessionService, messageQueueService, taskTerminal, agentRepo, wsHandler,
+    db, cfg, sessionService, messageQueueService, taskTerminal, taskService, agentRepo, wsHandler,
     budgetService, apiTokenService, inboxService, settingService, openApiRateLimiter,
     notifCipher, outboundSubscriptionService, holder, agentExecutor,
     openCallLogHolder, openTriggerSettle, openCallSettle,

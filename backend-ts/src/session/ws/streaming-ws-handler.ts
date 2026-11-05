@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Agent, ContentPart, LlmModel, LocalSkillRef, Message, MessageQueueItem, McpToolRef, Session } from '../../domain/types.js';
 import type { TaskNotifySource } from '../task-terminal.service.js';
 import type { MessageQueueSource } from '../types.js';
+import type { ExternalEventRef } from '../../task/types.js';
 import { imageUrlFromPart } from '../session-vo.js';
 import { stripImageUrlLines } from '../util/image-url-annotation.js';
 import { queueWaitMsOf } from '../../openapi/open-api-call-log.logic.js';
@@ -104,12 +105,12 @@ export interface WsHandlerDeps {
   };
   taskTerminalService: {
     finishExecution(sessionId: number, userId: number, phase: string, executionId: string, reason?: string, notifySource?: TaskNotifySource): Promise<void>;
-    beginExecution?(sessionId: number, executionId: string, source?: TaskNotifySource): Promise<void>;
+    beginExecution?(sessionId: number, executionId: string, source?: TaskNotifySource, externalEvent?: ExternalEventRef | null): Promise<{ duplicate: boolean }>;
   };
   messageQueueService: {
     listPending(sessionId: number): Promise<MessageQueueItem[]>;
-    enqueue(sessionId: number, userId: number, content: string, images: string | null, scheduledTaskId?: number | null, source?: MessageQueueSource | null, openTriggerId?: number | null, openCallLogId?: number | null): Promise<void>;
-    enqueueHead(sessionId: number, userId: number, content: string, images: string | null, scheduledTaskId?: number | null, source?: MessageQueueSource | null, openTriggerId?: number | null, openCallLogId?: number | null): Promise<void>;
+    enqueue(sessionId: number, userId: number, content: string, images: string | null, scheduledTaskId?: number | null, source?: MessageQueueSource | null, openTriggerId?: number | null, openCallLogId?: number | null, externalEventId?: string | null, externalEventScope?: string | null): Promise<void>;
+    enqueueHead(sessionId: number, userId: number, content: string, images: string | null, scheduledTaskId?: number | null, source?: MessageQueueSource | null, openTriggerId?: number | null, openCallLogId?: number | null, externalEventId?: string | null, externalEventScope?: string | null): Promise<void>;
     dequeue(sessionId: number): Promise<MessageQueueItem | null>;
     getById(id: number): Promise<MessageQueueItem | null>;
     delete(id: number): Promise<void>;
@@ -268,6 +269,8 @@ interface QueueSettlement {
   triggerId: number | null;
   /** 入站调用流水绑定（API/WEBHOOK 入队时非空） */
   callLogId: number | null;
+  /** 外部事件身份（API 幂等键 / Webhook 事件 ID），消费时交给任务域去重 */
+  externalEvent: ExternalEventRef | null;
   /** 入队到开始消费的毫秒数；时间戳解析失败为 null */
   queueWaitMs: number | null;
   /** 消费时落库的用户消息；补偿删消息后清空 */
@@ -278,7 +281,7 @@ interface QueueSettlement {
 type QueuedSource = 'SCHEDULED' | 'WEBHOOK' | 'API' | 'SIGNAL';
 
 /** 队列行 → settlement：V133 前的存量行 source_type 为 NULL，按 scheduledTaskId 回退为 SCHEDULED。 */
-function queueSettlementOf(row: { sourceType?: string | null; scheduledTaskId?: number | null; openTriggerId?: number | null; openCallLogId?: number | null; createdAt?: string | Date | null }): QueueSettlement | null {
+function queueSettlementOf(row: { sourceType?: string | null; scheduledTaskId?: number | null; openTriggerId?: number | null; openCallLogId?: number | null; externalEventId?: string | null; externalEventScope?: string | null; createdAt?: string | Date | null }): QueueSettlement | null {
   const source: QueuedSource | null = row.sourceType === 'SCHEDULED' || row.sourceType === 'WEBHOOK' || row.sourceType === 'API'
     || row.sourceType === 'SIGNAL'
     ? row.sourceType
@@ -290,15 +293,20 @@ function queueSettlementOf(row: { sourceType?: string | null; scheduledTaskId?: 
     taskId: resolved === 'SCHEDULED' ? (row.scheduledTaskId ?? null) : null,
     triggerId: resolved === 'WEBHOOK' ? (row.openTriggerId ?? null) : null,
     callLogId: row.openCallLogId ?? null,
+    externalEvent: row.externalEventId != null && row.externalEventScope != null
+      ? { id: row.externalEventId, scope: row.externalEventScope } : null,
     queueWaitMs: queueWaitMsOf(row.createdAt),
     messageId: null,
   };
 }
 
 /** settlement → 入队参数，回补队首时透传保源。 */
-function settlementToEnqueueArgs(settlement: QueueSettlement | null): { scheduledTaskId: number | null; source: QueuedSource | null; openTriggerId: number | null; openCallLogId: number | null } {
-  if (settlement == null) return { scheduledTaskId: null, source: null, openTriggerId: null, openCallLogId: null };
-  return { scheduledTaskId: settlement.taskId, source: settlement.source, openTriggerId: settlement.triggerId, openCallLogId: settlement.callLogId };
+function settlementToEnqueueArgs(settlement: QueueSettlement | null): { scheduledTaskId: number | null; source: QueuedSource | null; openTriggerId: number | null; openCallLogId: number | null; externalEventId: string | null; externalEventScope: string | null } {
+  if (settlement == null) return { scheduledTaskId: null, source: null, openTriggerId: null, openCallLogId: null, externalEventId: null, externalEventScope: null };
+  return {
+    scheduledTaskId: settlement.taskId, source: settlement.source, openTriggerId: settlement.triggerId, openCallLogId: settlement.callLogId,
+    externalEventId: settlement.externalEvent?.id ?? null, externalEventScope: settlement.externalEvent?.scope ?? null,
+  };
 }
 
 /**
@@ -318,8 +326,9 @@ export function createScheduledLiveExecution(handler: StreamingWsHandler) {
     startedAt?: number,
     scheduledTaskId?: number | null,
     source?: 'SCHEDULED' | 'WEBHOOK' | 'API' | 'SIGNAL' | null,
+    externalEvent?: ExternalEventRef | null,
   ): Promise<void> =>
-    handler.executePersistedUserPrompt(session, userId, executionId, savedMessage, startedAt, scheduledTaskId, source);
+    handler.executePersistedUserPrompt(session, userId, executionId, savedMessage, startedAt, scheduledTaskId, source, externalEvent);
 }
 
 export class StreamingWsHandler {
@@ -356,7 +365,7 @@ export class StreamingWsHandler {
    * executePersistedUserPrompt 入口写入、runExecution finally 按归属清理。
    * 三个 finisher 据此给 finishExecution 传 SCHEDULED / WEBHOOK / API。
    */
-  private readonly liveSourceBindings = new Map<number, { source: QueuedSource }>();
+  private readonly liveSourceBindings = new Map<number, { source: QueuedSource; externalEvent: ExternalEventRef | null }>();
   private readonly mcpSyncTimeoutSeconds: number;
 
   constructor(private readonly deps: WsHandlerDeps) {
@@ -600,6 +609,7 @@ export class StreamingWsHandler {
         await this.deps.messageQueueService.enqueueHead(
           sessionId, userId, content, images.length > 0 ? JSON.stringify(images) : null,
           requeueArgs.scheduledTaskId, requeueArgs.source, requeueArgs.openTriggerId, requeueArgs.openCallLogId,
+          requeueArgs.externalEventId, requeueArgs.externalEventScope,
         );
         await this.sendQueueUpdated(sessionId, userId);
       } catch (e) {
@@ -759,6 +769,7 @@ export class StreamingWsHandler {
       // 与 queueSettlements 同口径：入口取值，finally 按归属清理，迟到旧执行体不串味。
       const boundLiveSource = this.liveSourceBindings.get(sessionId) ?? null;
       const executionSource: TaskNotifySource | null = boundLiveSource?.source ?? boundSettlement?.source ?? null;
+      const executionExternalEvent = boundLiveSource?.externalEvent ?? boundSettlement?.externalEvent ?? null;
       // 终态驱动消费门禁：FAILED 时不再自动消费队列下一条。默认 'FAILED' 保守兜底——
       // 任何遗漏赋值的分支都倾向「不消费」，宁可暂停也不错误消耗用户消息。
       let terminalPhase: 'COMPLETED' | 'CANCELLED' | 'FAILED' = 'FAILED';
@@ -776,7 +787,16 @@ export class StreamingWsHandler {
           return;
         }
         await this.deps.sessionService.updatePhase(sessionId, 'RUNNING');
-        await this.deps.taskTerminalService.beginExecution?.(sessionId, executionId, executionSource ?? 'MANUAL');
+        const begun = await this.deps.taskTerminalService.beginExecution?.(
+          sessionId, executionId, executionSource ?? 'MANUAL', executionExternalEvent,
+        );
+        if (begun?.duplicate) {
+          // 外部事件已被其他执行认领：本次不进入 Harness，会话恢复空闲；
+          // 按 CANCELLED 收敛队列绑定（不计触发器连续失败）。
+          await this.deps.sessionService.updatePhase(sessionId, 'IDLE');
+          terminalPhase = 'CANCELLED';
+          return;
+        }
         this.deps.registry.send(userId, wsEvent('session_status', sessionId, { phase: 'RUNNING', executionId }));
         this.deps.registry.send(userId, wsEvent('session_list_update', sessionId, { phase: 'RUNNING' }));
         if (session.sessionType === 'SIDE_TASK') this.deps.treeSignalPublisher.publishIfSideTask(sessionId);
@@ -868,6 +888,7 @@ export class StreamingWsHandler {
     startedAt?: number,
     scheduledTaskId?: number | null,
     source?: 'SCHEDULED' | 'WEBHOOK' | 'API' | 'SIGNAL' | null,
+    externalEvent?: ExternalEventRef | null,
   ): Promise<void> {
     const sessionId = session.id!;
     this.deps.titleService.scheduleForFirstUserMessage(sessionId, savedMessage.id, savedMessage.content ?? '');
@@ -880,7 +901,8 @@ export class StreamingWsHandler {
     // 来源绑定必须在任何早退之前登记：takePendingCancel 命中时收件箱来源也要正确；
     // runExecution 的 finally 按归属清理，不会残留到手工执行。对象身份即归属判定。
     const liveSource: QueuedSource | null = source ?? (scheduledTaskId != null ? 'SCHEDULED' : null);
-    const sourceBinding = liveSource != null ? { source: liveSource } : null;
+    const sourceBinding = liveSource != null || externalEvent != null
+      ? { source: liveSource ?? 'API', externalEvent: externalEvent ?? null } : null;
     if (sourceBinding != null) {
       this.liveSourceBindings.set(sessionId, sourceBinding);
     }
@@ -1798,6 +1820,7 @@ export class StreamingWsHandler {
                 await this.deps.messageQueueService.enqueueHead(
                   sessionId, userId, content, item.images ?? null,
                   requeueArgs.scheduledTaskId, requeueArgs.source, requeueArgs.openTriggerId, requeueArgs.openCallLogId,
+                  requeueArgs.externalEventId, requeueArgs.externalEventScope,
                 );
                 await this.sendQueueUpdated(sessionId, userId);
               } catch (requeueErr) {
@@ -1927,6 +1950,7 @@ export class StreamingWsHandler {
           await this.deps.messageQueueService.enqueueHead(
             sessionId, userId, content, head.images ?? null,
             requeueArgs.scheduledTaskId, requeueArgs.source, requeueArgs.openTriggerId, requeueArgs.openCallLogId,
+            requeueArgs.externalEventId, requeueArgs.externalEventScope,
           );
           await this.sendQueueUpdated(sessionId, userId);
         } catch (e) {

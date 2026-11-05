@@ -47,6 +47,10 @@ export interface MessageQueueItem {
   openTriggerId?: number | null;
   /** API/WEBHOOK 入队时的调用流水绑定 */
   openCallLogId?: number | null;
+  /** 忙时入队透传的外部事件 ID */
+  externalEventId?: string | null;
+  /** 忙时入队透传的外部事件作用域 */
+  externalEventScope?: string | null;
   createdAt?: string | Date | null;
 }
 

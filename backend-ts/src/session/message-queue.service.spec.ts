@@ -38,11 +38,30 @@ describe('MessageQueueService', () => {
     expect(repo.insert).toHaveBeenCalledWith(item);
   });
 
+  it('enqueuePersistsExternalEventIdentity', async () => {
+    vi.mocked(repo.insert).mockClear();
+    vi.mocked(repo.findLastPendingForUpdate).mockResolvedValue(null);
+    const item = await service.enqueue(10, 20, 'event', null, null, 'API', null, 9, 'evt-1', 'token:3');
+    expect(item).toMatchObject({ externalEventId: 'evt-1', externalEventScope: 'token:3' });
+    expect(repo.insert).toHaveBeenCalledWith(expect.objectContaining({
+      externalEventId: 'evt-1', externalEventScope: 'token:3',
+    }));
+  });
+
   it('enqueueHeadInsertsBeforeCurrentHead', async () => {
     vi.mocked(repo.insert).mockClear();
     vi.mocked(repo.findFirstPendingForUpdate).mockResolvedValue(queue(2, 10, 1, 'PENDING'));
     await service.enqueueHead(10, 20, 'urgent', null);
     expect(repo.insert).toHaveBeenCalledWith(expect.objectContaining({ sortOrder: 0, content: 'urgent' }));
+  });
+
+  it('enqueueHeadPreservesExternalEventIdentityOnCompensation', async () => {
+    vi.mocked(repo.insert).mockClear();
+    vi.mocked(repo.findFirstPendingForUpdate).mockResolvedValue(null);
+    await service.enqueueHead(10, 20, 'compensate', null, null, 'WEBHOOK', 7, 9, 'evt-2', 'trigger:7');
+    expect(repo.insert).toHaveBeenCalledWith(expect.objectContaining({
+      externalEventId: 'evt-2', externalEventScope: 'trigger:7',
+    }));
   });
 
   it('dequeueMarksHeadDeletedWhenPresent', async () => {

@@ -5,7 +5,10 @@ import type { AgentTaskVO, TaskDetailVO, TaskExecutionVO, TaskPageVO, TaskTrigge
 import { OPEN_RUN_ADMISSION_POLICY_VERSION } from '../openapi/admission.js';
 import type { Session } from '../session/types.js';
 import type { TaskRepository } from './task.repository.js';
-import type { AgentTask, TaskExecution, TaskPageFilter, TaskSource, TaskStage, TaskTrigger } from './types.js';
+import type {
+  AgentTask, BeginExecutionResult, ExternalEventRef, ExternalEventTrace, TaskExecution,
+  TaskPageFilter, TaskSource, TaskStage, TaskTrigger,
+} from './types.js';
 
 const TERMINAL = new Set<TaskStage>(['COMPLETED', 'FAILED', 'CANCELLED']);
 const INTERRUPTED_EXECUTION_REASON = '执行因进程中断未完成，已自动恢复';
@@ -25,24 +28,70 @@ function policyVersionOf(source: TaskSource): string | null {
     : null;
 }
 
+function isDuplicateKey(err: unknown): boolean {
+  if (typeof err !== 'object' || err == null) return false;
+  const value = err as { code?: string; errno?: number };
+  return value.code === 'ER_DUP_ENTRY' || value.errno === 1062;
+}
+
+const TASK_STAGES = new Set<TaskStage>(['QUEUED', 'WORKING', 'BLOCKED', 'FAILED', 'COMPLETED', 'CANCELLED']);
+
+/** 外部事件已被其他执行认领：必须抛出以回滚事务，由 beginExecution 在事务外重查。 */
+class ExternalEventClaimedError extends Error {
+  constructor(readonly externalEvent: ExternalEventRef) {
+    super('external event already claimed');
+    this.name = 'ExternalEventClaimedError';
+  }
+}
+
 export class TaskService {
   constructor(private readonly repo: TaskRepository) {}
 
-  async beginExecution(session: Session, executionId: string, source?: TaskSource): Promise<TaskExecution> {
+  async beginExecution(
+    session: Session,
+    executionId: string,
+    source?: TaskSource,
+    externalEvent?: ExternalEventRef | null,
+  ): Promise<BeginExecutionResult> {
     this.validate(session, executionId);
+    try {
+      return await this.beginExecutionInTransaction(session, executionId, source, externalEvent);
+    } catch (err) {
+      if (!(err instanceof ExternalEventClaimedError)) throw err;
+      const trace = await this.repo.externalEventTrace(err.externalEvent.scope, err.externalEvent.id);
+      if (trace == null) throw err;
+      return {
+        execution: await this.repo.executionById(trace.executionId),
+        duplicate: true,
+      };
+    }
+  }
+
+  private beginExecutionInTransaction(
+    session: Session,
+    executionId: string,
+    source?: TaskSource,
+    externalEvent?: ExternalEventRef | null,
+  ): Promise<BeginExecutionResult> {
     return this.repo.transaction(async (repo) => {
       const current = await repo.lockSession(session.userId, session.id!);
       if (current == null) throw new BusinessException(ErrorCode.SESSION_NOT_FOUND);
       const actualSource = sourceOf(current, source);
-      const task = await this.ensureTask(repo, current, actualSource);
       const existing = await repo.executionById(executionId);
       if (existing != null) {
+        const task = await this.ensureTask(repo, current, actualSource);
         this.requireExecutionOwner(existing, task);
-        return existing;
+        return { execution: existing, duplicate: false };
       }
-      const execution = await this.createExecution(repo, task, executionId, 'WORKING', actualSource);
+      // 外部事件先于任务主档创建：重复投递不得留下空 Task。
+      const claimed = await this.duplicateExternalEvent(repo, externalEvent);
+      if (claimed != null) return claimed;
+      const task = await this.ensureTask(repo, current, actualSource);
+      const created = await this.createExecution(repo, task, executionId, 'WORKING', actualSource, externalEvent);
+      if (created.duplicate) return created;
+      const execution = created.execution!;
       await repo.updateById(task.id!, this.taskFields(current, 'WORKING', executionId, actualSource));
-      return execution;
+      return created;
     });
   }
 
@@ -72,7 +121,8 @@ export class TaskService {
         }
       }
 
-      const execution = await this.createExecution(repo, task, executionId, 'WORKING', actualSource);
+      const created = await this.createExecution(repo, task, executionId, 'WORKING', actualSource);
+      const execution = created.execution!;
       await repo.updateById(task.id!, this.taskFields(current, 'WORKING', executionId, actualSource));
       return execution;
     });
@@ -125,7 +175,8 @@ export class TaskService {
         this.requireExecutionOwner(execution, task);
         if (TERMINAL.has(execution.status)) return;
       } else {
-        execution = await this.createExecution(repo, task, executionId, phase, actualSource);
+        const created = await this.createExecution(repo, task, executionId, phase, actualSource);
+        execution = created.execution!;
       }
       await repo.updateExecution(execution.id!, { status: phase, finishedAt: nowSql(), failureReason: failureReason ?? null });
       const currentExecution = task.lastExecutionId == null ? null : await repo.executionById(task.lastExecutionId);
@@ -138,6 +189,15 @@ export class TaskService {
   async page(filter: TaskPageFilter): Promise<TaskPageVO> {
     const result = await this.repo.page(filter);
     return { ...result, items: result.items.map((task) => this.taskVO(task)) };
+  }
+
+  /** 开放触发入口的只读去重查询：命中即返回原会话与执行状态。 */
+  async findExternalEvent(scope: string, id: string): Promise<ExternalEventTrace | null> {
+    if (!scope.trim() || !id.trim()) return null;
+    const trace = await this.repo.externalEventTrace(scope, id);
+    if (trace == null) return null;
+    const status = TASK_STAGES.has(trace.status as TaskStage) ? trace.status as TaskStage : 'WORKING';
+    return { sessionId: trace.sessionId, executionId: trace.executionId, status };
   }
 
   async get(userId: number, id: number): Promise<TaskDetailVO | null> {
@@ -174,7 +234,10 @@ export class TaskService {
   private triggerVO(trigger: TaskTrigger): TaskTriggerVO {
     return {
       id: trigger.id!, taskId: trigger.taskId, sessionId: trigger.sessionId,
-      source: trigger.source, sourceEventId: trigger.sourceEventId, createdAt: trigger.createdAt ?? null,
+      source: trigger.source, sourceEventId: trigger.sourceEventId,
+      externalEventId: trigger.externalEventId ?? null,
+      externalEventScope: trigger.externalEventScope ?? null,
+      createdAt: trigger.createdAt ?? null,
     };
   }
 
@@ -197,15 +260,42 @@ export class TaskService {
     };
   }
 
-  private async createExecution(repo: TaskRepository, task: AgentTask, executionId: string, status: TaskStage, source: TaskSource): Promise<TaskExecution> {
+  private async createExecution(
+    repo: TaskRepository,
+    task: AgentTask,
+    executionId: string,
+    status: TaskStage,
+    source: TaskSource,
+    externalEvent?: ExternalEventRef | null,
+  ): Promise<BeginExecutionResult> {
     const latest = await repo.latestExecution(task.id!);
     const execution: TaskExecution = {
       taskId: task.id!, sessionId: task.sessionId, executionId, attemptNo: (latest?.attemptNo ?? 0) + 1,
       status, startedAt: status === 'WORKING' ? nowSql() : null, failureReason: null,
     };
     execution.id = await repo.insertExecution(execution);
-    await repo.insertTrigger({ taskId: task.id!, sessionId: task.sessionId, source, sourceEventId: executionId });
-    return execution;
+    try {
+      await repo.insertTrigger({
+        taskId: task.id!, sessionId: task.sessionId, source, sourceEventId: executionId,
+        externalEventId: externalEvent?.id ?? null, externalEventScope: externalEvent?.scope ?? null,
+      });
+    } catch (e) {
+      // 执行行刚插入成功，唯一键冲突只可能来自 Trigger。外部事件冲突必须抛出，
+      // 让事务回滚本轮新建的执行；普通执行 ID 冲突直接上抛，避免留下无入口的执行。
+      if (isDuplicateKey(e) && externalEvent != null
+        && await repo.triggerByExternalEvent(externalEvent.scope, externalEvent.id) != null) {
+        throw new ExternalEventClaimedError(externalEvent);
+      }
+      throw e;
+    }
+    return { execution, duplicate: false };
+  }
+
+  private async duplicateExternalEvent(repo: TaskRepository, externalEvent?: ExternalEventRef | null): Promise<BeginExecutionResult | null> {
+    if (externalEvent == null) return null;
+    const claimed = await repo.triggerByExternalEvent(externalEvent.scope, externalEvent.id);
+    if (claimed == null) return null;
+    return { execution: await repo.executionById(claimed.sourceEventId), duplicate: true };
   }
 
   private validate(session: Session, executionId: string): void {

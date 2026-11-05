@@ -33,6 +33,10 @@ export interface TaskTriggerVO {
   sessionId: number;
   source: TaskSource;
   sourceEventId: string;
+  /** 外部事件 ID（API Idempotency-Key / Webhook X-Mao-Event-Id）；非外部触发为 null。 */
+  externalEventId: string | null;
+  /** 外部事件作用域：token:<id> 或 trigger:<id>。 */
+  externalEventScope: string | null;
   createdAt: string | null;
 }
 

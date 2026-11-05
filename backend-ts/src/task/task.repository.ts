@@ -189,6 +189,27 @@ export class TaskRepository {
     );
   }
 
+  triggerByExternalEvent(scope: string, id: string): Promise<TaskTrigger | null> {
+    return this.db.queryOne<TaskTrigger>(
+      'SELECT * FROM agent_task_trigger WHERE external_event_scope = ? AND external_event_id = ? LIMIT 1',
+      [scope, id],
+    );
+  }
+
+  /** 外部事件 → 已有执行；Trigger 存在但执行缺失时按 WORKING 保守返回。 */
+  async externalEventTrace(scope: string, id: string): Promise<{ sessionId: number; executionId: string; status: string } | null> {
+    const row = await this.db.queryOne<{ sessionId: number; executionId: string; status?: string | null }>(
+      `SELECT t.session_id AS sessionId, t.source_event_id AS executionId, e.status
+         FROM agent_task_trigger t
+         LEFT JOIN agent_task_execution e ON e.execution_id = t.source_event_id
+        WHERE t.external_event_scope = ? AND t.external_event_id = ?
+        LIMIT 1`,
+      [scope, id],
+    );
+    if (row == null) return null;
+    return { sessionId: Number(row.sessionId), executionId: row.executionId, status: row.status ?? 'WORKING' };
+  }
+
   triggers(taskId: number): Promise<TaskTrigger[]> {
     return this.db.query<TaskTrigger>('SELECT * FROM agent_task_trigger WHERE task_id = ? ORDER BY id DESC LIMIT 50', [taskId]);
   }

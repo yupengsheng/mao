@@ -3,6 +3,7 @@ import type { AppConfig } from './config/app-config.js';
 import type { SessionService } from './session/session.service.js';
 import type { MessageQueueService } from './session/message-queue.service.js';
 import type { TaskTerminalService } from './session/task-terminal.service.js';
+import type { TaskService } from './task/task.service.js';
 import type { MysqlAgentRepository } from './agent/agent.repository.js';
 import type { StreamingWsHandler } from './session/ws/streaming-ws-handler.js';
 import type { BudgetService } from './budget/budget.service.js';
@@ -39,6 +40,7 @@ export interface OpenApiServicesDeps {
   sessionService: SessionService;
   messageQueueService: MessageQueueService;
   taskTerminal: TaskTerminalService;
+  taskService: TaskService;
   agentRepo: MysqlAgentRepository;
   wsHandler: StreamingWsHandler;
   budgetService: BudgetService;
@@ -70,7 +72,7 @@ export interface OpenApiServicesResult {
 }
 
 export function assembleOpenApiServices(deps: OpenApiServicesDeps): OpenApiServicesResult {
-  const { db, cfg, sessionService, messageQueueService, taskTerminal, agentRepo, wsHandler, budgetService, apiTokenService, inboxService, settingService, openApiRateLimiter, notifCipher, outboundSubscriptionService, holder, agentExecutor, openCallLogHolder, openTriggerSettle, openCallSettle } = deps;
+  const { db, cfg, sessionService, messageQueueService, taskTerminal, taskService, agentRepo, wsHandler, budgetService, apiTokenService, inboxService, settingService, openApiRateLimiter, notifCipher, outboundSubscriptionService, holder, agentExecutor, openCallLogHolder, openTriggerSettle, openCallSettle } = deps;
 
   // 准入与管理接口共用同一仓储实例：绑定校验读到的行与用户可见配置同源。
   const webhookTriggerRepo = new MysqlWebhookTriggerRepository(db);
@@ -93,6 +95,7 @@ export function assembleOpenApiServices(deps: OpenApiServicesDeps): OpenApiServi
       return block == null ? null : { message: budgetBlockMessage(block) };
     },
     liveExecution: createScheduledLiveExecution(wsHandler),
+    findExternalEvent: (scope, id) => taskService.findExternalEvent(scope, id),
     admission,
   });
   const callLogRepo = new OpenApiCallLogRepository(db);

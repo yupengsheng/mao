@@ -87,6 +87,10 @@
               </div>
               <div class="attempt-meta">
                 <span>本次来源：{{ executionSources.has(execution.executionId) ? taskSourceLabel(executionSources.get(execution.executionId)!) : '未记录' }}</span>
+                <span v-if="executionEvents.has(execution.executionId)">
+                  外部事件：{{ executionEvents.get(execution.executionId)!.id }}
+                  （{{ executionEvents.get(execution.executionId)!.scope }}）
+                </span>
                 <span>开始：{{ formatDateTime(execution.startedAt) || '未记录' }}</span>
                 <span>结束：{{ formatDateTime(execution.finishedAt) || (execution.status === 'WORKING' ? '执行中' : '未记录') }}</span>
               </div>
@@ -114,6 +118,11 @@ const router = useRouter()
 const sessionStore = useSessionStore()
 const { items, total, page, size, filters, loading, error, selectedId, detail, detailLoading, detailError, selectTask, changePage, refresh } = useTaskRecords()
 const executionSources = computed(() => new Map((detail.value?.triggers ?? []).map(trigger => [trigger.sourceEventId, trigger.source])))
+const executionEvents = computed(() => new Map(
+  (detail.value?.triggers ?? [])
+    .filter(trigger => trigger.externalEventId != null && trigger.externalEventScope != null)
+    .map(trigger => [trigger.sourceEventId, { id: trigger.externalEventId!, scope: trigger.externalEventScope! }]),
+))
 const opening = ref(false)
 const navigationError = ref('')
 let navigationSequence = 0

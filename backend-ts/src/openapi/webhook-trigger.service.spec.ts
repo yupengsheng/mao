@@ -101,8 +101,10 @@ describe('WebhookTriggerService（P2）', () => {
     expect(h.openRunRun).toHaveBeenCalledTimes(1);
     const input = h.openRunRun.mock.calls[0][0] as {
       source: string; triggerId: number; message: string; admissionBinding: unknown;
+      externalEvent: unknown;
     };
     expect(input.source).toBe('WEBHOOK');
+    expect(input.externalEvent).toEqual({ id: 'event-1', scope: 'trigger:1' });
     expect(input.triggerId).toBe(1);
     expect(input.admissionBinding).toEqual({ kind: 'WEBHOOK_TRIGGER', triggerId: 1 });
     expect(input.message).toContain('收到外部 Webhook 事件（触发器：CI 触发器）');
@@ -126,6 +128,16 @@ describe('WebhookTriggerService（P2）', () => {
     expect(h.openRunRun).not.toHaveBeenCalled();
     expect(h.callLog.markAccepted).not.toHaveBeenCalled();
     expect(h.callLog.markRejected).not.toHaveBeenCalled();
+    expect(h.repo.recordOutcome).not.toHaveBeenCalled();
+  });
+
+  it('任务域判定重复时透传 deduplicated，且不回写触发器直跑计数', async () => {
+    const h = makeHarness();
+    h.openRunRun.mockResolvedValue({
+      sessionId: 11, messageId: 12, queued: false, terminalPhase: 'COMPLETED', deduplicated: true,
+    });
+    const outcome = await h.service.handleFire('a'.repeat(32), { ...signedHeaders(body), eventId: 'event-1' }, body);
+    expect(outcome).toMatchObject({ ok: true, sessionId: 11, queued: false, deduplicated: true });
     expect(h.repo.recordOutcome).not.toHaveBeenCalled();
   });
 

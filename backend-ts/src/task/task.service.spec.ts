@@ -15,7 +15,21 @@ function fixture() {
   const executions: TaskExecution[] = [];
   const triggers: TaskTrigger[] = [];
   const repo = {
-    transaction: async (work: (store: unknown) => Promise<unknown>) => work(repo),
+    transaction: async (work: (store: unknown) => Promise<unknown>) => {
+      const snapshot = {
+        task: task == null ? null : { ...task },
+        executions: executions.map((item) => ({ ...item })),
+        triggers: triggers.map((item) => ({ ...item })),
+      };
+      try {
+        return await work(repo);
+      } catch (error) {
+        task = snapshot.task;
+        executions.splice(0, executions.length, ...snapshot.executions);
+        triggers.splice(0, triggers.length, ...snapshot.triggers);
+        throw error;
+      }
+    },
     lockSession: async (userId: number, sessionId: number) => userId === session.userId && sessionId === session.id ? session : null,
     findBySessionId: async () => task,
     findById: async (userId: number, id: number) => task?.userId === userId && task.id === id ? task : null,
@@ -28,8 +42,24 @@ function fixture() {
       .sort((a, b) => b.attemptNo - a.attemptNo || (b.id ?? 0) - (a.id ?? 0)),
     insertExecution: async (input: TaskExecution) => { executions.push({ ...input, id: executions.length + 1 }); return executions.length; },
     updateExecution: async (id: number, fields: Partial<TaskExecution>) => { Object.assign(executions.find((item) => item.id === id)!, fields); },
-    insertTrigger: async (input: TaskTrigger) => { triggers.push(input); },
+    insertTrigger: async (input: TaskTrigger) => {
+      if (input.externalEventId != null && input.externalEventScope != null
+        && triggers.some((item) => item.externalEventId === input.externalEventId
+          && item.externalEventScope === input.externalEventScope)) {
+        throw Object.assign(new Error('duplicate external event'), { code: 'ER_DUP_ENTRY' });
+      }
+      triggers.push(input);
+    },
     triggerByExecutionId: async (id: string) => triggers.find((item) => item.sourceEventId === id) ?? null,
+    triggerByExternalEvent: async (scope: string, id: string) => triggers.find(
+      (item) => item.externalEventScope === scope && item.externalEventId === id,
+    ) ?? null,
+    externalEventTrace: async (scope: string, id: string) => {
+      const trigger = triggers.find((item) => item.externalEventScope === scope && item.externalEventId === id);
+      if (trigger == null) return null;
+      const execution = executions.find((item) => item.executionId === trigger.sourceEventId);
+      return { sessionId: trigger.sessionId, executionId: trigger.sourceEventId, status: execution?.status ?? 'WORKING' };
+    },
     triggers: async () => triggers,
     executions: async () => executions,
     deleteBySessionId: vi.fn(async () => undefined),
@@ -123,6 +153,43 @@ describe('Task execution lifecycle', () => {
     expect(setup.executions).toHaveLength(1);
     expect(setup.executions[0]).toMatchObject({ status: 'COMPLETED', finishedAt, failureReason: null });
     expect(setup.task()?.stage).toBe('COMPLETED');
+  });
+
+  it('deduplicates an external event before creating another task execution', async () => {
+    const setup = fixture();
+    await setup.service.beginExecution(setup.session, 'first', 'API', { scope: 'token:9', id: 'evt-1' });
+
+    const duplicate = await setup.service.beginExecution(setup.session, 'second', 'API', { scope: 'token:9', id: 'evt-1' });
+
+    expect(duplicate).toMatchObject({ duplicate: true, execution: { executionId: 'first' } });
+    expect(setup.executions).toHaveLength(1);
+    expect(setup.triggers).toHaveLength(1);
+    expect(setup.task()).toMatchObject({ lastExecutionId: 'first', stage: 'WORKING' });
+  });
+
+  it('keeps the same external event id isolated across token and webhook scopes', async () => {
+    const setup = fixture();
+    await setup.service.beginExecution(setup.session, 'api', 'API', { scope: 'token:9', id: 'evt-1' });
+    const webhook = await setup.service.beginExecution(setup.session, 'hook', 'WEBHOOK', { scope: 'trigger:3', id: 'evt-1' });
+
+    expect(webhook.duplicate).toBe(false);
+    expect(setup.executions.map((item) => item.executionId)).toEqual(['api', 'hook']);
+    expect(setup.triggers.map((item) => item.externalEventScope)).toEqual(['token:9', 'trigger:3']);
+  });
+
+  it('rolls back the inserted execution when a concurrent claim wins the external event', async () => {
+    const setup = fixture();
+    await setup.service.beginExecution(setup.session, 'winner', 'WEBHOOK', { scope: 'trigger:3', id: 'evt-1' });
+    vi.spyOn(setup.repo, 'triggerByExternalEvent').mockResolvedValueOnce(null);
+
+    const duplicate = await setup.service.beginExecution(
+      setup.session, 'loser', 'WEBHOOK', { scope: 'trigger:3', id: 'evt-1' },
+    );
+
+    expect(duplicate).toMatchObject({ duplicate: true, execution: { executionId: 'winner' } });
+    expect(setup.executions.map((item) => item.executionId)).toEqual(['winner']);
+    expect(setup.triggers.map((item) => item.sourceEventId)).toEqual(['winner']);
+    expect(setup.task()).toMatchObject({ lastExecutionId: 'winner', stage: 'WORKING' });
   });
 
   it('projects waiting and resuming onto the current execution without changing its timing or source', async () => {

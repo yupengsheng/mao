@@ -9,7 +9,7 @@ import type { TaskNotificationDeliveryService } from '../notification/task/deliv
 import type { TaskNotificationDelivery } from '../notification/task/types.js';
 import type { ExtractionSessionInput } from '../memory/memory-extraction.service.js';
 import type { TaskService } from '../task/task.service.js';
-import type { TaskStage, TaskSource } from '../task/types.js';
+import type { ExternalEventRef, TaskStage, TaskSource } from '../task/types.js';
 import { WEIXIN_PROJECT_KEY } from '../domain/types.js';
 import { isFeishuChannelSession } from '../harness/tool/feishu-channel-tool.js';
 import { isDingtalkChannelSession } from '../harness/tool/dingtalk-channel-tool.js';
@@ -91,16 +91,23 @@ export class TaskTerminalService {
     private readonly taskService?: TaskService | null,
   ) {}
 
-  async beginExecution(sessionId: number, executionId?: string, source?: TaskSource): Promise<void> {
+  async beginExecution(
+    sessionId: number,
+    executionId?: string,
+    source?: TaskSource,
+    externalEvent?: ExternalEventRef | null,
+  ): Promise<{ duplicate: boolean }> {
     const actualExecutionId = executionId ?? this.registry.getSessionExecution?.(sessionId);
-    if (actualExecutionId == null || actualExecutionId.trim() === '') return;
+    if (actualExecutionId == null || actualExecutionId.trim() === '') return { duplicate: false };
     try {
       this.registry.setSessionExecution?.(sessionId, actualExecutionId);
-      if (this.taskService == null) return;
+      if (this.taskService == null) return { duplicate: false };
       const session = await this.sessionService.getSession(sessionId);
-      await this.taskService.beginExecution(session, actualExecutionId, source);
+      const result = await this.taskService.beginExecution(session, actualExecutionId, source, externalEvent);
+      return { duplicate: result.duplicate };
     } catch (error) {
       console.warn(`[task] failed to begin execution: sessionId=${sessionId}, executionId=${actualExecutionId}`, error);
+      return { duplicate: false };
     }
   }
 

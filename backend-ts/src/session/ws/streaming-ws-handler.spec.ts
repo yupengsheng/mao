@@ -56,7 +56,7 @@ describe('StreamingWsHandler', () => {
     getLastUserMessage: vi.fn(async () => message(3, 'USER')),
     deleteMessageById: vi.fn(async () => undefined),
   };
-  const taskTerminalService = { finishExecution: vi.fn() };
+  const taskTerminalService = { finishExecution: vi.fn(), beginExecution: vi.fn(async () => ({ duplicate: false })) };
   const onScheduledTaskQueueConsumed = vi.fn(async () => undefined);
   const messageQueueService = {
     listPending: vi.fn(async () => []), enqueue: vi.fn(), dequeue: vi.fn(), getById: vi.fn(),
@@ -140,6 +140,29 @@ describe('StreamingWsHandler', () => {
     // 不能清快照——否则同一会话下一轮某 server 连接失败时无法沿用上次成功的工具集。
     expect(mcpSyncService.clearLocalSession).toHaveBeenCalledWith(11);
     expect(mcpSyncService.clearSession).not.toHaveBeenCalled();
+  });
+
+  it('skips harness and settles cancelled when the external event was already claimed', async () => {
+    vi.clearAllMocks();
+    executor.tasks.length = 0;
+    registry.getUserId.mockReturnValue(7);
+    sessionService.getSession.mockResolvedValue(session('CLOUD', 'IDLE'));
+    sessionService.saveMessage.mockResolvedValue(message(99, 'USER'));
+    harnessService.prepareMessage.mockResolvedValue('event-dup');
+    messageQueueService.listPending.mockResolvedValue([]);
+    taskTerminalService.beginExecution.mockResolvedValueOnce({ duplicate: true });
+
+    await handler.handleTextMessage(ws, JSON.stringify({
+      type: 'send_message', sessionId: 11, data: { content: 'retry', eventId: 'event-dup' },
+    }));
+    await executor.runAll();
+
+    expect(taskTerminalService.beginExecution).toHaveBeenCalledWith(
+      11, 'event-dup', 'MANUAL', null,
+    );
+    expect(harnessService.executeFromEvent).not.toHaveBeenCalled();
+    expect(sessionService.updatePhase).toHaveBeenLastCalledWith(11, 'IDLE');
+    expect(taskTerminalService.finishExecution).not.toHaveBeenCalled();
   });
 
   it('sendMessageInjectsImageUrlsIntoThePersistedTextPart', async () => {
@@ -1069,7 +1092,7 @@ describe('StreamingWsHandler', () => {
       submit.mockRestore();
     }
     // 回补队首的同时必须删掉已落库的 USER，否则下次消费会重复落库同一条消息
-    expect(messageQueueService.enqueueHead).toHaveBeenCalledWith(11, 7, '#{next}#', null, null, null, null, null);
+    expect(messageQueueService.enqueueHead).toHaveBeenCalledWith(11, 7, '#{next}#', null, null, null, null, null, null, null);
     expect(sessionService.deleteMessageById).toHaveBeenCalledWith(11, 100);
   });
 
@@ -1093,7 +1116,7 @@ describe('StreamingWsHandler', () => {
     } finally {
       registry.send.mockReset();
     }
-    expect(messageQueueService.enqueueHead).toHaveBeenCalledWith(11, 7, '#{next}#', null, null, null, null, null);
+    expect(messageQueueService.enqueueHead).toHaveBeenCalledWith(11, 7, '#{next}#', null, null, null, null, null, null, null);
     expect(sessionService.deleteMessageById).toHaveBeenCalledWith(11, 101);
   });
 
@@ -1279,11 +1302,11 @@ describe('StreamingWsHandler', () => {
 
     const spy = vi.spyOn(handler, 'executePersistedUserPrompt');
     const live = createScheduledLiveExecution(handler);
-    expect(live.length).toBe(7); // 形参表与 ScheduledLiveExecution 对齐，防止回归成漏参 lambda
+    expect(live.length).toBe(8); // 形参表与 ScheduledLiveExecution 对齐，防止回归成漏参 lambda
 
     await live(session('CLOUD', 'IDLE'), 7, 'sched-5', { id: 94, content: '定时任务' }, undefined, 55);
     expect(spy).toHaveBeenCalledWith(
-      session('CLOUD', 'IDLE'), 7, 'sched-5', { id: 94, content: '定时任务' }, undefined, 55, undefined,
+      session('CLOUD', 'IDLE'), 7, 'sched-5', { id: 94, content: '定时任务' }, undefined, 55, undefined, undefined,
     );
 
     await executor.runAll();
@@ -1771,7 +1794,7 @@ describe('StreamingWsHandler', () => {
       await executor.runAll();
 
       expect(sessionService.deleteMessageById).toHaveBeenCalledWith(11, 77);
-      expect(messageQueueService.enqueueHead).toHaveBeenCalledWith(11, 7, 'insert-me', null, 9, 'SCHEDULED', null, null);
+      expect(messageQueueService.enqueueHead).toHaveBeenCalledWith(11, 7, 'insert-me', null, 9, 'SCHEDULED', null, null, null, null);
       expect(handler.hasExecutionClaim(11)).toBe(false);
     });
 

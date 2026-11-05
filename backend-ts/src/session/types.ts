@@ -95,6 +95,10 @@ export interface MessageQueue {
   openTriggerId?: number | null;
   /** API/WEBHOOK 入队时的调用流水绑定，消费终态后回写 open_api_call_log */
   openCallLogId?: number | null;
+  /** 忙时入队透传的外部事件 ID（任务域据此去重） */
+  externalEventId?: string | null;
+  /** 忙时入队透传的外部事件作用域（token:<id> / trigger:<id>） */
+  externalEventScope?: string | null;
   deleted?: number;
   createdAt?: string | null;
   updatedAt?: string | null;

@@ -8,6 +8,7 @@ import { withSessionLock } from '../schedule/scheduled-task.service.js';
 import { isActivePhase } from '../session/session-vo.js';
 import type { MessageQueueSource } from '../session/types.js';
 import type { OpenRunAdmission, OpenRunAdmissionBinding } from './admission.js';
+import type { ExternalEventRef, ExternalEventTrace } from '../task/types.js';
 
 /** 开放触发支持的消息长度上限（技术方案 §5.3）。 */
 export const OPEN_RUN_MESSAGE_MAX_LENGTH = 32000;
@@ -17,6 +18,8 @@ export interface OpenRunDeps {
   sessionService: {
     getSession(id: number): Promise<Session | null>;
     updatePhase(sessionId: number, phase: string): Promise<void>;
+    deleteMessageById?(sessionId: number, messageId: number): Promise<void>;
+    deleteSession?(sessionId: number): Promise<void>;
     saveMessage(sessionId: number, role: string, content: unknown, a: null, b: null, c: null, d: number, e: null): Promise<Message>;
     /**
      * 位置签名必须与 SessionService.createSession（session.service.ts:97-114）逐位一致：
@@ -44,13 +47,13 @@ export interface OpenRunDeps {
     ): Promise<Session>;
   };
   messageQueueService: {
-    enqueue(sessionId: number, userId: number, content: string, images: string | null, scheduledTaskId?: number | null, source?: MessageQueueSource | null, openTriggerId?: number | null, openCallLogId?: number | null): Promise<unknown>;
+    enqueue(sessionId: number, userId: number, content: string, images: string | null, scheduledTaskId?: number | null, source?: MessageQueueSource | null, openTriggerId?: number | null, openCallLogId?: number | null, externalEventId?: string | null, externalEventScope?: string | null): Promise<unknown>;
   };
   harnessService: {
     executeFromEvent(sessionId: number, executionId: string, listener: unknown): Promise<void>;
   };
   taskTerminalService: {
-    beginExecution?(sessionId: number, executionId: string, source?: TaskNotifySource): Promise<void>;
+    beginExecution?(sessionId: number, executionId: string, source?: TaskNotifySource, externalEvent?: ExternalEventRef | null): Promise<{ duplicate: boolean }>;
     finishExecution(sessionId: number, userId: number, phase: string, executionId: string, reason?: string, notifySource?: TaskNotifySource): Promise<void>;
   };
   agentLookup: {
@@ -64,7 +67,9 @@ export interface OpenRunDeps {
    */
   budgetCheck?: (target: { userId: number; agentId: number }) => Promise<{ message: string } | null>;
   /** 注入的 live WS 执行路径（createScheduledLiveExecution）；null 时走 no-op listener 兜底。 */
-  liveExecution: ((session: Session, userId: number, executionId: string, savedMessage: Message, startedAt?: number, scheduledTaskId?: number | null, source?: 'SCHEDULED' | 'WEBHOOK' | 'API' | 'SIGNAL' | null) => Promise<void>) | null;
+  liveExecution: ((session: Session, userId: number, executionId: string, savedMessage: Message, startedAt?: number, scheduledTaskId?: number | null, source?: 'SCHEDULED' | 'WEBHOOK' | 'API' | 'SIGNAL' | null, externalEvent?: ExternalEventRef | null) => Promise<void>) | null;
+  /** 任务域外部事件查询：入口预检查，命中直接返回 deduplicated。 */
+  findExternalEvent?: (scope: string, id: string) => Promise<ExternalEventTrace | null>;
   /**
    * 触发来源准入（可选注入；生产装配必须注入）。
    * 未注入时保持既有测试/装配兼容，注入后失败关闭：缺失或不匹配的绑定一律拒绝。
@@ -85,6 +90,8 @@ export interface OpenRunInput {
   callLogId?: number | null;
   /** 本次触发链的显式身份绑定；由各来源入口传入，不读取请求可写字段。 */
   admissionBinding?: OpenRunAdmissionBinding | null;
+  /** 外部事件身份（API Idempotency-Key / Webhook X-Mao-Event-Id）。 */
+  externalEvent?: ExternalEventRef | null;
 }
 
 export interface OpenRunResult {
@@ -96,6 +103,12 @@ export interface OpenRunResult {
    * queued=true 时为占位值——该执行尚未发生，真实终态由队列消费侧回写，此处无人消费。
    */
   terminalPhase: 'COMPLETED' | 'FAILED' | 'CANCELLED';
+  /** 同一外部事件已由任务域认领：未新建 Trigger/Execution，也未调用 Harness。 */
+  deduplicated?: boolean;
+}
+
+function terminalPhaseOf(status: ExternalEventTrace['status']): 'COMPLETED' | 'FAILED' | 'CANCELLED' {
+  return status === 'FAILED' || status === 'CANCELLED' ? status : 'COMPLETED';
 }
 
 function noopListener(): Record<string, () => void> {
@@ -125,6 +138,17 @@ export class OpenRunService {
     }
     // 准入必须在预算与会话创建/复用之前：拒绝时不得留下空会话、消息或排队项。
     await this.assertAdmission(input);
+    // 任务域去重先于预算检查：重复事件既不该重复扣费，也不该因预算变化被拒。
+    const duplicate = await this.externalEventTrace(input);
+    if (duplicate != null) {
+      return {
+        sessionId: duplicate.sessionId,
+        messageId: null,
+        queued: false,
+        terminalPhase: terminalPhaseOf(duplicate.status),
+        deduplicated: true,
+      };
+    }
     // 预算 BLOCK 在会话创建/复用与 withSessionLock 之前：拒绝时不留下孤儿空会话（技术方案 §5.7）
     if (this.deps.budgetCheck != null) {
       const blocked = await this.deps.budgetCheck({ userId: input.userId, agentId: input.agentId });
@@ -193,7 +217,10 @@ export class OpenRunService {
       const busy = this.deps.isSessionBusy(sessionId) || isActivePhase(latest.phase);
       if (busy) {
         // 忙则排队：落 source_type + open_trigger_id 两列（类比 scheduledTaskId 回写绑定）
-        await this.deps.messageQueueService.enqueue(sessionId, input.userId, message, null, null, input.source, input.triggerId ?? null, input.callLogId ?? null);
+        await this.deps.messageQueueService.enqueue(
+          sessionId, input.userId, message, null, null, input.source, input.triggerId ?? null, input.callLogId ?? null,
+          input.externalEvent?.id ?? null, input.externalEvent?.scope ?? null,
+        );
         return { sessionId, messageId: null, queued: true, terminalPhase: 'COMPLETED' as const };
       }
 
@@ -212,19 +239,57 @@ export class OpenRunService {
       if (this.deps.liveExecution != null) {
         // liveExecution（runExecution）内部吞掉失败/取消并落终态后正常返回，
         // 必须回读会话真实终态（照抄 executeTask 的回读逻辑）
-        await this.deps.liveExecution(session, input.userId, executionId, savedMessage, startedAt, null, input.source);
+        await this.deps.liveExecution(session, input.userId, executionId, savedMessage, startedAt, null, input.source, input.externalEvent ?? null);
         const after = await this.deps.sessionService.getSession(sessionId);
         const actual = after?.phase;
         terminalPhase = actual === 'FAILED' || actual === 'CANCELLED' ? actual : 'COMPLETED';
+        const racedDuplicate = await this.externalEventTrace(input);
+        if (racedDuplicate != null && racedDuplicate.executionId !== executionId) {
+          await this.rollbackDuplicateAttempt(input, sessionId, savedMessage.id ?? null);
+          return {
+            sessionId: racedDuplicate.sessionId, messageId: null, queued: false,
+            terminalPhase: terminalPhaseOf(racedDuplicate.status), deduplicated: true,
+          };
+        }
       } else {
         // 兜底路径（测试/装配缺失）：显式落 COMPLETED 终态并带来源
-        await this.deps.taskTerminalService.beginExecution?.(sessionId, executionId, input.source);
+        const begun = await this.deps.taskTerminalService.beginExecution?.(
+          sessionId, executionId, input.source, input.externalEvent ?? null,
+        );
+        if (begun?.duplicate) {
+          await this.deps.sessionService.updatePhase(sessionId, 'IDLE');
+          await this.rollbackDuplicateAttempt(input, sessionId, savedMessage.id ?? null);
+          const duplicate = await this.externalEventTrace(input);
+          return {
+            sessionId: duplicate?.sessionId ?? sessionId, messageId: null, queued: false,
+            terminalPhase: duplicate == null ? 'CANCELLED' as const : terminalPhaseOf(duplicate.status),
+            deduplicated: true,
+          };
+        }
         await this.deps.harnessService.executeFromEvent(sessionId, executionId, noopListener());
         await this.deps.taskTerminalService.finishExecution(sessionId, input.userId, 'COMPLETED', executionId, undefined, input.source);
         terminalPhase = 'COMPLETED';
       }
       return { sessionId, messageId: savedMessage.id ?? null, queued: false, terminalPhase };
     });
+  }
+
+  private async externalEventTrace(input: OpenRunInput): Promise<ExternalEventTrace | null> {
+    if (input.externalEvent == null || this.deps.findExternalEvent == null) return null;
+    return this.deps.findExternalEvent(input.externalEvent.scope, input.externalEvent.id);
+  }
+
+  private async rollbackDuplicateAttempt(input: OpenRunInput, sessionId: number, messageId: number | null): Promise<void> {
+    if (messageId != null) {
+      await this.deps.sessionService.deleteMessageById?.(sessionId, messageId).catch((e) => {
+        console.warn(`[openapi] failed to delete duplicate event message ${messageId}: ${(e as Error).message}`);
+      });
+    }
+    if (input.sessionId == null) {
+      await this.deps.sessionService.deleteSession?.(sessionId).catch((e) => {
+        console.warn(`[openapi] failed to delete duplicate event session ${sessionId}: ${(e as Error).message}`);
+      });
+    }
   }
 
   private async assertAdmission(input: OpenRunInput): Promise<void> {

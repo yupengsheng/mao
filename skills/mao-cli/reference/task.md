@@ -36,7 +36,7 @@ QUEUED 为事务内初始化状态。WORKING 表示执行中，BLOCKED 表示等
 - `GET /api/v1/tasks/:id`，返回 Result.data：`{ task, latestExecution, executions, triggers }`。执行和入口各最多最近 50 条。
 - 不存在/他人任务按既有 Result 业务错误返回 code=404。查询不接受用 userId 切换所有者。关联 Session 删除或转交后旧任务不可见。删除会话时会回收该会话的任务主档、执行与入口记录；边路任务提升为普通会话时，在同一事务内回收旧边路会话的任务记录。清理失败只记录日志，不阻断会话删除；任务历史不会迁移到提升后的新会话。
 
-Task.source 是首次来源；triggers 中的 source 是对应执行实际来源。当前 sourceEventId 等于 executionId，仅对同一次执行登记去重，不能据此识别上游重新投递的同一消息。
+Task.source 是首次来源；triggers 中的 source 是对应执行实际来源。sourceEventId 等于 executionId，仍只用于同一次执行登记去重。上游重新投递的同一外部事件改由 `externalEventId` + `externalEventScope` 识别：API 按 `token:<TokenID>` 绑定 `Idempotency-Key`，Webhook 按 `trigger:<触发器ID>` 绑定 `X-Mao-Event-Id`，同一作用域内只认领一次执行。未携带事件 ID 的手工 / 定时 / Signal 执行这两列为 null。
 
 开放触发（API / Webhook / Signal）任务创建或再次执行时，`agent_task.policy_version` 记录 `open-run-admission/v1`，用于审计触发准入策略；手工、定时与 IM 通道任务保持为空，后续手工重跑不会清空已有版本。该字段不在任务查询响应中返回。
 
@@ -46,4 +46,4 @@ Task.source 是首次来源；triggers 中的 source 是对应执行实际来源
 
 飞书、钉钉在无内存循环但会话仍执行中时补写取消，优先使用在途 ID，再查询本人 Task 最新未结算的执行 ID，以取消原尝试。只有没有可用记录或查询失败时才使用新的随机 ID，已结束会话不生成取消尝试。崩溃恢复登记新一次执行时，会在同一事务内把该任务尚处于 WORKING / BLOCKED 的旧尝试标为 FAILED，结束时间取恢复登记时间，原因固定为「执行因进程中断未完成，已自动恢复」；相同恢复 executionId 幂等。恢复来源优先沿用最高编号旧尝试的 Trigger，取不到时按 Session 推断。多实例并发仍依赖部署排空与静默阈值，不是数据库租约。
 
-部署需应用 V179 / V195 迁移；V195 只新增 `agent_task_trigger(session_id)` 索引，正常使用现有 `FLYWAY_ENABLED` 迁移流程即可。
+部署需应用 V179 / V195 / V198 迁移；V198 新增 `agent_task_trigger` 外部事件列与唯一键，并给 `message_queue` 增加透传列，正常使用现有 `FLYWAY_ENABLED` 迁移流程即可。
