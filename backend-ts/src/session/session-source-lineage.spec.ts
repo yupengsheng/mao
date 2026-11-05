@@ -120,6 +120,26 @@ describe('admin 会话来源（技术方案 §4.1-6/7、§4.1-8）', () => {
     expect(String(call2[2])).toContain('source = ?');
   });
 
+  it('listSessionsForAdmin 按创建日期过滤，反序日期自动纠正、非法日期忽略', async () => {
+    const a = makeAdminService();
+    await a.service.listSessionsForAdmin(1, 10, null, null, null, null, null, null, null, null, '2026-09-01', '2026-09-07');
+    const call = vi.mocked(a.sessionRepo.selectPage).mock.calls[0]!;
+    expect(String(call[2])).toContain('created_at >= ? AND created_at < ?');
+    expect(call[3]).toContain('2026-09-01 00:00:00');
+    expect(call[3]).toContain('2026-09-08 00:00:00');
+
+    const b = makeAdminService();
+    await b.service.listSessionsForAdmin(1, 10, null, null, null, null, null, null, null, null, '2026-09-07', '2026-09-01');
+    const reversed = vi.mocked(b.sessionRepo.selectPage).mock.calls[0]!;
+    expect(reversed[3]).toContain('2026-09-01 00:00:00');
+    expect(reversed[3]).toContain('2026-09-08 00:00:00');
+
+    const c = makeAdminService();
+    await c.service.listSessionsForAdmin(1, 10, null, null, null, null, null, null, null, null, '2026/09/01', '2026-09-07');
+    const invalid = vi.mocked(c.sessionRepo.selectPage).mock.calls[0]!;
+    expect(String(invalid[2])).not.toContain('created_at >=');
+  });
+
   it('toAdminSessionVO 输出 source，缺省归 web', () => {
     const base = { id: 1, userId: 7, title: 't', status: 'ACTIVE', executionMode: 'CLOUD' } as Session;
     const withSource = toAdminSessionVO({ ...base, source: 'dingtalk' } as Session, new Map(), new Map(), new Map());

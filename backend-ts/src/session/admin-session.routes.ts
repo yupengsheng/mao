@@ -98,6 +98,8 @@ export function registerAdminSessionRoutes(app: FastifyInstance, deps: AdminSess
       queryOptStr(request, 'status'),
       queryOptStr(request, 'messageScope'),
       queryOptStr(request, 'source'),
+      queryOptStr(request, 'startDate'),
+      queryOptStr(request, 'endDate'),
     );
     const records = pageResult.records;
     const userMap = await batchLoadUsers(records);

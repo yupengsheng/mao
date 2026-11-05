@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import { BusinessException } from '../common/business-exception.js';
 import { ErrorCode } from '../common/error-code.js';
 import { javaLocalDateTimeString, nowSql, nowSqlMs } from '../common/datetime.js';
+import { addDaysYmd } from '../common/json.js';
 import { loadConfig } from '../config/app-config.js';
 import {
   SEARCH_KEYWORD_MAX_LENGTH,
@@ -72,6 +73,11 @@ const SEARCH_RESULT_LIMIT = 20;
 const RECENT_USER_MESSAGE_SCAN_BATCH = 50;
 /** 写入会话工作区的 runtime 临时目录/文件前缀，会话删除时一并清理。 */
 const RUNTIME_WORKSPACE_PREFIX = 'mao-runtime-';
+
+/** 仅接受 YYYY-MM-DD；日期过滤是下钻辅助条件，非法值忽略而不是报错。 */
+function isValidYmd(value: string | null | undefined): value is string {
+  return value != null && /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
 
 export class SessionService {
   static readonly SEARCH_RESULT_LIMIT = SEARCH_RESULT_LIMIT;
@@ -485,6 +491,8 @@ export class SessionService {
     status?: string | null,
     messageScope?: string | null,
     source?: string | null,
+    startDate?: string | null,
+    endDate?: string | null,
   ): Promise<{ records: Session[]; total: number; current: number; size: number; matchSnippets: Record<number, string> }> {
     const clauses: string[] = [];
     const params: unknown[] = [];
@@ -539,6 +547,12 @@ export class SessionService {
     }
     clauses.push('status = ?');
     params.push(status != null && status.length > 0 ? status : 'ACTIVE');
+    // 分析页下钻透传统计周期：按创建日期闭区间过滤；非法/反序日期宽松忽略，避免地址栏拼错命中 0 行。
+    if (isValidYmd(startDate) && isValidYmd(endDate)) {
+      const [from, to] = startDate! <= endDate! ? [startDate!, endDate!] : [endDate!, startDate!];
+      clauses.push('created_at >= ? AND created_at < ?');
+      params.push(`${from} 00:00:00`, `${addDaysYmd(to, 1)} 00:00:00`);
+    }
     const whereSql = clauses.length > 0 ? clauses.join(' AND ') : '1=1';
     // 按最后活动倒序（最近有动作的浮到最前；未产生过活动的 NULL 由 MySQL 归底）；
     // last_activity_at 秒级精度：并列行补唯一 tiebreaker，保证深翻页不重复/丢行
