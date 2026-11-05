@@ -1,3 +1,11 @@
+## 0.0.450 (2026-11-05)
+
+### 后端
+- **容器侧不再依赖宿主经验库服务**：经验索引的文件系统逻辑下沉到 `harness/shared/experience-index-store`，宿主继续使用完整 `yaml` 解析，容器执行器改用无第三方依赖的轻量 frontmatter 解析。容器运行时依赖闭包不再包含 `harness/experience/`，避免经验库链路把宿主依赖带入镜像；索引格式、陈旧判定、原子写与并发行为保持不变。
+
+### 部署
+- **容器依赖闭包新增宿主目录断言**：`container-dependency-closure.spec.ts` 在 CI 中拒绝闭包进入 `harness/experience/` 等宿主服务目录，并锁定容器侧使用共享存储层。
+
 ## 0.0.449 (2026-11-05)
 
 ### 后端

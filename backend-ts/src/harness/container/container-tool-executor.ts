@@ -12,7 +12,8 @@ import { GlobSearchTool } from '../tool/impl/glob-search-tool.js';
 import { GrepSearchTool } from '../tool/impl/grep-search-tool.js';
 import type { Tool } from '../tool/tool.js';
 import { harnessLog } from '../log.js';
-import { ExperienceIndexService, EXPERIENCE_ROOT_SUBDIR } from '../experience/experience-index.service.js';
+import { ExperienceIndexStore, EXPERIENCE_ROOT_SUBDIR } from '../shared/experience-index-store.js';
+import { parseExperienceFrontmatterLite } from '../shared/experience-frontmatter-lite.js';
 import type { RuntimeEnvelope } from './runtime-channel-protocol.js';
 
 /** 容器内允许根清单（技术方案 §5.5）。 */
@@ -128,8 +129,11 @@ export class ContainerToolExecutor {
   }
 
   private experienceRefreshCallback(shareDir: string): (absPath: string) => void {
-    const indexService = new ExperienceIndexService(path.join(shareDir, EXPERIENCE_ROOT_SUBDIR));
-    return (absPath: string) => indexService.refreshIfUnderRoot(absPath);
+    const indexStore = new ExperienceIndexStore(
+      path.join(shareDir, EXPERIENCE_ROOT_SUBDIR),
+      parseExperienceFrontmatterLite,
+    );
+    return (absPath: string) => indexStore.refreshIfUnderRoot(absPath);
   }
 
   get unfinishedBackgroundTasks(): number {

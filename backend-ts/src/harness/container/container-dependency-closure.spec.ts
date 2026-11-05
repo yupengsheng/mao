@@ -11,7 +11,8 @@ import { fileURLToPath } from 'node:url';
  * 镜像由 backend-ts/package.json + package-lock.json 的 `npm ci --omit=dev` 构建，因此：
  * 1. 闭包中的运行时 bare import 必须是 dependencies（devDependencies 不会进镜像）；
  * 2. 不得出现非字面量动态 import（静态扫描无法证明它落在镜像内）；
- * 3. 相对 import 必须逐层递归，注释 / 模板串里的示例文本不算真实依赖。
+ * 3. 相对 import 必须逐层递归，注释 / 模板串里的示例文本不算真实依赖；
+ * 4. 闭包不得进入宿主服务目录（如 `harness/experience/`），容器侧只能依赖明确抽出的共享模块。
  *
  * `import type` / `export type` 在 tsc 后会被擦除，不要求运行时包存在；这也是
  * `@mao/contracts` 虽在 devDependencies 却可以出现在容器源码中的原因。
@@ -20,6 +21,7 @@ const backendDir = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const srcDir = join(backendDir, 'src');
 const entry = join(srcDir, 'harness', 'container', 'runtime-agent.ts');
 const BUILTINS = new Set(builtinModules);
+const HOST_SERVICE_PREFIXES = ['harness/experience/'];
 
 interface ClosureScan {
   files: string[];
@@ -213,6 +215,16 @@ describe('container runtime dependency closure', () => {
 
     expect(scan.files).toContain('harness/container/runtime-agent.ts');
     expect(missing, detail).toEqual([]);
+  });
+
+  it('does not couple the container closure to host service directories', () => {
+    const scan = scanClosure();
+    const hostServiceFiles = scan.files.filter((file) => HOST_SERVICE_PREFIXES.some((prefix) => file.startsWith(prefix)));
+    expect(
+      hostServiceFiles,
+      `container closure must not import host service modules:\n${hostServiceFiles.map((file) => `  ${file}`).join('\n')}`,
+    ).toEqual([]);
+    expect(scan.files).toContain('harness/shared/experience-index-store.ts');
   });
 
   it('does not use non-literal dynamic imports in the container closure', () => {

@@ -420,7 +420,7 @@ FROM message WHERE deleted = 0;
 
    预检结果会缓存在后端内存：成功后在进程生命周期内直接放行；失败后 30 秒内所有容器入口（工具 / 终端 / MCP）立即返回「原因 + 处置」，不再逐次等待 15 秒连接超时；窗口到期自动重新预检，Docker 或镜像恢复后无需重启后端。并发预检共享同一次执行，避免同一时刻重复跑镜像冒烟。管理后台「系统设置 → 运行环境」可查看运行模式、镜像是否可用、依赖指纹是否一致、最近一次预检结果与在线容器连接用户（页面只读查询，不主动触发预检）。
 
-   容器侧依赖闭包由 `container-dependency-closure.spec.ts` 在 CI 中守门：运行时 bare import 必须属于生产依赖，`import type` 不要求镜像内存在；非字面量动态 import 会被拒绝。
+   容器侧依赖闭包由 `container-dependency-closure.spec.ts` 在 CI 中守门：运行时 bare import 必须属于生产依赖，`import type` 不要求镜像内存在；非字面量动态 import 会被拒绝；闭包也不得进入 `harness/experience/` 等宿主服务目录（容器侧共享逻辑只允许从 `harness/shared/` 引入）。
 3. **数据目录**：`/opt/mao-data/runtime/channels`（socket 根）与 `/opt/mao-data/deps`（持久依赖）需存在且后端进程可写（首次启动预检会校验，不满足直接启动失败，不静默降级）。
 4. **上传目录**：图片产物（`generate_image` / `edit_image`）落 `{FILE_UPLOAD_DIR}/{userId}/`（宿主机按用户隔离、同名挂入容器），外网经 Nginx `^~ /uploads/` 与 `^~ /api/uploads/` 两个前缀访问；按用户隔离后请确认 Nginx 配置含这两个 location（见上文 Nginx 片段），否则图片类 `file.url` 会被扩展名正则 location 吞掉变 404。
 5. **公共共享目录**：`/opt/mao-data/share`（`MAO_SHARE_DIR` 可覆盖）由后端启动自动创建，无需手工准备。管理员向其中投放文件后，全体 CLOUD 用户的 Agent 即可读取；其 `agent-experience/` 子目录为 **Agent 团队经验库**（0.0.342 起，按 Agent 分库 `<agentId>/`，Agent 会话可读写沉淀经验，管理后台可维护）。**0.0.342 起容器模式该目录改为 rw 挂载**（经验库需容器内写入；挂载 mode 参与容器指纹，升级后存量容器自动重建），管理员投放内容的防误删从挂载层退化为信任 + 备份兜底。投放即时生效（目录级挂载，新增/修改文件无需重启或重建容器）；建议属主与后端运行用户一致、权限 755。**共享即公开**：请勿向该目录投放敏感内容。目录不计入任何用户配额，占满磁盘影响全体服务，建议纳入 `df` 监控；经验库为 Agent 自动写入且整根可写，建议每日快照兜底（示例：`0 3 * * * tar -czf /opt/mao-data/backup/share-$(date +\%F).tgz -C /opt/mao-data share && find /opt/mao-data/backup -name 'share-*.tgz' -mtime +14 -delete`）。
