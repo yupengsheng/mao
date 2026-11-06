@@ -28,6 +28,8 @@ export class MysqlSignalWatcherRepository {
       status: watcher.status,
       lastValueHash: watcher.lastValueHash,
       lastValueSnippet: watcher.lastValueSnippet,
+      lastChangeOldSnippet: watcher.lastChangeOldSnippet,
+      lastChangeNewSnippet: watcher.lastChangeNewSnippet,
       lastCheckedAt: watcher.lastCheckedAt,
       lastChangedAt: watcher.lastChangedAt,
       consecutiveFailures: watcher.consecutiveFailures,
@@ -103,6 +105,9 @@ export class MysqlSignalWatcherRepository {
     if (patch.promptTemplate !== undefined) row.promptTemplate = patch.promptTemplate;
     if (patch.status !== undefined) row.status = patch.status;
     if (patch.lastValueHash !== undefined) row.lastValueHash = patch.lastValueHash;
+    if (patch.lastValueSnippet !== undefined) row.lastValueSnippet = patch.lastValueSnippet;
+    if (patch.lastChangeOldSnippet !== undefined) row.lastChangeOldSnippet = patch.lastChangeOldSnippet;
+    if (patch.lastChangeNewSnippet !== undefined) row.lastChangeNewSnippet = patch.lastChangeNewSnippet;
     if (patch.lastChangedAt !== undefined) row.lastChangedAt = patch.lastChangedAt;
     if (patch.consecutiveFailures !== undefined) row.consecutiveFailures = patch.consecutiveFailures;
     if (patch.triggerMode !== undefined) row.triggerMode = patch.triggerMode;
@@ -151,21 +156,40 @@ export class MysqlSignalWatcherRepository {
    */
   async markChecked(
     id: number,
-    patch: { lastValueHash: string | null; lastValueSnippet: string | null; lastChangedAt: string | null; consecutiveFailures: number },
+    patch: {
+      lastValueHash: string | null;
+      lastValueSnippet: string | null;
+      lastChangedAt: string | null;
+      consecutiveFailures: number;
+      /** 「上次变化」新旧值对（V203）：带了键才写，不带键保持原值（缺省行为不变）。 */
+      lastChangeOldSnippet?: string | null;
+      lastChangeNewSnippet?: string | null;
+    },
   ): Promise<void> {
+    const changes: string[] = [];
+    const params: unknown[] = [
+      patch.lastValueHash,
+      patch.lastValueSnippet == null ? null : patch.lastValueSnippet.slice(0, 1024),
+      patch.lastChangedAt,
+      ts(Date.now()),
+      patch.consecutiveFailures,
+    ];
+    // 带了键才参与 SET：不带键的老调用方行为逐字不变。
+    if ('lastChangeOldSnippet' in patch) {
+      changes.push('last_change_old_snippet = ?');
+      params.push(patch.lastChangeOldSnippet == null ? null : patch.lastChangeOldSnippet.slice(0, 1024));
+    }
+    if ('lastChangeNewSnippet' in patch) {
+      changes.push('last_change_new_snippet = ?');
+      params.push(patch.lastChangeNewSnippet == null ? null : patch.lastChangeNewSnippet.slice(0, 1024));
+    }
+    params.push(id);
     await this.db.execute(
       `UPDATE signal_watcher
        SET last_value_hash = ?, last_value_snippet = ?, last_changed_at = ?, last_checked_at = ?,
-           consecutive_failures = IF(consecutive_failures = ?, 0, consecutive_failures)
+           consecutive_failures = IF(consecutive_failures = ?, 0, consecutive_failures)${changes.length > 0 ? `, ${changes.join(', ')}` : ''}
        WHERE id = ?`,
-      [
-        patch.lastValueHash,
-        patch.lastValueSnippet == null ? null : patch.lastValueSnippet.slice(0, 1024),
-        patch.lastChangedAt,
-        ts(Date.now()),
-        patch.consecutiveFailures,
-        id,
-      ],
+      params,
     );
   }
 
@@ -206,6 +230,8 @@ export class MysqlSignalCheckRepository {
       watcherId: check.watcherId,
       httpStatus: check.httpStatus,
       valueHash: check.valueHash,
+      oldValueSnippet: check.oldValueSnippet,
+      newValueSnippet: check.newValueSnippet,
       changed: check.changed,
       triggeredSessionId: check.triggeredSessionId,
       error: check.error,
@@ -222,7 +248,23 @@ export class MysqlSignalCheckRepository {
     );
   }
 
-  /** 补写判定值哈希（探针成功、判定值算出来后回填）。 */
+  /**
+   * 补写判定值哈希 + 新旧值片段（探针成功、判定值算出来后回填，V202）。
+   * 一次 UPDATE 写三列：未变行 / 首轮建基线的行同样留痕。
+   */
+  async updateValue(id: number, patch: { valueHash: string; oldValueSnippet: string | null; newValueSnippet: string | null }): Promise<void> {
+    await this.db.execute(
+      'UPDATE signal_watcher_check SET value_hash = ?, old_value_snippet = ?, new_value_snippet = ? WHERE id = ?',
+      [
+        patch.valueHash,
+        patch.oldValueSnippet == null ? null : patch.oldValueSnippet.slice(0, 1024),
+        patch.newValueSnippet == null ? null : patch.newValueSnippet.slice(0, 1024),
+        id,
+      ],
+    );
+  }
+
+  /** 补写判定值哈希（保留供存量调用链，新增场景用 updateValue）。 */
   async updateHash(id: number, valueHash: string): Promise<void> {
     await this.db.execute('UPDATE signal_watcher_check SET value_hash = ? WHERE id = ?', [valueHash, id]);
   }

@@ -20,6 +20,8 @@ function watcher(overrides: Partial<SignalWatcher> = {}): SignalWatcher {
     status: 'ACTIVE',
     lastValueHash: null,
     lastValueSnippet: null,
+    lastChangeOldSnippet: null,
+    lastChangeNewSnippet: null,
     lastCheckedAt: null,
     lastChangedAt: null,
     consecutiveFailures: 0,
@@ -99,5 +101,39 @@ describe('registerSignalAdminRoutes compareMode 入参', () => {
     listForAdmin.mockClear();
     await handler(req({ compareMode: 'NOT_A_MODE' }), reply);
     expect(listForAdmin).toHaveBeenCalledWith(1, 20, { status: null, userId: undefined, compareMode: null });
+  });
+
+  it('列表透出 jsonPath 与上次变化新旧值片段', async () => {
+    const row = watcher({
+      compareMode: 'JSON_FIELD',
+      jsonPath: 'data.price',
+      lastValueSnippet: '2',
+      lastChangeOldSnippet: '1',
+      lastChangeNewSnippet: '2',
+    });
+    const app = { get: vi.fn() };
+    registerSignalAdminRoutes(app as never, {
+      watcherRepo: { listForAdmin: vi.fn(async () => ({ rows: [row], total: 1 })) } as never,
+      permissionService: { hasPermission: vi.fn(async () => true) } as never,
+      userLookup: { findByIds: vi.fn(async () => [{ id: 7, username: 'u', displayName: 'U' }]) },
+    });
+    const handler = app.get.mock.calls[0]![1] as (req: unknown, reply: unknown) => Promise<unknown>;
+    const reply = {
+      status: vi.fn(() => reply),
+      header: vi.fn(() => reply),
+      send: vi.fn(),
+    };
+    await handler({ userId: 1, query: {} }, reply);
+
+    const payload = JSON.parse(reply.send.mock.calls[0]![0] as string) as {
+      data: { records: Array<Record<string, unknown>> };
+    };
+    expect(payload.data.records[0]).toMatchObject({
+      compareMode: 'JSON_FIELD',
+      jsonPath: 'data.price',
+      lastValueSnippet: '2',
+      lastChangeOldSnippet: '1',
+      lastChangeNewSnippet: '2',
+    });
   });
 });

@@ -65,6 +65,42 @@
   opacity: 0.5;
 }
 
+/* 新建会话宽按钮：取代原先头部的「+」图标入口（目标小、窄面板更难命中）。
+   羊皮纸底 + 细边框 + 灰字，气质与侧栏一致；但底色比侧栏亮一档
+   （--aw-surface-pearl #fafafc）、边框用 --aw-hairline（#e0e0e0）而非
+   --aw-divider-soft（#f0f0f0）——后者与羊皮纸 #f5f5f7 几乎同色，按钮会与
+   背景融在一起看不出边界。
+   hover 加深底色、文字转墨色，反馈明确。
+   左右 8px 与下方 .panel-content 对齐，顶部不额外留白（header 已有 12px 下内边距）。 */
+.task-index-panel .new-session-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex-shrink: 0;
+  margin: 0 8px 8px;
+  height: var(--aw-btn-height);
+  padding: var(--aw-btn-padding);
+  border: 1px solid var(--aw-hairline);
+  border-radius: var(--aw-radius-xs);
+  background: var(--aw-surface-pearl);
+  color: var(--aw-ink-muted-48);
+  font-size: var(--aw-text-fine);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.task-index-panel .new-session-btn:hover {
+  background: var(--aw-surface-hover);
+  color: var(--aw-ink);
+  border-color: var(--aw-border);
+}
+
+.task-index-panel .new-session-btn .new-session-label {
+  line-height: 1.2;
+}
+
 .task-index-panel .panel-content {
   flex: 1;
   overflow-y: auto;
@@ -747,6 +783,11 @@
 .task-index-panel.actions-hidden .header-actions .refresh-btn {
   width: 20px;
   height: 20px;
+}
+
+/* 窄面板下新建会话宽按钮仍整条保留：文案自解释，140px 也放得下图标 + 两字 */
+.task-index-panel.actions-hidden .new-session-btn {
+  margin: 0 4px 8px;
 }
 
 /* --- 聚焦模式 --- */

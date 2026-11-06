@@ -180,7 +180,7 @@ describe('AdminAnalyticsService', () => {
     const result = (await service.summary(7)) as Record<string, any>;
 
     expect(result.userActivity).toHaveLength(1);
-    expect(result.userActivity[0]).toMatchObject({ username: 'ada', sessionCount: 3, messageCount: 7, totalTokens: 700 });
+    expect(result.userActivity[0]).toMatchObject({ username: 'ada', sessionCount: 3, messageCount: 7, totalTokens: 1200 });
   });
 
   it('summaryClampsDaysWindow', async () => {
@@ -338,7 +338,7 @@ describe('AdminAnalyticsService', () => {
     expect(result.sceneStats[0]).toMatchObject({ key: 'agent', callTokens: 800 });
     expect(result.protocolStats[0]).toMatchObject({ key: 'openai-compatible', callCount: 10 });
     expect(result.userTokenTop).toEqual([
-      expect.objectContaining({ userId: 1, displayName: 'Ada', totalTokens: 700 }),
+      expect.objectContaining({ userId: 1, displayName: 'Ada', totalTokens: 1200 }),
     ]);
   });
 
@@ -384,7 +384,9 @@ describe('AdminAnalyticsService', () => {
       callCount: 9,
       callFailCount: 1,
       callTokens: 1200,
+      totalTokens: 1200,
     });
+    expect(result.tokenTop).toEqual([expect.objectContaining({ userId: 1, totalTokens: 1200 })]);
   });
 
   it('agentsScopeMergesCallSuccessRate', async () => {
@@ -567,10 +569,14 @@ describe('AdminAnalyticsService', () => {
   it('usersAndAgentsScopeReturnTokenTopSortedIndependently', async () => {
     const statistics = { getOverview: vi.fn(async () => ({})) };
     const store = buildStore();
-    // 明细集（按消息数截断）只含 ada；tokenTop 数据源需覆盖未进入明细集的重消耗用户/Agent
+    // 用户 tokenTop 走 llm_call 口径，需覆盖未进入消息明细集的重消耗用户；Agent tokenTop 仍按消息口径
     store.selectMessageStatsByUser = vi.fn(async () => [
       { id: 1, messageCount: 7, totalTokens: 700 },
       { id: 2, messageCount: 1, totalTokens: 9000 },
+    ]);
+    store.selectLlmCallStatsByUser = vi.fn(async () => [
+      { id: 1, callCount: 9, failCount: 1, callTokens: 1200 },
+      { id: 2, callCount: 3, failCount: 0, callTokens: 9000 },
     ]);
     store.selectMessageStatsByAgent = vi.fn(async () => [
       { id: 9, messageCount: 8, totalTokens: 800 },
@@ -585,7 +591,7 @@ describe('AdminAnalyticsService', () => {
     const users = (await service.usersScope(7)) as Record<string, any>;
     expect(users.tokenTop).toEqual([
       expect.objectContaining({ userId: 2, totalTokens: 9000 }),
-      expect.objectContaining({ userId: 1, totalTokens: 700 }),
+      expect.objectContaining({ userId: 1, totalTokens: 1200 }),
     ]);
 
     const agents = (await service.agentsScope(7)) as Record<string, any>;

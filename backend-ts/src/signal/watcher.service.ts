@@ -13,6 +13,7 @@ import {
   computeValueHash,
   ProbeValueError,
   renderWatcherPrompt,
+  truncateSnippet,
   valueTextForDiff,
 } from './watcher.logic.js';
 
@@ -102,6 +103,11 @@ export interface SignalWatcherView {
   promptTemplate: string;
   status: SignalWatcherStatus;
   lastValueHash: string | null;
+  /** 上次判定内容片段（供失败行「上次正常值」用；失败不覆盖它）。 */
+  lastValueSnippet: string | null;
+  /** 上次那次变化的旧/新值（列表卡「上次变化」的数据源）。 */
+  lastChangeOldSnippet: string | null;
+  lastChangeNewSnippet: string | null;
   lastCheckedAt: string | null;
   lastChangedAt: string | null;
   consecutiveFailures: number;
@@ -166,6 +172,8 @@ export class WatcherService {
       status: 'ACTIVE',
       lastValueHash: null,
       lastValueSnippet: null,
+      lastChangeOldSnippet: null,
+      lastChangeNewSnippet: null,
       lastCheckedAt: null,
       lastChangedAt: null,
       consecutiveFailures: 0,
@@ -233,6 +241,8 @@ export class WatcherService {
     if (resetBaseline) {
       patch.lastValueHash = null;
       patch.lastValueSnippet = null;
+      patch.lastChangeOldSnippet = null;
+      patch.lastChangeNewSnippet = null;
       patch.lastChangedAt = null;
     }
     await this.deps.watcherRepo.update(id, userId, patch);
@@ -260,6 +270,8 @@ export class WatcherService {
       patch.consecutiveFailures = 0;
       patch.lastValueHash = null;
       patch.lastValueSnippet = null;
+      patch.lastChangeOldSnippet = null;
+      patch.lastChangeNewSnippet = null;
       patch.lastChangedAt = null;
     }
     await this.deps.watcherRepo.update(id, userId, patch);
@@ -362,6 +374,8 @@ export class WatcherService {
       watcherId: watcher.id,
       httpStatus: result.httpStatus,
       valueHash: null,
+      oldValueSnippet: null,
+      newValueSnippet: null,
       changed: 0,
       triggeredSessionId: null,
       error: null,
@@ -393,7 +407,15 @@ export class WatcherService {
       return;
     }
 
-    await this.deps.checkRepo.updateHash(checkId, valueHash);
+    // 本次判定所用的旧值：函数开头那份快照（与 lastValueHash 比对的同一份），
+    // 绝不用触发前复读的 fresh.lastValueSnippet——探针在途期间用户若编辑判定字段，
+    // 复读值与「是否变化」的判定基准已不一致。
+    const oldSnippet = watcher.lastValueSnippet == null ? null : truncateSnippet(watcher.lastValueSnippet);
+    await this.deps.checkRepo.updateValue(checkId, {
+      valueHash,
+      oldValueSnippet: oldSnippet,
+      newValueSnippet: truncateSnippet(newText),
+    });
 
     // 首轮：只建基线不触发
     if (watcher.lastValueHash == null || watcher.lastValueHash === '') {
@@ -488,6 +510,8 @@ export class WatcherService {
       await this.deps.watcherRepo.markChecked(watcher.id, {
         lastValueHash: valueHash,
         lastValueSnippet: newText,
+        lastChangeOldSnippet: oldSnippet,
+        lastChangeNewSnippet: truncateSnippet(newText),
         lastChangedAt: formatDateTime(Date.now()),
         consecutiveFailures: watcher.consecutiveFailures ?? 0,
       });
@@ -500,6 +524,9 @@ export class WatcherService {
     // 「失败」两行自相矛盾的记录。同时把基线 hash 推进到本次读到的值——否则目标值不变时
     // 下一轮仍判为「变化」，每轮都重新发起一次 Agent 运行（退避期内重复触发 N 次）。
     await this.markCheckError(checkId, failure);
+    // 列表卡「上次变化」与 lastChangedAt 同义：只表示上一次成功触发。
+    // 触发失败不改这两列，否则时间仍停在上次成功（或「从未」），内容却已换成这一轮。
+    // 本轮新旧值留在 check 行上，抽屉「详情」在错误下附出；基线 hash/snippet 仍要推进。
     await this.deps.watcherRepo.markChecked(watcher.id, {
       lastValueHash: valueHash,
       lastValueSnippet: newText,
@@ -529,6 +556,8 @@ export class WatcherService {
       watcherId: watcher.id,
       httpStatus,
       valueHash: null,
+      oldValueSnippet: null,
+      newValueSnippet: null,
       changed: 0,
       triggeredSessionId: null,
       error: message.slice(0, 500),
@@ -794,6 +823,9 @@ export class WatcherService {
       consecutiveFailures: Number(row.consecutiveFailures ?? 0),
       triggerMode: row.triggerMode,
       reuseSessionId: row.reuseSessionId ?? null,
+      lastValueSnippet: row.lastValueSnippet ?? null,
+      lastChangeOldSnippet: row.lastChangeOldSnippet ?? null,
+      lastChangeNewSnippet: row.lastChangeNewSnippet ?? null,
       createdAt: row.createdAt ?? null,
     };
   }

@@ -6,14 +6,17 @@ const LOCAL_UNSYNCED_SKILLS_PREFIX = '~/.agents/skills';
 export class RuntimeDataResolver {
   readonly runtimeRoot: string;
   readonly userHomeRoot: string;
+  /** 可选：技能视图根。未配置时容器技能视图相关方法不可用。 */
+  readonly skillViewsRoot: string | null;
 
-  constructor(runtimeDir: string, userHomeDir: string) {
+  constructor(runtimeDir: string, userHomeDir: string, skillViewsDir?: string | null) {
     this.runtimeRoot = path.resolve(runtimeDir);
     this.userHomeRoot = path.resolve(userHomeDir);
+    this.skillViewsRoot = skillViewsDir ? path.resolve(skillViewsDir) : null;
   }
 
-  static forTest(runtimeDir: string, userHomeDir: string): RuntimeDataResolver {
-    return new RuntimeDataResolver(runtimeDir, userHomeDir);
+  static forTest(runtimeDir: string, userHomeDir: string, skillViewsDir?: string | null): RuntimeDataResolver {
+    return new RuntimeDataResolver(runtimeDir, userHomeDir, skillViewsDir);
   }
 
   resolveSessionRuntimeDir(userId: number, sessionId: number): string {
@@ -61,6 +64,19 @@ export class RuntimeDataResolver {
   resolveUserHomeDir(userId: number | null | undefined): string | null {
     if (userId == null) return null;
     return path.join(this.userHomeRoot, String(userId));
+  }
+
+  /** 用户级技能视图根：容器内按用户 ro 挂载的根（只含该用户的技能视图）。 */
+  resolveUserSkillViewsDir(userId: number): string {
+    if (this.skillViewsRoot == null) {
+      throw new Error('skillViewsDir is not configured');
+    }
+    return path.join(this.skillViewsRoot, String(userId));
+  }
+
+  /** 单个技能的视图目录（{skillViewsDir}/{userId}/{skillName}）：会话软链的目标。 */
+  resolveSkillViewDir(userId: number, skillName: string): string {
+    return path.join(this.resolveUserSkillViewsDir(userId), skillName);
   }
 
   formatLocalSkillsPath(sessionId: number, skillName: string): string {

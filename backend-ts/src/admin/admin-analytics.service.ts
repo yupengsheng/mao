@@ -984,7 +984,7 @@ export class AdminAnalyticsService {
       this.trends(range, callOpts),
       this.store.selectLlmCallSceneStats(range, { ...callOpts, modelId: sceneModelId }),
       this.store.selectLlmCallProtocolStats(range, callOpts),
-      this.userTokenTop(range, MAX_SCOPE_LIMIT),
+      this.userTokenTop(range, MAX_SCOPE_LIMIT, callOpts),
     ]);
     return {
       period: this.periodMeta(range, previous),
@@ -1015,7 +1015,7 @@ export class AdminAnalyticsService {
     const pagination = resolvePagination(opts, limit);
     const [allRows, tokenTop, activeUsers, previousTotals] = await Promise.all([
       this.userActivityRows(range, callOpts),
-      this.userTokenTop(range, pagination.pageSize),
+      this.userTokenTop(range, pagination.pageSize, callOpts),
       this.store.countActiveUsers(range),
       this.previousTotals(previous, callOpts),
     ]);
@@ -1483,7 +1483,6 @@ export class AdminAnalyticsService {
     ]);
     const sessionCounts = idMap(sessionRows, (r) => r.sessionCount);
     const messageCounts = idMap(messageRows, (r) => r.messageCount);
-    const tokens = idMap(messageRows, (r) => r.totalTokens);
     const callCounts = idMap(callRows, (r) => r.callCount);
     const failCounts = idMap(callRows, (r) => r.failCount);
     const cancelledCounts = idMap(callRows, (r) => r.cancelledCount);
@@ -1505,7 +1504,7 @@ export class AdminAnalyticsService {
         displayName: user.displayName,
         sessionCount,
         messageCount,
-        totalTokens: tokens.get(uid) ?? 0,
+        totalTokens: callTokens.get(uid) ?? 0,
         lastLoginAt: user.lastLoginAt != null ? String(user.lastLoginAt) : null,
         callCount: calls,
         callFailCount: fails,
@@ -1518,16 +1517,21 @@ export class AdminAnalyticsService {
     return rows;
   }
 
-  /** Token 排行独立按 totalTokens 排序截断，避免依赖消息数截断的明细集而遗漏重消耗用户。 */
+  /**
+   * Token 排行独立按 totalTokens 排序截断，避免依赖消息数截断的明细集而遗漏重消耗用户。
+   * Token 取 llm_call.total_tokens（与明细/调用/成本同源）。
+   */
   private async userTokenTop(
     range: AnalyticsRange,
     limit: number,
+    callOpts?: { excludeConnectivity?: boolean },
   ): Promise<Array<Record<string, unknown>>> {
-    const [users, messageRows] = await Promise.all([
+    const opts = { excludeConnectivity: callOpts?.excludeConnectivity !== false };
+    const [users, callRows] = await Promise.all([
       this.store.listUsers(),
-      this.store.selectMessageStatsByUser(range),
+      this.store.selectLlmCallStatsByUser(range, opts),
     ]);
-    const tokens = idMap(messageRows, (r) => r.totalTokens);
+    const tokens = idMap(callRows, (r) => r.callTokens);
     const meta = new Map(users.filter((u) => u.id != null).map((u) => [u.id!, u]));
     const rows: Array<Record<string, unknown>> = [];
     for (const [userId, totalTokens] of tokens) {

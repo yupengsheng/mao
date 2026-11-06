@@ -34,6 +34,8 @@ function watcher(overrides: Partial<SignalWatcher> = {}): SignalWatcher {
     status: 'ACTIVE',
     lastValueHash: null,
     lastValueSnippet: null,
+    lastChangeOldSnippet: null,
+    lastChangeNewSnippet: null,
     lastCheckedAt: null,
     lastChangedAt: null,
     consecutiveFailures: 0,
@@ -76,6 +78,7 @@ function makeHarness(seed: SignalWatcher, extra: SignalWatcher[] = []) {
   const checkRepo = {
     insert: vi.fn(async () => 1),
     markTriggered: vi.fn(async () => undefined),
+    updateValue: vi.fn(async () => undefined),
     updateHash: vi.fn(async () => undefined),
     markChanged: vi.fn(async () => undefined),
     markWarning: vi.fn(async () => undefined),

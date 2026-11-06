@@ -66,6 +66,12 @@
             <span>间隔 {{ watcher.intervalMinutes }} 分钟</span>
             <span v-if="watcher.compareMode === 'JSON_FIELD'">路径 {{ watcher.jsonPath }}</span>
             <span>上次变化：{{ watcher.lastChangedAt ? formatTime(watcher.lastChangedAt) : '从未' }}</span>
+            <span
+              v-if="watcher.lastChangeOldSnippet != null || watcher.lastChangeNewSnippet != null"
+              class="last-change-text"
+            >
+              {{ lastChangeText(watcher) }}
+            </span>
             <span>上次轮询：{{ watcher.lastCheckedAt ? formatTime(watcher.lastCheckedAt) : '从未' }}</span>
             <span v-if="watcher.consecutiveFailures > 0" class="fail-text">连续失败 {{ watcher.consecutiveFailures }} 次</span>
           </div>
@@ -116,6 +122,11 @@
           />
         </el-form-item>
         <el-form-item label="请求头">
+          <!--
+            el-form 渲染的是原生 <form>：内部 <button> 不写 type 默认就是 submit，
+            点击会触发表单提交导致整页重载（打包态 file:// + hash 路由下 hash 丢失，
+            表现为窗口自行关闭、页面重置）。增删请求头行的按钮必须显式 type="button"。
+          -->
           <div class="header-editor">
             <div v-for="(pair, index) in form.headers" :key="index" class="header-row">
               <el-input v-model="pair.key" placeholder="Header 名" />
@@ -123,11 +134,11 @@
                 v-model="pair.value"
                 :placeholder="editing && pair.masked ? '留空不修改' : '值'"
               />
-              <button class="action-btn action-btn-danger" @click="removeHeaderRow(index)">
+              <button type="button" class="action-btn action-btn-danger" @click="removeHeaderRow(index)">
                 <el-icon :size="14"><Delete /></el-icon>
               </button>
             </div>
-            <button class="add-header-btn" @click="addHeaderRow">
+            <button type="button" class="add-header-btn" @click="addHeaderRow">
               <el-icon :size="12"><Plus /></el-icon> 添加请求头
             </button>
           </div>
@@ -218,11 +229,12 @@
                 会话 #{{ row.triggeredSessionId }}
               </a>
               <span v-if="row.warning" class="warn-text">{{ warningLabel(row.warning) }}</span>
+              <span v-if="!row.triggeredSessionId && !row.warning">-</span>
             </template>
           </el-table-column>
           <el-table-column label="详情" min-width="140" show-overflow-tooltip>
             <template #default="{ row }">
-              <span class="error-text">{{ row.error || row.valueHash?.slice(0, 12) || '-' }}</span>
+              <span :class="{ 'error-text': row.error }" class="detail-text">{{ checkDetailText(row) }}</span>
             </template>
           </el-table-column>
         </el-table>
@@ -285,6 +297,7 @@ import {
   type SignalWatcherStatus
 } from '../../api'
 import type { SignalWatcherWarning } from '@mao/contracts'
+import { formatSignalChangeValue, formatSignalCheckDetail } from '@mao/contracts'
 import {
   DISABLE_AFTER_FAILURES,
   TRIGGER_MODE_LABELS,
@@ -337,6 +350,8 @@ const checksLoading = ref(false)
 const checksWatcherId = ref<number | null>(null)
 const checks = ref<SignalWatcherCheckPage>({ rows: [], total: 0 })
 const checksPage = ref(1)
+/** 抽屉打开的那条哨兵：给 checks 行的文案提供 compareMode / jsonPath 口径。 */
+const checksWatcher = ref<SignalWatcherView | null>(null)
 
 const testVisible = ref(false)
 const testResult = ref<SignalWatcherTestResult | null>(null)
@@ -378,6 +393,44 @@ function warningLabel(warning: SignalWatcherWarning): string {
 function formatTime(value: string | null): string {
   if (!value) return '-'
   return value.replace('T', ' ').slice(0, 16)
+}
+
+/** 列表卡「上次变化：旧 → 新」一句；从未变化 / 已重置基线时整句不渲染（见模板 v-if）。 */
+function lastChangeText(watcher: SignalWatcherView): string {
+  return formatSignalChangeValue({
+    compareMode: watcher.compareMode,
+    oldText: watcher.lastChangeOldSnippet,
+    newText: watcher.lastChangeNewSnippet,
+    jsonPath: watcher.jsonPath
+  })
+}
+
+function watcherCompareMode(): SignalCompareMode {
+  return checksWatcher.value?.compareMode ?? 'HASH'
+}
+
+function checksJsonPath(): string | null {
+  return checksWatcher.value?.jsonPath ?? null
+}
+
+/**
+ * checks「详情」列文案（三态 + NULL 回落，与 admin 同口径）。
+ * formatSignalCheckDetail 已含「触发失败」附新旧值对的第二行。
+ */
+function checkDetailText(row: {
+  changed: number
+  error: string | null
+  oldValueSnippet: string | null
+  newValueSnippet: string | null
+}): string {
+  return formatSignalCheckDetail({
+    compareMode: watcherCompareMode(),
+    changed: row.changed,
+    error: row.error,
+    oldValueSnippet: row.oldValueSnippet,
+    newValueSnippet: row.newValueSnippet,
+    jsonPath: checksJsonPath()
+  })
 }
 
 async function fetchWatchers(): Promise<void> {
@@ -560,6 +613,7 @@ async function confirmDelete(watcher: SignalWatcherView): Promise<void> {
 
 async function openChecks(watcher: SignalWatcherView): Promise<void> {
   checksWatcherId.value = watcher.id
+  checksWatcher.value = watcher
   checksPage.value = 1
   checksVisible.value = true
   await fetchChecks()
@@ -900,6 +954,16 @@ onMounted(() => {
 .error-text {
   font-size: 12px;
   color: var(--aw-ink-muted);
+  word-break: break-all;
+}
+
+.detail-text {
+  display: block;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.last-change-text {
   word-break: break-all;
 }
 

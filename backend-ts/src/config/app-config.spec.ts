@@ -20,6 +20,7 @@ describe('app-config', () => {
     expect(cfg.server.servlet.contextPath).toBe('/api');
     expect(cfg.spring.flyway.enabled).toBe(true);
     expect(cfg.jwt.expiration).toBe(86400000);
+    expect(cfg.app.harness.skillViewsDir).toBe('./skill-views');
     if (prevPort === undefined) {
       delete process.env.MAO_TS_PORT;
     } else {

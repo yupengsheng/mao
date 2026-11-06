@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { MysqlSignalWatcherRepository } from './signal.repository.js';
+import { MysqlSignalCheckRepository, MysqlSignalWatcherRepository } from './signal.repository.js';
 
 /**
  * 仓储 SQL 语义回归。
@@ -26,7 +26,8 @@ function capture() {
     }),
   };
   const repo = new MysqlSignalWatcherRepository(db as never);
-  return { repo, calls };
+  const checkRepo = new MysqlSignalCheckRepository(db as never);
+  return { repo, checkRepo, calls };
 }
 
 describe('recordFailure 停用阈值（BUG-I 回归）', () => {
@@ -80,5 +81,66 @@ describe('markChecked 失败计数条件清零（BUG-G 回归）', () => {
     });
     const update = h.calls.find((c) => c.sql.includes('last_value_hash = ?'));
     expect(update!.sql).not.toContain('LEAST(');
+  });
+
+  it('未传「上次变化」两列时 SQL 不写这两列（老调用方行为不变）', async () => {
+    const h = capture();
+    await h.repo.markChecked(1, {
+      lastValueHash: 'abc',
+      lastValueSnippet: 'OLD',
+      lastChangedAt: null,
+      consecutiveFailures: 0,
+    });
+    const update = h.calls.find((c) => c.sql.includes('last_value_hash = ?'))!;
+    expect(update.sql).not.toContain('last_change_old_snippet');
+    expect(update.sql).not.toContain('last_change_new_snippet');
+    expect(update.params).toHaveLength(6);
+  });
+
+  it('传了「上次变化」两列时按旧值、新值、id 追加参数', async () => {
+    const h = capture();
+    await h.repo.markChecked(1, {
+      lastValueHash: 'abc',
+      lastValueSnippet: 'NEW',
+      lastChangedAt: '2026-11-06 10:00:00',
+      consecutiveFailures: 0,
+      lastChangeOldSnippet: 'OLD',
+      lastChangeNewSnippet: 'NEW',
+    });
+    const update = h.calls.find((c) => c.sql.includes('last_value_hash = ?'))!;
+    expect(update.sql).toContain('last_change_old_snippet = ?');
+    expect(update.sql).toContain('last_change_new_snippet = ?');
+    expect(update.params.slice(-3)).toEqual(['OLD', 'NEW', 1]);
+  });
+});
+
+describe('watcher 更新与 check 取值回填（V202/V203）', () => {
+  it('update 把 lastChange* 映射到 snake_case 列', async () => {
+    const h = capture();
+    await h.repo.update(1, 7, {
+      lastChangeOldSnippet: 'prev-old',
+      lastChangeNewSnippet: 'prev-new',
+    });
+    const update = h.calls.find((c) => c.sql.includes('UPDATE signal_watcher SET'))!;
+    expect(update.sql).toContain('last_change_old_snippet = ?');
+    expect(update.sql).toContain('last_change_new_snippet = ?');
+    expect(update.params).toEqual(['prev-old', 'prev-new', 1, 7]);
+  });
+
+  it('updateValue 一次写入 hash、旧值片段、新值片段，并按列宽截断', async () => {
+    const h = capture();
+    await h.checkRepo.updateValue(9, {
+      valueHash: 'h',
+      oldValueSnippet: 'o'.repeat(1100),
+      newValueSnippet: 'n'.repeat(1100),
+    });
+    const update = h.calls.find((c) => c.sql.includes('UPDATE signal_watcher_check'))!;
+    expect(update.sql).toContain('value_hash = ?');
+    expect(update.sql).toContain('old_value_snippet = ?');
+    expect(update.sql).toContain('new_value_snippet = ?');
+    expect(update.params[0]).toBe('h');
+    expect(update.params[1]).toBe('o'.repeat(1024));
+    expect(update.params[2]).toBe('n'.repeat(1024));
+    expect(update.params[3]).toBe(9);
   });
 });

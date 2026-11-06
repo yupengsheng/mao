@@ -41,6 +41,14 @@ describe('BUG-C1 空串环境变量顶掉 ${VAR:default} 的默认值', () => {
     });
   });
 
+  it('SKILL_VIEWS_DIR= 空串时应回落到默认 skill-views', () => {
+    withEnv({ SKILL_VIEWS_DIR: '' }, () => {
+      const cfg = loadConfig();
+      expect(cfg.app.harness.skillViewsDir).not.toBe('');
+      expect(cfg.app.harness.skillViewsDir).toBe('./skill-views');
+    });
+  });
+
   it('WORKSPACE_ROOT= 空串时不应把 workspace-root 解析成空路径', () => {
     withEnv({ WORKSPACE_ROOT: '' }, () => {
       const cfg = loadConfig();

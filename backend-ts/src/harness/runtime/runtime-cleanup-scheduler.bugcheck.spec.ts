@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdirSync, symlinkSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, symlinkSync, rmSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { RuntimeCleanupScheduler } from './runtime-cleanup-scheduler.js';
@@ -55,5 +55,32 @@ describe('BUGCHECK runtime cleanup scheduler must survive entries that vanish mi
     }
 
     expect(error).toBeNull();
+  });
+});
+
+describe('runtime cleanup scheduler skill-view tmp', () => {
+  it('removes stale skill-view staging entries and keeps fresh ones', async () => {
+    const root = join(tmpdir(), `mao-runtime-cleanup-views-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const skillViewsDir = join(root, 'skill-views');
+    const userTmp = join(skillViewsDir, '.tmp', '7');
+    mkdirSync(join(root, 'runtime'), { recursive: true });
+    mkdirSync(join(userTmp, 'stale-stage'), { recursive: true });
+    mkdirSync(join(userTmp, 'fresh-stage'), { recursive: true });
+    const old = new Date(Date.now() - 2 * 3600_000);
+    utimesSync(join(userTmp, 'stale-stage'), old, old);
+
+    const scheduler = new RuntimeCleanupScheduler(join(root, 'runtime'), {
+      intervalMs: 60_000,
+      shellOutputMaxAgeDays: 7,
+      cleanupSkills: true,
+    }, undefined, skillViewsDir);
+
+    try {
+      await scheduler.runCleanup();
+      expect(existsSync(join(userTmp, 'stale-stage'))).toBe(false);
+      expect(existsSync(join(userTmp, 'fresh-stage'))).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

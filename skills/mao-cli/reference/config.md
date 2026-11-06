@@ -24,6 +24,7 @@
 | `/opt/mao-data/workspace` | Agent 工作区（`WORKSPACE_ROOT`） |
 | `/opt/mao-data/skills` | 平台技能（`SKILLS_DIR`） |
 | `/opt/mao-data/userskills` | 用户技能（`USER_SKILLS_DIR`） |
+| `/opt/mao-data/skill-views` | 系统技能的用户级只读视图（`SKILL_VIEWS_DIR`）；容器按用户挂载 `{root}/{userId}` |
 | `/opt/mao-data/uploads` | 上传与 APK OTA（`FILE_UPLOAD_DIR`） |
 | `/opt/mao-data/users` | CLOUD 用户 HOME（`MAO_USER_HOME_DIR`） |
 | `/opt/mao-data/runtime` | 运行时状态、蓝绿部署锁（`MAO_RUNTIME_DIR`） |
@@ -51,6 +52,7 @@
 | `EXECUTION_LEASE_ENABLED` | 否 | 任务域二期执行租约，默认 false。开启后普通执行先过单会话门禁并检查 `PENDING` 等待，终态结算校验 fencing token，崩溃恢复按过期租约接管；恢复后的等待只读，不自动回答或审批。建议先开启等待持久化并观察后再开本开关 |
 | `WORKSPACE_ROOT` | **是** | 工作区根 |
 | `SKILLS_DIR` / `USER_SKILLS_DIR` | **是** | 技能目录 |
+| `SKILL_VIEWS_DIR` | 否 | 系统技能用户级只读视图根，默认 `./skill-views`；生产建议 `/opt/mao-data/skill-views`。容器模式按用户只读挂载 `{root}/{userId}`，平台技能源不再进容器 |
 | `FILE_UPLOAD_DIR` | **是** | 本地上传目录 |
 | `MAO_RUNTIME_DIR` | 否 | 运行时目录 |
 | `MAO_USER_HOME_DIR` | 否 | CLOUD 用户 HOME |
@@ -180,7 +182,7 @@ web_search 工具支持 Tavily / TinyFish 双实现，在管理后台「系统�
 |------|------|------|
 | `MAO_CLEANUP_INTERVAL_MS` | 86400000（1 天） | 清理调度间隔 |
 | `MAO_CLEANUP_SHELL_MAX_AGE_DAYS` | 7 | 会话 runtime 下 `shellOutput/sh-*.out` 与 `webPages/*.md`（网页全文落盘）的保留天数 |
-| `MAO_CLEANUP_SKILLS` | true | 是否清理会话 runtime 下的 skills 链接目录（活跃会话跳过）。技能以符号链接指向源目录，清理只删链接，不影响源与已全局安装的 CLI |
+| `MAO_CLEANUP_SKILLS` | true | 是否清理会话 runtime 下的 skills 链接目录（活跃会话跳过）。技能以符号链接指向用户级视图 / 用户技能目录，清理只删链接，不影响源与已全局安装的 CLI |
 
 ### 密钥轮换注意
 

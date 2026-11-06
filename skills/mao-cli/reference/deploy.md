@@ -37,6 +37,7 @@
 ├── workspace/
 ├── skills/
 ├── userskills/
+├── skill-views/             # 系统技能的用户级只读视图
 ├── uploads/                  # releases/ 放 APK OTA
 ├── users/
 └── runtime/
@@ -45,7 +46,7 @@
 首次创建数据目录：
 
 ```bash
-mkdir -p /opt/mao-data/{workspace,skills,userskills,uploads,users,runtime}
+mkdir -p /opt/mao-data/{workspace,skills,userskills,skill-views,uploads,users,runtime}
 ```
 
 ## 一、服务器环境
@@ -120,6 +121,7 @@ MAO_RUNTIME_DIR=/opt/mao-data/runtime
 MAO_USER_HOME_DIR=/opt/mao-data/users
 SKILLS_DIR=/opt/mao-data/skills
 USER_SKILLS_DIR=/opt/mao-data/userskills
+SKILL_VIEWS_DIR=/opt/mao-data/skill-views
 EOF
 chmod 600 /opt/mao/backend-ts/.env
 ```
@@ -447,6 +449,7 @@ FROM message WHERE deleted = 0;
 - 用户级覆盖：管理后台「用户管理 → 编辑用户 → 运行时模式」（跟随全局 / 容器隔离 / 宿主机）。先对内部账号开启观察，再逐步放大。
 - 空闲回收只 `docker stop` 不删（数据在挂载卷，秒级恢复）；容器内有活跃 shell 会话 / 未消费后台任务 / attach 中终端时不回收。异常容器兜底清理：`scripts/container-gc.sh`（建议 cron 每 10 分钟）。
 - 切换（全局或单用户）到 docker 模式时，其宿主机上仍活着的旧 shell 会话会被终止，不做迁移。
+- 容器内固定注入 `LANG=C.UTF-8`（0.0.479 起），locale 敏感命令对中文等多字节内容的行为与宿主机对齐；env 随 `docker run` 固化，升级前已存在的容器需重建后生效。
 
 ### 运维排查
 

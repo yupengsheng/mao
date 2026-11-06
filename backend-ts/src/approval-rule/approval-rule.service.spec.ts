@@ -122,6 +122,14 @@ describe('ApprovalRuleService', () => {
     expect(await service.match({ userId: 9, sessionId: null, toolName: 'shell', argumentsJson: '{"command":"git push --force"}' })).toBeNull();
   });
 
+  it('matchScansFullCommandEvenWhenDangerousTokenIsAfter512Chars', async () => {
+    const cmd = `echo ${'a'.repeat(600)} ; rm -rf /tmp/x`;
+    repo.listEnabledForMatch.mockResolvedValue([
+      row({ ruleType: 'SHELL_PREFIX', ruleValue: 'echo' }),
+    ]);
+    expect(await service.match({ userId: 9, sessionId: null, toolName: 'shell', argumentsJson: JSON.stringify({ command: cmd }) })).toBeNull();
+  });
+
   it('matchMcpToolByFullName', async () => {
     repo.listEnabledForMatch.mockResolvedValue([
       row({ ruleType: 'MCP_TOOL', ruleValue: 'mcp__fs__read' }),

@@ -62,6 +62,12 @@
       <el-table-column label="上次变化" width="160">
         <template #default="{ row }">{{ formatDateTime(row.lastChangedAt) }}</template>
       </el-table-column>
+      <el-table-column label="上次变化内容" min-width="240" show-overflow-tooltip>
+        <template #default="{ row }">
+          <span v-if="row.lastChangeOldSnippet != null || row.lastChangeNewSnippet != null">{{ lastChangeText(row) }}</span>
+          <span v-else>-</span>
+        </template>
+      </el-table-column>
       <el-table-column label="创建时间" width="160">
         <template #default="{ row }">{{ formatDateTime(row.createdAt) }}</template>
       </el-table-column>
@@ -83,6 +89,7 @@ import { onActivated, onMounted, reactive, ref } from 'vue'
 import { Refresh } from '@element-plus/icons-vue'
 import { api } from '../../api'
 import type { SignalCompareMode, SignalTriggerMode, SignalWatcherStatus } from '@mao/contracts'
+import { formatSignalChangeValue } from '@mao/contracts'
 import { formatDateTime } from '../../utils/datetime'
 import ResponsivePagination from '../../components/ResponsivePagination.vue'
 
@@ -95,10 +102,16 @@ interface WatcherRow {
   method: string
   intervalMinutes: number
   compareMode: SignalCompareMode
+  /** JSON 字段模式的取值路径（列表「上次变化内容」带路径）。 */
+  jsonPath: string | null
   triggerMode: SignalTriggerMode
   status: SignalWatcherStatus
   lastCheckedAt: string | null
   lastChangedAt: string | null
+  lastValueSnippet: string | null
+  /** 上次变化的旧/新值（从未变化 / 已重置基线时为 null）。 */
+  lastChangeOldSnippet: string | null
+  lastChangeNewSnippet: string | null
   consecutiveFailures: number
   createdAt: string | null
 }
@@ -154,6 +167,16 @@ function triggerModeLabel(mode: SignalTriggerMode): string {
 
 function statusTagType(status: SignalWatcherStatus): 'success' | 'warning' | 'danger' | 'info' {
   return STATUS_TAGS[status] ?? 'info'
+}
+
+/** 列表行「上次变化内容」一句（与桌面同一口径）。 */
+function lastChangeText(row: WatcherRow): string {
+  return formatSignalChangeValue({
+    compareMode: row.compareMode,
+    oldText: row.lastChangeOldSnippet,
+    newText: row.lastChangeNewSnippet,
+    jsonPath: row.jsonPath
+  })
 }
 
 function buildParams(page: number, size: number): Record<string, unknown> {

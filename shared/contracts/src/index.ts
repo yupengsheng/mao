@@ -1,7 +1,8 @@
 // @mao/contracts — 前后端共享的类型契约入口
 //
 // 约定：
-// 1. 仅导出纯类型（interface / type / enum），禁止放入运行时逻辑（函数、类实例、常量值除外）。
+// 1. 以纯类型为主（interface / type / enum）；少量两端展示必须同口径的纯函数/常量
+//    （如 signal.ts 的值格式化）可导出，禁止放入有 IO 或框架依赖的运行时逻辑。
 // 2. 数据实体（数据库行）、Repository/Service 接口、前端 UI 视图模型均不在此列。
 // 3. 后端通过 `export type { X } from '@mao/contracts'` 从自身 types.ts re-export，保持原有 import 路径不变。
 // 4. 前端通过 `import type { X } from '@mao/contracts'` 消费，避免重复定义。
@@ -22,7 +23,8 @@ export type {
 } from './inbox';
 export type { QuickCommandItem, QuickCommandsVO } from './command';
 export type { LlmCallScene } from './usage';
-export type { SignalCompareMode, SignalWatcherStatus, SignalTriggerMode, SignalWatcherWarning } from './signal';
+export type { SignalCompareMode, SignalWatcherStatus, SignalTriggerMode, SignalWatcherWarning, SignalWhenChangeInput, SignalCheckDetailInput } from './signal';
+export { SIGNAL_SNIPPET_MAX_CHARS, truncateSignalSnippet, formatSignalChangeValue, formatSignalCheckDetail } from './signal';
 export type { MemoryScope, MemoryStatus, MemorySource } from './memory';
 export type { ApprovalRuleType, ApprovalRuleScope, ApprovalHint } from './approval-rule';
 export type { FeedbackReason, FeedbackSource, FeedbackStatus } from './feedback';

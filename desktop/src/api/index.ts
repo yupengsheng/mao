@@ -1038,6 +1038,11 @@ export interface SignalWatcherView {
   /** REUSE_SESSION 模式当前复用的会话 id（只读；指针由系统维护，不接受提交）。 */
   reuseSessionId: number | null
   lastValueHash: string | null
+  /** 上次判定内容片段（失败不覆盖它）。 */
+  lastValueSnippet: string | null
+  /** 上次那次变化的旧/新值（从未变化 / 已重置基线时为 null）。 */
+  lastChangeOldSnippet: string | null
+  lastChangeNewSnippet: string | null
   lastCheckedAt: string | null
   lastChangedAt: string | null
   consecutiveFailures: number
@@ -1049,6 +1054,9 @@ export interface SignalWatcherCheckView {
   checkedAt: string | null
   httpStatus: number | null
   valueHash: string | null
+  /** 本次判定所对照的上次值 / 本次值片段；失败行与上线前历史行为 null。 */
+  oldValueSnippet: string | null
+  newValueSnippet: string | null
   changed: number
   triggeredSessionId: number | null
   error: string | null
