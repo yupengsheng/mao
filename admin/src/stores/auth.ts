@@ -9,6 +9,7 @@ interface User {
   displayName: string
   email: string
   avatarUrl: string
+  authSource: string
   permissions?: string[]
   isAdmin?: boolean
 }

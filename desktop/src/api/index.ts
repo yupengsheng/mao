@@ -144,6 +144,17 @@ api.interceptors.response.use(
   }
 )
 
+export interface ChangeOwnPasswordPayload {
+  oldPassword: string
+  newPassword: string
+  confirmPassword: string
+}
+
+/** 自助改密：登录态即可（无需 user:write），服务端校验旧密码。 */
+export async function changeOwnPassword(payload: ChangeOwnPasswordPayload): Promise<void> {
+  await api.put('/users/me/password', payload)
+}
+
 export interface GitCredential {
   id: number
   domain: string

@@ -22,6 +22,7 @@ function help() {
   mao user create --username --password [--display-name] [--email] [--role-ids 1,2] [--status 1]
   mao user update --id [--display-name] [--email] [--role-ids] [--status]
   mao user reset-password --id --new-password --confirm-password
+  mao user change-password --old-password --new-password --confirm-password
   mao user set-status --id --status
   mao user assign-roles --id --role-ids 1,2
 `;
@@ -77,6 +78,17 @@ async function run(ctx, subcommand, _rest, flags) {
         status: getNumber(flags, 'status'),
       });
       const result = await put(ctx, `/users/${id}`, body);
+      emitResult(result, { raw: ctx.raw });
+      return;
+    }
+    case 'change-password': {
+      // 自助改密：改当前登录账号，服务端校验旧密码；无需 user:write
+      const body = {
+        oldPassword: requireFlag(flags, 'old-password', '当前密码'),
+        newPassword: requireFlag(flags, 'new-password', '新密码'),
+        confirmPassword: requireFlag(flags, 'confirm-password', '确认密码'),
+      };
+      const result = await put(ctx, '/users/me/password', body);
       emitResult(result, { raw: ctx.raw });
       return;
     }

@@ -2,7 +2,7 @@
 
 ## 用途
 
-管理后台用户：列表、详情、创建、更新、重置密码、启停、分配角色。
+管理后台用户：列表、详情、创建、更新、重置密码、自助改密、启停、分配角色。
 
 ## 命令选择
 
@@ -13,7 +13,8 @@
 | 新建用户 | `user create` |
 | 改资料/角色/状态 | `user update` |
 | 仅改状态 | `user set-status` |
-| 重置密码 | `user reset-password` |
+| 重置密码（管理员） | `user reset-password` |
+| 修改自己的密码 | `user change-password` |
 | 仅分配角色 | `user assign-roles` |
 
 ## 命令：user list
@@ -98,6 +99,22 @@ mao user update --id 3 --display-name 新名字 --status 1
 
 ```bash
 mao user reset-password --id 3 --new-password 'NewPass1' --confirm-password 'NewPass1'
+```
+
+## 命令：user change-password
+
+修改**当前登录账号**的密码，登录态即可，无需 `user:write`。服务端校验当前密码；第三方登录账号（无本地密码）会被拒绝，请前往对应平台修改。密码须 8–64 位，且同时包含字母和数字；新密码不能与当前密码相同。改密后当前登录保持有效，其他已登录设备也无需重新登录。
+
+| 参数 | 必填 | 类型 | 含义 | 后端字段 |
+|------|------|------|------|----------|
+| `--old-password` | 是 | 字符串 | 当前密码 | `oldPassword` |
+| `--new-password` | 是 | 字符串 | 新密码 | `newPassword` |
+| `--confirm-password` | 是 | 字符串 | 确认密码，须与新密码一致 | `confirmPassword` |
+
+`PUT /users/me/password`
+
+```bash
+mao user change-password --old-password 'OldPass1' --new-password 'NewPass2' --confirm-password 'NewPass2'
 ```
 
 ## 命令：user set-status

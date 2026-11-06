@@ -42,7 +42,7 @@
             </span>
             <template #dropdown>
               <el-dropdown-menu>
-                <el-dropdown-item v-if="canWrite" command="change-password">修改密码</el-dropdown-item>
+                <el-dropdown-item v-if="isLocalUser" command="change-password">修改密码</el-dropdown-item>
                 <el-dropdown-item command="logout" divided>退出登录</el-dropdown-item>
               </el-dropdown-menu>
             </template>
@@ -151,7 +151,7 @@ watch(changePasswordVisible, (visible, prev) => {
   if (!visible && prev) readinessRefreshKey.value += 1
 })
 
-const canWrite = computed(() => authStore.hasPermission('user:write'))
+const isLocalUser = computed(() => authStore.user?.authSource === 'LOCAL')
 
 async function handleCommand(command: string) {
   if (command === 'logout') {
