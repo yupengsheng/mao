@@ -1,7 +1,10 @@
 <template>
-  <div class="tool-call-card" :class="[`status-${toolCall.status}`]">
+  <div class="tool-call-card" :class="[`status-${toolCall.status}`, { standalone }]">
     <div class="tool-header" @click="toggleExpand">
       <div class="tool-info">
+        <!-- 工具类型图标：仅在单独渲染（无组头）时挂，充当组壳的一部分。组内每行都挂会与
+             组头图标重复（组头已表达「这一类工具」），故多调用组内不显示。 -->
+        <el-icon v-if="standalone" class="tool-icon" :size="14"><component :is="toolIcon" /></el-icon>
         <span class="tool-summary">{{ displaySummary }}</span>
       </div>
       <div class="tool-status">
@@ -31,15 +34,115 @@
     </div>
     <div v-if="isExpanded && hasExpandableBody" class="tool-body">
       <div v-if="formattedInput" class="tool-result">
-        <div class="result-label">输入</div>
-        <div class="code-block-wrapper">
-          <pre class="result-content"><code>{{ formattedInput }}</code></pre>
-          <button class="copy-btn" title="复制" @click="copyText(formattedInput)">
-            <el-icon :size="14"><CopyDocument /></el-icon>
-          </button>
-        </div>
+        <template v-if="richView">
+          <!-- 富视图骨架（edit_file / shell / read_file）：默认只渲染自然形态，原始输入/输出
+                JSON 收起在同一个开关后，避免转义噪音盖住命令、输出与文件内容本身 -->
+          <ToolCallDiffView v-if="editDiffView" :blocks="editDiffView.blocks" />
+          <template v-else-if="shellView">
+            <ToolShellView
+              :command="shellView.primary"
+              :label="shellView.primaryLabel"
+              :output="shellView.output"
+              :error="shellView.error"
+            />
+          </template>
+          <template v-else-if="fileView">
+            <div v-if="fileView.content" class="code-block-wrapper">
+              <div class="result-label">内容</div>
+              <ToolFileContent :content="fileView.content" :file-path="fileView.path" :start-line="fileView.startLine" />
+            </div>
+          </template>
+          <template v-else-if="writeView">
+            <!-- write_file：只展示写入的整篇内容（行号从 1 起）。文件路径与新建/覆盖
+                 不在正文里单独占一行——卡片头 summary 已由后端 summarizer 带上路径与行数，
+                 file_change.type 的差异体现在底栏行数差上（CREATED 无 +/-，MODIFIED 有）。 -->
+            <div v-if="writeView.content" class="code-block-wrapper">
+              <div class="result-label">写入内容</div>
+              <ToolFileContent :content="writeView.content" :file-path="writeView.path" />
+            </div>
+          </template>
+          <template v-else-if="globView">
+            <ToolGlobView
+              :pattern="globView.pattern"
+              :path="globView.path"
+              :search-root="globView.searchRoot"
+              :files="globView.files"
+              :truncated="globView.truncated"
+              :error="globView.error"
+              @open-file="handleOpenToolFile"
+            />
+          </template>
+          <template v-else-if="grepView">
+            <ToolGrepView
+              :pattern="grepView.pattern"
+              :glob="grepView.glob"
+              :path="grepView.path"
+              :ignore-case="grepView.ignoreCase"
+              :groups="grepView.groups"
+              :error="grepView.error"
+              @open-file="handleOpenToolFile"
+            />
+          </template>
+          <template v-else-if="webSearchView">
+            <ToolWebSearchView
+              :query="webSearchView.query"
+              :items="webSearchView.items"
+              :error="webSearchView.error"
+            />
+          </template>
+          <template v-else-if="webPageView">
+            <ToolWebPageView
+              :url="webPageView.url"
+              :title="webPageView.title"
+              :content="webPageView.content"
+              :truncated="webPageView.truncated"
+              :full-file="webPageView.fullFile"
+              :error="webPageView.error"
+              @open-file="handleOpenToolFile"
+            />
+          </template>
+          <div class="diff-footer-row">
+            <span v-if="richBadge" class="exit-badge" :class="richBadge.ok ? 'ok' : 'fail'">
+              {{ richBadge.text }}
+            </span>
+            <span v-if="richSummary" class="edit-summary">{{ richSummary }}</span>
+            <button class="expand-result-btn" @click="showRawIo = !showRawIo">
+              {{ showRawIo ? '收起原始输入输出' : '查看原始输入输出' }}
+            </button>
+          </div>
+          <template v-if="showRawIo">
+            <div class="result-label">输入</div>
+            <div class="code-block-wrapper">
+              <pre class="result-content"><code>{{ formattedInput }}</code></pre>
+              <button class="copy-btn" title="复制" @click="copyText(formattedInput)">
+                <el-icon :size="14"><CopyDocument /></el-icon>
+              </button>
+            </div>
+            <div class="result-label">输出</div>
+            <div v-if="displayResultText" class="code-block-wrapper">
+              <pre class="result-content"><code>{{ displayResultText }}</code></pre>
+              <button class="copy-btn" title="复制完整输出" @click="copyText(fullResultText)">
+                <el-icon :size="14"><CopyDocument /></el-icon>
+              </button>
+            </div>
+            <div v-if="isResultTruncated" class="result-expand-row">
+              <button class="expand-result-btn" @click="showFullResult = !showFullResult">
+                {{ showFullResult ? '收起完整输出' : '展开完整输出' }}
+              </button>
+            </div>
+          </template>
+        </template>
+        <template v-else>
+          <div class="result-label">输入</div>
+          <div class="code-block-wrapper">
+            <pre class="result-content"><code>{{ formattedInput }}</code></pre>
+            <button class="copy-btn" title="复制" @click="copyText(formattedInput)">
+              <el-icon :size="14"><CopyDocument /></el-icon>
+            </button>
+          </div>
+        </template>
       </div>
-      <div v-if="toolCall.result || imagePreviewUrl" class="tool-result">
+      <div v-if="(toolCall.result || imagePreviewUrl) && !richView" class="tool-result">
         <div class="result-label">输出</div>
         <el-image
           v-if="imagePreviewUrl"
@@ -73,18 +176,81 @@ import { ElMessage } from 'element-plus'
 import { Select, CloseBold, ArrowDown, CopyDocument } from '@element-plus/icons-vue'
 import type { ToolCall } from '../../composables/useChat'
 import { useSessionStore } from '../../stores/session'
+import { useCenterTabs } from '../../composables/useCenterTabs'
 import { copyText as copyToClipboard } from '../../utils/clipboard'
 import { getToolDisplayName, getToolInputPreview } from '../../utils/toolDisplay'
+import { getToolIcon } from '../../utils/toolIcons'
+import { buildEditDiff } from '../../utils/toolDiff'
+import ToolCallDiffView from './ToolCallDiffView.vue'
+import ToolFileContent from './ToolFileContent.vue'
+import ToolShellView from './ToolShellView.vue'
+import ToolGlobView from './ToolGlobView.vue'
+import ToolGrepView from './ToolGrepView.vue'
+import ToolWebSearchView from './ToolWebSearchView.vue'
+import ToolWebPageView from './ToolWebPageView.vue'
+
+/** 工具结果 JSON 的安全解析：非 JSON / 非对象返回 null，富视图据此回退原始展示。 */
+function parseResultNode(result?: string): Record<string, unknown> | null {
+  if (!result) return null
+  try {
+    const node = JSON.parse(result) as unknown
+    return node && typeof node === 'object' && !Array.isArray(node) ? node as Record<string, unknown> : null
+  } catch {
+    return null
+  }
+}
+
+function textOf(value: unknown): string {
+  return typeof value === 'string' ? value : ''
+}
+
+/**
+ * edit_file 结果摘要：成功时一行「替换 N 处 · +a -d」（行数取后端 file_change 口径，
+ * 缺失时回退 diff 片段自算）；失败时直显 error 文案；执行中/解析失败返回空串。
+ */
+function readEditSummary(result: string | undefined, diff: { added: number; deleted: number }): string {
+  const node = parseResultNode(result)
+  if (!node) return ''
+  if (node.success === true) {
+    const fc = (node.file_change ?? {}) as Record<string, unknown>
+    const added = Number(fc.lines_added ?? diff.added)
+    const deleted = Number(fc.lines_deleted ?? diff.deleted)
+    const parts: string[] = []
+    const replacements = Number(node.replacements)
+    if (Number.isFinite(replacements) && replacements > 0) parts.push(`替换 ${replacements} 处`)
+    parts.push(`+${added} -${deleted}`)
+    return parts.join(' · ')
+  }
+  return textOf(node.error)
+}
 
 const props = withDefaults(defineProps<{
   toolCall: ToolCall
   hideProcess?: boolean
+  /** 单独渲染（工具组内只有一个调用、没有组头）时，卡片头充当组壳：补齐点击热区与悬停反馈 */
+  standalone?: boolean
 }>(), {
-  hideProcess: false
+  hideProcess: false,
+  standalone: false,
 })
 
 const sessionStore = useSessionStore()
 const openSubagent = inject<(payload: { childSessionId: number; title?: string }) => void>('openSubagent', () => {})
+/** 工具卡片里的文件路径（glob/grep 结果、open_web_page 完整内容文件）点击后在中心区打开，
+ *  CLOUD/LOCAL 分支与 FileChangePanel.handleFileClick 同口径。 */
+const { openFileTab } = useCenterTabs(computed(() => sessionStore.activeSessionId))
+
+function handleOpenToolFile(path: string) {
+  if (!path) return
+  const session = sessionStore.activeSession
+  if (!session) return
+  const canOpen = session.executionMode === 'CLOUD'
+    ? !!sessionStore.activeSessionId
+    : !!session.workspace
+  if (!canOpen) return
+  const title = path.split(/[/\\]/).pop() || path
+  openFileTab(path, title, session.workspace || undefined)
+}
 
 const isExpanded = ref(props.toolCall.isExpanded ?? false)
 
@@ -165,6 +331,8 @@ const displaySummary = computed(() => {
 
 const inputPreview = computed(() => getToolInputPreview(props.toolCall.name, props.toolCall.input))
 
+const toolIcon = computed(() => getToolIcon(props.toolCall.name))
+
 const formattedInput = computed(() => {
   const input = props.toolCall.input
   if (!input) return ''
@@ -174,6 +342,254 @@ const formattedInput = computed(() => {
     return ''
   }
 })
+
+/**
+ * edit_file 的替换片段 diff：入参自带完整 old/new_string，无需等 file_change 事件，
+ * 实时流式与历史回放同源（后端落库前只剥 file_change_diff，不动入参）。
+ * 无变化或参数缺失时返回 null，卡片回退原始 JSON 展示。
+ */
+const editDiffView = computed(() => {
+  if (props.toolCall.name !== 'edit_file') return null
+  const input = props.toolCall.input
+  if (!input) return null
+  const oldStr = typeof input.old_string === 'string' ? input.old_string : ''
+  const newStr = typeof input.new_string === 'string' ? input.new_string : ''
+  if (oldStr === '' && newStr === '') return null
+  const diff = buildEditDiff(oldStr, newStr)
+  if (diff.blocks.length === 0) return null
+  return { ...diff, summary: readEditSummary(props.toolCall.result, diff) }
+})
+
+/**
+ * shell 富视图：命令（exec）/ stdin（write_stdin）+ 终端输出原文，渲染为终端会话块。
+ * 多动作工具：close/list 等无命令也无输出的动作拿不到可渲染内容，返回 null 走原始 JSON。
+ */
+const shellView = computed(() => {
+  if (props.toolCall.name !== 'shell') return null
+  const input = props.toolCall.input
+  if (!input) return null
+  const action = typeof input.action === 'string' ? input.action : 'exec'
+  const node = parseResultNode(props.toolCall.result)
+  const primary = action === 'exec'
+    ? textOf(input.command)
+    : action === 'write_stdin' ? textOf(input.input) : ''
+  const output = textOf(node?.output)
+  const error = textOf(node?.error)
+  // 命令尚未返回结果时也值得展示（执行中）；两者皆无才回退
+  if (!primary && !output && !error) return null
+  const exitRaw = node?.exit_code
+  const exitCode = typeof exitRaw === 'number' && Number.isFinite(exitRaw) ? exitRaw : null
+  const summaryParts: string[] = []
+  if (!error) {
+    if (node?.truncated === true) summaryParts.push('输出已截断')
+    const message = textOf(node?.message)
+    if (message) summaryParts.push(message)
+  }
+  return {
+    primary,
+    primaryLabel: action === 'write_stdin' ? 'stdin' : '命令',
+    output,
+    error,
+    badge: exitCode == null ? null : { text: `exit ${exitCode}`, ok: exitCode === 0 },
+    summary: summaryParts.join(' · '),
+  }
+})
+
+/**
+ * read_file 富视图：文件内容 + 行号槽（起始行号取 offset），底栏给总行数与读取范围。
+ * 图片读取（media_type=image）保持图片预览 + 原始输出，不进此分支。
+ */
+const fileView = computed(() => {
+  if (props.toolCall.name !== 'read_file') return null
+  if (imagePreviewUrl.value) return null
+  const input = props.toolCall.input
+  if (!input) return null
+  const node = parseResultNode(props.toolCall.result)
+  if (!node) return null
+  const error = textOf(node.error)
+  const content = textOf(node.content)
+  if (!error && !content) return null
+  const totalLines = typeof node.total_lines === 'number' && node.total_lines > 0 ? node.total_lines : null
+  const offset = typeof input.offset === 'number' && input.offset > 0 ? input.offset : 0
+  const contentLines = content === '' ? 0 : content.split('\n').length
+  const path = textOf(input.path) || textOf(input.file_path)
+  const summaryParts: string[] = []
+  if (error) summaryParts.push(error)
+  else {
+    if (totalLines != null) summaryParts.push(`共 ${totalLines} 行`)
+    if (contentLines > 0) summaryParts.push(`第 ${offset + 1}–${offset + contentLines} 行`)
+  }
+  return {
+    content: error ? '' : content,
+    path,
+    startLine: offset + 1,
+    summary: summaryParts.join(' · '),
+  }
+})
+
+/**
+ * write_file 富视图：写入的文件内容 + 行号 + 语法高亮。
+ * 与 read_file 同源，但内容来自入参 content（结果里只有行数/字节数，没有原文）。
+ * 不做 diff：旧内容在客户端拿不到——后端 file_change_diff 在 WS 推送与落库前都被
+ * stripPrivateDiff 剥掉，实时流式与历史回放同源地只有新内容；覆盖类改动的 diff 看
+ * FileChangePanel（快照由服务端另存，不走工具结果）。
+ * 路径与新建/覆盖不在正文单独占行：卡片头 summary 已由后端 summarizer 带上路径与行数，
+ * type 的差异体现在底栏行数差上（CREATED 无 +/-，MODIFIED 有）。
+ */
+const writeView = computed(() => {
+  if (props.toolCall.name !== 'write_file') return null
+  const input = props.toolCall.input
+  if (!input) return null
+  const content = typeof input.content === 'string' ? input.content : ''
+  const path = textOf(input.path) || textOf(input.file_path)
+  const node = parseResultNode(props.toolCall.result)
+  const error = textOf(node?.error)
+  if (!error && !content) return null
+  const fc = (node?.file_change ?? {}) as Record<string, unknown>
+  const totalLines = typeof fc.total_lines === 'number' && fc.total_lines > 0 ? fc.total_lines : null
+  const added = Number(fc.lines_added)
+  const deleted = Number(fc.lines_deleted)
+  const parts: string[] = []
+  if (error) parts.push(error)
+  else {
+    if (totalLines != null) parts.push(`共 ${totalLines} 行`)
+    if (Number.isFinite(added) && Number.isFinite(deleted) && (added > 0 || deleted > 0)) {
+      parts.push(`+${added} -${deleted}`)
+    }
+  }
+  return {
+    // 失败时与 read_file 同口径：不渲染内容块，只留 error（内容写失败了，展示它只会造成误导）
+    content: error ? '' : content,
+    path,
+    summary: parts.join(' · '),
+  }
+})
+
+/** glob_search 富视图：文件路径列表，路径相对搜索根目录，点击可在中心区打开。 */
+const globView = computed(() => {
+  if (props.toolCall.name !== 'glob_search') return null
+  const input = props.toolCall.input
+  if (!input) return null
+  const node = parseResultNode(props.toolCall.result)
+  if (!node) return null
+  const files = Array.isArray(node.files)
+    ? node.files.filter((f): f is string => typeof f === 'string')
+    : []
+  const error = textOf(node.error)
+  const parts: string[] = []
+  if (error) parts.push(error)
+  else {
+    parts.push(`${files.length} 个文件`)
+    if (node.truncated === true) parts.push('已截断')
+  }
+  return {
+    pattern: textOf(input.pattern),
+    path: textOf(input.path),
+    searchRoot: textOf(node.search_root),
+    files,
+    truncated: node.truncated === true,
+    error,
+    summary: parts.join(' · '),
+  }
+})
+
+/** grep_search 富视图：按文件分组的命中行（上下文行 contextual 淡显）。 */
+const grepView = computed(() => {
+  if (props.toolCall.name !== 'grep_search') return null
+  const input = props.toolCall.input
+  if (!input) return null
+  const node = parseResultNode(props.toolCall.result)
+  if (!node) return null
+  type Row = { line: number; content: string; contextual: boolean }
+  const groups: { file: string; rows: Row[] }[] = []
+  const byFile = new Map<string, { file: string; rows: Row[] }>()
+  let hitCount = 0
+  for (const raw of Array.isArray(node.matches) ? node.matches : []) {
+    if (!raw || typeof raw !== 'object') continue
+    const entry = raw as Record<string, unknown>
+    const file = textOf(entry.file)
+    const line = Number(entry.line)
+    if (!file || !Number.isFinite(line)) continue
+    const contextual = entry.contextual === true
+    let group = byFile.get(file)
+    if (!group) {
+      group = { file, rows: [] }
+      byFile.set(file, group)
+      groups.push(group)
+    }
+    group.rows.push({ line, content: textOf(entry.content), contextual })
+    if (!contextual) hitCount++
+  }
+  const total = typeof node.total_matches === 'number' ? node.total_matches : hitCount
+  const error = textOf(node.error)
+  const parts: string[] = []
+  if (error) parts.push(error)
+  else if (total > 0) {
+    parts.push(`${total} 处匹配 · ${groups.length} 个文件`)
+    if (node.truncated === true) parts.push('已截断')
+  }
+  return {
+    pattern: textOf(input.pattern),
+    glob: textOf(input.glob),
+    path: textOf(input.path),
+    ignoreCase: input.ignore_case === true || input.ignore_case === 'true',
+    groups,
+    error,
+    summary: parts.join(' · '),
+  }
+})
+
+/** web_search 富视图：标题 + host + 摘要 的结果列表。 */
+const webSearchView = computed(() => {
+  if (props.toolCall.name !== 'web_search') return null
+  const input = props.toolCall.input
+  if (!input) return null
+  const node = parseResultNode(props.toolCall.result)
+  if (!node) return null
+  const items = (Array.isArray(node.results) ? node.results : [])
+    .filter((r): r is Record<string, unknown> => !!r && typeof r === 'object' && !Array.isArray(r))
+    .map(r => ({ title: textOf(r.title), url: textOf(r.url), content: textOf(r.content) }))
+    .filter(item => item.url || item.title)
+  const error = textOf(node.error)
+  return {
+    query: textOf(input.query),
+    items,
+    error,
+    summary: error || `${items.length} 条结果`,
+  }
+})
+
+/** open_web_page 富视图：标题 + url + Markdown 正文（content 即 turndown 产物）。 */
+const webPageView = computed(() => {
+  if (props.toolCall.name !== 'open_web_page') return null
+  const input = props.toolCall.input
+  if (!input) return null
+  const node = parseResultNode(props.toolCall.result)
+  if (!node) return null
+  const content = textOf(node.content)
+  const length = typeof node.content_length === 'number' ? node.content_length : content.length
+  const error = textOf(node.error)
+  return {
+    url: textOf(input.url) || textOf(node.url),
+    title: textOf(node.title),
+    content,
+    truncated: node.truncated === true,
+    fullFile: textOf(node.full_content_file),
+    error,
+    summary: error || (length > 0 ? `正文 ${length.toLocaleString()} 字符` : ''),
+  }
+})
+
+const richView = computed(() =>
+  editDiffView.value ?? shellView.value ?? fileView.value
+  ?? writeView.value ?? globView.value ?? grepView.value ?? webSearchView.value ?? webPageView.value)
+const richSummary = computed(() =>
+  editDiffView.value?.summary ?? shellView.value?.summary ?? fileView.value?.summary
+  ?? writeView.value?.summary ?? globView.value?.summary ?? grepView.value?.summary
+  ?? webSearchView.value?.summary ?? webPageView.value?.summary ?? '')
+const richBadge = computed(() => shellView.value?.badge ?? null)
+
+const showRawIo = ref(false)
 
 const hasExpandableBody = computed(
   () => !!(formattedInput.value || props.toolCall.result || imagePreviewUrl.value)
@@ -241,6 +657,29 @@ function toggleExpand() {
   transition: border-color 0.2s;
 }
 
+/* 单独渲染（无组头）时卡片头即组壳：与 ToolCallGroup 的 .tool-group-header 同口径——
+   同样的内边距、圆角、悬停底色与字号（组头走 --aw-text-caption，卡片头原本硬编码 12px，
+   单调用时若保留 12px 就会比多调用组的组头小一号），让单调用和多调用组长得一样 */
+.tool-call-card.standalone {
+  margin-top: 2px;
+  padding: 0;
+}
+
+.tool-call-card.standalone .tool-header {
+  padding: 5px;
+  border-radius: var(--aw-radius-sm);
+  transition: background 0.15s;
+}
+
+.tool-call-card.standalone .tool-header:hover {
+  background: var(--aw-canvas-parchment);
+}
+
+/* 多调用组内仍是「组头 14px > 明细行 12px」的层级，只有充当组壳时才跟组头同字号 */
+.tool-call-card.standalone .tool-summary {
+  font-size: var(--aw-text-caption);
+}
+
 .tool-call-card.status-running {
   border-color: var(--aw-primary);
 }
@@ -275,6 +714,12 @@ function toggleExpand() {
   text-overflow: ellipsis;
   white-space: nowrap;
   letter-spacing: -0.12px;
+}
+
+.tool-icon {
+  color: var(--aw-ink-muted-48);
+  flex-shrink: 0;
+  display: inline-flex;
 }
 
 .tool-status {
@@ -418,6 +863,44 @@ function toggleExpand() {
 
 .result-expand-row {
   margin-top: 2px;
+}
+
+/* edit_file diff 视图底栏：左为结果摘要/失败原因，右为原始输入输出开关 */
+.diff-footer-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.exit-badge {
+  flex-shrink: 0;
+  font-family: var(--aw-font-mono);
+  font-size: var(--aw-text-fine);
+  line-height: 1;
+  padding: 3px 6px;
+  border-radius: var(--aw-radius-xs);
+  cursor: default;
+  white-space: nowrap;
+}
+
+.exit-badge.ok {
+  color: var(--aw-success);
+  background: color-mix(in srgb, var(--aw-success) 12%, transparent);
+}
+
+.exit-badge.fail {
+  color: var(--aw-danger);
+  background: color-mix(in srgb, var(--aw-danger) 12%, transparent);
+}
+
+.edit-summary {
+  font-family: var(--aw-font-mono);
+  font-size: var(--aw-text-fine);
+  color: var(--aw-ink-muted-48);
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 .expand-result-btn {
