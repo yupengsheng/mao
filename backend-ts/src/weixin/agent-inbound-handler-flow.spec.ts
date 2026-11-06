@@ -98,6 +98,48 @@ describe('AgentWeixinInboundHandler cancel replace', () => {
     handler.shutdown();
   });
 
+  it('relays the platform queue after releasing the execution flag', async () => {
+    let inbound!: AgentWeixinInboundHandler;
+    const onQueuesDrained = vi.fn(() => {
+      expect(inbound.hasRunningSession(100)).toBe(false);
+    });
+    inbound = new AgentWeixinInboundHandler({
+      weixinSessionService: { getOrCreateWeixinSession: vi.fn(async () => ({ id: 100, userId: 1 })) },
+      harnessService: { prepareMessage: vi.fn(async () => 'exec-1'), execute: vi.fn(async () => undefined) },
+      sessionService: {
+        saveMessage: vi.fn(async () => ({ id: 10, content: 'msg' })),
+        updatePhase: vi.fn(),
+        getMessages: vi.fn(async () => [{ role: 'ASSISTANT', content: 'wx-reply' }]),
+        cleanupIncompleteTail: vi.fn(async () => 0),
+        updateContextTokens: vi.fn(),
+        deleteMessageById: vi.fn(),
+        getSession: vi.fn(async () => ({ phase: 'IDLE' })),
+      },
+      accountRepository: { findByAccountId: vi.fn(async () => ({ userId: 1 })) },
+      agentLoop: {
+        getCancelFlag: vi.fn(() => undefined),
+        requestCancel: vi.fn(),
+        registerCancelFlag: vi.fn(() => new AtomicBoolean(false)),
+        removeCancelFlag: vi.fn(),
+      },
+      shellSessionManager: { closeByConversation: vi.fn() },
+      registry: { send: vi.fn() },
+      taskTerminalService: { finishExecution: vi.fn() },
+      activityService: { record: vi.fn(async () => ({ id: 1 })) },
+      activityHeartbeat: { touch: vi.fn() },
+      sessionTodoMapper: { deleteBySessionId: vi.fn(), selectBySessionId: vi.fn(async () => []) },
+      modelService: { getModel: vi.fn(async () => ({ supportsVision: 0 })) },
+      weixinFileStorageService: { saveFile: vi.fn() },
+      onQueuesDrained,
+    } as unknown as AgentWeixinInboundHandlerDeps);
+
+    const reply = await inbound.onMessage({ accountId: 'acc-1', body: 'msg-1' } as WeixinInboundMessageContext);
+
+    expect(reply?.text).toBe('wx-reply');
+    await vi.waitFor(() => expect(onQueuesDrained).toHaveBeenCalledWith(100));
+    inbound.shutdown();
+  });
+
   it('waits for a desktop loop to release before starting', async () => {
     const desktopFlag = new AtomicBoolean(false);
     let current: AtomicBoolean | undefined = desktopFlag;

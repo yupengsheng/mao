@@ -24,7 +24,7 @@ import { createFeishuRecoveryProgressHelper } from './feishu-cards.js';
 import { createFeishuUserIdHelper } from './feishu-session.js';
 import { FeishuInboundQueueRepository } from './feishu/inbound-queue.repository.js';
 import { FeishuTaskQueueService } from './feishu/inbound-queue.service.js';
-import { createQueuePositionHelper } from './app-utils.js';
+import { createPlatformQueueRelay, createQueuePositionHelper } from './app-utils.js';
 import { createPersistCancelledHelper } from './app-utils.js';
 import { AgentFeishuInboundHandler } from './feishu/agent-inbound-handler.js';
 import { channelAssistantReply } from './session/util/citation-markers.js';
@@ -123,6 +123,7 @@ export function assembleFeishuHandler(deps: FeishuHandlerDeps): FeishuHandlerRes
   const feishuTaskQueue = new FeishuTaskQueueService(feishuInboundQueueRepo);
   const queuePositionOf = createQueuePositionHelper({ feishuInboundQueueRepo });
   const persistCancelledIfActive = createPersistCancelledHelper({ sessionService: d.sessionService, taskTerminal: d.taskTerminal, feishuProgressCardRepo });
+  const relayPlatformQueues = createPlatformQueueRelay({ sessionService: d.sessionService, wsHandler: d.wsHandler });
   const feishuInboundHandler = new AgentFeishuInboundHandler({
     registry: d.wsRegistry,
     resolveStreamUserId: async (sessionId: number) => {
@@ -337,6 +338,8 @@ export function assembleFeishuHandler(deps: FeishuHandlerDeps): FeishuHandlerRes
         console.warn(`清理飞书进度卡片映射失败, sessionId=${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
       }
     },
+    isSessionExecuting: (sessionId: number) => d.wsHandler?.hasExecutionClaim(sessionId) === true,
+    onQueuesDrained: relayPlatformQueues,
   });
   d.scheduledService.setFeishuResultPusher(async (sessionId: number, text: string) => {
     const channel = await feishuMessageService.findSessionChannel(sessionId);
@@ -536,6 +539,8 @@ export function assembleFeishuHandler(deps: FeishuHandlerDeps): FeishuHandlerRes
     activityHeartbeat: d.activityHeartbeat,
     todoMapper: d.todoMapper,
     shellManager: d.shellManager,
+    isSessionExecuting: (sessionId: number) => d.wsHandler?.hasExecutionClaim(sessionId) === true,
+    onQueuesDrained: relayPlatformQueues,
   });
   d.dingtalkMediaHolder.current = dingtalk.mediaSend;
   const feishuMonitor = new FeishuMonitorService(cfg.feishu.bot, d.feishuBots, feishuInboundProcessor, async (data: any) => feishuCardActionService.handle(data, ''));

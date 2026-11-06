@@ -127,4 +127,33 @@ describe('AgentDingtalkInboundHandler sessions', () => {
     expect(parts[0].type).toBe('text');
     expect(parts[0].text).toBe('图片已保存到会话工作区：chat-files/2026-10-13/dingtalk-image-msg_1.jpg');
   });
+
+  it('relays the platform queue after the dingtalk queue is empty and idle', async () => {
+    const onQueuesDrained = vi.fn();
+    const claimNext = vi.fn(async () => null);
+    const { handler: inbound } = handler({
+      queueService: { claimNext, complete: vi.fn(async () => undefined), hasPending: vi.fn(async () => false) } as never,
+      onQueuesDrained,
+    });
+
+    await inbound.drainNextIfPending(20);
+
+    await vi.waitFor(() => expect(onQueuesDrained).toHaveBeenCalledWith(20));
+    expect(claimNext).toHaveBeenCalledWith(20);
+  });
+
+  it('does not claim or relay queues while the WS side holds the session', async () => {
+    const onQueuesDrained = vi.fn();
+    const claimNext = vi.fn(async () => null);
+    const { handler: inbound } = handler({
+      queueService: { claimNext, complete: vi.fn(async () => undefined), hasPending: vi.fn(async () => false) } as never,
+      isSessionExecuting: () => true,
+      onQueuesDrained,
+    });
+
+    await inbound.drainNextIfPending(20);
+
+    expect(claimNext).not.toHaveBeenCalled();
+    expect(onQueuesDrained).not.toHaveBeenCalled();
+  });
 });

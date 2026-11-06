@@ -194,7 +194,7 @@ import {
   downloadFeishuMediaBuffer,
   dataUriOf,
 } from './feishu-media.js';
-import { expandHome, parseSqlTimeMs, resolveShareDir, runtimeSessionCleanup } from './app-utils.js';
+import { createPlatformQueueRelay, expandHome, parseSqlTimeMs, resolveShareDir, runtimeSessionCleanup } from './app-utils.js';
 import { registerAllRoutes } from './app-routes.js';
 import { registerAppHooks } from './app-hooks.js';
 import { assembleContainerRuntime } from './app-container-runtime.js';
@@ -957,9 +957,24 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     ecpAuth, ecpSessionRepo, feishu, pendingBindingMessages, sessionTitleService,
     permissionService, routeChatClient, feishuActiveProgress, feishuAskFormStore,
     dingtalkMediaHolder, mcpServerLookup, activityService, activityHeartbeat, todoMapper,
-    jwt,
+    jwt, wsHandler,
   });
   const { feishuInboundHandler, feishuInboundProcessor, feishuCardActionService, feishuMonitor, dingtalk, feishuTaskQueue, feishuProgressCardRepo, createFeishuRecoveryProgress, analyticsService, statisticsService, adminAnalytics, httpToolStatsStore, mcpValidator } = feishuHandler;
+
+  // 平台队列 ↔ IM 入站队列互相接力：任一侧排空且会话空闲后，推进另一侧的排队消息，
+  // 避免「定时任务在会话忙时入队、之后只有 IM 通道执行」导致永久 QUEUED。
+  const platformQueueRelay = createPlatformQueueRelay({ sessionService, wsHandler });
+  weixinInboundHandler.setOnQueuesDrained(platformQueueRelay);
+  weixinInboundHandler.setIsSessionExecuting((sessionId) => wsHandler.hasExecutionClaim(sessionId));
+  wsHandler.registerExternalBusyCheck((sessionId) => feishuInboundHandler.hasRunningSession(sessionId));
+  wsHandler.registerExternalBusyCheck((sessionId) => dingtalk.hasRunningSession(sessionId));
+  wsHandler.registerExternalBusyCheck((sessionId) => weixinInboundHandler.hasRunningSession(sessionId));
+  wsHandler.registerImQueueDrainHandler((sessionId) => {
+    void feishuInboundHandler.drainNextIfPending(sessionId);
+  });
+  wsHandler.registerImQueueDrainHandler((sessionId) => {
+    void dingtalk.drainNextIfPending(sessionId);
+  });
 
   await registerAllRoutes({
     app, db, cfg, apiPrefix, jwt, agentRuntimeCfg,

@@ -767,6 +767,46 @@ describe('AgentFeishuInboundHandler', () => {
     expect(queueService.claimNext).toHaveBeenCalledTimes(1); // 当前未配置队列行，claim 返回 null（已断言）→ 不再执行
   });
 
+  it('relays platform queue when the feishu queue is empty and the session is idle', async () => {
+    const onQueuesDrained = vi.fn();
+    const queueService = makeQueueService();
+    const handler = new AgentFeishuInboundHandler({
+      sessionService: makeSessionService(),
+      harnessService: { prepareMessage: vi.fn(() => 'e'), execute: vi.fn(async () => undefined) } as never,
+      createCancelFlag: makeFlag,
+      releaseCancelFlag: vi.fn(),
+      listenerFactory: async () => listener,
+      queueService,
+      onQueuesDrained,
+    });
+
+    await handler.drainNextIfPending(7);
+
+    await vi.waitFor(() => expect(onQueuesDrained).toHaveBeenCalledWith(7));
+    expect(queueService.claimNext).toHaveBeenCalledWith(7);
+  });
+
+  it('does not claim or relay queues while the WS side holds the session', async () => {
+    const onQueuesDrained = vi.fn();
+    const queueService = makeQueueService();
+    const handler = new AgentFeishuInboundHandler({
+      sessionService: makeSessionService(),
+      harnessService: { prepareMessage: vi.fn(() => 'e'), execute: vi.fn(async () => undefined) } as never,
+      createCancelFlag: makeFlag,
+      releaseCancelFlag: vi.fn(),
+      listenerFactory: async () => listener,
+      queueService,
+      isSessionExecuting: () => true,
+      onQueuesDrained,
+    });
+
+    await handler.drainNextIfPending(7);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(queueService.claimNext).not.toHaveBeenCalled();
+    expect(onQueuesDrained).not.toHaveBeenCalled();
+  });
+
   it('saves message with image content parts when media downloaded', async () => {
     const sessionService = makeSessionService();
     const harness = { prepareMessage: vi.fn(() => 'e'), execute: vi.fn(async () => undefined) };

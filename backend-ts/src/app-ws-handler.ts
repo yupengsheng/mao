@@ -159,7 +159,7 @@ export function assembleWsHandler(deps: WsHandlerDeps): StreamingWsHandler {
   } as never);
 
   scheduledService.setLiveExecution(createScheduledLiveExecution(wsHandler));
-  scheduledService.setSessionBusyCheck((sessionId) => wsHandler.hasExecutionClaim(sessionId));
+  scheduledService.setSessionBusyCheck((sessionId) => wsHandler.hasCrossChannelBusy(sessionId));
   scheduledService.setBudgetCheck(async (target) => {
     const block = await budgetService.checkAdmission(target);
     return block == null ? null : { message: budgetBlockMessage(block) };

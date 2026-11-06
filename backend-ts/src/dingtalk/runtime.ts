@@ -65,6 +65,10 @@ export interface DingtalkRuntime {
   shutdown(): void;
   /** 关机时 best-effort 冲刷在途合并窗口（只保证触发启动，执行由停机收尾等待/标记）。 */
   flushInbound(): Promise<void>;
+  /** 入站队列有 pending 时立即排空（WS 平台队列排空后的接力入口）。 */
+  drainNextIfPending(sessionId: number): Promise<void>;
+  /** 钉钉侧是否正在执行（供 WS 跨通道忙检查；同步、无副作用）。 */
+  hasRunningSession(sessionId: number): boolean;
   mediaSend: DingtalkMediaSendSupport;
   recoverProgress(sessionId: number): Promise<{ progress: FeishuCardProgress; roundOffset: number } | null>;
   onCrashFinished(sessionId: number, phase: string): Promise<void>;
@@ -111,6 +115,10 @@ export function createDingtalkRuntime(deps: {
   activityHeartbeat: unknown;
   todoMapper: unknown;
   shellManager: { closeByConversation(sessionId: number): void };
+  /** 跨通道忙判定：WS/桌面端正在执行本会话时让行。 */
+  isSessionExecuting?: (sessionId: number) => boolean;
+  /** 入站队列排空且会话空闲时，接力消费平台排队消息。 */
+  onQueuesDrained?: (sessionId: number) => void;
   fetchImpl?: typeof fetch;
 }): DingtalkRuntime {
   const fetchImpl = deps.fetchImpl ?? fetch;
@@ -376,6 +384,8 @@ export function createDingtalkRuntime(deps: {
       });
       await updateCard(fetchImpl, await tokens.getAccessToken(cred.bot.clientId, cred.secret), row.outTrackId, params);
     },
+    isSessionExecuting: deps.isSessionExecuting,
+    onQueuesDrained: deps.onQueuesDrained,
   });
 
   handlerBox.current = handler;
@@ -472,6 +482,8 @@ export function createDingtalkRuntime(deps: {
 
   return {
     mediaSend,
+    drainNextIfPending: (sessionId) => handler.drainNextIfPending(sessionId),
+    hasRunningSession: (sessionId) => handler.hasRunningSession(sessionId),
     registerRoutes(app) {
       registerDingtalkBotRoutes(app, {
         repository: bots,
