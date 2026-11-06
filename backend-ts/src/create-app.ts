@@ -178,6 +178,7 @@ import { FixedWindowRateLimiter } from './openapi/rate-limiter.js';
 import { OpenRunService, type OpenRunDeps } from './openapi/open-run.service.js';
 import { WebhookTriggerService, type WebhookTriggerDeps } from './openapi/webhook-trigger.service.js';
 import { OutboundSubscriptionService } from './openapi/outbound-subscription.service.js';
+import { GenericHttpWebhookSender } from './openapi/generic-webhook-sender.js';
 import { OPEN_HOOKS_PATH_PREFIX, registerOpenApiRoutes, type RawBodyRequest } from './openapi/open.routes.js';
 import { OpenApiCallLogService } from './openapi/open-api-call-log.service.js';
 import { MysqlHttpToolRepository } from './http-tool/http-tool.repository.js';
@@ -714,10 +715,13 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
   // 可选回调接入同一收口（ask_user 派发点在工具层直调 recordQuestionPending）
   const outboundSubscriptionRepo = new MysqlOutboundSubscriptionRepository(db);
   const outboundDeliveryRepo = new MysqlOutboundDeliveryRepository(db);
+  // 测试投递与调度器共用同一发送器实例（装配层只建一次）
+  const genericWebhookSender = new GenericHttpWebhookSender();
   const outboundSubscriptionService = new OutboundSubscriptionService({
     subscriptionRepo: outboundSubscriptionRepo,
     deliveryRepo: outboundDeliveryRepo,
     cipher: notifCipher,
+    sender: genericWebhookSender,
   });
   const inboxRepo = new InboxRepository(db);
   const inboxService = new InboxService(
@@ -1001,7 +1005,7 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
   const { closeApp } = assembleLifecycle({
     app, db, cfg, ctx,
     scheduledStore, scheduledService, settingService, notifCipher, senderRegistry,
-    sessionService, outboundDeliveryRepo, outboundSubscriptionRepo, auditService,
+    sessionService, outboundDeliveryRepo, outboundSubscriptionRepo, genericWebhookSender, auditService,
     agentExecutor, inboxCleanupStore, callLogService, callLogCleanup, callLogRepair,
     ecpSessionRepo, weixinMonitor, feishuMonitor, dingtalk, pendingBindingMessages,
     shellManager, terminalManager, wsHandler, subagentMapper, sessionMap, sessionSvc,

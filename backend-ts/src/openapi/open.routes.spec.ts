@@ -11,6 +11,9 @@ interface HarnessOptions {
   scopes?: string[];
   rateAllowed?: boolean;
   callLog?: boolean;
+  subscriptionService?: unknown;
+  /** true 时模拟 JWT 会话身份（管理接口用）；默认 API Token 身份。 */
+  jwtSession?: boolean;
 }
 
 async function makeHarness(options: HarnessOptions = {}) {
@@ -19,7 +22,7 @@ async function makeHarness(options: HarnessOptions = {}) {
   app.addHook('preHandler', async (request) => {
     const req = request as ApiTokenAuthedRequest;
     req.userId = 7;
-    req.apiTokenScopes = options.scopes ?? ['open:run'];
+    if (!options.jwtSession) req.apiTokenScopes = options.scopes ?? ['open:run'];
     req.apiTokenId = 3;
   });
 
@@ -43,7 +46,7 @@ async function makeHarness(options: HarnessOptions = {}) {
     openRun: { run: openRunRun } as never,
     apiTokenService: {} as never,
     triggerService: {} as never,
-    subscriptionService: {} as never,
+    subscriptionService: (options.subscriptionService ?? {}) as never,
     rateLimiter: { allow: rateAllow } as never,
     callLog: options.callLog === false
       ? null
@@ -244,6 +247,34 @@ describe('开放 API run 幂等路由', () => {
       expect(res.statusCode).toBe(503);
       expect(res.json()).toMatchObject({ code: 3055, message: '准入检查暂不可用，请稍后重试' });
       expect(h.markRejected).toHaveBeenCalledWith(9, 100, expect.objectContaining({ code: 3055 }));
+    } finally {
+      await h.app.close();
+    }
+  });
+});
+
+describe('开放 API 出站订阅测试投递', () => {
+  it('POST /v1/open/subscriptions/:id/test 透传用户与订阅 id，返回同步结果', async () => {
+    const sendTest = vi.fn(async () => ({ success: true, httpStatus: 200, error: null, durationMs: 12 }));
+    const h = await makeHarness({ subscriptionService: { sendTest }, jwtSession: true });
+    try {
+      const res = await h.app.inject({ method: 'POST', url: '/v1/open/subscriptions/9/test' });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toMatchObject({ code: 0, data: { success: true, httpStatus: 200, durationMs: 12 } });
+      expect(sendTest).toHaveBeenCalledWith(7, 9);
+    } finally {
+      await h.app.close();
+    }
+  });
+
+  it('订阅不存在等业务异常按 envelope 透传', async () => {
+    const sendTest = vi.fn(async () => {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '订阅不存在');
+    });
+    const h = await makeHarness({ subscriptionService: { sendTest }, jwtSession: true });
+    try {
+      const res = await h.app.inject({ method: 'POST', url: '/v1/open/subscriptions/999/test' });
+      expect(res.json()).toMatchObject({ code: 2001, message: '订阅不存在' });
     } finally {
       await h.app.close();
     }

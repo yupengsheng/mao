@@ -11,7 +11,6 @@ import { userMessagePreviewOf } from './notification/task/user-message-preview.j
 import { createSessionDetailUrlResolver } from './feishu/progress-card.js';
 import { OutboundDeliveryScheduler } from './openapi/outbound-delivery.scheduler.js';
 import { OutboundDeliveryCleanup } from './openapi/outbound-delivery.cleanup.js';
-import { GenericHttpWebhookSender } from './openapi/generic-webhook-sender.js';
 import { InboxCleanupScheduler } from './inbox/inbox.cleanup.js';
 import { ScheduledTaskRunCleanupScheduler } from './schedule/run-cleanup.js';
 import { EcpRenewScheduler } from './auth/ecp-renew.scheduler.js';
@@ -106,7 +105,7 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
     deliveryRepo: d.outboundDeliveryRepo,
     subscriptionRepo: d.outboundSubscriptionRepo,
     cipher: d.notifCipher,
-    sender: new GenericHttpWebhookSender(),
+    sender: d.genericWebhookSender,
     auditRecorder: {
       recordDeliveryFailed: async (input: any) => {
         let userId: number | null = null;

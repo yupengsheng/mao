@@ -29,6 +29,7 @@ const HELP = `用法:
   mao open subscription list
   mao open subscription create --event <task.completed|task.failed|question.pending> --target-url <https-url>  # secret 只显示一次
   mao open subscription set-enabled --id <id> --enabled true|false
+  mao open subscription test --id <订阅id>                       # 用真实 Secret 同步发送 test:true 示例事件
   mao open subscription deliveries --id <订阅id>
   mao open subscription delete --id <id>
   mao open run --agent-id <id> --message <文本> [--session-id <id>] [--idempotency-key <键>] --api-token <mao_...>
@@ -201,6 +202,11 @@ async function subscriptionGroup(ctx) {
     case 'deliveries': {
       const id = requireNumber(flags, 'id', '订阅 ID');
       outputResult(await request({ ...common, method: 'GET', path: `/open/subscriptions/${id}/deliveries` }), globals);
+      return;
+    }
+    case 'test': {
+      const id = requireNumber(flags, 'id', '订阅 ID');
+      outputResult(await request({ ...common, method: 'POST', path: `/open/subscriptions/${id}/test` }), globals);
       return;
     }
     case 'delete': {

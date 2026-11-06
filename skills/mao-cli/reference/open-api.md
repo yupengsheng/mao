@@ -17,7 +17,7 @@
 - **API Token**：`mao_` 前缀 + 48 位随机字符，sha256 落库；明文另以 AES-GCM 密文加密留存（密钥 `APP_OPENAPI_TOKEN_SECRET`，未配置回退内置默认密钥），属主可随时用 `open token reveal` 或桌面端「复制 Token」再次获取，不再限于创建时一次。2026-10-10 之前签发、未留密文的旧 Token 无法再取回明文，需吊销重签。scope 首期仅 `open:run`，只能在 `/v1/open/**` 端点使用（调用其它 REST 接口一律 401）。每人最多 20 个未吊销 Token，默认 90 天过期，吊销即时生效。轮换加密密钥后旧 Token 不能再复制明文（sha256 鉴权不受影响）。
 - **Webhook 触发器**：`pathToken` 决定公开 URL，`secret` 用于 HMAC-SHA256 签名（创建 / 轮换时只展示一次）。时间戳容忍 ±300 秒，签名基于原始请求体原文。不存在 / 已停用 / 验签失败统一返回 404 + `{code:3040,message:"not found"}`，不探测资源是否存在。连续 5 次执行失败自动停用，并在收件箱推送「触发器停用」。绑定的会话被删除后，触发器自动回退为每次触发新建会话；绑定的会话若是边路任务并被提升为主会话，触发器改绑新主会话，继续推进同一任务；若历史残留仍指向已删除会话，首次触发会自动解绑并按新会话重试一次。并发改绑到其他会话时不会把旧请求投到新绑定。
 - **run 端点**：恒返回 202 异步语义（`sessionId` / `messageId` / `queued`）；目标会话忙时消息自动进入待发送队列（`queued=true`）。可选 `Idempotency-Key` 请求头按 Token 隔离重试，重复请求不再启动执行。指定 `sessionId` 时，会话必须属于路径上的同一个 Agent，不一致返回参数错误，不会改用会话里的另一个 Agent 执行。触发器绑定会话同样要求与触发器的 Agent 一致。限流：每 Token 60 次/分钟，超限 429 + `Retry-After`。
-- **出站订阅**：目标 URL 必须 HTTPS（禁止 userinfo 与 hash 片段）；请求带 `X-Mao-Event` / `X-Mao-Timestamp` / `X-Mao-Signature`；失败按 1 / 5 / 25 分钟退避重试，3 次后置 FAILED 保留记录，不无限重投。`GET /v1/open/subscriptions/:id/deliveries` 可查最近投递。投递记录保留 90 天，`SUCCEEDED` / `FAILED` 历史每小时自动清理；`PENDING` / `SENDING` 不受影响，因此可查范围只包含保留期内的终态记录。
+- **出站订阅**：目标 URL 必须 HTTPS（禁止 userinfo 与 hash 片段）；请求带 `X-Mao-Event` / `X-Mao-Timestamp` / `X-Mao-Signature`；失败按 1 / 5 / 25 分钟退避重试，3 次后置 FAILED 保留记录，不无限重投。`POST /v1/open/subscriptions/:id/test` 用真实 secret 同步发送一条 `test: true` 示例事件，返回 HTTP 状态、错误与耗时，不写投递历史、不触发重试，停用订阅也可测试。`GET /v1/open/subscriptions/:id/deliveries` 可查最近投递。投递记录保留 90 天，`SUCCEEDED` / `FAILED` 历史每小时自动清理；`PENDING` / `SENDING` 不受影响，因此可查范围只包含保留期内的终态记录。
 
 ## 明确不包含
 
@@ -33,6 +33,7 @@
 | 建 / 改 / 删 / 启停触发器 | `open trigger create` / `update` / `delete` / `update --enabled` |
 | 轮换触发器密钥 | `open trigger rotate-secret` |
 | 配 / 启停 / 删出站订阅 | `open subscription create` / `set-enabled` / `delete` |
+| 测试订阅连通与签名 | `open subscription test` |
 | 查看投递记录 | `open subscription deliveries` |
 | 以 API Token 触发运行 | `open run` |
 | 查看入站调用流水 | `open calls list` / `open calls get` |
@@ -155,6 +156,26 @@ mao open subscription create --event task.failed --target-url https://ops.exampl
 回调请求头：`X-Mao-Event`、`X-Mao-Timestamp`、`X-Mao-Signature`（对实际发送字节签名，算法同触发器）。2xx 视为成功；429 与 5xx 会重试。
 
 `digest.daily`（每日运营摘要）payload 为 `{ event, coveredDate, digest, text, sentAt }`：`digest` 是六板块结构化数据（tasks / scheduled / watchers / approvals / cost / openApi，空板块为 null），`text` 是 Markdown 全文，任选其一渲染。
+
+## 命令：mao open subscription test
+
+### 用途
+
+用订阅保存的真实 secret 同步发送一条带 `test: true` 的示例事件，验证目标地址连通性、签名配置与接收方解析逻辑。测试不写投递历史、不触发重试，停用中的订阅同样可以测试。
+
+### 参数说明
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| `--id` | 是 | 订阅 ID；只能测试本人资源 |
+
+### 示例
+
+```bash
+mao open subscription test --id 12
+```
+
+返回 `{ success, httpStatus, error, durationMs }`：`success=false` 时按 `error` 排查目标不可达、证书或非 2xx 响应；接收方可用 payload 中的 `test: true` 与真实事件区分。
 
 ## 命令：mao open run
 

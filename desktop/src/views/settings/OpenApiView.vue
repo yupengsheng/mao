@@ -167,6 +167,9 @@
               <span v-else class="badge badge-danger">已停用</span>
             </div>
             <div class="item-actions">
+              <el-tooltip content="测试投递" :show-after="300">
+                <button class="action-btn" :disabled="testingId === sub.id" @click="testDelivery(sub)"><el-icon :size="14"><Promotion /></el-icon></button>
+              </el-tooltip>
               <el-tooltip content="最近投递" :show-after="300">
                 <button class="action-btn" @click="showDeliveries(sub)"><el-icon :size="14"><Clock /></el-icon></button>
               </el-tooltip>
@@ -358,7 +361,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { Plus, Delete, RefreshRight, VideoPause, VideoPlay, Clock, CopyDocument, Tickets, Reading, Download } from '@element-plus/icons-vue'
+import { Plus, Delete, RefreshRight, VideoPause, VideoPlay, Clock, CopyDocument, Tickets, Reading, Download, Promotion } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRouter } from 'vue-router'
 import {
@@ -366,7 +369,7 @@ import {
   listApiTokens, issueApiToken, revealApiToken, revokeApiToken, setTokenLogFullBody, reEnableToken,
   listWebhookTriggers, createWebhookTrigger, updateWebhookTrigger, deleteWebhookTrigger, rotateWebhookTriggerSecret,
   listOutboundSubscriptions, createOutboundSubscription, setOutboundSubscriptionEnabled, deleteOutboundSubscription,
-  listOutboundDeliveries, listOpenApiCalls,
+  listOutboundDeliveries, listOpenApiCalls, testOutboundSubscription,
   type ApiTokenView, type WebhookTriggerView, type OutboundSubscriptionView, type OutboundDeliveryView, type OpenApiCallView
 } from '../../api'
 import { copyText as copyToClipboard } from '../../utils/clipboard'
@@ -400,6 +403,8 @@ const secretDialogVisible = ref(false)
 const deliveriesDialogVisible = ref(false)
 const deliveriesLoading = ref(false)
 const deliveries = ref<OutboundDeliveryView[]>([])
+/** 测试投递进行中的订阅 id（按钮级 loading，防连点）。 */
+const testingId = ref<number | null>(null)
 
 const tokenForm = ref({ name: '', scopes: ['open:run'] as string[] })
 const triggerForm = ref<{ name: string; agentId: number | null; sessionId: number | null }>({ name: '', agentId: null, sessionId: null })
@@ -761,6 +766,24 @@ async function removeSubscription(sub: OutboundSubscriptionView): Promise<void> 
     await fetchSubscriptions()
   } catch {
     // handled by interceptor
+  }
+}
+
+/** 测试投递：用真实 Secret 同步发一条 test:true 示例事件，一秒验证签名与连通性（不写投递历史）。 */
+async function testDelivery(sub: OutboundSubscriptionView): Promise<void> {
+  if (testingId.value != null) return
+  testingId.value = sub.id
+  try {
+    const result = await testOutboundSubscription(sub.id)
+    if (result.success) {
+      ElMessage.success(`测试成功（HTTP ${result.httpStatus ?? 200}，${result.durationMs}ms）`)
+    } else {
+      ElMessage.error(`测试失败：${result.error ?? '目标不可达'}`)
+    }
+  } catch {
+    // handled by interceptor
+  } finally {
+    testingId.value = null
   }
 }
 

@@ -801,6 +801,19 @@ export async function deleteOutboundSubscription(id: number): Promise<void> {
   await api.delete(`/open/subscriptions/${id}`)
 }
 
+export interface OutboundSubscriptionTestResult {
+  success: boolean
+  httpStatus: number | null
+  error: string | null
+  durationMs: number
+}
+
+/** 测试投递：用真实 Secret 同步发送 test:true 示例事件，不写投递历史。 */
+export async function testOutboundSubscription(id: number): Promise<OutboundSubscriptionTestResult> {
+  const { data } = await api.post(`/open/subscriptions/${id}/test`)
+  return data
+}
+
 export async function listOutboundDeliveries(subscriptionId: number): Promise<OutboundDeliveryView[]> {
   const { data } = await api.get(`/open/subscriptions/${subscriptionId}/deliveries`)
   return data ?? []
