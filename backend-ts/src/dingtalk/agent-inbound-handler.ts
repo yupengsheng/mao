@@ -31,6 +31,8 @@ export interface DingtalkSessionAdapter {
   updatePhase?(sessionId: number, phase: string): Promise<void>;
   cleanupIncompleteTail?(sessionId: number): Promise<number>;
   getPhase?(sessionId: number): Promise<string | null>;
+  /** 最近一次执行的运行身份（技术方案 2026-11-04 §5.2）：重试续跑同一次执行时透传。 */
+  getLastRuntimeUserId?(sessionId: number): Promise<number | null>;
 }
 
 export interface DingtalkMediaDownload {
@@ -433,10 +435,18 @@ export class AgentDingtalkInboundHandler implements DingtalkInboundHandler {
       await progress.update('RUNNING', roundOffset, '正在重试，请稍候…', []).catch(() => undefined);
       await this.broadcastRunning(sessionId, executionId, null);
       const listener = await this.options.listenerFactory?.(sessionId, stub, executionId) ?? new NoopAgentEventListener();
+      // 重试续跑同一次执行（技术方案 2026-11-04 §5.2）：按持久化的运行身份恢复；读取失败回落 owner。
+      let retryRuntimeUserId: number | null = null;
+      try {
+        retryRuntimeUserId = (await this.options.sessionService.getLastRuntimeUserId?.(sessionId)) ?? null;
+      } catch (e) {
+        // 读取失败回落 owner（与崩溃恢复同源语义），但留痕：否则「身份漂移」在故障时静默复现。
+        console.warn(`钉钉重试读取运行身份失败，回落 owner, sessionId=${sessionId}: ${e instanceof Error ? e.message : String(e)}`);
+      }
       started = true;
       const executeListener = CompositeAgentEventListener.of(listener, cardListener);
-      if (lease == null) await this.options.harnessService.execute(sessionId, null, executeListener, cancelFlag, null);
-      else await this.options.harnessService.execute(sessionId, null, executeListener, cancelFlag, null, lease);
+      if (lease == null) await this.options.harnessService.execute(sessionId, null, executeListener, cancelFlag, retryRuntimeUserId);
+      else await this.options.harnessService.execute(sessionId, null, executeListener, cancelFlag, retryRuntimeUserId, lease);
       if (cancelFlag.get()) {
         await this.options.sessionService.cleanupIncompleteTail?.(sessionId);
         await cardListener.cancel(this.interrupted.has(sessionId));

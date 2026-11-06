@@ -144,6 +144,8 @@ export function assembleFeishuHandler(deps: FeishuHandlerDeps): FeishuHandlerRes
       updatePhase: async (sessionId: number, phase: any) => { await d.sessionService.updatePhase(sessionId, phase); },
       cleanupIncompleteTail: async (sessionId: number) => d.sessionService.cleanupIncompleteTail(sessionId),
       getPhase: async (sessionId: number) => (await d.sessionService.getSession(sessionId))?.phase ?? null,
+      getLastRuntimeUserId: async (sessionId: number) =>
+        (await d.sessionService.getSession(sessionId))?.lastRuntimeUserId ?? null,
       getLatestAssistantReplyWithId: async (sessionId: number) => {
         const messages = await d.sessionService.getMessages(sessionId);
         let messageId: number | null = null;

@@ -54,6 +54,7 @@ export interface PasswordHasher {
 
 export interface UserRepository {
   findById(id: number): Promise<User | null>;
+  findByIds(ids: number[]): Promise<User[]>;
   findByUsername(username: string): Promise<User | null>;
   findByEmail?(email: string): Promise<User | null>;
   /** 邮件通知渠道收件地址查询（V162）：按 id 只取 email 列，用户不存在返回 null。 */
@@ -98,6 +99,8 @@ export interface UserRoleRepository {
   countByRoleId(roleId: number): Promise<number>;
   countByUserAndRole(userId: number, roleId: number): Promise<number>;
   deleteByUserId(userId: number): Promise<void>;
+  /** 删除单个「用户-角色」绑定；角色侧批量移除使用。 */
+  deleteByUserAndRole?(userId: number, roleId: number): Promise<void>;
   insert(row: UserRole): Promise<void>;
   /** 可选：在事务中执行先删后插（Mysql 实现提供）。 */
   transaction?<T>(fn: (tx: UserRoleRepository) => Promise<T>): Promise<T>;

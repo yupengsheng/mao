@@ -77,7 +77,7 @@ CLI：`mao agent list|get|create|update|set-enabled` 等（见 [agent.md](agent.
 
 ## Skills 管理
 
-维护平台 Skill 文档目录。为内部规范、排障流程编写独立 Skill；按 Agent 场景关联子集。页面分两个 Tab：
+维护平台 Skill 文档目录。为内部规范、排障流程编写独立 Skill；按 Agent 场景关联子集。系统 Skill 列表的「关联 Agent」列可反查引用数量，悬停查看 Agent 名称并点击直达过滤后的 Agent 列表。页面分两个 Tab：
 
 | Tab | 内容 |
 |-----|------|
@@ -119,7 +119,7 @@ CLI：`mao user ...`（见 [user.md](user.md)）。
 
 ## 角色权限
 
-RBAC：创建角色、分配权限点、关联用户。角色列表的「成员」打开用户管理并只显示拥有该角色的用户（CLI：`mao user list --role-id <id>`）。普通用户不应有模型密钥、审计等敏感权限。保存权限期间不可继续勾选或切换角色，完成后界面与服务端保持一致。
+RBAC：创建角色、分配权限点、关联用户。角色列表的「成员」打开成员管理弹窗：可按用户名 / 显示名 / 邮箱搜索并分页勾选，批量添加或移出该角色的成员，已加入 / 未加入状态行内标记；增删后列表用户数即时刷新。移除 `ADMIN` 角色成员时保留最后管理员守卫。用户管理页仍可按角色筛选（CLI：`mao user list --role-id <id>`）。普通用户不应有模型密钥、审计等敏感权限。保存权限期间不可继续勾选或切换角色，完成后界面与服务端保持一致。
 
 角色删除（0.0.452 起）：仅支持删除没有用户的自定义角色，删除时一并清理权限绑定；角色下仍有用户需先在用户管理迁走，系统内置 `ADMIN` / `USER` 不可删除。CLI：`mao role delete --id <id>`。
 
@@ -127,7 +127,7 @@ CLI：`mao role ...`、`mao permission list`（见 [role.md](role.md)）。
 
 ## MCP 服务器
 
-管理全局 MCP（stdio / HTTP）：创建、启停、测试连接、查看工具列表。用户可在桌面端配置私有 MCP；会话按 Agent 注入 `mcp__{server}__{tool}`。
+管理全局 MCP（stdio / HTTP）：创建、启停、测试连接、查看工具列表。列表的「关联 Agent」列展示引用该服务器的 Agent，悬停可点击名称直达 Agent 管理。用户可在桌面端配置私有 MCP；会话按 Agent 注入 `mcp__{server}__{tool}`。
 
 CLI：`mao mcp ...`（见 [mcp.md](mcp.md)）。
 
@@ -199,7 +199,7 @@ CLI：`mao llm-call list`（见 [llm-call.md](llm-call.md)）。
 
 ## 自定义工具
 
-「运行 → 自定义工具」（读需 `http_tool:read`，写需 `http_tool:write`）管理自定义 HTTP 工具：清单表按关键字 / 启用态筛选（工具名、展示名、端点、只读 / 可写、超时），支持新建 / 编辑 / 启停 / 删除与「测试调用」抽屉（草稿实调一次、不落库）；统计表按工具名聚合并调用次数、失败次数、失败率、调用用户数与首次 / 最近调用时间（数据来自运行轨迹中的 `http_call` 记录，仅交互会话产生；只统计仍保留的 `session_activity`，默认 180 天、最低 90 天）。工具由管理员统一配置，在 Agent 编辑表单的「自定义 HTTP 工具」多选里关联到具体 Agent（0.0.327 起不再由用户在客户端配置）。
+「运行 → 自定义工具」（读需 `http_tool:read`，写需 `http_tool:write`）管理自定义 HTTP 工具：清单表按关键字 / 启用态筛选（工具名、展示名、端点、只读 / 可写、超时、关联 Agent），支持新建 / 编辑 / 启停 / 删除与「测试调用」抽屉（草稿实调一次、不落库）；统计表按工具名聚合并调用次数、失败次数、失败率、调用用户数与首次 / 最近调用时间（数据来自运行轨迹中的 `http_call` 记录，仅交互会话产生；只统计仍保留的 `session_activity`，默认 180 天、最低 90 天）。工具由管理员统一配置，在 Agent 编辑表单的「自定义 HTTP 工具」多选里关联到具体 Agent（0.0.327 起不再由用户在客户端配置）。
 
 工具定义与调用口径见 [http-tool.md](http-tool.md)；内网放行网段在「系统设置 → 工具与终端 → 自定义 HTTP 工具」配置。
 
@@ -210,6 +210,7 @@ CLI：`mao http-tool list|enabled|stats|create|update|delete|set-enabled|test`�
 平台级配置，例如：
 
 - **登录认证**（密钥 AES 加密存储，LDAP/飞书登录/OSS 提供一键测试连接）：
+  - 账号密码登录（0.0.481）：`auth.password.enabled` 默认开启；关闭后桌面 / Web / 安卓与 `mao auth login` 不能使用本地密码或 LDAP，管理后台登录页仍保留密码入口。至少保留飞书 OAuth（真实 App ID）或 ECP 飞书登录之一，否则拒绝保存。
   - 公司 SSO（0.0.111）：启用开关、校验域名白名单、宿主 Origin 白名单、Access 有效期、校验超时；白名单支持换行或逗号输入，宿主 Origin 可填精确 HTTPS、`https://*.example.com`（任意层级子域、不含根域、端口严格匹配）或 `*`（所有来源）。以 `auth.companySso.config` 完整快照保存，新换票即时生效，取消 SSO 环境变量。业务系统仍用 `MaoChat.init` 的 `auth.checkUrl` 指定接口地址，详见 [SSO 配置](config.md#公司-ssoweb-embed-sdk)。
   - ECP 飞书登录、LDAP 认证、飞书 OAuth 登录（0.0.82 起由环境变量迁入）
   - 集成配置（0.0.298）：浮窗助手 Agent（`embed.agentId`，留空回落系统默认 Agent，见下文「浮窗助手」）
@@ -218,9 +219,13 @@ CLI：`mao http-tool list|enabled|stats|create|update|delete|set-enabled|test`�
 - **模型任务**（各功能的默认模型，留空则跟随会话/系统默认）：会话（`session.titleModelId` 标题生成）、代码（`git.commitMessageModelId` Git 提交信息）、记忆（`memory.extractionModelId` 记忆自动抽取）
 - **工具与终端**：网络工具（Tavily / TinyFish 搜索实现切换与各自 API Key，0.0.83 新增双实现）、网页抓取、Shell 会话、云端终端、审批（审批模型与 Jev 前置决策；「测试连接」用当前表单探测 Jev 端点与 API Key，可未保存）、自定义 HTTP 工具（`tools.http.privateAllowlist` 内网放行 CIDR 清单，见 [http-tool.md](http-tool.md)）
 - **通知与消息**：任务通知（0.0.88 迁入，即时生效）、微信（`weixin.agentId` / `weixin.modelId` 微信通道 Agent 与模型）
-- **平台与运维**：分享（匿名分享链接开关）、审计（日志保留天数，后台每小时据此自动清理）、用量（LLM 调用流水保留天数、会话活动保留天数，均默认 180 天、最低 90 天，后台每小时据此自动清理）、运行环境（工作区与 Skill 目录只读展示；容器模式额外展示运行时镜像、依赖指纹、最近预检与在线容器连接健康状态，不主动触发预检）
+- **平台与运维**：菜单可见性（`admin.menu.hidden`，部署级隐藏不用的功能菜单；隐藏不影响访问权限，「系统设置」不可隐藏，详见下文）、分享（匿名分享链接开关）、审计（日志保留天数，后台每小时据此自动清理）、用量（LLM 调用流水保留天数、会话活动保留天数，均默认 180 天、最低 90 天，后台每小时据此自动清理）、运行环境（工作区与 Skill 目录只读展示；容器模式额外展示运行时镜像、依赖指纹、最近预检与在线容器连接健康状态，不主动触发预检）
 
 读写需 `settings:read` / `settings:write` 权限；页面顶部的搜索框支持按配置名称、key、说明或选项搜索，选中结果会跳到对应控件并短暂高亮（SSO / ECP 等 JSON 配置可定位到具体子字段）。左侧目录按上述分两级展示（默认折叠为分组标题行，点击分组或滚动到该组内容时自动展开），可快速跳转分组；滚动右侧配置时目录固定不跟随页面滚走。CLI：`mao settings list|set`（见 [settings.md](settings.md)）。
+
+### 菜单可见性
+
+管理员可在「系统设置 → 平台与运维 → 菜单可见性」按部署场景隐藏不用的菜单（0.0.481 起）：部署级全局配置、所有账号一致，侧栏与窄屏抽屉同步过滤，保存后即时生效。隐藏只影响菜单展示——路由、权限校验与直接输入网址访问都不变（如需收权请用「角色权限」）；「系统设置」不可隐藏，面板内「恢复默认（全部显示）」可一键还原。隐藏「用量分析」等首页候选页后，登录落地、访问后台根地址、Logo / 返回首页与顶栏不可关闭的首页签自动落到下一个可见且有权限的页面。REST 读写：`GET /v1/system-settings/menu-visibility`（仅需登录）、`PUT /v1/system-settings/admin.menu.hidden`（需 `settings:write`）。
 
 ## 浮窗助手（0.0.298 起）
 

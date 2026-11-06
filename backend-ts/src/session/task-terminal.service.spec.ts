@@ -90,6 +90,17 @@ describe('TaskTerminalService memory extraction dispatch', () => {
     expect(h.extraction.extractForSession).not.toHaveBeenCalled();
   });
 
+  it('记忆抽取取运行身份（last_runtime_user_id），缺失回落会话归属（D5 同源）', async () => {
+    const h = build({ lastRuntimeUserId: 67 });
+    await h.terminal.finishExecution(11, 7, 'COMPLETED', 'exec-1');
+    h.memoryJobs.forEach((job) => { void job(); });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(h.extraction.extractForSession).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 11,
+      userId: 67,
+    }));
+  });
+
   it('doesNotDispatchForSubagentOrSideTask', async () => {
     const h = build({ sessionType: 'SUBAGENT', projectKey: null, workspace: null });
     await h.terminal.finishExecution(11, 7, 'COMPLETED', 'exec-1');

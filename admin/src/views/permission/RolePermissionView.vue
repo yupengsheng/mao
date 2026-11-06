@@ -125,17 +125,20 @@
         <el-button type="primary" :loading="savingRole" @click="saveRole">保存</el-button>
       </template>
     </ResponsiveDialog>
+
+    <RoleMemberDialog v-model="memberDialogVisible" :role="memberRole" @changed="handleMembersChanged" />
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, reactive, ref, watch, onActivated, onMounted, onUnmounted } from 'vue'
-import { onBeforeRouteLeave, useRouter } from 'vue-router'
+import { onBeforeRouteLeave } from 'vue-router'
 import type { FormInstance, FormRules } from 'element-plus'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../../api'
 import { useAuthStore } from '../../stores/auth'
 import ResponsiveDialog from '../../components/ResponsiveDialog.vue'
+import RoleMemberDialog from './RoleMemberDialog.vue'
 
 interface Role {
   id: number
@@ -164,7 +167,8 @@ const dirtyPermissions = ref(false)
 const dialogVisible = ref(false)
 const dialogMode = ref<'create' | 'edit'>('create')
 const roleFormRef = ref<FormInstance>()
-const router = useRouter()
+const memberDialogVisible = ref(false)
+const memberRole = ref<Role | null>(null)
 const authStore = useAuthStore()
 const canWrite = computed(() => authStore.hasPermission('role:write'))
 const roleForm = reactive({
@@ -355,7 +359,25 @@ function handleEditRole(role: Role) {
 }
 
 function handleViewMembers(role: Role) {
-  router.push({ path: '/users', query: { roleId: String(role.id) } })
+  memberRole.value = role
+  memberDialogVisible.value = true
+}
+
+/** 弹窗内增删成员后：刷新角色列表的用户数，并同步弹窗拿到的角色对象。 */
+async function handleMembersChanged() {
+  const id = currentRole.value?.id
+  await fetchAll()
+  if (id != null) {
+    const updated = roles.value.find((r) => r.id === id)
+    if (updated) {
+      if (dirtyPermissions.value) currentRole.value = updated
+      else selectRole(updated)
+    }
+  }
+  if (memberRole.value) {
+    const updated = roles.value.find((r) => r.id === memberRole.value!.id)
+    if (updated) memberRole.value = updated
+  }
 }
 
 function roleDeleteDisabledReason(role: Role): string {

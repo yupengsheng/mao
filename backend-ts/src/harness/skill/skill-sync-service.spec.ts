@@ -210,8 +210,32 @@ describe('SkillSyncService', () => {
     const { svc } = makeService(root, systemFolder, userDir);
     const agent = { id: 3, name: 'a', systemPrompt: 'p', skillNames: '["java"]' };
     await svc.syncToSession(agent, 7, 11);
-    expect(svc.getRemovedSkillNames({ ...agent, skillNames: '[]' }, null, 11)).toEqual(expect.arrayContaining(['java', 'mine']));
+    // 用户技能仍在磁盘上，即使不在 Agent 配置中也会继续同步，因此只报告系统技能 java。
+    const removed = svc.getRemovedSkillNames({ ...agent, skillNames: '[]' }, 7, 11);
+    expect(removed).toContain('java');
+    expect(removed).not.toContain('mine');
     expect(svc.getRemovedSkillNames(null, 7, 11)).toEqual([]);
     expect(svc.getRemovedSkillNames(agent, 7, null)).toEqual([]);
+  });
+
+  it('isolates sync state per runtime user in the same session', async () => {
+    const root = useTmpDir('skills-runtime-users-');
+    const systemFolder = makeSystemSkill(root);
+    const userDir = join(root, 'users');
+    for (const [uid, name] of [['7', 'seven'], ['8', 'eight']] as const) {
+      mkdirSync(join(userDir, uid, name), { recursive: true });
+      writeFileSync(join(userDir, uid, name, 'SKILL.md'),
+        `---\nname: ${name}\ndescription: ${name}\n---\n${name}`);
+    }
+    const { runtime, svc } = makeService(root, systemFolder, userDir);
+    const agent = { id: 3, name: 'a', systemPrompt: 'p', skillNames: '["java"]' };
+    await svc.syncToSession(agent, 7, 11);
+    await svc.syncToSession(agent, 8, 11);
+
+    expect(runtime.resolveSkillsDir(7, 11)).not.toBe(runtime.resolveSkillsDir(8, 11));
+    expect(svc.getRemovedSkillNames({ ...agent, skillNames: '[]' }, 7, 11)).toEqual(['java']);
+    expect(svc.getRemovedSkillNames({ ...agent, skillNames: '[]' }, 8, 11)).toEqual(['java']);
+    expect(svc.getRemovedSkillNames({ ...agent, skillNames: '[]' }, 7, 11))
+      .not.toContain('eight');
   });
 });

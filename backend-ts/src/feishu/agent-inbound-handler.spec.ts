@@ -37,6 +37,7 @@ function baseSessionService() {
     cleanupIncompleteTail: vi.fn(async () => 0),
     getPhase: vi.fn(async (): Promise<string | null> => null),
     getMessages: vi.fn(async () => []),
+    getLastRuntimeUserId: vi.fn(async () => 67),
   };
 }
 
@@ -607,6 +608,8 @@ describe('AgentFeishuInboundHandler', () => {
       expect(onExecutionFinished).toHaveBeenCalledWith(7, expect.anything(), expect.any(String), 'COMPLETED', undefined, null);
     });
     expect(harness.execute).toHaveBeenCalledTimes(1);
+    expect(harness.execute).toHaveBeenCalledWith(
+      7, null, expect.anything(), expect.anything(), 67);
     expect(registry.send).toHaveBeenCalledWith(9, expect.objectContaining({
       type: 'session_status',
       sessionId: 7,
@@ -615,6 +618,31 @@ describe('AgentFeishuInboundHandler', () => {
     expect(updates).toContainEqual({ status: 'RUNNING', content: '正在重试，请稍候…', messageId: undefined });
     // 重试路径同样回传终态消息 id，快照才绑到本卡对应的回复上
     expect(updates).toContainEqual({ status: 'COMPLETED', content: '重试后的答案', messageId: 12 });
+  });
+
+  it('retryExecution falls back to owner when runtime identity lookup fails', async () => {
+    const sessionService = makeSessionService({
+      getPhase: vi.fn(async () => 'FAILED'),
+      getLastRuntimeUserId: vi.fn(async () => { throw new Error('db down'); }),
+    });
+    const harness = { prepareMessage: vi.fn(() => 'e'), execute: vi.fn(async () => undefined) };
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const handler = new AgentFeishuInboundHandler({
+      sessionService,
+      harnessService: harness as never,
+      createCancelFlag: makeFlag,
+      releaseCancelFlag: vi.fn(),
+      listenerFactory: async () => listener,
+    });
+    const result = await handler.retryExecution(7, async () => ({
+      update: async () => undefined,
+    }));
+    expect(result).toEqual({ ok: true });
+    await vi.waitFor(() => expect(harness.execute).toHaveBeenCalledTimes(1));
+    expect(harness.execute).toHaveBeenCalledWith(
+      7, null, expect.anything(), expect.anything(), null);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('飞书重试读取运行身份失败'));
+    warn.mockRestore();
   });
 
   it('drains the feishu queue after a successful retry', async () => {

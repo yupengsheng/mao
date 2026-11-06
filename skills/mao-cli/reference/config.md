@@ -6,7 +6,9 @@
 
 文档与命令示例统一用 `https://mao.example.com` 表示**你部署后的对外站点**（把主机名换成自己的域名）。路径约定见 [deploy.md](deploy.md)：桌面 `/`、管理后台 `/admin/`、API `/api/`、上传 `/uploads/`。
 
-`mao-cli` / `mao-agent` 共用 `MAO_BASE_URL`（或 `--base-url`）。推荐写成站点根，例如 `https://mao.example.com`；也接受 `https://mao.example.com/api` 与 `https://mao.example.com/api/v1`，工具会自己归一化。未设置时回落到开源仓库内置的示例域名（`https://mao.etarch.cn`，最低优先级）。**私有化部署后该地址通常不可达**，必须改成自己的实例。
+`mao-cli` / `mao-agent` 共用 `MAO_BASE_URL`（或 `--base-url`）。推荐写成站点根，例如 `https://mao.example.com`；也接受 `https://mao.example.com/api` 与 `https://mao.example.com/api/v1`，工具会自己归一化。
+
+两个 CLI 都**不再内置默认站点地址**：`mao-agent` 首次 `login` 会在交互终端要求输入并保存到 `~/.mao/agent-cli/config.json`；`mao-cli` 的联网命令直接报错并给出设置方式（`--base-url` / `MAO_BASE_URL`），`logout` 仅做本地清理不受影响。云端执行环境（Agent 的 shell / 终端 PTY、容器）与桌面 LOCAL shell 由平台自动注入 `MAO_BASE_URL`——取系统设置「站点根地址」（`site.baseUrl`，留空回落 `upload.baseUrl`），私有化部署请在管理后台「系统设置 → 集成配置 → 站点」填写自己的实例地址。
 
 ## 默认账号
 
@@ -15,6 +17,15 @@
 | 用户名 | 密码 | 说明 |
 |--------|------|------|
 | admin | admin123 | 系统管理员，**上线后立即改密** |
+
+### 账号密码登录开关（0.0.481）
+
+管理后台「系统设置 → 登录认证 → 账号密码登录」维护，配置键 `auth.password.enabled`，默认开启。关闭后：
+
+- 桌面 / Web / 安卓登录页隐藏用户名、密码、「记住用户名」和登录按钮，只保留可用的飞书 / ECP 入口；全部关闭时提示「当前未开放登录方式，请联系管理员」。
+- `POST /v1/auth/login` 拒绝本地密码与 LDAP 登录，`mao auth login` 会收到「账号密码登录已关闭」；已登录会话不受影响。
+- 管理后台 `POST /v1/auth/admin/login` 始终保留用户名密码，避免本地 admin 无法进入。
+- 关闭前必须至少保留一种交互登录方式：飞书 OAuth（`auth.feishu.enabled=true` 且 App ID 非空、非 `1234567890`）或 ECP 飞书登录（`enabled=true` 且 appCode、baseUrl 均非空）。关闭飞书 OAuth、清空 App ID、关闭 ECP 时同样会做该校验，不能移除最后一种方式。
 
 ## 数据目录（生产典型）
 
@@ -58,8 +69,21 @@
 | `MAO_USER_HOME_DIR` | 否 | CLOUD 用户 HOME |
 | `MAO_SHARE_DIR` | 否 | 公共共享目录，默认 `/opt/mao-data/share`：管理员宿主机投放，全员 CLOUD 用户只读（容器模式 ro 挂载，host 模式只读不强制）。不属于 `MAO_CONTAINER_*` 容器调参系列 |
 | `MAO_CLOUD_RUNTIME` | 否 | CLOUD 执行面运行时缺省值：`host`（默认，现状行为）；`docker` 每用户容器隔离（部署前置见 [deploy.md](deploy.md#容器隔离运行时v0295)）。管理后台「系统设置 → 运行环境 → 用户运行时模式」（`system_setting.runtime.mode`）优先于该变量，后台可切换且保存即生效 |
+| `MAO_RUNTIME_IDENTITY` | 否 | 群聊运行身份：`execution`（默认，执行期资源跟随本次发言者）/ `owner`（应急回退，跟随会话归属）。影响技能、文件、容器、终端、CLI、依赖与记忆；列表权限、审批、计费与预算不受影响。非法值告警并回落到 `execution` |
 | `MAO_CONTAINER_*` | 否 | 容器模式参数：`MAO_CONTAINER_IDLE_MINUTES` / `MAO_CONTAINER_MAX_LIFETIME_HOURS` / `MAO_CONTAINER_MEMORY_MB` / `MAO_CONTAINER_CPUS` / `MAO_CONTAINER_PIDS_LIMIT` / `MAO_CONTAINER_IMAGE` / `MAO_CONTAINER_NETWORK` / `MAO_CONTAINER_CHANNEL_DIR` / `MAO_CONTAINER_DIST_DIR` / `MAO_CONTAINER_DEPS_DIR` / `MAO_CONTAINER_TMP_DIR`（默认 `/opt/mao-data/tmp`，按 `{tmpDir}/{userId}` 挂到容器 `/tmp`） / `MAO_CONTAINER_TMP_RETENTION_DAYS`（默认 7） / `MAO_CONTAINER_START_TIMEOUT_MS` |
 | `MAO_BLUE_GREEN_DRAIN_SEC` | 否 | 蓝绿切换后停旧实例延迟，默认 60s |
+
+### 群聊运行身份（0.0.482）
+
+飞书 / 钉钉群与话题会话里，会话归属者（建会话的人）与本次发言者可能不是同一人。设 `runtimeUserId = executionUserId ?? session.userId`，执行期资源一律按运行身份落盘与寻址：
+
+- **按运行身份**：技能同步与用户技能 / 用户命令路径、文件与工作区工具、CLOUD 容器 / 终端 / shell、CLI 与依赖安装目录、凭据缓存、上传与生成产物、`dump_user_messages` / `open_web_page` 缓存、长期记忆的注入与抽取。
+- **按会话归属（不变）**：会话列表、权限与审计、流式订阅、通知、压缩归档、定时任务、手动压缩、侧任务、MCP server 列表与容器寻址。
+- **按触发人（不变）**：审批规则、LLM 计费与预算仍取 `executionUserId`。
+
+开关 `MAO_RUNTIME_IDENTITY` 只在后端启动时读取，默认 `execution`。应急回退设为 `owner` 后需重启；回退后群聊里等于「以建会话者身份执行」，非归属成员可能重新遇到技能路径不可读。每次执行会把运行身份写入 `session.last_runtime_user_id`，供崩溃恢复、子代理继承、定时任务与飞书 / 钉钉重试沿用；该字段由迁移 `V206` 自动添加，无需回填。
+
+跨成员访问时错误提示会带上「属于其他成员（当前执行身份 #x）」；这不是权限放宽，个人技能、凭据、依赖与产物仍严格按人隔离。提示词在运行身份与归属不一致时会显式声明「当前执行身份」，便于模型理解自己的工作目录。
 
 ### ECP 飞书登录（全站）
 
@@ -210,7 +234,7 @@ web_search 工具支持 Tavily / TinyFish 双实现，在管理后台「系统�
 
 | 方式 | 说明 |
 |------|------|
-| 本地密码 | 默认 |
+| 本地密码 | 默认；受「账号密码登录」总开关控制 |
 | LDAP | 部署配置启用 |
 | 飞书 OAuth | 部署配置启用 |
 | ECP 飞书登录 | 管理后台「系统设置 → 集成配置 → ECP 飞书登录」启用 |

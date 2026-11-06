@@ -78,6 +78,10 @@
               <ContainerRebuildPanel
                 v-else-if="section.kind === 'container-rebuild'"
               />
+              <MenuVisibilityPanel
+                v-else-if="section.kind === 'menu-visibility'"
+                :can-write="canWrite"
+              />
               <template v-else-if="section.kind === 'integration'">
                 <el-alert
                   v-if="section.name === firstIntegrationName"
@@ -255,6 +259,7 @@ import EcpConfigPanel from './components/EcpConfigPanel.vue'
 import ShellEnvVarsPanel from './components/ShellEnvVarsPanel.vue'
 import ContainerHostsPanel from './components/ContainerHostsPanel.vue'
 import ContainerRebuildPanel from './components/ContainerRebuildPanel.vue'
+import MenuVisibilityPanel from './components/MenuVisibilityPanel.vue'
 import RuntimeEnvironmentPanel from './components/RuntimeEnvironmentPanel.vue'
 import SettingsSearchBox from './components/SettingsSearchBox.vue'
 import { INTEGRATION_GROUP_CATALOG } from './integrationFieldCatalog'
@@ -272,6 +277,7 @@ const MODEL_SELECT_KEYS = new Set(['weixin.modelId', 'session.titleModelId', 'gi
 /** Agent 下拉 key：weixin.agentId / embed.agentId 共用同一 el-select + agents 数据源（留空回落默认 Agent）。 */
 const AGENT_SELECT_KEYS = new Set(['weixin.agentId', 'embed.agentId'])
 const INTEGRATION_KEYS = new Set([
+  'auth.password.enabled',
   'auth.ldap.enabled', 'auth.ldap.url', 'auth.ldap.baseDn', 'auth.ldap.userDn', 'auth.ldap.password', 'auth.ldap.userSearchBase',
   'auth.feishu.enabled', 'auth.feishu.appId', 'auth.feishu.appSecret', 'auth.feishu.redirectUri',
   'upload.storageMode', 'upload.baseUrl', 'file.maxSizeMb', 'site.baseUrl',
@@ -290,6 +296,7 @@ const INTEGRATION_KEYS = new Set([
 
 /** 集成组显示名：key 为 IntegrationConfigPanel 的 group name，锚点 id 为 `setting-group-${name}`。 */
 const INTEGRATION_LABELS: Record<string, string> = {
+  password: '账号密码登录',
   ldap: 'LDAP 认证',
   feishu: '飞书 OAuth 登录',
   upload: '上传配置',
@@ -306,12 +313,13 @@ const INTEGRATION_LABELS: Record<string, string> = {
 }
 
 /** 目录分组声明：右侧卡片渲染顺序与目录一致。integration=集成配置组，category=后端 system_setting 分类；后端新增的未声明分类兜底归入「其他」。 */
-const TOC_GROUPS: Array<{ label: string; sections: Array<{ kind: 'company-sso' | 'ecp' | 'shell-env' | 'container-hosts' | 'container-rebuild' | 'integration' | 'category'; name: string }> }> = [
+const TOC_GROUPS: Array<{ label: string; sections: Array<{ kind: 'company-sso' | 'ecp' | 'menu-visibility' | 'shell-env' | 'container-hosts' | 'container-rebuild' | 'integration' | 'category'; name: string }> }> = [
   {
     label: '登录认证',
     sections: [
       { kind: 'company-sso', name: 'company-sso' },
       { kind: 'ecp', name: 'ecp' },
+      { kind: 'integration', name: 'password' },
       { kind: 'integration', name: 'ldap' },
       { kind: 'integration', name: 'feishu' },
       // 集成配置分类：既有 key 均走 IntegrationConfigPanel / 专属面板，此处只渲染 embed.agentId（浮窗助手）
@@ -370,6 +378,8 @@ const TOC_GROUPS: Array<{ label: string; sections: Array<{ kind: 'company-sso' |
   {
     label: '平台与运维',
     sections: [
+      // 菜单可见性：部署级隐藏不用的功能菜单（V204 admin.menu.hidden）
+      { kind: 'menu-visibility', name: 'menu-visibility' },
       { kind: 'category', name: '分享' },
       { kind: 'category', name: '审计' },
       { kind: 'category', name: '用量' },
@@ -390,8 +400,11 @@ const ecpRow = computed(() => settings.value.find((item) => item.settingKey === 
 const CONTAINER_INHERIT_KEY = 'runtime.container.inheritHostHosts'
 const CONTAINER_EXTRA_HOSTS_KEY = 'runtime.container.extraHosts'
 const CONTAINER_AUTO_UPGRADE_KEY = 'runtime.container.autoUpgrade'
+/** 菜单可见性（V204）：值是 JSON 数组，走 MenuVisibilityPanel 专属面板，不进分类卡片 /「其他」兜底。 */
+const ADMIN_MENU_HIDDEN_KEY = 'admin.menu.hidden'
 const SPECIAL_KEYS = new Set([
-  ...INTEGRATION_KEYS, COMPANY_SSO_KEY, ECP_CONFIG_KEY, CONTAINER_INHERIT_KEY, CONTAINER_EXTRA_HOSTS_KEY, CONTAINER_AUTO_UPGRADE_KEY,
+  ...INTEGRATION_KEYS, COMPANY_SSO_KEY, ECP_CONFIG_KEY, CONTAINER_INHERIT_KEY, CONTAINER_EXTRA_HOSTS_KEY,
+  CONTAINER_AUTO_UPGRADE_KEY, ADMIN_MENU_HIDDEN_KEY,
 ])
 const containerInheritRow = computed(() => settings.value.find((item) => item.settingKey === CONTAINER_INHERIT_KEY))
 const containerExtraHostsRow = computed(() => settings.value.find((item) => item.settingKey === CONTAINER_EXTRA_HOSTS_KEY))
@@ -666,7 +679,7 @@ const settingsByCategory = computed(() => {
 interface TocSection {
   id: string
   label: string
-  kind: 'company-sso' | 'ecp' | 'shell-env' | 'container-hosts' | 'container-rebuild' | 'integration' | 'category'
+  kind: 'company-sso' | 'ecp' | 'menu-visibility' | 'shell-env' | 'container-hosts' | 'container-rebuild' | 'integration' | 'category'
   name: string
 }
 
@@ -705,13 +718,15 @@ const tocGroups = computed<TocGroup[]>(() => {
             ? '公司 SSO'
             : decl.kind === 'ecp'
               ? 'ECP 飞书登录'
-              : decl.kind === 'shell-env'
-                ? 'Shell 环境变量'
-                : decl.kind === 'container-hosts'
-                  ? '容器域名解析'
-                  : decl.kind === 'container-rebuild'
-                    ? '容器管理'
-                    : decl.name,
+              : decl.kind === 'menu-visibility'
+                ? '菜单可见性'
+                : decl.kind === 'shell-env'
+                  ? 'Shell 环境变量'
+                  : decl.kind === 'container-hosts'
+                    ? '容器域名解析'
+                    : decl.kind === 'container-rebuild'
+                      ? '容器管理'
+                      : decl.name,
       })
     }
     if (sections.length > 0) groups.push({ label: group.label, sections })

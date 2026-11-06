@@ -674,7 +674,11 @@ export class CrashRecoveryRunner {
       await this.sessionService.updatePhase(sessionId, 'RUNNING');
       this.notifyClient(userId, sessionId, 'RUNNING', executionId);
       const executionListener = extra == null ? listener as never : CompositeAgentEventListener.of(listener, extra);
-      await this.harnessService.execute(sessionId, null, executionListener as never, cancelFlag, null, lease);
+      // 恢复的是同一次执行（技术方案 2026-11-04 §5.8）：按持久化的运行身份续跑，缺失回落 owner。
+      await this.harnessService.execute(
+        sessionId, null, executionListener as never, cancelFlag,
+        session.lastRuntimeUserId ?? null, lease,
+      );
       if (cancelFlag.get()) {
         try { await extra?.cancel?.(); } catch (e) {
           harnessLog('warn', `Recovery extra cancel failed for session ${sessionId}`, e);

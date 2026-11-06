@@ -220,6 +220,12 @@ interface AppUpdateError {
 
 type ServerUpdateFeedMode = 'follow-site' | 'package-default' | 'disabled'
 
+interface ServerConfigHistoryEntry {
+  serverBaseUrl: string
+  allowHttp: boolean
+  lastConnectedAt: string | null
+}
+
 interface ServerConfigInfo {
   serverBaseUrl: string
   updateFeedMode: ServerUpdateFeedMode
@@ -230,6 +236,7 @@ interface ServerConfigInfo {
   hostKey: string
   apiBase: string
   updateFeed: { mode: string; url: string | null }
+  history?: ServerConfigHistoryEntry[]
 }
 
 interface ServerConfigSetResult {
@@ -263,6 +270,8 @@ interface ElectronAPI {
     }): Promise<ServerConfigSetResult>
     probe(serverBaseUrl: string, options?: { allowHttp?: boolean }): Promise<ServerConfigProbeResult>
     openPicker(): Promise<{ ok: boolean }>
+    closePicker(): Promise<{ ok: boolean }>
+    removeHistory(serverBaseUrl: string): Promise<{ ok: boolean; error?: string; history?: ServerConfigHistoryEntry[] }>
   }
 
   getAppVersion(): Promise<string>

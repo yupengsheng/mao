@@ -327,6 +327,7 @@ export function assembleHarnessEngine(deps: HarnessEngineDeps): HarnessEngineRes
     d.experienceMountService ?? null,
     d.executionLeaseService ?? null,
     d.executionLeaseEnabled === true,
+    cfg.app.harness.runtimeIdentityMode,
   );
   d.holder.harness = harness;
 

@@ -162,7 +162,9 @@
           </template>
         </el-table-column>
         <el-table-column label="关联 Agent" width="110" align="right" class-name="hide-on-mobile" label-class-name="hide-on-mobile">
-          <template #default="{ row }">{{ relatedAgentCount(row.name) }}</template>
+          <template #default="{ row }">
+            <RelatedAgentsPopover :agents="agentsBySkill(row.name)" />
+          </template>
         </el-table-column>
         <el-table-column prop="folderPath" label="路径" min-width="250" show-overflow-tooltip class-name="hide-on-mobile" label-class-name="hide-on-mobile" />
         <el-table-column label="操作" width="160" fixed="right">
@@ -315,18 +317,20 @@ import { UploadFilled } from '@element-plus/icons-vue'
 import { api, apiGetWithHeaders } from '../../api'
 import { useAuthStore } from '../../stores/auth'
 import { useBreakpoint } from '../../composables/useBreakpoint'
+import { useAgentRelations } from '../../composables/useAgentRelations'
 import ResponsiveDialog from '../../components/ResponsiveDialog.vue'
 import ResponsivePagination from '../../components/ResponsivePagination.vue'
+import RelatedAgentsPopover from '../../components/RelatedAgentsPopover.vue'
 
 const { isMobile } = useBreakpoint()
 const authStore = useAuthStore()
 const canWrite = computed(() => authStore.hasPermission('skill:write'))
+const { agentsBySkill, load: loadAgentRelations } = useAgentRelations()
 
 const activeTab = ref<'system' | 'personal'>('system')
 const loading = ref(false)
 const skillDocs = ref<any[]>([])
 const personalSkills = ref<any[]>([])
-const agents = ref<any[]>([])
 const keyword = ref('')
 const filterUserId = ref<number | null>(null)
 const currentPage = ref(1)
@@ -342,8 +346,6 @@ const assignUserIds = ref<number[]>([])
 
 let loadSeq = 0
 let keywordDebounceTimer: ReturnType<typeof setTimeout> | null = null
-let agentsLoaded = false
-let agentsPromise: Promise<void> | null = null
 
 function readTotalCount(headers: unknown): number {
   if (!headers || typeof headers !== 'object') return NaN
@@ -353,34 +355,17 @@ function readTotalCount(headers: unknown): number {
   return Number(value)
 }
 
-function ensureAgents(): Promise<void> {
-  if (agentsLoaded) return Promise.resolve()
-  if (agentsPromise) return agentsPromise
-  agentsPromise = api.get('/agents', { params: { includeDisabled: true } })
-    .then(({ data }) => {
-      agents.value = data || []
-      agentsLoaded = true
-    })
-    .finally(() => {
-      agentsPromise = null
-    })
-  return agentsPromise
-}
-
 async function fetchSkillDocs() {
   const seq = ++loadSeq
   loading.value = true
   try {
-    const [{ result, headers }] = await Promise.all([
-      apiGetWithHeaders<any[]>('/skill-docs', {
-        params: {
-          pageNum: currentPage.value,
-          pageSize: pageSize.value,
-          keyword: keyword.value.trim() || undefined,
-        },
-      }),
-      ensureAgents().catch(() => undefined),
-    ])
+    const { result, headers } = await apiGetWithHeaders<any[]>('/skill-docs', {
+      params: {
+        pageNum: currentPage.value,
+        pageSize: pageSize.value,
+        keyword: keyword.value.trim() || undefined,
+      },
+    })
     if (seq !== loadSeq) return
     const headerTotal = readTotalCount(headers)
     total.value = Number.isFinite(headerTotal) ? headerTotal : (result.data || []).length
@@ -488,10 +473,6 @@ function userOptionLabel(user: { id: number; username?: string | null; displayNa
     return `${user.displayName}（${user.username}）`
   }
   return name
-}
-
-function relatedAgentCount(skillName: string) {
-  return agents.value.filter(agent => (agent.skillNames || []).includes(skillName)).length
 }
 
 function isSkillAvailable(row: { filePath?: string; folderPath?: string }) {
@@ -817,7 +798,10 @@ async function handleDelete(row: any) {
   }
 }
 
-onMounted(fetchActiveTab)
+onMounted(() => {
+  void fetchActiveTab()
+  void loadAgentRelations()
+})
 
 let firstActivation = true
 onActivated(() => {
@@ -825,8 +809,8 @@ onActivated(() => {
     firstActivation = false
     return
   }
-  agentsLoaded = false
   void fetchActiveTab()
+  void loadAgentRelations()
 })
 
 onUnmounted(() => {

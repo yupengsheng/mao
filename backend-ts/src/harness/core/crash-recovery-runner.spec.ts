@@ -32,6 +32,7 @@ interface RunnerOptions {
   cancelled?: boolean;
   executeError?: Error;
   recoveryDeps?: CrashRecoveryDeps;
+  lastRuntimeUserId?: number | null;
 }
 
 function makeRunner(
@@ -40,7 +41,10 @@ function makeRunner(
   runtimeDir = '/tmp/mao-crash-recovery-spec-runtime-missing',
 ) {
   const pending: Promise<void>[] = [];
-  const session = { id: 7, userId: 42, sessionType: 'DEFAULT', phase: 'RUNNING', modelId: null };
+  const session = {
+    id: 7, userId: 42, sessionType: 'DEFAULT', phase: 'RUNNING', modelId: null,
+    lastRuntimeUserId: options.lastRuntimeUserId ?? null,
+  };
   const sessionMapper = {
     selectByPhase: vi.fn().mockResolvedValue([session]),
     selectById: vi.fn().mockResolvedValue(session),
@@ -204,6 +208,14 @@ describe('CrashRecoveryRunner.createExtraListeners', () => {
     expect(onExecutionFinished).toHaveBeenCalledWith(7, 42, 'COMPLETED');
   });
 
+  it('resumes with the persisted runtime identity', async () => {
+    const { runner, harnessService, pending } = makeRunner(undefined, { lastRuntimeUserId: 67 });
+    await runner.run();
+    await Promise.all(pending);
+    expect(harnessService.execute).toHaveBeenCalledWith(
+      7, null, expect.anything(), expect.anything(), 67, null);
+  });
+
   it('runningNotificationsCarryTheNewExecutionIdSoReconnectClientsCanRebind', async () => {
     const { runner, registry, taskTerminalService, pending } = makeRunner();
     await runner.run();
@@ -265,6 +277,7 @@ describe('CrashRecoveryRunner lease-aware recovery', () => {
     active?: LeaseHandle | null;
     enabled?: boolean;
     priorExecutionId?: string | null;
+    lastRuntimeUserId?: number | null;
   }) {
     const leaseService = {
       getActive: vi.fn().mockResolvedValue(options.active ?? null),
@@ -293,6 +306,7 @@ describe('CrashRecoveryRunner lease-aware recovery', () => {
       setExecutionStage: vi.fn().mockResolvedValue(undefined),
     };
     const built = makeRunner(undefined, {
+      lastRuntimeUserId: options.lastRuntimeUserId,
       recoveryDeps: {
         executionLeaseService: leaseService as never,
         executionWaitRepository: waitRepository as never,
@@ -318,6 +332,16 @@ describe('CrashRecoveryRunner lease-aware recovery', () => {
     expect(fixture.taskTerminalService.finishExecution).toHaveBeenCalledWith(
       7, 42, 'COMPLETED', executionId, undefined, 'MANUAL', await lease);
     expect(fixture.leaseService.release).toHaveBeenCalledWith(await lease);
+  });
+
+  it('resumes a lease-backed execution with the persisted runtime identity', async () => {
+    const fixture = makeLeaseAwareRunner({ waits: [], lastRuntimeUserId: 67 });
+    await fixture.runner.run();
+    await Promise.all(fixture.pending);
+
+    const lease = await fixture.leaseService.acquire.mock.results[0]!.value;
+    expect(fixture.harnessService.execute).toHaveBeenCalledWith(
+      7, null, expect.anything(), expect.anything(), 67, lease);
   });
 
   it('projects an unexpired approval as a read-only BLOCKED wait', async () => {

@@ -9,6 +9,7 @@ const { TerminalManager } = require('./terminalManager.cjs')
 const { createLocalShellRuntime, resolveShellProtocol } = require('./localShell.cjs')
 const promptImageResizer = require('./promptImageResizer.cjs')
 const serverConfigLib = require('./serverConfig.cjs')
+const { resolveShellMaoBaseUrl } = require('./shellEnv.cjs')
 const chatAttachment = require('./chatAttachment.cjs')
 const desktopPrefsLib = require('./desktopPrefs.cjs')
 const { createTray } = require('./tray.cjs')
@@ -373,6 +374,7 @@ async function resolveUserPath() {
 
 /**
  * Build environment with user's full PATH and current MAO_TOKEN from local auth store.
+ * 同时注入 MAO_BASE_URL（当前连接的服务器），shell 里的 mao / mao-agent 不再依赖内置默认地址。
  */
 async function buildShellEnv() {
   const userPath = await resolveUserPath()
@@ -387,6 +389,15 @@ async function buildShellEnv() {
     env.MAO_TOKEN = token
   } else {
     delete env.MAO_TOKEN
+  }
+  const maoBaseUrl = resolveShellMaoBaseUrl({
+    configured: isServerConfigured(),
+    serverBaseUrl: getEffectiveServerBaseUrl()
+  })
+  if (maoBaseUrl) {
+    env.MAO_BASE_URL = maoBaseUrl
+  } else {
+    delete env.MAO_BASE_URL
   }
   return env
 }
@@ -403,6 +414,15 @@ function refreshMaoTokenInShellSession(session) {
     session.writeStdin(protocol.envSet('MAO_TOKEN', token) + '\n')
   } else {
     session.writeStdin(protocol.envUnset('MAO_TOKEN') + '\n')
+  }
+  const maoBaseUrl = resolveShellMaoBaseUrl({
+    configured: isServerConfigured(),
+    serverBaseUrl: getEffectiveServerBaseUrl()
+  })
+  if (maoBaseUrl) {
+    session.writeStdin(protocol.envSet('MAO_BASE_URL', maoBaseUrl) + '\n')
+  } else {
+    session.writeStdin(protocol.envUnset('MAO_BASE_URL') + '\n')
   }
 }
 
@@ -1165,7 +1185,12 @@ async function applyServerConfig(payload = {}) {
   serverConfigCache = null
   loadServerConfig(true)
 
-  // 更新源跟随站点时重新绑定 feed
+  // 历史只记「连接成功」过的地址，置顶去重供快速切换
+  try {
+    serverConfigLib.recordServerHistory(app.getPath('userData'), targetBase, allowHttp)
+  } catch (e) {
+    console.warn('[server] history record failed:', e?.message)
+  }
   const feed = serverConfigLib.resolveUpdateFeedUrl(getServerConfig(), getUpdateFeedUrlOverride())
   if (feed.url) {
     try {
@@ -1192,8 +1217,8 @@ function openServerPickerWindow() {
     return
   }
   serverPickerWindow = new BrowserWindow({
-    width: 480,
-    height: 560,
+    width: 560,
+    useContentSize: true,
     resizable: false,
     minimizable: false,
     maximizable: false,
@@ -1651,6 +1676,7 @@ ipcMain.handle('server-config-get', () => {
     hostKey: getServerHostKey(),
     apiBase: getApiBaseUrl(),
     updateFeed: feed,
+    history: serverConfigLib.readServerHistory(app.getPath('userData')),
   }
 })
 
@@ -1668,6 +1694,20 @@ ipcMain.handle('server-config-set', async (_event, payload = {}) => {
 ipcMain.handle('server-config-open-picker', () => {
   openServerPickerWindow()
   return { ok: true }
+})
+
+ipcMain.handle('server-picker-close', () => {
+  if (serverPickerWindow && !serverPickerWindow.isDestroyed()) {
+    serverPickerWindow.close()
+  }
+  return { ok: true }
+})
+
+ipcMain.handle('server-config-remove-history', (_event, payload = {}) => {
+  const target = String(payload?.serverBaseUrl || '').trim()
+  if (!target) return { ok: false, error: '缺少地址', history: serverConfigLib.readServerHistory(app.getPath('userData')) }
+  const history = serverConfigLib.removeServerHistory(app.getPath('userData'), target)
+  return { ok: true, history }
 })
 
 // ========== Window control IPC handlers ==========

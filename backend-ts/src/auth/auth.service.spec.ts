@@ -82,4 +82,39 @@ describe('AuthService', () => {
   it('logout is a no-op', () => {
     service.logout();
   });
+
+  it('passwordLoginSwitchOffRejectsLocalAndLdapWithoutTouchingCredentials', async () => {
+    const repo = {
+      findByUsername: vi.fn(async () => user(9, 'alice', 'hash', 1)),
+      updateById: vi.fn(),
+    } as unknown as UserRepository;
+    const ldapSvc = {
+      isConfigured: vi.fn(async () => true),
+      authenticate: vi.fn(),
+    } as unknown as LdapAuthService;
+    const switchedOff = new AuthService(repo, jwtService, hasher, ldapSvc, undefined, async () => false);
+
+    await expect(switchedOff.login('alice', 'secret')).rejects.toThrow('账号密码登录已关闭');
+    expect(repo.findByUsername).not.toHaveBeenCalled();
+    expect(ldapSvc.authenticate).not.toHaveBeenCalled();
+  });
+
+  it('ignorePasswordSwitchKeepsAdminLoginWorkingWhenSwitchIsOff', async () => {
+    const u = user(10, 'admin', 'hash', 1);
+    const repo = {
+      findByUsername: vi.fn(async () => u),
+      updateById: vi.fn(),
+    } as unknown as UserRepository;
+    vi.mocked(hasher.matches).mockResolvedValue(true);
+    const switchedOff = new AuthService(repo, jwtService, hasher, null, undefined, async () => false);
+
+    const vo = await switchedOff.login('admin', 'secret', { ignorePasswordSwitch: true });
+    expect(vo.user.username).toBe('admin');
+  });
+
+  it('passwordLoginEnabledUsesInjectedProviderAndDefaultsToOn', async () => {
+    await expect(service.passwordLoginEnabled()).resolves.toBe(true);
+    const switchedOff = new AuthService(userRepo, jwtService, hasher, null, undefined, async () => false);
+    await expect(switchedOff.passwordLoginEnabled()).resolves.toBe(false);
+  });
 });

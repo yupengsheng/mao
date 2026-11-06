@@ -196,7 +196,7 @@ export interface WsHandlerDeps {
   };
   shellSessionManager: { closeByConversation(sessionId: number): void };
   skillSyncService: {
-    syncToSession(agent: Agent, userId: number, sessionId: number): Promise<void>;
+    syncToSession(agent: Agent, userId: number, sessionId: number): Promise<{ failed: string[] }>;
     getRemovedSkillNames(agent: Agent, userId: number, sessionId: number): string[];
   };
   localSkillRegistry: {

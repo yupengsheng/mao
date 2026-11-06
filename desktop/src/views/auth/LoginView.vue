@@ -25,41 +25,56 @@
         class="login-form"
         @submit.prevent="handleLogin"
       >
-        <el-form-item prop="username">
-          <el-input
-            ref="usernameInputRef"
-            v-model="form.username"
-            placeholder="用户名"
-            prefix-icon="User"
-            size="large"
-            @keyup.enter="handleLogin"
-          />
-        </el-form-item>
-        <el-form-item prop="password">
-          <el-input
-            ref="passwordInputRef"
-            v-model="form.password"
-            type="password"
-            placeholder="密码"
-            prefix-icon="Lock"
-            show-password
-            size="large"
-            @keyup.enter="handleLogin"
-          />
-        </el-form-item>
-        <el-form-item class="remember-item">
-          <el-checkbox v-model="rememberUsername">记住用户名</el-checkbox>
-        </el-form-item>
-        <el-form-item class="submit-item">
-          <el-button
-            type="primary"
-            native-type="submit"
-            :loading="passwordLoading"
-            class="login-btn"
-          >
-            登录
-          </el-button>
-        </el-form-item>
+        <template v-if="authStore.features.passwordEnabled">
+          <el-form-item prop="username">
+            <el-input
+              ref="usernameInputRef"
+              v-model="form.username"
+              placeholder="用户名"
+              prefix-icon="User"
+              size="large"
+              @keyup.enter="handleLogin"
+            />
+          </el-form-item>
+          <el-form-item prop="password">
+            <el-input
+              ref="passwordInputRef"
+              v-model="form.password"
+              type="password"
+              placeholder="密码"
+              prefix-icon="Lock"
+              show-password
+              size="large"
+              @keyup.enter="handleLogin"
+            />
+          </el-form-item>
+          <el-form-item class="remember-item">
+            <el-checkbox v-model="rememberUsername">记住用户名</el-checkbox>
+          </el-form-item>
+          <el-form-item class="submit-item">
+            <el-button
+              type="primary"
+              native-type="submit"
+              :loading="passwordLoading"
+              class="login-btn"
+            >
+              登录
+            </el-button>
+          </el-form-item>
+        </template>
+        <p
+          v-if="!authStore.features.passwordEnabled && !authStore.features.feishuEnabled && !authStore.features.ecpEnabled"
+          class="login-closed"
+        >
+          当前未开放登录方式，请联系管理员
+        </p>
+        <div
+          v-if="authStore.features.passwordEnabled && (authStore.features.feishuEnabled || authStore.features.ecpEnabled)"
+          class="login-or"
+          role="separator"
+        >
+          <span>或</span>
+        </div>
         <el-form-item
           v-if="authStore.features.feishuEnabled || authStore.features.ecpEnabled"
           class="feishu-actions-item"
@@ -98,7 +113,7 @@
           {{ activeFeishuProvider === 'ecp' ? 'ECP 飞书登录' : '飞书登录' }}
         </el-button>
         <el-button class="password-entry" link @click="backToPasswordLogin">
-          返回密码登录
+          {{ authStore.features.passwordEnabled ? '返回密码登录' : '返回登录' }}
         </el-button>
       </div>
     </div>
@@ -116,7 +131,8 @@ import { useAuthStore } from '../../stores/auth'
 import appIcon from '../../assets/app-icon-small.png'
 import { useTheme } from '../../utils/theme'
 import { readRedirectQuery, safeRedirect } from '../../utils/login-redirect'
-import { openExternalUrl } from '../../utils/capacitor'
+import { isAndroidCapacitor, openExternalUrl } from '../../utils/capacitor'
+import { feishuPollPhase, openFeishuAuthPopup } from '../../utils/feishu-login-poll'
 import { safeRemoveItem, safeSetItem } from '../../utils/safe-storage'
 
 type LoginMode = 'password' | 'feishu'
@@ -153,6 +169,7 @@ const formRules: FormRules = {
 }
 
 let pollTimer: number | null = null
+let popupWatchTimer: number | null = null
 let polling = false
 let feishuState = ''
 /** 飞书轮询取消标志：返回密码登录/卸载时终止仍在进行的 pollFeishuResult 循环 */
@@ -178,7 +195,7 @@ async function finishLogin() {
 }
 
 async function handleLogin() {
-  if (passwordLoading.value) return
+  if (!authStore.features.passwordEnabled || passwordLoading.value) return
   const valid = await formRef.value?.validate().catch(() => false)
   if (!valid) {
     await nextTick()
@@ -250,8 +267,8 @@ async function startFeishuLogin(provider: FeishuProvider) {
         feishuStatusText.value = '授权窗口已关闭'
         backToPasswordLogin()
       }
-    } else {
-      // Web / 安卓: 新窗口打开飞书授权页，轮询状态
+    } else if (isAndroidCapacitor()) {
+      // 安卓壳交给系统浏览器，授权完成后由用户回到 App，原页面继续轮询
       feishuStatusText.value = '请在打开的飞书授权页面中完成登录'
       const opened = await openExternalUrl(authUrl)
       if (!opened) {
@@ -261,6 +278,18 @@ async function startFeishuLogin(provider: FeishuProvider) {
         return
       }
       startPolling(qr.pollInterval || 2)
+    } else {
+      // Web: 弹窗授权。回调页会关掉自己，焦点回到这个登录页。
+      feishuStatusText.value = '请在弹出的飞书窗口中完成登录'
+      const popup = openFeishuAuthPopup(authUrl)
+      if (!popup) {
+        feishuStatusText.value = '授权页面被浏览器拦截，请允许弹窗后重试'
+        ElMessage.error('授权页面被浏览器拦截，请允许弹窗后重试')
+        backToPasswordLogin()
+        return
+      }
+      watchFeishuPopup(popup)
+      startPolling(qr.pollInterval || 2)
     }
   } catch (error) {
     feishuStatusText.value = '飞书登录启动失败'
@@ -268,6 +297,35 @@ async function startFeishuLogin(provider: FeishuProvider) {
   } finally {
     feishuLoading.value = false
   }
+}
+
+function watchFeishuPopup(popup: Window) {
+  clearPopupWatch()
+  popupWatchTimer = window.setInterval(() => {
+    if (!popup.closed) return
+    clearPopupWatch()
+    void onFeishuPopupClosed()
+  }, 300)
+}
+
+function clearPopupWatch() {
+  if (popupWatchTimer) {
+    window.clearInterval(popupWatchTimer)
+    popupWatchTimer = null
+  }
+}
+
+/** 弹窗关掉后立刻问一次结果。还在换票就继续等；用户提前关掉且仍未开始，则回到密码登录。 */
+async function onFeishuPopupClosed() {
+  const deadline = Date.now() + 3000
+  while (polling && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  await checkFeishuStatus()
+  if (!feishuState || !pollTimer) return
+  if (feishuStatusText.value === '正在完成登录…' || feishuStatusText.value === '登录成功') return
+  feishuStatusText.value = '授权窗口已关闭'
+  backToPasswordLogin()
 }
 
 function startPolling(intervalSeconds: number) {
@@ -287,12 +345,14 @@ async function checkFeishuStatus() {
       ? await authStore.pollEcpFeishuLogin(feishuState)
       : await authStore.pollFeishuLogin(feishuState)
     feishuPollFailures = 0
-    if (result.status === 'PENDING') {
-      feishuStatusText.value = '等待飞书确认'
+    const phase = feishuPollPhase(result.status)
+    // 回调换票期间是 PROCESSING。把它当成结束会停掉轮询，页面停在「飞书登录未完成」。
+    if (phase === 'pending' || phase === 'processing') {
+      feishuStatusText.value = phase === 'processing' ? '正在完成登录…' : '等待飞书确认'
       return
     }
     clearPollTimer()
-    if (result.status === 'SUCCESS') {
+    if (phase === 'success') {
       feishuStatusText.value = '登录成功'
       feishuState = ''
       await finishLogin()
@@ -349,6 +409,7 @@ async function pollFeishuResult(state: string) {
 
 function backToPasswordLogin() {
   pollCancelled = true
+  clearPopupWatch()
   clearPollTimer()
   mode.value = 'password'
   feishuState = ''
@@ -376,6 +437,7 @@ function showError(error: unknown, fallback: string) {
 
 onBeforeUnmount(() => {
   pollCancelled = true
+  clearPopupWatch()
   clearPollTimer()
 })
 </script>
@@ -492,6 +554,32 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: 8px;
   width: 100%;
+}
+
+.login-or {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 16px 0 14px;
+  color: var(--aw-muted);
+  font-size: var(--aw-text-fine);
+  line-height: 1;
+}
+
+.login-or::before,
+.login-or::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--aw-divider);
+}
+
+.login-closed {
+  margin: 0;
+  color: var(--aw-muted);
+  font-size: var(--aw-text-caption);
+  line-height: 22px;
+  text-align: center;
 }
 
 /* 登录页 CTA 保持醒目的大按钮：自设度量，优先级高于全站 small 统一规则 */

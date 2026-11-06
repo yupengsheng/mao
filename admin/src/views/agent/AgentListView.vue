@@ -189,7 +189,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, onActivated, onMounted } from 'vue'
+import { computed, ref, onActivated, onMounted, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
 import { api, apiGetWithHeaders } from '../../api'
@@ -204,6 +205,7 @@ import AgentExperienceLibraryDialog from './AgentExperienceLibraryDialog.vue'
 const experienceAgent = ref<{ id: number; name: string; experienceLibraryEnabled?: boolean } | null>(null)
 
 const { isMobile } = useBreakpoint()
+const route = useRoute()
 
 const loading = ref(false)
 const loadingDetail = ref(false)
@@ -366,6 +368,15 @@ async function handleDelete(row: any) {
     // Cancelled
   }
 }
+
+// 支持 RelatedAgentsPopover 的 ?keyword= 直跳预填；keep-alive 复活时也会命中路由变化。
+watch(() => route.query.keyword, (kw) => {
+  if (typeof kw === 'string' && kw.trim() !== '') {
+    searchQuery.value = kw.trim()
+    currentPage.value = 1
+    fetchAgents()
+  }
+}, { immediate: true })
 
 onMounted(() => {
   refreshAgentData()

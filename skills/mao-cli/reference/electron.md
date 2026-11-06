@@ -48,7 +48,8 @@ npm run dist
 |----|------|
 | 配置存储 | Electron `userData/server-config.json`（站点根、更新源策略、是否允许 HTTP） |
 | 首次启动 | 未配置时展示本地服务器配置页，填写站点地址并保存 |
-| 配置入口 | 应用菜单「服务器设置…」；桌面端设置 →「服务器」 |
+| 配置入口 | 应用菜单「服务器设置…」；桌面端设置 →「服务器」；两个入口均为「当前连接状态卡 + 历史地址一键切换 + 手动连接表单」结构 |
+| 历史快切 | 连接成功过的地址存 `userData/server-history.json`（最多 10 个，最近连接置顶）；列表内一键切换（不同服务器弹确认），删除可选；删除历史不影响当前连接 |
 | 环境变量 | `MAO_DESKTOP_SERVER_URL` 锁定站点（优先于配置文件）；`MAO_DESKTOP_UPDATE_URL` 覆盖更新源 |
 | 地址归一化 | 接受站点根、`/api`、`/api/v1`；无协议默认 `https://` |
 | 切换行为 | 清除登录态；关闭终端/MCP/本地 Shell；LOCAL 目录按 host 隔离：`~/.mao/runtime/<host>/<sessionId>` |
@@ -57,6 +58,8 @@ npm run dist
 **私有部署前提**：每套 Mao 仍需在本域构建并部署桌面 Web（`VITE_API_BASE_URL=https://<本域>/api/v1`），壳只负责加载该站 SPA。各站 `version.json` 与前端资源同域即可。
 
 API 地址由该站前端构建产物注入；壳内 skill-sync 等主进程请求从当前站点推导 `{origin}/api`。
+
+Electron 的本地 Shell / MCP 终端会随当前连接站点注入 `MAO_BASE_URL`（未选服务器时不注入），`mao` / `mao-agent` 等 CLI 直接复用该地址，不再回落到示例域名；切换服务器后新命令使用新地址。
 
 ## 自动更新
 

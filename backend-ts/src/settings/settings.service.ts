@@ -52,6 +52,8 @@ export const LDAP_BASE_DN_KEY = 'auth.ldap.baseDn';
 export const LDAP_USER_DN_KEY = 'auth.ldap.userDn';
 export const LDAP_PASSWORD_KEY = 'auth.ldap.password';
 export const LDAP_USER_SEARCH_BASE_KEY = 'auth.ldap.userSearchBase';
+/** 账号密码登录总开关（V205，默认开启）。关闭后仅影响桌面 / Web / 安卓与 POST /auth/login（含 LDAP）。 */
+export const PASSWORD_LOGIN_ENABLED_KEY = 'auth.password.enabled';
 export const FEISHU_ENABLED_KEY = 'auth.feishu.enabled';
 export const FEISHU_APP_ID_KEY = 'auth.feishu.appId';
 export const FEISHU_APP_SECRET_KEY = 'auth.feishu.appSecret';
@@ -97,8 +99,17 @@ export const NOTIFY_EMAIL_KEYS: readonly string[] = [
   NOTIFY_EMAIL_SMTP_SECURE_KEY, NOTIFY_EMAIL_SMTP_USER_KEY, NOTIFY_EMAIL_SMTP_PASSWORD_KEY,
   NOTIFY_EMAIL_FROM_ADDR_KEY,
 ];
+/** 影响交互式登录方式的配置项：批量保存后需按最终值联合校验，避免逐项读到旧值误判。 */
+const INTERACTIVE_LOGIN_KEYS = new Set<string>([
+  PASSWORD_LOGIN_ENABLED_KEY, FEISHU_ENABLED_KEY, FEISHU_APP_ID_KEY, ECP_CONFIG_KEY,
+]);
 
 export const SHARE_TOKEN_LINKS_ENABLED_KEY = 'share.tokenLinksEnabled';
+
+/** 管理后台侧边菜单隐藏列表（JSON 数组，元素为菜单路由路径）。缺行 / 空值 / 解析失败 = 全部显示。 */
+export const ADMIN_MENU_HIDDEN_KEY = 'admin.menu.hidden';
+/** 隐藏列表长度上限，防异常大值。 */
+const ADMIN_MENU_HIDDEN_MAX = 64;
 
 const HARNESS_COMPACTION_ENABLED_KEY = 'harness.compaction.enabled';
 const HARNESS_COMPACTION_CONTEXT_WINDOW_TOKENS_KEY = 'harness.compaction.contextWindowTokens';
@@ -210,12 +221,26 @@ export class SystemSettingService {
     return setting != null ? (setting.value ?? null) : null;
   }
 
+  /** 管理后台菜单隐藏列表（部署级全局配置，缺省全部显示；坏数据按全部显示容错）。 */
+  async getAdminMenuHidden(): Promise<string[]> {
+    return parseAdminMenuHidden(await this.getValue(ADMIN_MENU_HIDDEN_KEY));
+  }
+
   /**
    * 环境变量注入总开关（技术方案 §5.1）。行缺失或值非 false/0 一律视为开启：
    * 新能力默认可用；紧急停用必须显式写 false（与 getBool 未设置返回 false 的语义不同）。
    */
   async shellEnvVarsEnabled(): Promise<boolean> {
     const raw = (await this.getText(SHELL_ENV_VARS_ENABLED_KEY)).trim().toLowerCase();
+    return raw !== 'false' && raw !== '0';
+  }
+
+  /**
+   * 桌面端账号密码登录是否开放。行缺失或空值视为开启。
+   * 显式 false / 0 才关闭；关闭后本地密码与 LDAP 不能走 POST /auth/login。管理后台不受影响。
+   */
+  async passwordLoginEnabled(): Promise<boolean> {
+    const raw = (await this.getText(PASSWORD_LOGIN_ENABLED_KEY, 'true')).trim().toLowerCase();
     return raw !== 'false' && raw !== '0';
   }
 
@@ -257,10 +282,13 @@ export class SystemSettingService {
       if (setting.editable == null || setting.editable !== 1) {
         throw new BusinessException(ErrorCode.PARAM_INVALID, `该配置仅展示，不支持在后台修改: ${item.key}`);
       }
-      rows.push({ setting, next: await this.resolveNextValue(setting, item.value) });
+      rows.push({ setting, next: await this.resolveNextValue(setting, item.value, { deferInteractiveLoginCheck: true }) });
     }
     if (rows.some(({ setting }) => NOTIFY_EMAIL_KEYS.includes(setting.settingKey))) {
       await this.validateEmailSmtpGroup(new Map(rows.map(({ setting, next }) => [setting.settingKey, next])));
+    }
+    if (rows.some(({ setting }) => INTERACTIVE_LOGIN_KEYS.has(setting.settingKey))) {
+      await this.validateInteractiveLoginBatch(rows);
     }
     return this.settingRepo.transaction(async (tx) => {
       const result: SystemSetting[] = [];
@@ -614,13 +642,25 @@ export class SystemSettingService {
     }
   }
 
-  private async resolveNextValue(setting: SystemSetting, value: string | null | undefined): Promise<string | null> {
+  private async resolveNextValue(
+    setting: SystemSetting,
+    value: string | null | undefined,
+    options?: { deferInteractiveLoginCheck?: boolean },
+  ): Promise<string | null> {
     if (setting.settingKey === COMPANY_SSO_CONFIG_KEY) {
       const { requireHttps: _requireHttps, ...config } = this.parseCompanySsoConfig(value);
       return JSON.stringify(config);
     }
     if (setting.settingKey === ECP_CONFIG_KEY) {
-      return JSON.stringify(this.parseEcpConfig(value));
+      const config = this.parseEcpConfig(value);
+      if (!options?.deferInteractiveLoginCheck) {
+        await this.assertInteractiveLoginRemains({
+          ecpEnabled: config.enabled,
+          ecpAppCode: config.appCode,
+          ecpBaseUrl: config.baseUrl,
+        });
+      }
+      return JSON.stringify(config);
     }
     if (setting.isSecret === 1) {
       if (value == null) {
@@ -629,15 +669,92 @@ export class SystemSettingService {
       if (value === SECRET_MASK) {
         throw new BusinessException(ErrorCode.PARAM_INVALID, '不能提交掩码值，请输入新值或留空');
       }
-      await this.validateValue(setting.settingKey, value);
+      await this.validateValue(setting.settingKey, value, options);
       if (value === '') {
         return '';
       }
       return this.encryptSecret(value);
     }
     const normalized = value != null ? value : '';
-    await this.validateValue(setting.settingKey, normalized);
+    await this.validateValue(setting.settingKey, normalized, options);
     return normalized;
+  }
+
+  /**
+   * 密码登录关闭后，登录页必须还剩飞书 OAuth 或 ECP 之一。
+   * 飞书 OAuth 与登录按钮同一口径：开关打开且 App ID 不是占位值。
+   */
+  private async assertInteractiveLoginRemains(overrides: {
+    password?: boolean;
+    feishuEnabled?: boolean;
+    feishuAppId?: string;
+    ecpEnabled?: boolean;
+    ecpAppCode?: string;
+    ecpBaseUrl?: string;
+  } = {}): Promise<void> {
+    const passwordOn = overrides.password ?? await this.passwordLoginEnabled();
+    if (passwordOn) return;
+    const feishu = await this.getFeishuOAuthConfig();
+    const ecp = await this.getEcpConfig();
+    const feishuEnabled = overrides.feishuEnabled ?? feishu.enabled;
+    const feishuAppId = (overrides.feishuAppId ?? feishu.appId).trim();
+    const ecpEnabled = overrides.ecpEnabled ?? ecp.enabled;
+    const ecpAppCode = overrides.ecpAppCode ?? ecp.appCode;
+    const ecpBaseUrl = overrides.ecpBaseUrl ?? ecp.baseUrl;
+    const feishuOn = feishuEnabled && hasText(feishuAppId) && feishuAppId !== '1234567890';
+    const ecpOn = ecpEnabled && hasText(ecpAppCode) && hasText(ecpBaseUrl);
+    if (!feishuOn && !ecpOn) {
+      throw new BusinessException(
+        ErrorCode.PARAM_INVALID,
+        '至少保留一种登录方式。关闭账号密码登录前，请先启用飞书 OAuth（填写真实 App ID）或 ECP 飞书登录',
+      );
+    }
+  }
+
+  /**
+   * 批量保存时登录方式必须按「本批最终值」联合判断：
+   * 逐项校验读到的是数据库存量，密码关闭 + 同批开启飞书会因 enabled 尚未落库而误拒绝。
+   */
+  private async validateInteractiveLoginBatch(
+    rows: Array<{ setting: SystemSetting; next: string | null }>,
+  ): Promise<void> {
+    const pending = new Map(rows.map(({ setting, next }) => [setting.settingKey, next]));
+    const passwordOn = pending.has(PASSWORD_LOGIN_ENABLED_KEY)
+      ? !/^(false|0)$/i.test((pending.get(PASSWORD_LOGIN_ENABLED_KEY) ?? '').trim())
+      : await this.passwordLoginEnabled();
+    if (passwordOn) return;
+
+    const feishu = await this.getFeishuOAuthConfig();
+    const feishuEnabled = pending.has(FEISHU_ENABLED_KEY)
+      ? isEnabledFlag(pending.get(FEISHU_ENABLED_KEY))
+      : feishu.enabled;
+    const feishuAppId = pending.has(FEISHU_APP_ID_KEY)
+      ? (pending.get(FEISHU_APP_ID_KEY) ?? '')
+      : feishu.appId;
+
+    let ecpEnabled: boolean;
+    let ecpAppCode: string;
+    let ecpBaseUrl: string;
+    if (pending.has(ECP_CONFIG_KEY)) {
+      const config = this.parseEcpConfig(pending.get(ECP_CONFIG_KEY));
+      ecpEnabled = config.enabled;
+      ecpAppCode = config.appCode;
+      ecpBaseUrl = config.baseUrl;
+    } else {
+      const ecp = await this.getEcpConfig();
+      ecpEnabled = ecp.enabled;
+      ecpAppCode = ecp.appCode;
+      ecpBaseUrl = ecp.baseUrl;
+    }
+
+    await this.assertInteractiveLoginRemains({
+      password: false,
+      feishuEnabled,
+      feishuAppId,
+      ecpEnabled,
+      ecpAppCode,
+      ecpBaseUrl,
+    });
   }
 
   private encryptSecret(plaintext: string): string {
@@ -763,7 +880,32 @@ export class SystemSettingService {
     return Number.isInteger(n) && n > 0 ? n : 10;
   }
 
-  private async validateValue(key: string, value: string | null | undefined): Promise<void> {
+  private async validateValue(
+    key: string,
+    value: string | null | undefined,
+    options?: { deferInteractiveLoginCheck?: boolean },
+  ): Promise<void> {
+    if (key === ADMIN_MENU_HIDDEN_KEY) {
+      this.validateAdminMenuHidden(value);
+      return;
+    }
+    if (key === PASSWORD_LOGIN_ENABLED_KEY) {
+      if (!/^(true|false)$/i.test((value ?? '').trim())) {
+        throw new BusinessException(ErrorCode.PARAM_INVALID, '账号密码登录开关必须为 true 或 false');
+      }
+      if (!options?.deferInteractiveLoginCheck && /^false$/i.test(value!.trim())) {
+        await this.assertInteractiveLoginRemains({ password: false });
+      }
+      return;
+    }
+    if (!options?.deferInteractiveLoginCheck) {
+      if (key === FEISHU_ENABLED_KEY && /^(false|0)$/i.test((value ?? '').trim())) {
+        await this.assertInteractiveLoginRemains({ feishuEnabled: false });
+      }
+      if (key === FEISHU_APP_ID_KEY) {
+        await this.assertInteractiveLoginRemains({ feishuAppId: value ?? '' });
+      }
+    }
     if (key === WEIXIN_AGENT_ID_KEY || key === EMBED_AGENT_ID_KEY) {
       await this.validateAgentIdSetting(key, value, key === WEIXIN_AGENT_ID_KEY ? '微信智能体' : '浮窗助手');
       return;
@@ -903,6 +1045,43 @@ export class SystemSettingService {
   }
 
   /**
+   * 菜单隐藏列表形状校验：JSON 数组、元素为 / 开头的路由路径、去重后 ≤ ADMIN_MENU_HIDDEN_MAX 项、
+   * 禁止 /settings（配置入口自身被藏后管理员将无法通过界面恢复；后端拒收是防绕过前端的防御纵深）。
+   * 空值 / 空数组 = 恢复全部显示，放行。
+   */
+  private validateAdminMenuHidden(value: string | null | undefined): void {
+    const raw = (value ?? '').trim();
+    if (raw === '' || raw === '[]') return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '菜单隐藏配置必须是 JSON 数组');
+    }
+    if (!Array.isArray(parsed)) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '菜单隐藏配置必须是 JSON 数组');
+    }
+    const seen = new Set<string>();
+    for (const item of parsed) {
+      if (typeof item !== 'string') {
+        throw new BusinessException(ErrorCode.PARAM_INVALID, '菜单隐藏配置的元素必须是以 / 开头的路由路径');
+      }
+      // 先 trim 再判定：读侧 parseAdminMenuHidden 会 trim，此处同步口径，防止 '/settings ' 之类的变体绕过。
+      const path = item.trim();
+      if (!path.startsWith('/')) {
+        throw new BusinessException(ErrorCode.PARAM_INVALID, '菜单隐藏配置的元素必须是以 / 开头的路由路径');
+      }
+      if (path === '/settings') {
+        throw new BusinessException(ErrorCode.PARAM_INVALID, '「系统设置」不可隐藏，否则将无法恢复菜单配置');
+      }
+      seen.add(path);
+    }
+    if (seen.size > ADMIN_MENU_HIDDEN_MAX) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, `菜单隐藏配置最多 ${ADMIN_MENU_HIDDEN_MAX} 项`);
+    }
+  }
+
+  /**
    * Agent ID 类配置（weixin.agentId / embed.agentId）保存校验：空值放行（回落默认 Agent 语义）；
    * 非数字 / Agent 不存在 / 新指向已停用 Agent 一律拒绝（值与存量相同则豁免，允许保存其他字段）。
    */
@@ -924,6 +1103,28 @@ export class SystemSettingService {
         throw new BusinessException(ErrorCode.PARAM_INVALID, '指定的 Agent 已停用');
       }
     }
+  }
+}
+
+/**
+ * 解析菜单隐藏列表：容错（坏 JSON / 非数组 / 非字符串元素 / 空白项全部忽略，重复项去重），永不抛错。
+ * 读取侧 fail-open：任何异常都按「全部显示」处理。
+ */
+export function parseAdminMenuHidden(raw: string | null | undefined): string[] {
+  if (raw == null || raw.trim() === '') return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const out: string[] = [];
+    for (const item of parsed) {
+      if (typeof item !== 'string') continue;
+      const path = item.trim();
+      if (path === '' || !path.startsWith('/') || out.includes(path)) continue;
+      out.push(path);
+    }
+    return out;
+  } catch {
+    return [];
   }
 }
 

@@ -141,6 +141,13 @@ describe('HarnessService buildContext memory injection', () => {
     expect(context.modelConfig?.modelId).toBe('flash-1');
   });
 
+  it('loadsMemoriesByRuntimeIdentity', async () => {
+    const memoryInjection = { listForInjection: vi.fn(async () => []) };
+    const { harness } = buildHarness(memoryInjection);
+    await harness.buildContext(11, null, null, false, 67);
+    expect(memoryInjection.listForInjection).toHaveBeenCalledWith(67, 'mao', '/Users/me/mao');
+  });
+
   it('skipsMemoryLookupWithoutInjectionDependency', async () => {
     const { harness, memoryInjection } = buildHarness(null);
     const context = await harness.buildContext(11, null, null);

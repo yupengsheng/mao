@@ -81,6 +81,7 @@ import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessageBox } from 'element-plus'
 import { useAuthStore } from '../stores/auth'
+import { useMenuStore } from '../stores/menu'
 import { useTabStore } from '../stores/tabs'
 import { useBreakpoint } from '../composables/useBreakpoint'
 import { useEmbedChat } from '../composables/useEmbedChat'
@@ -95,6 +96,7 @@ const SIDEBAR_KEY = 'admin-sidebar-collapsed'
 const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
+const menuStore = useMenuStore()
 const tabStore = useTabStore()
 const { isMobile } = useBreakpoint()
 // 浮窗助手：Layout 仅在登录后路由树挂载，卸载（登出跳 /login）时自动销毁 SDK 实例
@@ -133,11 +135,20 @@ watch(isMobile, (mobile) => {
   if (!mobile) drawerVisible.value = false
 })
 
-watch(() => authStore.user, (user) => {
-  if (!user) return
-  const path = pickHomePath((permission) => authStore.hasPermission(permission))
-  tabStore.setHomePath(path, homeTitle(path))
-}, { immediate: true })
+// 登录用户或菜单可见性变化时重置不可关闭的首页签：跳过部署级隐藏的页面，
+// 保证 TabBar 首页签与「点 Logo / 返回首页」的落点一致。
+watch(
+  [() => authStore.user, () => menuStore.hidden],
+  ([user]) => {
+    if (!user) return
+    const path = pickHomePath(
+      (permission) => authStore.hasPermission(permission),
+      (index) => menuStore.isHidden(index)
+    )
+    tabStore.setHomePath(path, homeTitle(path))
+  },
+  { immediate: true }
+)
 
 watch(route, (newRoute) => {
   tabStore.addTab(newRoute)

@@ -22,6 +22,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
         allowHttp: options?.allowHttp === true,
       }),
     openPicker: () => ipcRenderer.invoke('server-config-open-picker'),
+    closePicker: () => ipcRenderer.invoke('server-picker-close'),
+    removeHistory: (serverBaseUrl) =>
+      ipcRenderer.invoke('server-config-remove-history', { serverBaseUrl }),
   },
 
   // Original APIs

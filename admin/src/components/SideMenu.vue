@@ -40,32 +40,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, type Component } from 'vue'
+import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import {
-  Monitor,
-  Connection,
-  MagicStick,
-  ChatDotRound,
-  User,
-  Lock,
-  DocumentChecked,
-  Timer,
-  TrendCharts,
-  Setting,
-  Link,
-  Promotion,
-  ChatLineRound,
-  Tickets,
-  Flag,
-  Collection,
-  Wallet,
-  Key,
-  Aim,
-  Operation
-} from '@element-plus/icons-vue'
 import { useAuthStore } from '../stores/auth'
+import { useMenuStore } from '../stores/menu'
 import { pickHomePath } from '../utils/home'
+import { applyMenuVisibility, menuGroups, type MenuItemDef } from '../utils/menuNav'
 
 withDefaults(
   defineProps<{
@@ -82,85 +62,22 @@ const emit = defineEmits<{
 const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
+const menuStore = useMenuStore()
 
 const logoSrc = `${import.meta.env.BASE_URL}app-icon-small.png`
 
-interface MenuItem {
-  index: string
-  label: string
-  icon: Component
-  permission?: string
-}
-
-interface MenuGroup {
-  id: string
-  label: string
-  items: MenuItem[]
-}
-
-const menuGroups: MenuGroup[] = [
-  {
-    id: 'overview',
-    label: '',
-    items: [
-      { index: '/analytics', label: '用量分析', icon: TrendCharts, permission: 'analytics:read' }
-    ]
-  },
-  {
-    id: 'capability',
-    label: '能力',
-    items: [
-      { index: '/agents', label: 'Agent 管理', icon: Monitor, permission: 'agent:read' },
-      { index: '/models', label: '模型管理', icon: Connection, permission: 'model:read' },
-      { index: '/feishu-bots', label: '飞书机器人', icon: ChatLineRound, permission: 'feishu-bot:read' },
-      { index: '/dingtalk-bots', label: '钉钉机器人', icon: ChatLineRound, permission: 'dingtalk-bot:read' },
-      { index: '/skills', label: 'Skills 管理', icon: MagicStick, permission: 'skill:read' },
-      { index: '/system-commands', label: '指令管理', icon: Promotion, permission: 'command:read' },
-      { index: '/mcp-servers', label: 'MCP 服务器', icon: Link, permission: 'mcp:read' }
-    ]
-  },
-  {
-    id: 'runtime',
-    label: '运行',
-    items: [
-      { index: '/sessions', label: '会话管理', icon: ChatDotRound, permission: 'session:read' },
-      { index: '/scheduled-tasks', label: '定时任务', icon: Timer, permission: 'scheduled-task:read' },
-      { index: '/budgets', label: '用量预算', icon: Wallet, permission: 'budget:read' },
-      { index: '/llm-calls', label: '调用流水', icon: Tickets, permission: 'llm-call:read' },
-      { index: '/openapi-calls', label: '开放调用', icon: Tickets, permission: 'openapi:read' },
-      { index: '/signal-watchers', label: '信号哨兵', icon: Aim, permission: 'signal:read' },
-      { index: '/http-tools', label: '自定义工具', icon: Operation, permission: 'http_tool:read' },
-      { index: '/feedback', label: '点踩反馈', icon: Flag, permission: 'feedback:read' },
-      { index: '/memory', label: '用户记忆', icon: Collection, permission: 'memory:read' }
-    ]
-  },
-  {
-    id: 'security',
-    label: '安全',
-    items: [
-      { index: '/users', label: '用户管理', icon: User, permission: 'user:read' },
-      { index: '/roles', label: '角色权限', icon: Lock, permission: 'role:read' },
-      { index: '/approval-rules', label: '审批规则', icon: Key, permission: 'approval-rule:read' },
-      { index: '/audit-logs', label: '审计日志', icon: DocumentChecked, permission: 'audit:read' }
-    ]
-  },
-  {
-    id: 'system',
-    label: '系统',
-    items: [
-      { index: '/settings', label: '系统设置', icon: Setting, permission: 'settings:read' }
-    ]
-  }
-]
-
-function canSee(item: MenuItem) {
+function canSee(item: MenuItemDef) {
   return !item.permission || authStore.hasPermission(item.permission)
 }
 
+// 权限过滤之上再叠加部署级可见性过滤（applyMenuVisibility 内部已剔除变空的分组）。
 const visibleGroups = computed(() =>
-  menuGroups
-    .map(group => ({ ...group, items: group.items.filter(canSee) }))
-    .filter(group => group.items.length > 0)
+  applyMenuVisibility(
+    menuGroups
+      .map(group => ({ ...group, items: group.items.filter(canSee) }))
+      .filter(group => group.items.length > 0),
+    menuStore.hidden
+  )
 )
 
 const activeMenu = computed(() => {
@@ -169,7 +86,10 @@ const activeMenu = computed(() => {
 })
 
 function goHome() {
-  const path = pickHomePath((permission) => authStore.hasPermission(permission))
+  const path = pickHomePath(
+    (permission) => authStore.hasPermission(permission),
+    (index) => menuStore.isHidden(index)
+  )
   router.push(path === '/forbidden' ? '/login' : path)
   emit('select')
 }

@@ -23,6 +23,7 @@ function handler(options: Partial<ConstructorParameters<typeof AgentDingtalkInbo
       getLatestAssistantReply: async () => '回复',
       updatePhase: async () => undefined,
       getPhase: async () => 'IDLE',
+      getLastRuntimeUserId: async () => 67,
       ...(options.sessionService ?? {}),
     },
     harnessService: { prepareMessage: () => 'evt', execute, ...(options.harnessService ?? {}) },
@@ -155,5 +156,24 @@ describe('AgentDingtalkInboundHandler sessions', () => {
 
     expect(claimNext).not.toHaveBeenCalled();
     expect(onQueuesDrained).not.toHaveBeenCalled();
+  });
+
+  it('retries with the persisted runtime identity instead of the owner', async () => {
+    const { handler: inbound, execute } = handler({
+      sessionService: {
+        getPhase: async () => 'FAILED',
+        getLastRuntimeUserId: async () => 67,
+        cleanupIncompleteTail: async () => 0,
+        getMessages: async () => [],
+        updatePhase: async () => undefined,
+      },
+    });
+    const result = await inbound.retryExecution(20, async () => ({
+      update: async () => undefined,
+    }));
+    expect(result).toEqual({ ok: true });
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(1));
+    expect(execute).toHaveBeenCalledWith(
+      20, null, expect.anything(), expect.anything(), 67);
   });
 });

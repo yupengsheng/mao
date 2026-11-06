@@ -1305,3 +1305,90 @@ describe('PromptEngine 自定义 HTTP 工具目录分节（技术方案 2026-10-
     expect(keys.indexOf('custom-http-tools')).toBeGreaterThan(keys.indexOf('mcp-workingset'));
   });
 });
+
+describe('PromptEngine 运行身份（技术方案 2026-11-04）', () => {
+  function setup() {
+    const runtime = RuntimeDataResolver.forTest('/tmp/rt-identity', '/tmp/home-identity');
+    const userCommandService = {
+      getByUserIdAndName: vi.fn(async (uid: number, name: string) => (
+        name === 'review' ? { content: `review-by-${uid}` } : null
+      )),
+    };
+    const skillSync = {
+      getUserSkillDocuments: vi.fn((uid: number) => (
+        uid === 67 ? [{ name: 'mine', description: 'user 67 skill' }] : []
+      )),
+    };
+    const skillLoader = {
+      hasSkill: (name: string) => name === 'java',
+      getAllNames: () => ['java'],
+      getAllDocuments: () => [{ name: 'java', description: 'Java skill' }],
+    };
+    const engine = new PromptEngine(
+      skillLoader as never,
+      { getWorkspaceRoot: () => '/ws' } as never,
+      runtime,
+      userCommandService as never,
+      skillSync as never,
+    );
+    return { engine, runtime, userCommandService, skillSync };
+  }
+
+  function context(overrides: Partial<AgentExecutionContext> = {}): AgentExecutionContext {
+    const ctx = new AgentExecutionContext();
+    ctx.executionMode = 'CLOUD';
+    ctx.workspace = '/ws';
+    ctx.userId = 7;
+    ctx.runtimeUserId = 67;
+    ctx.sessionId = 11;
+    ctx.systemPrompt = 'You are Mao';
+    ctx.sessionBaseYmd = '2026-11-06';
+    ctx.availableSkillNames = ['java', 'mine'];
+    ctx.availableSkillDocs.set('java', { name: 'java', description: 'Java skill' });
+    ctx.availableSkillDocs.set('mine', { name: 'mine', description: 'user 67 skill' });
+    ctx.tools = [tool('read_file')];
+    Object.assign(ctx, overrides);
+    return ctx;
+  }
+
+  it('renders runtime identity, upload dir and skill paths by runtime user', async () => {
+    const { engine, userCommandService } = setup();
+    const ctx = context({
+      runtimeUserDisplayName: '张三',
+      messages: [{ role: 'user', content: 'use ${java}$ and #{review}#' }],
+    });
+    const request = await engine.buildRequest(ctx);
+    const system = request.messages[0].content as string;
+    expect(system).toContain('## 执行身份');
+    expect(system).toContain('用户 #67 张三');
+    expect(system).toContain('会话归属：用户 #7');
+    expect(system).toContain('`/tmp/rt-identity/67/11/incoming`');
+    expect(system).toContain('`/tmp/rt-identity/67/11/skills/java/SKILL.md`');
+    expect(userCommandService.getByUserIdAndName).toHaveBeenCalledWith(67, 'review');
+    expect(request.messages[1].content as string).toContain('/java');
+    expect(request.messages[1].content as string).toContain('review-by-67');
+  });
+
+  it('omits the runtime identity section when runtime and owner are the same', async () => {
+    const { engine } = setup();
+    const request = await engine.buildRequest(context({ runtimeUserId: 7 }));
+    const system = request.messages[0].content as string;
+    expect(system).not.toContain('## 执行身份');
+    expect(system).toContain('`/tmp/rt-identity/7/11/incoming`');
+  });
+
+  it('falls back to the owner when runtimeUserId is absent', async () => {
+    const { engine, userCommandService, skillSync } = setup();
+    const ctx = context({
+      runtimeUserId: undefined,
+      messages: [{ role: 'user', content: '#{review}# ${mine}$' }],
+    });
+    const request = await engine.buildRequest(ctx);
+    const system = request.messages[0].content as string;
+    expect(system).not.toContain('## 执行身份');
+    expect(system).toContain('`/tmp/rt-identity/7/11/incoming`');
+    expect(userCommandService.getByUserIdAndName).toHaveBeenCalledWith(7, 'review');
+    expect(skillSync.getUserSkillDocuments).toHaveBeenCalledWith(7);
+    expect(request.messages[1].content as string).toContain('review-by-7');
+  });
+});

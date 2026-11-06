@@ -166,7 +166,7 @@ function makeHarness(overrides: Record<string, unknown> = {}) {
     getAllDocuments: vi.fn(() => [{ name: 'java', description: 'Java skill' }]),
   };
   const skillSync = {
-    syncToSession: vi.fn(async () => undefined),
+    syncToSession: vi.fn(async () => ({ failed: [] as string[] })),
     getUserSkillNames: vi.fn(() => ['mine']),
     getUserSkillDocuments: vi.fn(() => [{ name: 'mine', description: 'user skill' }]),
     loadAgentServers: vi.fn(async () => []),
@@ -215,6 +215,7 @@ function makeHarness(overrides: Record<string, unknown> = {}) {
       { role: 'USER', content: 'hello' },
       { role: 'ASSISTANT', content: 'world'.repeat(80) },
     ]),
+    touchRuntimeUser: vi.fn(async () => undefined),
   };
   const sessionCompactionService = {
     loadValidated: vi.fn(async () => null),
@@ -281,6 +282,7 @@ function makeHarness(overrides: Record<string, unknown> = {}) {
     deps.experienceMount ?? null,
     deps.executionLeaseService ?? null,
     deps.executionLeaseEnabled === true,
+    (deps.runtimeIdentityMode as 'execution' | 'owner' | undefined) ?? 'execution',
   );
   return { service, ...deps };
 }
@@ -888,6 +890,70 @@ describe('HarnessService.buildContext and execute', () => {
     expect(await service.resolveModel(3)).toEqual(model());
     expect(await service.resolveModel(null)).toEqual(model());
     expect(llmModelMapper.selectDefault).toHaveBeenCalled();
+  });
+});
+
+describe('HarnessService 运行身份（技术方案 2026-11-04）', () => {
+  it('默认 execution：运行身份取本次发言者并落库，技能与记忆按运行身份读取', async () => {
+    const { service, skillSync, sessionService, agentMapper } = makeHarness();
+    const ctx = await service.buildContext(10, null, null, false, 67);
+    expect(ctx.runtimeUserId).toBe(67);
+    expect(ctx.userId).toBe(7);
+    expect(sessionService.touchRuntimeUser).toHaveBeenCalledWith(10, 67);
+    expect(skillSync.syncToSession).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 2 }), 67, 10);
+    expect(skillSync.getUserSkillNames).toHaveBeenCalledWith(67);
+    expect(skillSync.getUserSkillDocuments).toHaveBeenCalledWith(67);
+    expect(agentMapper.selectById).toHaveBeenCalledWith(2);
+  });
+
+  it('无发言者（WS/定时任务）回落会话归属者', async () => {
+    const { service, skillSync, sessionService } = makeHarness();
+    const ctx = await service.buildContext(10);
+    expect(ctx.runtimeUserId).toBe(7);
+    expect(sessionService.touchRuntimeUser).toHaveBeenCalledWith(10, 7);
+    expect(skillSync.syncToSession).toHaveBeenCalledWith(expect.anything(), 7, 10);
+  });
+
+  it('owner 应急模式忽略本次发言者', async () => {
+    const { service, skillSync, sessionService } = makeHarness({ runtimeIdentityMode: 'owner' });
+    const ctx = await service.buildContext(10, null, null, false, 67);
+    expect(ctx.runtimeUserId).toBe(7);
+    expect(sessionService.touchRuntimeUser).toHaveBeenCalledWith(10, 7);
+    expect(skillSync.syncToSession).toHaveBeenCalledWith(expect.anything(), 7, 10);
+  });
+
+  it('落库失败只告警，不阻断上下文构建', async () => {
+    const { service, sessionService } = makeHarness();
+    sessionService.touchRuntimeUser.mockRejectedValue(new Error('db down'));
+    const ctx = await service.buildContext(10, null, null, false, 67);
+    expect(ctx.runtimeUserId).toBe(67);
+  });
+
+  it('仅身份不一致时查询发言者显示名', async () => {
+    const db = {
+      queryOne: vi.fn(async () => ({ displayName: '张三' })),
+    };
+    const { service } = makeHarness({ db });
+    const ctx = await service.buildContext(10, null, null, false, 67);
+    expect(ctx.runtimeUserDisplayName).toBe('张三');
+    expect(db.queryOne).toHaveBeenCalledWith(
+      'SELECT display_name FROM `user` WHERE id = ?', [67]);
+
+    db.queryOne.mockClear();
+    const sameIdentity = await service.buildContext(10);
+    expect(sameIdentity.runtimeUserDisplayName).toBeNull();
+    expect(db.queryOne).not.toHaveBeenCalled();
+  });
+
+  it('execute 将本次发言者透传给 buildContext', async () => {
+    const { service, promptEngine, agentLoop } = makeHarness();
+    await service.execute(10, null, {} as never, null, 67);
+    expect(promptEngine.buildRequest).toHaveBeenCalled();
+    const ctx = promptEngine.buildRequest.mock.calls[0]![0] as AgentExecutionContext;
+    expect(ctx.runtimeUserId).toBe(67);
+    expect(ctx.executionUserId).toBe(67);
+    expect(agentLoop.execute).toHaveBeenCalled();
   });
 });
 

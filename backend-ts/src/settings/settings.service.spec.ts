@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { BusinessException } from '../common/business-exception.js';
-import { SystemSettingService } from './settings.service.js';
+import { ADMIN_MENU_HIDDEN_KEY, parseAdminMenuHidden, SystemSettingService } from './settings.service.js';
 import { encryptAesGcmNonNull } from '../crypto/aes-gcm.js';
 import type { AgentLookup, ModelLookup, SystemSetting, SystemSettingRepository } from './types.js';
 
@@ -610,6 +610,97 @@ describe('SystemSettingService', () => {
   });
 });
 
+describe('SystemSettingService 菜单可见性（V204）', () => {
+  const mapper: SystemSettingRepository = {
+    list: vi.fn(),
+    findByKey: vi.fn(),
+    updateById: vi.fn(),
+    transaction: vi.fn(async (fn: (repo: SystemSettingRepository) => Promise<unknown>) => fn(mapper)),
+  };
+  const agentLookup: AgentLookup = { findById: vi.fn() };
+  const modelLookup: ModelLookup = { findById: vi.fn() };
+
+  function service(): SystemSettingService {
+    return new SystemSettingService(mapper, agentLookup, modelLookup, { workspaceRoot: '/ws', skillsDir: '/skills' });
+  }
+
+  function row(value: string | null): SystemSetting {
+    return { id: 1, settingKey: ADMIN_MENU_HIDDEN_KEY, category: '管理后台', value, editable: 1 };
+  }
+
+  beforeEach(() => {
+    vi.mocked(mapper.findByKey).mockReset();
+    vi.mocked(mapper.updateById).mockReset();
+  });
+
+  it('parseAdminMenuHidden：缺行 / 空值 / 坏数据一律按全部显示', () => {
+    expect(parseAdminMenuHidden(null)).toEqual([]);
+    expect(parseAdminMenuHidden(undefined)).toEqual([]);
+    expect(parseAdminMenuHidden('')).toEqual([]);
+    expect(parseAdminMenuHidden('   ')).toEqual([]);
+    expect(parseAdminMenuHidden('not-json')).toEqual([]);
+    expect(parseAdminMenuHidden('{}')).toEqual([]);
+    expect(parseAdminMenuHidden('"abc"')).toEqual([]);
+    expect(parseAdminMenuHidden('[1, true, null, { "a": 1 }]')).toEqual([]);
+  });
+
+  it('parseAdminMenuHidden：忽略空白项与非 / 开头项，去重并保序', () => {
+    expect(parseAdminMenuHidden('["/dingtalk-bots", "/openapi-calls", "/dingtalk-bots", "", "  ", "agents", 1]'))
+      .toEqual(['/dingtalk-bots', '/openapi-calls']);
+    expect(parseAdminMenuHidden('[" /sessions "]')).toEqual(['/sessions']);
+  });
+
+  it('getAdminMenuHidden：缺行 / 空值 / 坏 JSON 都返回空数组', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(null);
+    await expect(service().getAdminMenuHidden()).resolves.toEqual([]);
+    vi.mocked(mapper.findByKey).mockResolvedValue(row(''));
+    await expect(service().getAdminMenuHidden()).resolves.toEqual([]);
+    vi.mocked(mapper.findByKey).mockResolvedValue(row('oops'));
+    await expect(service().getAdminMenuHidden()).resolves.toEqual([]);
+  });
+
+  it('getAdminMenuHidden：返回合法隐藏列表', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(row('["/dingtalk-bots"]'));
+    await expect(service().getAdminMenuHidden()).resolves.toEqual(['/dingtalk-bots']);
+  });
+
+  it('update：接受 JSON 数组、空串与 []（恢复默认）', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(row('[]'));
+    await expect(service().update(ADMIN_MENU_HIDDEN_KEY, '["/dingtalk-bots","/openapi-calls"]'))
+      .resolves.toMatchObject({ value: '["/dingtalk-bots","/openapi-calls"]' });
+    await expect(service().update(ADMIN_MENU_HIDDEN_KEY, '[]')).resolves.toBeDefined();
+    await expect(service().update(ADMIN_MENU_HIDDEN_KEY, '')).resolves.toBeDefined();
+    await expect(service().update(ADMIN_MENU_HIDDEN_KEY, null)).resolves.toBeDefined();
+  });
+
+  it('update：拒绝非 JSON / 非数组 / 非字符串元素 / 非 / 开头元素', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(row('[]'));
+    await expect(service().update(ADMIN_MENU_HIDDEN_KEY, 'dingtalk')).rejects.toThrow(/JSON 数组/);
+    await expect(service().update(ADMIN_MENU_HIDDEN_KEY, '{}')).rejects.toThrow(/JSON 数组/);
+    await expect(service().update(ADMIN_MENU_HIDDEN_KEY, '[1]')).rejects.toThrow(/以 \/ 开头/);
+    await expect(service().update(ADMIN_MENU_HIDDEN_KEY, '["agents"]')).rejects.toThrow(/以 \/ 开头/);
+    expect(mapper.updateById).not.toHaveBeenCalled();
+  });
+
+  it('update：禁止隐藏「系统设置」（含前后空白变体）', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(row('[]'));
+    await expect(service().update(ADMIN_MENU_HIDDEN_KEY, '["/settings"]')).rejects.toThrow(/不可隐藏/);
+    await expect(service().update(ADMIN_MENU_HIDDEN_KEY, '[" /settings "]')).rejects.toThrow(/不可隐藏/);
+    await expect(service().update(ADMIN_MENU_HIDDEN_KEY, '["/settings "]')).rejects.toThrow(/不可隐藏/);
+    expect(mapper.updateById).not.toHaveBeenCalled();
+  });
+
+  it('update：最多 64 项（重复项去重后计数）', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(row('[]'));
+    const exactly64 = JSON.stringify(Array.from({ length: 64 }, (_, i) => `/menu-${i}`));
+    await expect(service().update(ADMIN_MENU_HIDDEN_KEY, exactly64)).resolves.toBeDefined();
+    const over65 = JSON.stringify([...Array.from({ length: 64 }, (_, i) => `/menu-${i}`), '/one-more']);
+    await expect(service().update(ADMIN_MENU_HIDDEN_KEY, over65)).rejects.toThrow(/最多 64 项/);
+    const duplicate65 = JSON.stringify(Array.from({ length: 65 }, () => '/same'));
+    await expect(service().update(ADMIN_MENU_HIDDEN_KEY, duplicate65)).resolves.toBeDefined();
+  });
+});
+
 describe('SystemSettingService 邮件 SMTP 配置（V162）', () => {
   const mapper: SystemSettingRepository = {
     list: vi.fn(),
@@ -816,5 +907,151 @@ describe('SystemSettingService 自定义 HTTP 工具设置项（V163）', () => 
     await expect(service().getPrivateAllowlistCidrs()).resolves.toEqual(['10.0.0.0/8']);
     vi.mocked(mapper.findByKey).mockResolvedValue(null);
     await expect(service().getPrivateAllowlistCidrs()).resolves.toEqual([]);
+  });
+});
+
+describe('SystemSettingService 账号密码登录开关（V205）', () => {
+  let rows: Map<string, SystemSetting>;
+  const mapper: SystemSettingRepository = {
+    list: vi.fn(),
+    findByKey: vi.fn(async (key: string) => rows.get(key) ?? null),
+    updateById: vi.fn(async (row: SystemSetting) => {
+      rows.set(row.settingKey, { ...row });
+    }),
+    transaction: vi.fn(async (fn: (repo: SystemSettingRepository) => Promise<unknown>) => fn(mapper)),
+  };
+  const agentLookup: AgentLookup = { findById: vi.fn() };
+  const modelLookup: ModelLookup = { findById: vi.fn() };
+
+  function service(): SystemSettingService {
+    return new SystemSettingService(mapper, agentLookup, modelLookup, { workspaceRoot: '/ws', skillsDir: '/skills' });
+  }
+
+  function row(key: string, value: string): SystemSetting {
+    return { id: 1, settingKey: key, category: '集成配置', value, editable: 1 };
+  }
+
+  function mockRows(values: Record<string, string | null>): void {
+    rows = new Map(Object.entries(values).map(([key, value]) => [
+      key, { ...row(key, value ?? ''), value },
+    ]));
+  }
+
+  function ecpConfig(enabled: boolean, appCode = 'EK0001', baseUrl = 'https://ecp.example.com/api/v1'): string {
+    return JSON.stringify({
+      enabled,
+      appCode,
+      baseUrl,
+      loginVariant: 'PARTNER',
+      timeoutMs: 10000,
+      desktopCallbackUrl: 'https://mao.example.com/auth/ecp/feishu-callback',
+      adminCallbackUrl: 'https://mao.example.com/admin/auth/ecp/feishu-callback',
+      channelCallbackUrl: '',
+      larkAppId: '',
+    });
+  }
+
+  beforeEach(() => {
+    vi.mocked(mapper.updateById).mockClear();
+    vi.mocked(mapper.findByKey).mockClear();
+  });
+
+  it('passwordLoginEnabled 缺行/空值默认开启，仅显式 false/0 关闭', async () => {
+    mockRows({});
+    await expect(service().passwordLoginEnabled()).resolves.toBe(true);
+    mockRows({ 'auth.password.enabled': '' });
+    await expect(service().passwordLoginEnabled()).resolves.toBe(true);
+    mockRows({ 'auth.password.enabled': 'TRUE' });
+    await expect(service().passwordLoginEnabled()).resolves.toBe(true);
+    mockRows({ 'auth.password.enabled': 'false' });
+    await expect(service().passwordLoginEnabled()).resolves.toBe(false);
+    mockRows({ 'auth.password.enabled': '0' });
+    await expect(service().passwordLoginEnabled()).resolves.toBe(false);
+  });
+
+  it('update 拒绝非法开关值且不落库', async () => {
+    mockRows({ 'auth.password.enabled': 'true' });
+    await expect(service().update('auth.password.enabled', 'yes')).rejects.toThrow(/必须为 true 或 false/);
+    expect(mapper.updateById).not.toHaveBeenCalled();
+  });
+
+  it('单独关闭密码且没有飞书/ECP 时拒绝，符合条件时允许', async () => {
+    mockRows({ 'auth.password.enabled': 'true' });
+    await expect(service().update('auth.password.enabled', 'false')).rejects.toThrow(/至少保留一种登录方式/);
+    expect(mapper.updateById).not.toHaveBeenCalled();
+
+    mockRows({
+      'auth.password.enabled': 'true',
+      'auth.feishu.enabled': 'true',
+      'auth.feishu.appId': 'cli_real_app_id',
+    });
+    await expect(service().update('auth.password.enabled', 'false')).resolves.toMatchObject({ value: 'false' });
+  });
+
+  it('飞书占位 App ID 不能作为唯一登录方式', async () => {
+    mockRows({
+      'auth.password.enabled': 'true',
+      'auth.feishu.enabled': 'true',
+      'auth.feishu.appId': '1234567890',
+    });
+    await expect(service().update('auth.password.enabled', 'false')).rejects.toThrow(/至少保留一种登录方式/);
+  });
+
+  it('密码关闭后关闭飞书或清空 App ID 会拒绝', async () => {
+    mockRows({
+      'auth.password.enabled': 'false',
+      'auth.feishu.enabled': 'true',
+      'auth.feishu.appId': 'cli_real_app_id',
+    });
+    await expect(service().update('auth.feishu.enabled', 'false')).rejects.toThrow(/至少保留一种登录方式/);
+    await expect(service().update('auth.feishu.appId', '')).rejects.toThrow(/至少保留一种登录方式/);
+  });
+
+  it('ECP 可作为密码关闭后的唯一登录方式', async () => {
+    mockRows({
+      'auth.password.enabled': 'true',
+      'auth.ecp.config': ecpConfig(true),
+    });
+    await expect(service().update('auth.password.enabled', 'false')).resolves.toMatchObject({ value: 'false' });
+  });
+
+  it('批量保存：密码关闭 + 同批开启飞书并填真实 App ID 成功', async () => {
+    mockRows({
+      'auth.password.enabled': 'true',
+      'auth.feishu.enabled': 'false',
+      'auth.feishu.appId': '',
+    });
+    const result = await service().updateBatch([
+      { key: 'auth.password.enabled', value: 'false' },
+      { key: 'auth.feishu.enabled', value: 'true' },
+      { key: 'auth.feishu.appId', value: 'cli_real_app_id' },
+    ]);
+    expect(result).toHaveLength(3);
+    expect(mapper.updateById).toHaveBeenCalledTimes(3);
+  });
+
+  it('批量保存：密码关闭 + 同批启用 ECP 成功', async () => {
+    mockRows({
+      'auth.password.enabled': 'true',
+      'auth.ecp.config': ecpConfig(false),
+    });
+    const result = await service().updateBatch([
+      { key: 'auth.password.enabled', value: 'false' },
+      { key: 'auth.ecp.config', value: ecpConfig(true) },
+    ]);
+    expect(result).toHaveLength(2);
+  });
+
+  it('批量保存：最终仍无登录方式时整体拒绝且不落库', async () => {
+    mockRows({
+      'auth.password.enabled': 'true',
+      'auth.feishu.enabled': 'false',
+      'auth.feishu.appId': '',
+    });
+    await expect(service().updateBatch([
+      { key: 'auth.password.enabled', value: 'false' },
+      { key: 'auth.feishu.enabled', value: 'false' },
+    ])).rejects.toThrow(/至少保留一种登录方式/);
+    expect(mapper.updateById).not.toHaveBeenCalled();
   });
 });

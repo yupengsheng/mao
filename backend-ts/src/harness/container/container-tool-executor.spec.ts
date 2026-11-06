@@ -94,6 +94,18 @@ describe('container tool executor', () => {
       expect(JSON.parse(read).error, `expected rejection for ${path}`).toBeDefined();
     }
 
+    // 跨成员诊断（技术方案 2026-11-04 §5.9）：runtime/uploads 的他人目录给专属文案，
+    // 其余越界继续用通用文案，避免把普通越界误归因为身份问题。
+    const foreignRuntime = await executor.handleToolCall(
+      'read_file', JSON.stringify({ path: join(runtimeDir, '8', 'session', 'x.txt') }), env);
+    expect(JSON.parse(foreignRuntime).error).toContain('其他用户的会话运行目录（当前执行身份 7）');
+    const foreignUpload = await executor.handleToolCall(
+      'read_file', JSON.stringify({ path: join(base, 'uploads', '8', 'gen.png') }), env);
+    expect(JSON.parse(foreignUpload).error).toContain('其他成员的产物目录（当前执行身份 7）');
+    const generic = await executor.handleToolCall(
+      'read_file', JSON.stringify({ path: join(base, 'elsewhere', 'x.txt') }), env);
+    expect(JSON.parse(generic).error).toContain('Path escape attempt: ');
+
     // 自己的每用户根照常放行
     mkdirSync(join(userHomeDir, '7'), { recursive: true });
     writeFileSync(join(userHomeDir, '7', 'mine.txt'), 'mine');

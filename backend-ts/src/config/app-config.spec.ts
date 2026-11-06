@@ -156,6 +156,40 @@ describe('入站合并窗口环境变量', () => {
   });
 });
 
+describe('运行身份环境变量', () => {
+  function withEnv(value: string | undefined, fn: () => void): void {
+    const prev = process.env.MAO_RUNTIME_IDENTITY;
+    if (value === undefined) delete process.env.MAO_RUNTIME_IDENTITY;
+    else process.env.MAO_RUNTIME_IDENTITY = value;
+    try {
+      resetConfigCache();
+      fn();
+    } finally {
+      if (prev === undefined) delete process.env.MAO_RUNTIME_IDENTITY;
+      else process.env.MAO_RUNTIME_IDENTITY = prev;
+      resetConfigCache();
+    }
+  }
+
+  it('默认 execution', () => {
+    withEnv(undefined, () => {
+      expect(loadConfig().app.harness.runtimeIdentityMode).toBe('execution');
+    });
+  });
+
+  it('owner/execution 可配，非法值回落 execution', () => {
+    withEnv('owner', () => {
+      expect(loadConfig().app.harness.runtimeIdentityMode).toBe('owner');
+    });
+    withEnv('execution', () => {
+      expect(loadConfig().app.harness.runtimeIdentityMode).toBe('execution');
+    });
+    withEnv('shared', () => {
+      expect(loadConfig().app.harness.runtimeIdentityMode).toBe('execution');
+    });
+  });
+});
+
 describe('自定义 HTTP 工具加密密钥环境变量', () => {
   const ENV_KEYS = ['APP_HTTP_TOOL_SECRET', 'APP_USER_TOOL_SECRET'];
 

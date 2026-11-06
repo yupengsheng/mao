@@ -57,6 +57,11 @@
           </template>
         </el-table-column>
         <el-table-column prop="timeoutMs" label="超时(ms)" width="100" />
+        <el-table-column label="关联 Agent" width="110" align="right">
+          <template #default="{ row }">
+            <RelatedAgentsPopover :agents="agentsByHttpTool(row.id)" />
+          </template>
+        </el-table-column>
         <el-table-column label="更新时间" width="170">
           <template #default="{ row }">{{ formatDateTime(row.updatedAt) }}</template>
         </el-table-column>
@@ -310,6 +315,8 @@ import { ElMessage } from 'element-plus'
 import { api } from '../../api'
 import { formatDateTime } from '../../utils/datetime'
 import { HEADER_VALUE_MASK, isSensitiveHeaderKey } from '../../utils/httpTool'
+import { useAgentRelations } from '../../composables/useAgentRelations'
+import RelatedAgentsPopover from '../../components/RelatedAgentsPopover.vue'
 import ResponsivePagination from '../../components/ResponsivePagination.vue'
 
 const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'] as const
@@ -388,6 +395,8 @@ const editingId = ref<number | null>(null)
 const submitting = ref(false)
 const nameError = ref('')
 const urlError = ref('')
+
+const { agentsByHttpTool, load: loadAgentRelations } = useAgentRelations()
 
 const emptyForm = () => ({
   name: '',
@@ -763,10 +772,12 @@ async function runTest() {
 onMounted(() => {
   void loadRecords()
   void loadStats()
+  void loadAgentRelations()
 })
 
 onActivated(() => {
   void loadStats()
+  void loadAgentRelations()
 })
 </script>
 
