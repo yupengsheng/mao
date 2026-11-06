@@ -214,7 +214,7 @@ CLI：`mao http-tool list|enabled|stats|create|update|delete|set-enabled|test`�
 - **通知与消息**：任务通知（0.0.88 迁入，即时生效）、微信（`weixin.agentId` / `weixin.modelId` 微信通道 Agent 与模型）
 - **平台与运维**：分享（匿名分享链接开关）、审计（日志保留天数，后台每小时据此自动清理）、用量（LLM 调用流水保留天数、会话活动保留天数，均默认 180 天、最低 90 天，后台每小时据此自动清理）、运行环境（工作区与 Skill 目录只读展示；容器模式额外展示运行时镜像、依赖指纹、最近预检与在线容器连接健康状态，不主动触发预检）
 
-读写需 `settings:read` / `settings:write` 权限；页面左侧目录按上述分两级展示（默认折叠为分组标题行，点击分组或滚动到该组内容时自动展开），可快速跳转分组；滚动右侧配置时目录固定不跟随页面滚走。CLI：`mao settings list|set`（见 [settings.md](settings.md)）。
+读写需 `settings:read` / `settings:write` 权限；页面顶部的搜索框支持按配置名称、key、说明或选项搜索，选中结果会跳到对应控件并短暂高亮（SSO / ECP 等 JSON 配置可定位到具体子字段）。左侧目录按上述分两级展示（默认折叠为分组标题行，点击分组或滚动到该组内容时自动展开），可快速跳转分组；滚动右侧配置时目录固定不跟随页面滚走。CLI：`mao settings list|set`（见 [settings.md](settings.md)）。
 
 ## 浮窗助手（0.0.298 起）
 

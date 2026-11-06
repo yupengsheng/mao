@@ -12,35 +12,35 @@
       <el-alert type="info" :closable="false" show-icon title="开启后新增 ECP 飞书登录入口，并加密保存 sessionToken 供 CLOUD shell 注入内部 CLI；不关闭其它登录方式。飞书机器人通道在开启后会检查发送者是否有有效 ECP 票，没有则引导用户先完成 ECP 飞书登录。" class="config-tip" />
       <el-alert type="info" :closable="false" show-icon title="保存后对新登录与 renew 即时生效，不需重启。" class="config-tip" />
       <el-form label-width="170px" label-position="left" class="group-form" :disabled="disabled">
-        <el-form-item label="启用 ECP 飞书登录">
+        <el-form-item :id="ECP_FIELD_IDS.enabled" label="启用 ECP 飞书登录" class="setting-field">
           <el-switch v-model="model.enabled" />
         </el-form-item>
-        <el-form-item label="appCode">
+        <el-form-item :id="ECP_FIELD_IDS.appCode" label="appCode" class="setting-field">
           <el-input v-model="model.appCode" placeholder="EK0001" />
         </el-form-item>
-        <el-form-item label="ECP API Base URL">
+        <el-form-item :id="ECP_FIELD_IDS.baseUrl" label="ECP API Base URL" class="setting-field">
           <el-input v-model="model.baseUrl" placeholder="https://ecp.example.com/api/v1" />
         </el-form-item>
-        <el-form-item label="loginVariant">
+        <el-form-item :id="ECP_FIELD_IDS.loginVariant" label="loginVariant" class="setting-field">
           <el-input v-model="model.loginVariant" placeholder="PARTNER" />
           <div class="field-hint">联调 400/401 时可调整，默认 PARTNER。</div>
         </el-form-item>
-        <el-form-item label="请求超时 (ms)">
+        <el-form-item :id="ECP_FIELD_IDS.timeout" label="请求超时 (ms)" class="setting-field">
           <el-input-number v-model="model.timeoutMs" :min="1000" :max="60000" :step="1000" step-strictly controls-position="right" />
         </el-form-item>
-        <el-form-item label="桌面回调 URL">
+        <el-form-item :id="ECP_FIELD_IDS.desktopCallback" label="桌面回调 URL" class="setting-field">
           <el-input v-model="model.desktopCallbackUrl" />
           <div class="field-hint">须在 ECP 登记；桌面 / Web / 安卓飞书回调。</div>
         </el-form-item>
-        <el-form-item label="管理后台回调 URL">
+        <el-form-item :id="ECP_FIELD_IDS.adminCallback" label="管理后台回调 URL" class="setting-field">
           <el-input v-model="model.adminCallbackUrl" />
           <div class="field-hint">须在 ECP 登记；管理后台飞书回调。</div>
         </el-form-item>
-        <el-form-item label="通道公网回调 URL">
+        <el-form-item :id="ECP_FIELD_IDS.channelCallback" label="通道公网回调 URL" class="setting-field">
           <el-input v-model="model.channelCallbackUrl" placeholder="https://apihub-test.danchuangglobal.com/api/mao/v1/auth/ecp/feishu/channel-callback" />
           <div class="field-hint">飞书通道「点我绑定」用；须在 ECP 登记。留空则沿用桌面回调 URL，此时外网（无内网/VPN）用户点卡片会卡在回调页。</div>
         </el-form-item>
-        <el-form-item label="lark App ID">
+        <el-form-item :id="ECP_FIELD_IDS.larkAppId" label="lark App ID" class="setting-field">
           <el-input v-model="model.larkAppId" placeholder="cli_xxxx" />
           <div class="field-hint">开启 ECP 后，Agent shell 注入 LARKSUITE_CLI_APP_ID 与用户飞书 UAT，供 lark-cli 使用；须与 ECP 换票返回的 UAT 属同一飞书应用。留空则不注入。</div>
         </el-form-item>
@@ -56,6 +56,7 @@ import { ElMessage } from 'element-plus'
 import { api } from '../../../api'
 import { ECP_CONFIG_KEY, defaultEcpConfig, parseEcpConfig, validateEcpConfig } from '../ecpConfig'
 import { useServerSyncGuard } from '../useServerSyncGuard'
+import { ECP_FIELD_IDS } from '../settingsSearchCatalog'
 
 const props = defineProps<{
   row?: { value: string | null; editable?: number }

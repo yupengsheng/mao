@@ -3,11 +3,17 @@
     <el-card class="page-card">
       <template #header>
         <div class="card-header">
-          <div>
+          <div class="card-heading">
             <div class="card-title">系统设置</div>
-            <div class="card-hint">按分类编辑平台配置，点击左侧目录可快速跳转。</div>
+            <div class="card-hint">按分类编辑平台配置，点击左侧目录可快速跳转；不知道在哪一组时，可按名称或 key 搜索定位。</div>
           </div>
-          <el-button @click="fetchSettings">
+          <SettingsSearchBox
+            class="header-search"
+            :fields="locatorFields"
+            :sections="locatorSections"
+            @select="locateSetting"
+          />
+          <el-button class="header-refresh" @click="fetchSettings">
             <el-icon><Refresh /></el-icon>
           </el-button>
         </div>
@@ -120,109 +126,112 @@
                   </template>
                   <RuntimeEnvironmentPanel v-if="section.name === '运行环境'" />
                   <el-form label-position="top" class="group-form">
-                    <el-form-item
+                    <div
                       v-for="row in settingsByCategory[section.name]"
+                      :id="settingFieldId(row.settingKey)"
                       :key="row.settingKey"
-                      :label="row.description || row.settingKey"
+                      class="setting-field"
                     >
-                      <div v-if="row.editable !== 1" class="field-readonly">{{ row.value || '未设置' }}</div>
-                      <template v-else>
-                        <el-switch
-                          v-if="isBooleanSetting(row.settingKey)"
-                          :model-value="isSwitchOn(row.settingKey)"
-                          :disabled="!canWrite"
-                          @change="(val: string | number | boolean) => { plainModel[row.settingKey] = val === true ? 'true' : 'false' }"
-                        />
-                        <el-select
-                          v-else-if="isMcpLoadModeSetting(row.settingKey)"
-                          v-model="plainModel[row.settingKey]"
-                          :disabled="!canWrite"
-                          placeholder="MCP 工具加载模式"
-                          style="width: 100%"
-                        >
-                          <el-option label="工作集（默认，按需查询参数）" value="working_set" />
-                          <el-option label="全量注入（旧行为，每次请求带完整 schema）" value="full" />
-                        </el-select>
-                        <el-select
-                          v-else-if="isRuntimeModeSetting(row.settingKey)"
-                          v-model="plainModel[row.settingKey]"
-                          :disabled="!canWrite"
-                          placeholder="用户运行时模式"
-                          style="width: 100%"
-                        >
-                          <el-option label="宿主机（host，默认）：工具在服务端宿主机执行" value="host" />
-                          <el-option label="容器隔离（docker）：每用户独立容器；切换后旧 shell 会话会终止" value="docker" />
-                        </el-select>
-                        <el-select
-                          v-else-if="isAgentSetting(row.settingKey)"
-                          v-model="plainModel[row.settingKey]"
-                          :disabled="!canWrite"
-                          clearable
-                          filterable
-                          placeholder="默认 Agent"
-                          style="width: 100%"
-                        >
-                          <el-option
-                            v-for="agent in agents"
-                            :key="agent.id"
-                            :label="agentLabel(agent)"
-                            :value="String(agent.id)"
-                            :disabled="agent.enabled === false"
+                      <el-form-item :label="row.description || row.settingKey">
+                        <div v-if="row.editable !== 1" class="field-readonly">{{ row.value || '未设置' }}</div>
+                        <template v-else>
+                          <el-switch
+                            v-if="isBooleanSetting(row.settingKey)"
+                            :model-value="isSwitchOn(row.settingKey)"
+                            :disabled="!canWrite"
+                            @change="(val: string | number | boolean) => { plainModel[row.settingKey] = val === true ? 'true' : 'false' }"
                           />
-                        </el-select>
-                        <el-select
-                          v-else-if="isModelSetting(row.settingKey)"
-                          v-model="plainModel[row.settingKey]"
-                          :disabled="!canWrite"
-                          clearable
-                          filterable
-                          placeholder="默认模型"
-                          style="width: 100%"
-                        >
-                          <el-option v-for="model in models" :key="model.id" :label="modelLabel(model)" :value="String(model.id)" />
-                        </el-select>
-                        <el-input-number
-                          v-else-if="isNumericKey(row.settingKey)"
-                          :model-value="toNumberOrNull(plainModel[row.settingKey])"
-                          :min="numericMin(row.settingKey)"
-                          :step="1"
-                          step-strictly
-                          controls-position="right"
-                          :disabled="!canWrite"
-                          style="width: 100%"
-                          @update:model-value="(val: number | undefined) => { plainModel[row.settingKey] = val == null ? '' : String(val) }"
-                        />
-                        <el-input
-                          v-else-if="isCidrAllowlistSetting(row.settingKey)"
-                          v-model="plainModel[row.settingKey]"
-                          type="textarea"
-                          :rows="4"
-                          :disabled="!canWrite"
-                          placeholder='["10.0.0.0/8","192.168.1.0/24"]'
-                        />
-                        <el-input
-                          v-else
-                          v-model="plainModel[row.settingKey]"
-                          :type="row.isSecret === 1 ? 'password' : 'text'"
-                          :placeholder="row.isSecret === 1 && row.value ? '已设置，留空表示不修改' : ''"
-                          :disabled="!canWrite"
-                          autocomplete="new-password"
-                        >
-                          <template v-if="row.isSecret === 1 && row.value" #append>
-                            <el-button
-                              v-if="!pendingClearKeys.has(row.settingKey)"
-                              :disabled="!canWrite"
-                              @click="markSecretClear(row.settingKey)"
-                            >清除</el-button>
-                            <el-tag v-else type="danger" size="small" closable @close="unmarkSecretClear(row.settingKey)">将清除</el-tag>
-                          </template>
-                        </el-input>
-                        <div v-if="isCidrAllowlistSetting(row.settingKey) && cidrAllowlistError(plainModel[row.settingKey])" class="field-error">
-                          {{ cidrAllowlistError(plainModel[row.settingKey]) }}
-                        </div>
-                        <div class="field-hint">{{ row.settingKey }}</div>
-                      </template>
-                    </el-form-item>
+                          <el-select
+                            v-else-if="isMcpLoadModeSetting(row.settingKey)"
+                            v-model="plainModel[row.settingKey]"
+                            :disabled="!canWrite"
+                            placeholder="MCP 工具加载模式"
+                            style="width: 100%"
+                          >
+                            <el-option label="工作集（默认，按需查询参数）" value="working_set" />
+                            <el-option label="全量注入（旧行为，每次请求带完整 schema）" value="full" />
+                          </el-select>
+                          <el-select
+                            v-else-if="isRuntimeModeSetting(row.settingKey)"
+                            v-model="plainModel[row.settingKey]"
+                            :disabled="!canWrite"
+                            placeholder="用户运行时模式"
+                            style="width: 100%"
+                          >
+                            <el-option label="宿主机（host，默认）：工具在服务端宿主机执行" value="host" />
+                            <el-option label="容器隔离（docker）：每用户独立容器；切换后旧 shell 会话会终止" value="docker" />
+                          </el-select>
+                          <el-select
+                            v-else-if="isAgentSetting(row.settingKey)"
+                            v-model="plainModel[row.settingKey]"
+                            :disabled="!canWrite"
+                            clearable
+                            filterable
+                            placeholder="默认 Agent"
+                            style="width: 100%"
+                          >
+                            <el-option
+                              v-for="agent in agents"
+                              :key="agent.id"
+                              :label="agentLabel(agent)"
+                              :value="String(agent.id)"
+                              :disabled="agent.enabled === false"
+                            />
+                          </el-select>
+                          <el-select
+                            v-else-if="isModelSetting(row.settingKey)"
+                            v-model="plainModel[row.settingKey]"
+                            :disabled="!canWrite"
+                            clearable
+                            filterable
+                            placeholder="默认模型"
+                            style="width: 100%"
+                          >
+                            <el-option v-for="model in models" :key="model.id" :label="modelLabel(model)" :value="String(model.id)" />
+                          </el-select>
+                          <el-input-number
+                            v-else-if="isNumericKey(row.settingKey)"
+                            :model-value="toNumberOrNull(plainModel[row.settingKey])"
+                            :min="numericMin(row.settingKey)"
+                            :step="1"
+                            step-strictly
+                            controls-position="right"
+                            :disabled="!canWrite"
+                            style="width: 100%"
+                            @update:model-value="(val: number | undefined) => { plainModel[row.settingKey] = val == null ? '' : String(val) }"
+                          />
+                          <el-input
+                            v-else-if="isCidrAllowlistSetting(row.settingKey)"
+                            v-model="plainModel[row.settingKey]"
+                            type="textarea"
+                            :rows="4"
+                            :disabled="!canWrite"
+                            placeholder='["10.0.0.0/8","192.168.1.0/24"]'
+                          />
+                          <el-input
+                            v-else
+                            v-model="plainModel[row.settingKey]"
+                            :type="row.isSecret === 1 ? 'password' : 'text'"
+                            :placeholder="row.isSecret === 1 && row.value ? '已设置，留空表示不修改' : ''"
+                            :disabled="!canWrite"
+                            autocomplete="new-password"
+                          >
+                            <template v-if="row.isSecret === 1 && row.value" #append>
+                              <el-button
+                                v-if="!pendingClearKeys.has(row.settingKey)"
+                                :disabled="!canWrite"
+                                @click="markSecretClear(row.settingKey)"
+                              >清除</el-button>
+                              <el-tag v-else type="danger" size="small" closable @close="unmarkSecretClear(row.settingKey)">将清除</el-tag>
+                            </template>
+                          </el-input>
+                          <div v-if="isCidrAllowlistSetting(row.settingKey) && cidrAllowlistError(plainModel[row.settingKey])" class="field-error">
+                            {{ cidrAllowlistError(plainModel[row.settingKey]) }}
+                          </div>
+                          <div class="field-hint">{{ row.settingKey }}</div>
+                        </template>
+                      </el-form-item>
+                    </div>
                   </el-form>
                 </el-card>
               </section>
@@ -247,6 +256,10 @@ import ShellEnvVarsPanel from './components/ShellEnvVarsPanel.vue'
 import ContainerHostsPanel from './components/ContainerHostsPanel.vue'
 import ContainerRebuildPanel from './components/ContainerRebuildPanel.vue'
 import RuntimeEnvironmentPanel from './components/RuntimeEnvironmentPanel.vue'
+import SettingsSearchBox from './components/SettingsSearchBox.vue'
+import { INTEGRATION_GROUP_CATALOG } from './integrationFieldCatalog'
+import { buildSettingsLocatorFields, settingFieldId, type LocatorSection, type SearchHit } from './settingsLocator'
+import { PANEL_LOCATOR_FIELDS, SECTION_KEYWORDS } from './settingsSearchCatalog'
 import { COMPANY_SSO_KEY } from './companySsoConfig'
 import { ECP_CONFIG_KEY } from './ecpConfig'
 import { cidrAllowlistError } from './cidrAllowlist'
@@ -376,8 +389,9 @@ const ecpRow = computed(() => settings.value.find((item) => item.settingKey === 
 /** 容器域名解析（V176）：走 ContainerHostsPanel 专属面板，不在「运行环境」分类里重复渲染。 */
 const CONTAINER_INHERIT_KEY = 'runtime.container.inheritHostHosts'
 const CONTAINER_EXTRA_HOSTS_KEY = 'runtime.container.extraHosts'
+const CONTAINER_AUTO_UPGRADE_KEY = 'runtime.container.autoUpgrade'
 const SPECIAL_KEYS = new Set([
-  ...INTEGRATION_KEYS, COMPANY_SSO_KEY, ECP_CONFIG_KEY, CONTAINER_INHERIT_KEY, CONTAINER_EXTRA_HOSTS_KEY,
+  ...INTEGRATION_KEYS, COMPANY_SSO_KEY, ECP_CONFIG_KEY, CONTAINER_INHERIT_KEY, CONTAINER_EXTRA_HOSTS_KEY, CONTAINER_AUTO_UPGRADE_KEY,
 ])
 const containerInheritRow = computed(() => settings.value.find((item) => item.settingKey === CONTAINER_INHERIT_KEY))
 const containerExtraHostsRow = computed(() => settings.value.find((item) => item.settingKey === CONTAINER_EXTRA_HOSTS_KEY))
@@ -712,6 +726,26 @@ const tocGroups = computed<TocGroup[]>(() => {
 /** 目录平铺条目：滚动跳转与高亮用。 */
 const toc = computed(() => tocGroups.value.flatMap((group) => group.sections))
 
+const locatorSections = computed<LocatorSection[]>(() =>
+  tocGroups.value.flatMap((group) =>
+    group.sections.map((section) => ({
+      id: section.id,
+      label: section.label,
+      group: group.label,
+      keywords: SECTION_KEYWORDS[section.id],
+    })),
+  ),
+)
+
+const locatorFields = computed(() =>
+  buildSettingsLocatorFields({
+    rows: settings.value,
+    integrationGroups: INTEGRATION_GROUP_CATALOG,
+    panelFields: PANEL_LOCATOR_FIELDS,
+    coveredKeys: SPECIAL_KEYS,
+  }),
+)
+
 const firstIntegrationName = computed(() => toc.value.find((section) => section.kind === 'integration')?.name ?? '')
 
 /** 手风琴：当前展开的分组 label。默认仅显示分组标题，滚动时自动跟随当前所在分组展开。 */
@@ -763,6 +797,28 @@ function scrollToSection(id: string) {
 }
 
 let observer: IntersectionObserver | null = null
+let locateLockUntil = 0
+let flashTimer = 0
+
+/** 搜索选中后跳到具体控件并短暂高亮；期间不让滚动观察器改回上一节。 */
+function locateSetting(hit: SearchHit) {
+  activeSection.value = hit.sectionId
+  const group = tocGroups.value.find((item) =>
+    item.sections.some((section) => section.id === hit.sectionId),
+  )
+  if (group) expandedGroup.value = group.label
+  locateLockUntil = Date.now() + 900
+  nextTick(() => {
+    const el = document.getElementById(hit.fieldId)
+    if (!el) return
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    document.querySelectorAll('.is-located').forEach((node) => node.classList.remove('is-located'))
+    el.classList.add('is-located')
+    window.clearTimeout(flashTimer)
+    flashTimer = window.setTimeout(() => el.classList.remove('is-located'), 2400)
+    ensureActiveItemVisible()
+  })
+}
 
 /** 监听各分组锚点进入可视区，高亮当前所在分组。 */
 function setupObserver() {
@@ -776,7 +832,7 @@ function setupObserver() {
       const visible = entries
         .filter((e) => e.isIntersecting)
         .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top)
-      if (visible.length > 0) {
+      if (visible.length > 0 && Date.now() >= locateLockUntil) {
         activeSection.value = (visible[0].target as HTMLElement).id
       }
     },
@@ -788,6 +844,7 @@ function setupObserver() {
 onBeforeUnmount(() => {
   observer?.disconnect()
   observer = null
+  window.clearTimeout(flashTimer)
 })
 
 async function fetchAgents() {
@@ -876,9 +933,23 @@ onActivated(() => {
 <style scoped>
 .card-header {
   display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 12px;
+  align-items: center;
+  gap: 16px;
+}
+
+.card-heading {
+  flex-shrink: 0;
+}
+
+.header-search {
+  flex: 1;
+  min-width: 220px;
+  max-width: 420px;
+  margin-left: auto;
+}
+
+.header-refresh {
+  flex-shrink: 0;
 }
 
 .card-title {
@@ -906,6 +977,10 @@ onActivated(() => {
 }
 
 .page-card > :deep(.el-card__body) {
+  overflow: visible;
+}
+
+.page-card > :deep(.el-card__header) {
   overflow: visible;
 }
 
@@ -1013,6 +1088,17 @@ onActivated(() => {
   scroll-margin-top: 12px;
 }
 
+.settings-content :deep(.setting-field) {
+  scroll-margin-top: 16px;
+  border-radius: 8px;
+}
+
+.settings-content :deep(.is-located) {
+  outline: 2px solid var(--mao-accent);
+  outline-offset: 3px;
+  border-radius: 8px;
+}
+
 .integration-tip {
   border-radius: 8px;
 }
@@ -1043,7 +1129,7 @@ onActivated(() => {
   margin-bottom: 16px;
 }
 
-.group-form :deep(.el-form-item:last-child) {
+.group-form :deep(.setting-field:last-child .el-form-item) {
   margin-bottom: 0;
 }
 
@@ -1068,6 +1154,22 @@ onActivated(() => {
 }
 
 @media (max-width: 768px) {
+  .card-header {
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+
+  .header-search {
+    order: 3;
+    flex-basis: 100%;
+    max-width: none;
+    margin-left: 0;
+  }
+
+  .header-refresh {
+    margin-left: auto;
+  }
+
   .settings-layout {
     flex-direction: column;
     gap: 16px;

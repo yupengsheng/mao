@@ -11,24 +11,24 @@
       <el-alert v-if="readError" type="error" :closable="false" show-icon :title="`公司 SSO 配置读取失败：${readError}`" description="已禁止编辑和保存，避免覆盖现有配置。请修复配置后点击页面刷新。" />
       <el-alert type="info" :closable="false" show-icon title="保存后新换票立即生效，不需重启。" class="config-tip" />
       <el-form label-width="150px" label-position="left" class="group-form" :disabled="disabled">
-        <el-form-item label="启用公司 SSO">
+        <el-form-item :id="SSO_FIELD_IDS.enabled" label="启用公司 SSO" class="setting-field">
           <el-switch v-model="model.enabled" />
           <div class="field-hint">启用时两个白名单均不能为空。</div>
         </el-form-item>
-        <el-form-item label="域名白名单">
+        <el-form-item :id="SSO_FIELD_IDS.domains" label="域名白名单" class="setting-field">
           <el-input v-model="domains" type="textarea" :rows="3" placeholder="example.com，多个域名使用英文逗号或换行分隔" />
           <div class="field-hint">允许校验 URL 的域名自身及其子域；填写至少两段的纯域名，不含 IP、协议、端口、路径或通配符。</div>
         </el-form-item>
-        <el-form-item label="宿主Origin白名单">
+        <el-form-item :id="SSO_FIELD_IDS.origins" label="宿主Origin白名单" class="setting-field">
           <el-input v-model="origins" type="textarea" :rows="3" placeholder="https://portal.example.com、https://*.example.com 或 *，多项使用英文逗号或换行分隔" />
           <div class="field-hint">支持精确 HTTPS Origin 或 https://*.example.com 子域模式；子域模式匹配任意层级子域，不含根域。默认 HTTPS 443（省略 :443），可显式指定非默认端口，如 :8443；端口须匹配。须为规范完整 Origin，不含尾部斜杠、路径、凭据、查询或片段；通配符仅限最左侧 *.，根域须为至少两段的合法 DNS 域名且不能为 IP。</div>
           <div class="field-hint">* 放开全部网页来源（包括 HTTP 和 null Origin），但仍须有效 SSO，校验域名白名单限制不变。</div>
         </el-form-item>
-        <el-form-item label="访问令牌 TTL (秒)">
+        <el-form-item :id="SSO_FIELD_IDS.ttl" label="访问令牌 TTL (秒)" class="setting-field">
           <el-input-number v-model="model.accessTtlSeconds" :min="60" :max="3600" :step="1" step-strictly controls-position="right" />
           <div class="field-hint">60–3600 秒，默认 1800 秒。</div>
         </el-form-item>
-        <el-form-item label="校验超时 (ms)">
+        <el-form-item :id="SSO_FIELD_IDS.timeout" label="校验超时 (ms)" class="setting-field">
           <el-input-number v-model="model.timeoutMs" :min="1" :max="30000" :step="1" step-strictly controls-position="right" />
           <div class="field-hint">1–30000 ms，默认 3000 ms。</div>
         </el-form-item>
@@ -45,6 +45,7 @@ import { ElMessage } from 'element-plus'
 import { api } from '../../../api'
 import { COMPANY_SSO_KEY, defaultCompanySsoConfig, parseCompanySsoConfig, splitAllowlist, validateCompanySsoConfig, type CompanySsoConfig } from '../companySsoConfig'
 import { useServerSyncGuard } from '../useServerSyncGuard'
+import { SSO_FIELD_IDS } from '../settingsSearchCatalog'
 
 const props = defineProps<{
   row?: { value: string | null; editable?: number }
