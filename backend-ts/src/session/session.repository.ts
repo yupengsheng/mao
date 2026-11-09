@@ -58,6 +58,19 @@ export interface MessageSearchHitRow {
   score: number;
 }
 
+/** 因 402/403 失败会话批量恢复的候选行：会话 + 最后一条 agent 场景 LLM 调用摘要。 */
+export interface FailedSessionCandidateRow {
+  sessionId: number;
+  userId: number | null;
+  agentId: number | null;
+  title: string | null;
+  executionMode: string | null;
+  sessionType: string | null;
+  lastActivityAt: string | null;
+  errorMessage: string | null;
+  failedAt: string | null;
+}
+
 function searchWhere(filter: MessageSearchSqlFilter): { where: string; params: unknown[] } {
   const params: unknown[] = [];
   const clauses = [
@@ -147,6 +160,93 @@ export class SessionRepository {
 
   selectByPhase(phase: string): Promise<Session[]> {
     return this.list('phase = ?', [phase], '');
+  }
+
+  /**
+   * 扫描最近窗口内活跃、当前 FAILED、且最后一次 agent 调用因 402/403 失败的普通主会话。
+   * 额度类关键词过滤放在服务层：scope=QUOTA 未命中的行要以跳过原因展示而非直接消失。
+   * windowStart 为空时不限时间窗（执行前按 id 复检）；limit 钳制在 1–500。
+   */
+  listFailedSessionsWithLastAgentError(
+    opts: { windowStart?: string | null; ids?: number[]; limit?: number } = {},
+  ): Promise<FailedSessionCandidateRow[]> {
+    const conditions = [
+      's.deleted = 0',
+      "s.status = 'ACTIVE'",
+      "s.phase = 'FAILED'",
+      "s.session_type = 'NORMAL'",
+      'l.success = 0',
+      "(l.error_message LIKE 'LLM API returned 402%' OR l.error_message LIKE 'LLM API returned 403%')",
+    ];
+    const params: unknown[] = [];
+    if (opts.windowStart != null) {
+      conditions.push('s.last_activity_at >= ?');
+      params.push(opts.windowStart);
+    }
+    if (opts.ids != null) {
+      if (opts.ids.length === 0) return Promise.resolve([]);
+      conditions.push(`s.id IN (${opts.ids.map(() => '?').join(',')})`);
+      params.push(...opts.ids);
+    }
+    const limit = Math.max(1, Math.min(opts.limit ?? 200, 500));
+    return this.db.query<FailedSessionCandidateRow>(
+      `SELECT s.id AS sessionId, s.user_id AS userId, s.agent_id AS agentId, s.title,
+              s.execution_mode AS executionMode, s.session_type AS sessionType,
+              s.last_activity_at AS lastActivityAt,
+              l.error_message AS errorMessage, l.created_at AS failedAt
+       FROM \`session\` s
+       JOIN llm_call l ON l.id = (
+         SELECT l2.id FROM llm_call l2
+         WHERE l2.session_id = s.id AND l2.scene = 'agent'
+         ORDER BY l2.id DESC LIMIT 1
+       )
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY s.last_activity_at DESC
+       LIMIT ${limit}`,
+      params,
+    );
+  }
+
+  /** 仍有待重试定时任务 run（next_retry_at 非空）的会话 id 集合：恢复排除项，其重试链会自己续跑。 */
+  async listSessionIdsWithPendingTaskRetry(sessionIds: number[]): Promise<Set<number>> {
+    const ids = [...new Set(sessionIds.filter((id) => Number.isSafeInteger(id) && id > 0))];
+    const out = new Set<number>();
+    if (ids.length === 0) return out;
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = await this.db.query<{ sessionId: number }>(
+      `SELECT DISTINCT session_id AS sessionId FROM scheduled_task_run
+       WHERE session_id IN (${placeholders}) AND next_retry_at IS NOT NULL`,
+      ids,
+    );
+    for (const row of rows) {
+      const id = Number(row.sessionId);
+      if (Number.isSafeInteger(id) && id > 0) out.add(id);
+    }
+    return out;
+  }
+
+  /** 引用会话的未删除定时任务清单（预览提示来源）；恢复不回写 run 状态。 */
+  async listScheduledTaskRefsBySessionIds(
+    sessionIds: number[],
+  ): Promise<Map<number, Array<{ id: number; name: string }>>> {
+    const bySession = new Map<number, Array<{ id: number; name: string }>>();
+    const ids = [...new Set(sessionIds.filter((id) => Number.isSafeInteger(id) && id > 0))];
+    if (ids.length === 0) return bySession;
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = await this.db.query<{ id: number; name: string; sessionId: number }>(
+      `SELECT id, name, session_id AS sessionId FROM scheduled_task
+       WHERE session_id IN (${placeholders}) AND deleted = 0
+       ORDER BY id ASC`,
+      ids,
+    );
+    for (const row of rows) {
+      const sessionId = Number(row.sessionId);
+      if (!Number.isSafeInteger(sessionId) || sessionId <= 0) continue;
+      const list = bySession.get(sessionId) ?? [];
+      list.push({ id: Number(row.id), name: String(row.name) });
+      bySession.set(sessionId, list);
+    }
+    return bySession;
   }
 
   listSideTasks(parentSessionId: number): Promise<Session[]> {

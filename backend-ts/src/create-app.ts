@@ -66,6 +66,7 @@ import { MysqlAuditLogRepository } from './audit/audit.repository.js';
 import { AuditLogService } from './audit/audit.service.js';
 import { PathSandbox } from './harness/safety/path-sandbox.js';
 import { SessionRepository, MessageRepository, FileChangeRepository } from './session/session.repository.js';
+import { FailedSessionRecoveryService } from './session/failed-session-recovery.service.js';
 import { SessionCompactionRepository, SessionCompactionEventRepository } from './session/session-compaction.repository.js';
 import { SessionCompactionService } from './session/session-compaction.service.js';
 import { SessionCompactionEventService } from './session/session-compaction-event.service.js';
@@ -993,6 +994,19 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     void dingtalk.drainNextIfPending(sessionId);
   });
 
+  // 因 402/403 失败会话的一键批量恢复：
+  // 候选查询编排 + 排除判定 + 预览/执行入口；续跑内核在 app-lifecycle 构造 CrashRecoveryRunner
+  // 后经 attachKernel 注入（路由注册先于 lifecycle 装配，故服务在此提前构造）。
+  const failedSessionRecovery = new FailedSessionRecoveryService({
+    store: sessionRepo,
+    userLookup: { findByIds: (ids: number[]) => userRepo.findByIds(ids) },
+    agentLookup: { findByIds: (ids: number[]) => agentRepo.findByIds(ids) },
+    messageLookup: { getLastUserMessage: (sessionId: number) => sessionService.getLastUserMessage(sessionId) },
+    progressCardLookup: feishuProgressCardRepo,
+    isSessionClaimed: (sessionId: number) => wsHandler.hasExecutionClaim(sessionId),
+    pushFinalReply: (sessionId: number) => scheduledService.pushFinalReplyIfApplicable(sessionId),
+  });
+
   await registerAllRoutes({
     app, db, cfg, apiPrefix, jwt, agentRuntimeCfg,
     authService, feishu, ecpAuth, userService, userRepo, permissionService,
@@ -1011,6 +1025,7 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     agentRepo, modelRepo, todoRepo, pathSandbox, subagentExecutionRepo,
     sessionCompactionEventService, sessionCompactionService, runTraceService, runTraceRecordService,
     approvalRegistry, askUserQuestionsRegistry, inFlightToolRegistry, treeSignalPublisher,
+    failedSessionRecovery,
     workspaceBrowse, terminalManager, workspaceGit, gitCommitMsg, gitWrite, runtimeResolver,
     ossSts,
     skillBundleService, userSkillService, skillDocService,
@@ -1045,6 +1060,7 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     localToolSessions, subagentResultDelivery, taskTerminal, harness: holder.harness!, wsRegistry,
     activityService, activityHeartbeat, todoMapper, modelRepo, feishuProgressCardRepo,
     feishuInboundHandler, feishuTaskQueue, createFeishuRecoveryProgress,
+    failedSessionRecovery,
     weixinInboundHandler, feishuInboundProcessor, watcherScheduler, signalCheckCleanup,
     ptyChannelHubs, ptyHubGeneration, containerRegistry, channelServer,
     taskService, executionWaitRepository, executionLeaseService, executionOwnerInstance,

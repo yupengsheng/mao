@@ -14,6 +14,7 @@ export interface FeishuProgressCardRow {
 export interface FeishuProgressCardRepository {
   upsert(row: FeishuProgressCardRow): Promise<void>;
   findBySessionId(sessionId: number): Promise<FeishuProgressCardRow | null>;
+  findBySessionIds(sessionIds: number[]): Promise<Map<number, FeishuProgressCardRow>>;
   deleteBySessionId(sessionId: number): Promise<void>;
   deleteStaleBatch(cutoff: string, limit: number): Promise<number>;
 }
@@ -58,6 +59,24 @@ export class MysqlFeishuProgressCardRepository implements FeishuProgressCardRepo
     );
     if (row == null) return null;
     return mapProgressCardRow(row);
+  }
+
+  /** 批量查询活跃进度卡映射（批量恢复预览的「卡片续更」列）。 */
+  async findBySessionIds(sessionIds: number[]): Promise<Map<number, FeishuProgressCardRow>> {
+    const ids = [...new Set(sessionIds.filter((id) => Number.isSafeInteger(id) && id > 0))];
+    const out = new Map<number, FeishuProgressCardRow>();
+    if (ids.length === 0) return out;
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = await this.db.query<Record<string, unknown>>(
+      `SELECT session_id, bot_id, card_message_id, chat_type, chat_id, sender_open_id
+       FROM feishu_progress_card WHERE session_id IN (${placeholders})`,
+      ids,
+    );
+    for (const row of rows) {
+      const mapped = mapProgressCardRow(row);
+      if (mapped != null) out.set(mapped.sessionId, mapped);
+    }
+    return out;
   }
 
   async deleteBySessionId(sessionId: number): Promise<void> {

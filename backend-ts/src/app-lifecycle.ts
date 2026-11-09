@@ -312,6 +312,8 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
       executionLeaseEnabled: d.executionLeaseEnabled === true,
     },
   );
+  // 批量恢复与崩溃恢复共用同一续跑流程与并发防护：内核构造完成后注入服务。
+  d.failedSessionRecovery?.attachKernel(crash);
   void crash.run().catch((e: unknown) => console.error('Crash recovery failed', e)).then(async () => {
     await d.dingtalk.hydrate().catch((error: unknown) => console.error('钉钉入站队列启动恢复失败', error));
     const sessionIds = await d.feishuTaskQueue.hydrate();
