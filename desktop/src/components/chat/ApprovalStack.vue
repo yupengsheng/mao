@@ -11,7 +11,7 @@
         <template v-if="index !== items.length - 1">
           <div class="card-row">
             <el-icon class="card-icon" :size="12"><WarningFilled /></el-icon>
-            <span class="card-label">{{ titleMap[item.toolName] || '操作待审批' }}</span>
+            <span class="card-label">{{ resolveApprovalTitle(item.toolName) }}</span>
           </div>
         </template>
 
@@ -19,7 +19,7 @@
         <template v-else>
           <div class="card-row">
             <el-icon class="card-icon" :size="12"><WarningFilled /></el-icon>
-            <span class="card-label">{{ titleMap[item.toolName] || '操作待审批' }}</span>
+            <span class="card-label">{{ resolveApprovalTitle(item.toolName) }}</span>
             <span v-if="items.length > 1" class="card-badge">{{ items.length }}</span>
           </div>
           <div class="command-line" :class="{ expanded: expandedSet.has(item.requestId) }">
@@ -71,6 +71,7 @@ import { ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { WarningFilled } from '@element-plus/icons-vue'
 import { copyText as copyToClipboard } from '../../utils/clipboard'
+import { resolveApprovalTitle } from '../../utils/approvalTitle'
 
 import type { ApprovalHint } from '@mao/contracts'
 
@@ -86,12 +87,6 @@ export interface ApprovalItem {
 }
 
 const threshold = 120
-
-const titleMap: Record<string, string> = {
-  shell: '命令执行待审批',
-  write_file: '文件写入待审批',
-  edit_file: '文件编辑待审批'
-}
 
 const props = defineProps<{
   items: ApprovalItem[]
