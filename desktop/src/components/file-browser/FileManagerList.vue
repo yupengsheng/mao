@@ -81,7 +81,8 @@
 import { nextTick, ref, watch } from 'vue'
 import { CaretBottom, CaretTop, Document, FolderAdd, FolderOpened, Link, Picture } from '@element-plus/icons-vue'
 import type { FileNode } from '../../types/file-browser'
-import { DRAG_PATHS_MIME, effectiveDragSources, formatSize, formatTime, iconKindOf } from '../../utils/file-manager'
+import { effectiveDragSources, formatSize, formatTime, iconKindOf } from '../../utils/file-manager'
+import { setWorkspaceDragPayload } from '../../utils/workspaceDrag'
 
 const props = defineProps<{
   entries: FileNode[]
@@ -92,6 +93,8 @@ const props = defineProps<{
   sortBy: 'name' | 'size' | 'mtime'
   sortOrder: 'asc' | 'desc'
   readOnly?: boolean
+  /** 跨面板拖拽载荷携带的源工作区根（工作区总览打开的文件管理页签有值），供聊天 / 页签栏落点路由 */
+  workspaceRoot?: string
 }>()
 
 const emit = defineEmits<{
@@ -152,8 +155,9 @@ function canDragEntry(entry: FileNode): boolean {
 function onDragstart(entry: FileNode, e: DragEvent) {
   if (!canDragEntry(entry) || !e.dataTransfer) return
   const sources = effectiveDragSources(entry.path, props.selectedPaths)
-  e.dataTransfer.setData(DRAG_PATHS_MIME, JSON.stringify(sources))
-  e.dataTransfer.effectAllowed = 'move'
+  // 起点可见列表查不到的路径按文件处理（保守方向：误插引用可删，误吞文件则功能失效）
+  const dirFlags = new Map(props.entries.map((it) => [it.path, it.isDirectory]))
+  setWorkspaceDragPayload(e, sources.map((p) => ({ path: p, isDirectory: dirFlags.get(p) ?? false, workspaceRoot: props.workspaceRoot })))
   emit('item-dragstart', entry, e)
 }
 

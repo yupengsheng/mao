@@ -22,6 +22,7 @@
         @close-others="closeOtherTabs"
         @close-right="closeRightTabs"
         @reorder="reorderTab"
+        @workspace-file-drop="handleWorkspaceFileDrop"
       />
       <CenterTabContainer
         :tabs="tabs"
@@ -117,6 +118,7 @@ import type { FileChange } from '../../types/chat'
 import type { FileRangeQuotePayload } from '../../utils/selection-quote'
 import type { SideTaskContextMode } from '../../types/file-browser'
 import type { SideTaskEntryOptions } from '../../composables/useCenterTabs'
+import type { WorkspaceDragEntry } from '../../utils/workspaceDrag'
 import { getToken } from '../../utils/auth-storage'
 import { nowDateTime } from '../../utils/datetime'
 import { cloudProjectKeyForNewTask, newTaskWorkspacePrefill } from '../../utils/cloud-project'
@@ -364,6 +366,11 @@ provide('quoteFileRangeToChat', quoteFileRangeToChat)
 // Center tabs
 const activeSessionIdRef = computed(() => sessionStore.activeSessionId ?? '')
 const { tabs, activeTab, activeTabId, openFileTab, openDiffTab, closeTab, closeAllFileTabs, closeOtherTabs, reorderTab, closeRightTabs, activateTab, openSideTaskTab, setSideTaskFork, openSubagentTab, openTraceTab, openFileManagerTab, openWorkspaceFileManagerTab, openGitTab, updateSideTaskTab, restoreSideTaskTabs, restoreSubagentTabs, restoreTraceTab, restoreActiveTab, applyWorkspacePathChange } = useCenterTabs(activeSessionIdRef)
+
+/** 文件管理器 / 文件树拖文件到中心页签栏：去重、激活与版本递增由 openFileTab 内建；跨工作区来源按所属根路由 */
+function handleWorkspaceFileDrop(entries: WorkspaceDragEntry[]) {
+  for (const it of entries) openFileTab(it.path, it.path.split('/').pop() || it.path, it.workspaceRoot)
+}
 
 function isTypingTarget(target: EventTarget | null): boolean {
   return target instanceof HTMLElement

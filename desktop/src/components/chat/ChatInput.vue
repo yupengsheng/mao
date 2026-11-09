@@ -35,6 +35,8 @@
     <div
       class="textarea-area"
       :class="{ 'new-task-textarea': isNewTask && layout === 'docked', 'is-dragging-file': draggingFile }"
+      @dragover.capture="handleRefDragOver"
+      @drop.capture="handleRefDrop"
       @dragover.prevent="handleDragOver"
       @dragenter.prevent="handleDragEnter"
       @dragleave.prevent="handleDragLeave"
@@ -180,6 +182,7 @@ import { getUploadConfig } from '../../utils/storageMode'
 import { generateUUID } from '../../utils/uuid'
 import type { LocalPendingFile } from '../../utils/chatLocalAttach'
 import { MAX_PENDING_ATTACHMENTS, createPastedTextFile, nextPastedTextSeq, planPastedText } from './pasted-text-file'
+import { fileEntriesOf, hasWorkspaceDragPayload, parseWorkspaceDrag } from '../../utils/workspaceDrag'
 
 const props = withDefaults(defineProps<{
   disabled?: boolean
@@ -1120,6 +1123,30 @@ function handleDropFiles(e: DragEvent) {
       addPendingFile(file)
     }
   }
+}
+
+// ===== 工作区文件拖入（capture 先于编辑器，避免 ProseMirror 兜底插入裸路径）=====
+
+function handleRefDragOver(e: DragEvent) {
+  if (props.disabled) return
+  // dragover 处于 protected mode 读不到载荷数据，只能查 types；目录 / 文件在此阶段无法区分
+  if (!hasWorkspaceDragPayload(e.dataTransfer)) return
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+  draggingFile.value = true // 复用既有拖拽高亮，不新增视觉态
+}
+
+function handleRefDrop(e: DragEvent) {
+  if (props.disabled) return
+  const entries = parseWorkspaceDrag(e.dataTransfer)
+  if (entries.length === 0) return // 非工作区载荷：放行系统文件上传 / 浏览器默认行为
+  e.preventDefault()
+  e.stopPropagation()
+  draggingFile.value = false
+  // 跨工作区来源不落当前会话：只接受当前工作区或无根路径（会话文件）
+  const inSession = entries.filter((it) => !it.workspaceRoot || it.workspaceRoot === props.workspace)
+  const files = fileEntriesOf(inSession) // 目录一律忽略
+  for (const it of files) insertFileReference(it.path)
+  if (files.length > 0) saveDraft(props.draftKey) // onUpdate 不落草稿，插完显式保存一次
 }
 
 // ===== Send =====

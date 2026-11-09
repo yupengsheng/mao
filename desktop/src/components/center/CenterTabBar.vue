@@ -2,9 +2,10 @@
   <div
     ref="barEl"
     class="center-tab-bar"
-    @dragover="onBarReorderDragover"
+    :class="{ 'is-drag-over': barDragOver }"
+    @dragover="onBarDragOver($event), onBarReorderDragover($event)"
     @dragleave="onBarDragLeave"
-    @drop="onBarReorderDrop"
+    @drop.prevent="onBarDrop($event), onBarReorderDrop($event)"
   >
     <div
       v-for="tab in tabs"
@@ -86,6 +87,7 @@ import { computed, reactive, ref, watch, nextTick, onMounted, onUnmounted } from
 import { ChatDotRound, Document, DocumentCopy, Close, Share, TrendCharts, FolderOpened } from '@element-plus/icons-vue'
 import type { Tab } from '../../types/file-browser'
 import { shouldDismissContextMenuForScroll } from '../../utils/contextMenuDismiss'
+import { fileEntriesOf, hasWorkspaceDragPayload, parseWorkspaceDrag, type WorkspaceDragEntry } from '../../utils/workspaceDrag'
 import { useAgentStore } from '../../stores/agent'
 import { resolveAgentIdentity } from '../../utils/agent-identity'
 import AgentAvatar from '../agent/AgentAvatar.vue'
@@ -116,6 +118,7 @@ const emit = defineEmits<{
   'close-others': [tabId: string]
   'close-right': [tabId: string]
   reorder: [dragId: string, targetId: string, place: 'before' | 'after']
+  'workspace-file-drop': [entries: WorkspaceDragEntry[]]
 }>()
 
 const contextMenu = reactive({
@@ -129,6 +132,27 @@ const barEl = ref<HTMLElement | null>(null)
 const menuRef = ref<HTMLDivElement>()
 const adjustedX = ref(0)
 const adjustedY = ref(0)
+
+// ===== 工作区文件拖入落点（目录由 fileEntriesOf 过滤；entries 携带源工作区根，供宿主路由）=====
+
+const barDragOver = ref(false)
+
+function onBarDragOver(e: DragEvent) {
+  // dragover 处于 protected mode 读不到载荷数据，只能查 types；非工作区载荷不成为落点（保持默认禁止光标）
+  if (!hasWorkspaceDragPayload(e.dataTransfer)) {
+    barDragOver.value = false
+    return
+  }
+  e.preventDefault()
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+  barDragOver.value = true
+}
+
+function onBarDrop(e: DragEvent) {
+  barDragOver.value = false
+  const entries = fileEntriesOf(parseWorkspaceDrag(e.dataTransfer))
+  if (entries.length > 0) emit('workspace-file-drop', entries)
+}
 
 const TAB_REORDER_MIME = 'application/x-mao-tab-reorder'
 const draggingTabId = ref<string | null>(null)
@@ -223,13 +247,16 @@ function onBarReorderDrop(e: DragEvent) {
 }
 
 function onBarDragLeave(e: DragEvent) {
+  // 页签覆盖整栏，进出子元素时 dragleave 也会冒泡触发；仅在真正离开栏根时取消高亮
   const next = e.relatedTarget as Node | null
   if (next && barEl.value?.contains(next)) return
+  barDragOver.value = false
   draggingTabId.value = null
   reorderHint.value = null
 }
 
 function onWindowDragEnd() {
+  barDragOver.value = false
   draggingTabId.value = null
   reorderHint.value = null
 }
@@ -299,6 +326,11 @@ onUnmounted(() => {
 
 .center-tab-bar::-webkit-scrollbar {
   display: none;
+}
+
+.center-tab-bar.is-drag-over {
+  outline: 2px dashed var(--aw-primary, #409eff);
+  outline-offset: -2px;
 }
 
 .tab-item {
