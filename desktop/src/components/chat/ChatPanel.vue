@@ -109,7 +109,7 @@
           @share="openShareDialog"
         />
 
-        <div v-if="showTypingIndicator" class="typing-indicator">
+        <div v-if="showTypingIndicator" class="typing-indicator" role="status" aria-label="Agent 正在执行">
           <div class="typing-dots">
             <span></span>
             <span></span>
