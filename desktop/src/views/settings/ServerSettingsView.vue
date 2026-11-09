@@ -522,8 +522,8 @@ onMounted(() => {
 }
 
 .history-row.current {
-  background: rgba(0, 102, 204, 0.08);
-  border-color: rgba(0, 102, 204, 0.25);
+  background: rgba(var(--aw-accent-rgb), 0.08);
+  border-color: rgba(var(--aw-accent-rgb), 0.25);
 }
 
 .history-avatar {
@@ -584,7 +584,7 @@ onMounted(() => {
   flex-shrink: 0;
   font-size: 11px;
   color: var(--aw-primary, #0066cc);
-  border: 1px solid rgba(0, 102, 204, 0.4);
+  border: 1px solid rgba(var(--aw-accent-rgb), 0.4);
   border-radius: 999px;
   padding: 2px 8px;
 }

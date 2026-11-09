@@ -18,6 +18,37 @@
           <el-radio-button value="auto">跟随系统</el-radio-button>
         </el-radio-group>
       </div>
+      <div class="theme-row">
+        <div>
+          <div class="theme-label">强调色</div>
+          <div class="theme-hint">应用于按钮、链接与选中态，亮暗主题各自适配。</div>
+        </div>
+        <div class="accent-swatches">
+          <button
+            v-for="preset in ACCENT_PRESETS"
+            :key="preset.id"
+            type="button"
+            class="accent-swatch"
+            :class="{ active: accent === preset.id }"
+            :style="{ background: preset.swatch }"
+            :aria-label="'强调色：' + preset.label"
+            :aria-pressed="accent === preset.id"
+            :title="preset.label"
+            @click="setAccent(preset.id)"
+          />
+        </div>
+      </div>
+      <div class="theme-row">
+        <div>
+          <div class="theme-label">界面字号</div>
+          <div class="theme-hint">三档影响界面与正文字号，立即生效。</div>
+        </div>
+        <el-radio-group :model-value="fontScale" class="theme-radio-group" @change="handleFontScaleChange">
+          <el-radio-button v-for="option in FONT_SCALE_OPTIONS" :key="option.id" :value="option.id">
+            {{ option.label }}
+          </el-radio-button>
+        </el-radio-group>
+      </div>
     </div>
 
     <div class="profile-card">
@@ -94,6 +125,7 @@ import { api } from '../../api'
 import { useAuthStore } from '../../stores/auth'
 import { uploadImages } from '../../utils/imageUpload'
 import { useTheme, type ThemeMode } from '../../utils/theme'
+import { useAppearance, type FontScaleId } from '../../utils/appearance'
 import ChangePasswordDialog from './ChangePasswordDialog.vue'
 
 const passwordDialogVisible = ref(false)
@@ -102,12 +134,17 @@ const MAX_SIZE = 5 * 1024 * 1024
 
 const authStore = useAuthStore()
 const { theme, setTheme } = useTheme()
+const { accent, fontScale, setAccent, setFontScale, ACCENT_PRESETS, FONT_SCALE_OPTIONS } = useAppearance()
 
 /** 主题模式：与 theme.ts 的单例 ref 同源，写入 localStorage 后立即生效 */
 const themeMode = ref<ThemeMode>(theme.value)
 
 function handleThemeChange(value: ThemeMode) {
   setTheme(value)
+}
+
+function handleFontScaleChange(value: FontScaleId) {
+  setFontScale(value)
 }
 
 const form = reactive({
@@ -302,6 +339,10 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
 }
 
+.theme-row + .theme-row {
+  margin-top: 20px;
+}
+
 .theme-label {
   font-size: 13px;
   font-weight: 600;
@@ -312,6 +353,33 @@ onBeforeUnmount(() => {
 .theme-hint {
   font-size: 12px;
   color: var(--aw-ink-muted);
+}
+
+.accent-swatches {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.accent-swatch {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  cursor: pointer;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.08);
+  transition: transform 0.15s, box-shadow 0.15s;
+}
+
+.accent-swatch:hover {
+  transform: scale(1.1);
+}
+
+.accent-swatch.active {
+  outline: 2px solid var(--aw-primary);
+  outline-offset: 2px;
 }
 
 @media (max-width: 640px) {

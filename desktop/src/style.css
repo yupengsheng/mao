@@ -7,11 +7,11 @@
   --aw-primary: #0066cc;
   --aw-primary-focus: #0071e3;
   --aw-primary-on-dark: #2997ff;
-  --aw-primary-lighter: rgba(0, 102, 204, 0.10);
-  --aw-primary-soft: rgba(0, 102, 204, 0.05);
-  --aw-primary-hover: rgba(0, 102, 204, 0.08);
-  --aw-primary-ring: rgba(0, 102, 204, 0.12);
-  --aw-primary-line: rgba(0, 102, 204, 0.20);
+  --aw-primary-lighter: rgba(var(--aw-accent-rgb), 0.10);
+  --aw-primary-soft: rgba(var(--aw-accent-rgb), 0.05);
+  --aw-primary-hover: rgba(var(--aw-accent-rgb), 0.08);
+  --aw-primary-ring: rgba(var(--aw-accent-rgb), 0.12);
+  --aw-primary-line: rgba(var(--aw-accent-rgb), 0.20);
   --aw-on-primary: #ffffff;
 
   /* Colors — Surface */
@@ -55,7 +55,7 @@
   /* Colors — Accent aliases */
   --aw-accent: #0066cc;
   --aw-accent-rgb: 0, 102, 204;
-  --aw-accent-bg: rgba(0, 102, 204, 0.08);
+  --aw-accent-bg: rgba(var(--aw-accent-rgb), 0.08);
 
   /* Colors — Status */
   --aw-success: #34c759;
@@ -330,14 +330,14 @@ html.android-capacitor .terminal-keybar-btn {
   --aw-border: #38383a;
 
   --aw-primary-on-dark: #2997ff;
-  --aw-primary-lighter: rgba(41, 151, 255, 0.18);
-  --aw-primary-soft: rgba(41, 151, 255, 0.08);
-  --aw-primary-hover: rgba(41, 151, 255, 0.14);
-  --aw-primary-ring: rgba(41, 151, 255, 0.22);
-  --aw-primary-line: rgba(41, 151, 255, 0.32);
+  --aw-primary-lighter: rgba(var(--aw-accent-rgb), 0.18);
+  --aw-primary-soft: rgba(var(--aw-accent-rgb), 0.08);
+  --aw-primary-hover: rgba(var(--aw-accent-rgb), 0.14);
+  --aw-primary-ring: rgba(var(--aw-accent-rgb), 0.22);
+  --aw-primary-line: rgba(var(--aw-accent-rgb), 0.32);
   --aw-accent: #2997ff;
   --aw-accent-rgb: 41, 151, 255;
-  --aw-accent-bg: rgba(41, 151, 255, 0.12);
+  --aw-accent-bg: rgba(var(--aw-accent-rgb), 0.12);
 
   --aw-nav-bg:#1a1a1a;
   --aw-nav-text: #f5f5f7;
@@ -369,6 +369,128 @@ html.android-capacitor .terminal-keybar-btn {
   /* Terminal */
   --aw-terminal-bg: #252525;
   --aw-terminal-header-bg: #252525;
+}
+
+/* ===== 强调色预设：blue 默认不写属性 ===== */
+html[data-accent='violet'] {
+  --aw-primary: #6E56CF;
+  --aw-primary-focus: #7C66D6;
+  --aw-primary-on-dark: #A78BFA;
+  --aw-accent: #6E56CF;
+  --aw-accent-rgb: 110, 86, 207;
+  --el-color-primary-light-3: #8B78D9;
+  --el-color-primary-light-5: rgba(110, 86, 207, 0.15);
+  --el-color-primary-light-7: rgba(110, 86, 207, 0.10);
+  --el-color-primary-light-8: rgba(110, 86, 207, 0.08);
+  --el-color-primary-light-9: rgba(110, 86, 207, 0.05);
+}
+
+html[data-theme='dark'][data-accent='violet'] {
+  --aw-primary-on-dark: #A78BFA;
+  --aw-primary-lighter: rgba(167, 139, 250, 0.18);
+  --aw-primary-soft: rgba(167, 139, 250, 0.08);
+  --aw-primary-hover: rgba(167, 139, 250, 0.14);
+  --aw-primary-ring: rgba(167, 139, 250, 0.22);
+  --aw-primary-line: rgba(167, 139, 250, 0.32);
+  --aw-accent: #A78BFA;
+  --aw-accent-rgb: 167, 139, 250;
+  --aw-accent-bg: rgba(167, 139, 250, 0.12);
+}
+
+html[data-accent='green'] {
+  --aw-primary: #15803D;
+  --aw-primary-focus: #1A9247;
+  --aw-primary-on-dark: #46A758;
+  --aw-accent: #15803D;
+  --aw-accent-rgb: 21, 128, 61;
+  --el-color-primary-light-3: #449964;
+  --el-color-primary-light-5: rgba(21, 128, 61, 0.15);
+  --el-color-primary-light-7: rgba(21, 128, 61, 0.10);
+  --el-color-primary-light-8: rgba(21, 128, 61, 0.08);
+  --el-color-primary-light-9: rgba(21, 128, 61, 0.05);
+}
+
+html[data-theme='dark'][data-accent='green'] {
+  --aw-primary-on-dark: #46A758;
+  --aw-primary-lighter: rgba(70, 167, 88, 0.18);
+  --aw-primary-soft: rgba(70, 167, 88, 0.08);
+  --aw-primary-hover: rgba(70, 167, 88, 0.14);
+  --aw-primary-ring: rgba(70, 167, 88, 0.22);
+  --aw-primary-line: rgba(70, 167, 88, 0.32);
+  --aw-accent: #46A758;
+  --aw-accent-rgb: 70, 167, 88;
+  --aw-accent-bg: rgba(70, 167, 88, 0.12);
+}
+
+html[data-accent='orange'] {
+  --aw-primary: #C2410C;
+  --aw-primary-focus: #D64B14;
+  --aw-primary-on-dark: #F97316;
+  --aw-accent: #C2410C;
+  --aw-accent-rgb: 194, 65, 12;
+  --el-color-primary-light-3: #CE673D;
+  --el-color-primary-light-5: rgba(194, 65, 12, 0.15);
+  --el-color-primary-light-7: rgba(194, 65, 12, 0.10);
+  --el-color-primary-light-8: rgba(194, 65, 12, 0.08);
+  --el-color-primary-light-9: rgba(194, 65, 12, 0.05);
+}
+
+html[data-theme='dark'][data-accent='orange'] {
+  --aw-primary-on-dark: #F97316;
+  --aw-primary-lighter: rgba(249, 115, 22, 0.18);
+  --aw-primary-soft: rgba(249, 115, 22, 0.08);
+  --aw-primary-hover: rgba(249, 115, 22, 0.14);
+  --aw-primary-ring: rgba(249, 115, 22, 0.22);
+  --aw-primary-line: rgba(249, 115, 22, 0.32);
+  --aw-accent: #F97316;
+  --aw-accent-rgb: 249, 115, 22;
+  --aw-accent-bg: rgba(249, 115, 22, 0.12);
+}
+
+html[data-accent='graphite'] {
+  --aw-primary: #475569;
+  --aw-primary-focus: #5A6B85;
+  --aw-primary-on-dark: #94A3B8;
+  --aw-accent: #475569;
+  --aw-accent-rgb: 71, 85, 105;
+  --el-color-primary-light-3: #6C7787;
+  --el-color-primary-light-5: rgba(71, 85, 105, 0.15);
+  --el-color-primary-light-7: rgba(71, 85, 105, 0.10);
+  --el-color-primary-light-8: rgba(71, 85, 105, 0.08);
+  --el-color-primary-light-9: rgba(71, 85, 105, 0.05);
+}
+
+html[data-theme='dark'][data-accent='graphite'] {
+  --aw-primary-on-dark: #94A3B8;
+  --aw-primary-lighter: rgba(148, 163, 184, 0.18);
+  --aw-primary-soft: rgba(148, 163, 184, 0.08);
+  --aw-primary-hover: rgba(148, 163, 184, 0.14);
+  --aw-primary-ring: rgba(148, 163, 184, 0.22);
+  --aw-primary-line: rgba(148, 163, 184, 0.32);
+  --aw-accent: #94A3B8;
+  --aw-accent-rgb: 148, 163, 184;
+  --aw-accent-bg: rgba(148, 163, 184, 0.12);
+}
+
+/* ===== 界面字号三档：std 默认不写属性 ===== */
+html[data-font-scale='small'] {
+  --aw-text-body: 15px;
+  --aw-text-caption: 13px;
+  --aw-text-fine: 11px;
+  --aw-text-micro: 10px;
+  --el-font-size-base: 12px;
+  --el-font-size-small: 11px;
+  --el-font-size-extra-small: 11px;
+}
+
+html[data-font-scale='large'] {
+  --aw-text-body: 19px;
+  --aw-text-caption: 15px;
+  --aw-text-fine: 13px;
+  --aw-text-micro: 11px;
+  --el-font-size-base: 14px;
+  --el-font-size-small: 13px;
+  --el-font-size-extra-small: 13px;
 }
 
 /* ============================================
