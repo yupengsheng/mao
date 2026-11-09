@@ -15,6 +15,12 @@ export interface ReplOptions {
   modelId?: number;
   resolveModel: (spec: string) => Promise<number>;
   onExit: () => Promise<void>;
+  /**
+   * 延迟创建的新会话：每条消息执行前调用（幂等）。
+   * currentModelId 为当前生效模型（`/model` 可能已切换），创建时据此写库。
+   * 恢复既有会话/打印模式不传——此时会话在进入 REPL 前已就绪。
+   */
+  ensureSession?: (currentModelId?: number) => Promise<void>;
   /** 可切换会话列表（已按模式/工作区过滤、按最近排序、已截断）。query 为空取最近。 */
   listSwitchableSessions?: (query?: string) => Promise<SessionVO[]>;
   /** 切换会话（chat.ts 内完成守卫、重挂与状态刷新）。失败抛 CliError。 */
@@ -94,6 +100,7 @@ export async function runRepl(opts: ReplOptions): Promise<void> {
     opts.renderer.noteUser(text);
     opts.renderer.startRound();
     try {
+      await opts.ensureSession?.(opts.modelId);
       await opts.runner.runPrompt(text, opts.modelId);
     } catch (err) {
       print(err instanceof Error ? err.message : String(err), 'err');
@@ -368,7 +375,9 @@ export async function handleSlash(
     case 'model': {
       if (!arg) {
         const s = opts.runner.getSession();
-        io.print(`当前模型: ${s?.modelName ?? s?.modelId ?? '-'}`);
+        // 延迟创建的新会话：首条消息前尚无服务端会话，回退到已选择的模型。
+        const current = s?.modelName ?? s?.modelId ?? (opts.modelId != null ? `id=${opts.modelId}` : '-');
+        io.print(`当前模型: ${current}`);
         return;
       }
       try {

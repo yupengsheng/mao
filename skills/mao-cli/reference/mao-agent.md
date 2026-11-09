@@ -37,7 +37,7 @@ cd agent-cli && npm ci && npm run build && npm link
 
 ## 站点地址（baseUrl）
 
-`mao-agent` 不再内置默认站点地址，首次使用必须先设置。首次 `mao-agent login` 时若发现未配置（`--base-url` / `MAO_BASE_URL` / 项目配置 / 用户配置都没有），会在交互终端要求输入：需以 `https://` 或 `http://` 开头，只填站点根（可带 `/api`、`/api/v1`），校验通过后保存到 `~/.mao/agent-cli/config.json` 再继续登录。非交互场景（CI / 管道）与其它需要连接服务器的命令（`ls` / `resume` / chat）未配置时直接报错并给出设置方式；`logout` 不受影响（跳过服务端调用、仅本地清理），`status` 显示「(未设置)」，`update` 不依赖站点、不受影响。登录成功时若地址仅来自 `--base-url` / `MAO_BASE_URL`，会提示写入配置以便下次沿用。云端 shell / 终端与桌面 LOCAL shell 由平台自动注入 `MAO_BASE_URL`（见 [config.md](config.md#站点域名)），本地手动安装时按上述方式设置。
+`mao-agent` 不再内置默认站点地址，首次使用必须先设置。首次 `mao-agent login` 时若发现未配置（`--base-url` / `MAO_BASE_URL` / 项目配置 / 用户配置都没有），会在交互终端要求输入：需以 `https://` 或 `http://` 开头，只填站点根（可带 `/api`、`/api/v1`），校验通过后保存到 `~/.mao/agent-cli/config.json` 再继续登录。非交互场景（CI / 管道）与其它需要连接服务器的命令（`ls` / `resume` / chat）未配置时直接报错并给出设置方式；`logout` 不受影响（跳过服务端调用、仅本地清理），`status` 显示「(未设置)」，`update` 不依赖站点、不受影响。登录成功时若地址仅来自 `--base-url` / `MAO_BASE_URL`，会自动写入用户配置（已有用户配置不覆盖），下次可直接使用。云端 shell / 终端与桌面 LOCAL shell 由平台自动注入 `MAO_BASE_URL`（见 [config.md](config.md#站点域名)），本地手动安装时按上述方式设置。
 
 ## 基本用法
 
@@ -96,6 +96,7 @@ mao-agent -p "检查本次 PR 是否有明显的安全问题" \
 
 已定稿的对话逐行写入终端 scrollback（可用终端原生滚动回看，**不使用备用屏**），只有输入框、状态行和正在流式输出的尾部属于活动区，活动区高度始终小于终端高度，所以不会整屏重绘、也不会清掉历史。用户消息以 `❯` 回显；工具调用显示为 `⏺ name  args` + `⎿` 摘要。
 
+- 新建会话**延迟到第一条消息**才落库：交互模式只打开看看 / 直接退出不会在会话列表留下空白会话（打印模式 `-p` 与 `--resume` / `--continue` 仍在启动时创建或复用）
 - 执行中可排队输入下一条；`/cancel` 或 Ctrl+C 取消当前任务。启动时若自动续接正在运行的任务，续接结束后会继续消费排队输入
 - `/resume` 可在当前 REPL 内切换会话（不退出进程）：无参数弹出最近 20 个活跃会话，`/resume <id>` 直达，`/resume <关键词>` 按标题搜索。只允许同执行模式切换，LOCAL 目标工作区须在启动目录内；切换到运行中的会话会自动续接输出；挂载失败会回挂原会话
 - Agent 提问与 LOCAL 审批共用输入通道，多个请求按先后顺序排队（方向键 / y n a；带危险原因的审批需再按 Enter 确认）
@@ -109,7 +110,7 @@ mao-agent -p "检查本次 PR 是否有明显的安全问题" \
 | 命令 | 说明 |
 |------|------|
 | `/help` | 查看斜杠命令 |
-| `/session` | 当前会话信息（sessionId、Agent、模型、workspace、phase） |
+| `/session` | 当前会话信息（sessionId、Agent、模型、workspace、phase）；首条消息前提示「尚未创建会话」 |
 | `/resume [id\|关键词]` | 在当前 REPL 内切换会话：无参数弹出最近会话面板；也可直接给会话 id 或标题关键词 |
 | `/model <id\|name>` | 切换当前会话模型（持久写库）；无参数显示当前模型。`name` 按显示名匹配，见「模型解析」 |
 | `/todo` | 查看 Todo |
