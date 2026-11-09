@@ -29,6 +29,7 @@
           </svg>
         </div>
       </el-tooltip>
+      <CommandPalette ref="commandPaletteRef" :host="commandHost" />
       <SessionSearchPopover ref="searchPopoverRef" />
       <UsageBell />
       <el-tooltip v-if="authStore.user" content="执行记录" :show-after="100" placement="bottom" :disabled="isMobileDevice()">
@@ -124,6 +125,7 @@
     </div>
     <CommandManagerDrawer v-model="commandsDrawerVisible" />
     <InboxDrawer v-model="inboxDrawerVisible" />
+    <ShortcutHelpDialog ref="shortcutHelpRef" />
   </nav>
 </template><script setup lang="ts">
 import { ArrowLeft, ChatLineSquare, Clock, FolderOpened, Reading, Refresh, Setting, SwitchButton, User } from '@element-plus/icons-vue'
@@ -143,6 +145,9 @@ import SessionSearchPopover from '../search/SessionSearchPopover.vue'
 import UsageBell from '../usage/UsageBell.vue'
 import CommandManagerDrawer from '../command/CommandManagerDrawer.vue'
 import InboxDrawer from '../inbox/InboxDrawer.vue'
+import CommandPalette from '../palette/CommandPalette.vue'
+import ShortcutHelpDialog from '../palette/ShortcutHelpDialog.vue'
+import type { CommandHostActions } from '../../composables/useCommandRegistry'
 
 // macOS 窗口态红绿灯盖住左上角，需要预留；全屏后系统收起红绿灯，按钮贴左（与移动端一致）。
 // 原生全屏不走 Fullscreen API，用内容区是否铺满整屏判断。
@@ -155,8 +160,29 @@ function syncScreenFilling() {
 }
 
 const searchPopoverRef = ref()
+const commandPaletteRef = ref()
+const shortcutHelpRef = ref()
 const commandsDrawerVisible = ref(false)
 const inboxDrawerVisible = ref(false)
+
+/** 命令面板宿主动作：面板负责展示与过滤，TopNav 复用既有入口函数与 ref。 */
+const commandHost: CommandHostActions = {
+  openSearch: () => searchPopoverRef.value?.toggle(),
+  toggleTerminal,
+  canUseTerminal: () => terminalAvailability.value.enabled,
+  toggleLeft: () => toggleLeft(),
+  toggleRight: () => toggleRight(),
+  openInbox: () => {
+    inboxDrawerVisible.value = true
+  },
+  openCommands: () => {
+    commandsDrawerVisible.value = true
+  },
+  logout: () => {
+    void handleCommand('logout')
+  },
+  openShortcutHelp: () => shortcutHelpRef.value?.open()
+}
 
 const sessionStore = useSessionStore()
 const authStore = useAuthStore()
@@ -259,7 +285,7 @@ onUnmounted(() => {
   window.removeEventListener('resize', syncScreenFilling)
 })
 
-/** Ctrl/Cmd+K：打开/关闭会话搜索浮窗；Ctrl/Cmd+`：打开/关闭终端（常驻注册，不随页面切换失效）。 */
+/** Ctrl/Cmd+K：搜索浮窗；Ctrl/Cmd+`：终端；Ctrl/Cmd+Shift+P：命令面板；`?`：快捷键速查表（常驻注册）。 */
 function handleSearchShortcut(e: KeyboardEvent) {
   if (e.repeat) return
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
@@ -270,6 +296,20 @@ function handleSearchShortcut(e: KeyboardEvent) {
     e.preventDefault()
     toggleTerminal()
   }
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'p') {
+    e.preventDefault()
+    commandPaletteRef.value?.toggle()
+  }
+  if (e.key === '?' && !e.ctrlKey && !e.metaKey && !e.altKey && !isTypingTarget(e.target)) {
+    e.preventDefault()
+    shortcutHelpRef.value?.open()
+  }
+}
+
+/** 文本输入焦点守卫：`?` 速查表快捷键不得在输入框 / 编辑器聚焦时触发。 */
+function isTypingTarget(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement
+    && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)
 }
 
 let installPromptVisible = false
