@@ -78,4 +78,23 @@ describe('launcher position', () => {
     expect(readDock()).toBeNull();
     expect(p.dragging.value).toBe(false);
   });
+
+  it('入口按钮按桌面 28px / 窄屏 26px 计算贴边位置', async () => {
+    const originalWidth = window.innerWidth;
+    const originalViewport = window.visualViewport;
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: undefined });
+    try {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1024 });
+      const { placement: p } = mount();
+      expect(parseFloat(String(p.launcherStyle.value.left))).toBe(1024 - 24 - 28);
+
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: 400 });
+      window.dispatchEvent(new Event('resize'));
+      await nextTick();
+      expect(parseFloat(String(p.launcherStyle.value.left))).toBe(400 - 16 - 26);
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalWidth });
+      Object.defineProperty(window, 'visualViewport', { configurable: true, value: originalViewport });
+    }
+  });
 });
