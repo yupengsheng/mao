@@ -165,8 +165,9 @@ const pendingCallbacks = new Map<string, {
   reject?: (err: Error) => void
 }>()
 
-// 消息保存确认的回调机制
-type MessageSavedCallback = (sessionId: string, messageId: string) => void
+// 消息保存确认的回调机制：saved=false 表示服务端明确拒绝（未落库）——
+// 调用方（waitForMessageSaved）据此解锁输入框并回滚乐观消息，而不是干等超时。
+type MessageSavedCallback = (sessionId: string, messageId: string | null, saved: boolean) => void
 const messageSavedCallbacks = new Map<string, MessageSavedCallback>()
 
 // Module-level flags to ensure IPC listeners are registered only once
@@ -723,6 +724,22 @@ export function useStreamWS() {
       case 'pong':
         break
 
+      // LOCAL 执行端上下线（用户级事件，sessionId=null）：刷新会话快照里的
+      // targetDeviceOnline，让「在 xxx 上执行」横幅与发送前拦截实时跟随，
+      // 不再只有刷新页面才纠正（技术方案 2026-11-05 §4.1-7 实时化）。
+      case 'device_status': {
+        const deviceId = typeof data?.deviceId === 'string' ? data.deviceId : ''
+        if (deviceId && typeof data?.online === 'boolean') {
+          const deviceName = typeof data?.deviceName === 'string' ? data.deviceName : null
+          sessionStore.applyDeviceStatus(deviceId, data.online, deviceName)
+          // 持有本地快照的组件（边路面板的来源/边路会话设备态）按需订阅
+          window.dispatchEvent(new CustomEvent('device_status', {
+            detail: { deviceId, deviceName, online: data.online },
+          }))
+        }
+        break
+      }
+
       case 'content_delta':
         if (sessionId) {
           sessionStore.appendDelta(sessionId, data.delta)
@@ -1021,6 +1038,9 @@ export function useStreamWS() {
 
       case 'session_already_running':
         if (sessionId) {
+          // 同为落库前拒绝：不发 user_message_saved，等待保存确认的发送方要立即失败，
+          // 否则输入框卡「正在保存…」直到 60s 超时（与 error 帧同一口径）。
+          failMessageSaved(sessionId)
           const cb = pendingCallbacks.get(sessionId)
           if (cb) {
             pendingCallbacks.delete(sessionId)
@@ -1065,7 +1085,7 @@ export function useStreamWS() {
             sessionStore.updateLastMessageId(sid, 'user', remoteMsgId)
             // 消息保存确认回调：仅本端发送链路使用，远端事件不得误配本端在途发送。
             messageSavedCallbacks.forEach((callback) => {
-              callback(sid, remoteMsgId)
+              callback(sid, remoteMsgId, true)
             })
           } else if (hasRemoteEcho) {
             // 远端消息（无本端乐观消息可匹配）：追加回显并占位流式 assistant 消息。
@@ -1413,6 +1433,11 @@ export function useStreamWS() {
           // 而迟到的终态 session_status 帧再调 finishInterruptedStreamingMessage 已空转
           sessionStore.finishInterruptedStreamingMessage(sessionId, '执行失败中断')
           resetSessionStreamState(sessionId)
+          // 落库前拒绝（本地执行端未连接 / 模型不支持图片 / 预算 BLOCK 等）只回 error
+          // 帧、永不会发 user_message_saved：结算保存确认，让等待中的发送立即失败
+          // （输入框解锁、消息回滚），而不是干等 60s 超时。放在状态落定之后，保证
+          // 等待方恢复时横幅/相位已就绪；消息已落库后的运行期错误没有等待者，是 no-op。
+          failMessageSaved(sessionId)
           const cb = pendingCallbacks.get(sessionId)
           if (cb) {
             pendingCallbacks.delete(sessionId)
@@ -1479,6 +1504,19 @@ export function useStreamWS() {
     messageSavedCallbacks.delete(callbackId)
   }
 
+  /**
+   * 服务端落库前拒绝（本地执行端未连接 / 会话被占用 / 预算 BLOCK / 图片不支持等）时
+   * 结算该会话仍在等待的保存确认：这些拒绝只回 error 帧、永不会发 user_message_saved，
+   * 不结算的话等待方要干等 60s 超时，输入框一直转「正在保存…」。
+   * 只调用不删除：会话不匹配的回调自行忽略并保持登记，匹配的由 waitForMessageSaved
+   * 的 finish() 内 offMessageSaved 注销，避免误摘其他会话的等待者。
+   */
+  function failMessageSaved(sessionId: string) {
+    for (const callback of [...messageSavedCallbacks.values()]) {
+      callback(sessionId, null, false)
+    }
+  }
+
   /** 当前 WS readyState；未建立/已登出（ws 为 null）时返回 -1，供回前台恢复检测区分「从未连接」与「已断开」。 */
   function getReadyState(): number {
     return ws?.readyState ?? -1
@@ -1512,6 +1550,7 @@ export function useStreamWS() {
     setActiveExecution,
     clearActiveExecution,
     onMessageSaved,
-    offMessageSaved
+    offMessageSaved,
+    failMessageSaved
   }
 }

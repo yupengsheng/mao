@@ -2,6 +2,7 @@ import { harnessLog } from '../log.js';
 import type { ApprovalRegistry } from '../approval/approval-registry.js';
 import type { SessionTreeSignalPublisher } from '../approval/session-tree-signal-publisher.js';
 import type { LocalToolSessionRegistry } from './local-tool-session-registry.js';
+import { LOCAL_CLIENT_OFFLINE_TOOL_ERROR } from './local-tool-session-registry.js';
 import type { ApprovalHint } from '../approval/approval-hint.js';
 import type { TaskWaitReleaseReason } from '../core/task-wait-observer.js';
 import { approvalWaitPayload } from '../../task/wait-payload.js';
@@ -50,7 +51,7 @@ export class LocalToolExecutor {
   ): Promise<string> {
     if (!(await this.sessionRegistry.isConnected(sessionId))) {
       harnessLog('warn', `No local client connected for session ${sessionId}`);
-      return JSON.stringify({ error: 'Local client is not connected. Please ensure the desktop app is running and connected.' });
+      return JSON.stringify({ error: LOCAL_CLIENT_OFFLINE_TOOL_ERROR });
     }
     let pending: { requestId: string | null; future: Promise<string> } | null = null;
     let approvalRegistered = false;
