@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { harnessLog } from '../log.js';
 import type { RuntimeDataResolver } from '../runtime/runtime-data-resolver.js';
-import type { GitCredentialLookup } from '../../session/types.js';
+import type { GitTokenResolver } from '../../session/types.js';
 import type { ShellTokenIssuer, ShellUserLookup, ShellEcpInjector, ShellLarkUatInjector } from '../tool/impl/shell-session-tool.js';
 import type { RuntimeEnvelope } from './runtime-channel-protocol.js';
 
@@ -25,7 +25,7 @@ export class SessionEnvelopeBuilder {
   constructor(
     private readonly deps: {
       runtimeResolver: RuntimeDataResolver;
-      gitCredentialService?: GitCredentialLookup | null;
+      gitTokenResolver?: GitTokenResolver | null;
       jwtService?: ShellTokenIssuer | null;
       userLookup?: ShellUserLookup | null;
       ecpInjector?: ShellEcpInjector | null;
@@ -40,8 +40,9 @@ export class SessionEnvelopeBuilder {
     const { userId, sessionId, workspace } = input;
     let gitTokens: Record<string, string> = {};
     try {
-      gitTokens = userId != null && this.deps.gitCredentialService
-        ? await this.deps.gitCredentialService.getTokenMapByUser(userId)
+      // 按会话上下文解析（用户 token ∩ Agent 允许域）；容器内消费方零改动
+      gitTokens = userId != null && this.deps.gitTokenResolver
+        ? await this.deps.gitTokenResolver.resolveForSession(userId, sessionId)
         : {};
     } catch (e) {
       harnessLog('warn', `[envelope] git token lookup failed for user=${userId}: ${(e as Error).message}`);

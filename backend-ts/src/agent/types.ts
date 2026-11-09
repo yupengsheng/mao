@@ -13,6 +13,8 @@ export interface Agent {
   mcpServerIds?: string | null;
   /** 关联的自定义 HTTP 工具 ID 列表（JSON 数组字符串），为空表示不启用 */
   httpToolIds?: string | null;
+  /** Git 凭据域白名单（JSON 数组字符串）：null=未配置，'[]'=显式禁止，非空=白名单 */
+  gitAllowedDomains?: string | null;
   defaultModelId?: number | null;
   isDefault?: number | null;
   /** 1-启用 0-停用；缺省视为启用 */
@@ -69,7 +71,12 @@ export interface SuggestedQuestionInput {
 }
 
 export interface AgentRepository {
-  selectList(keyword?: string | null, includeDisabled?: boolean, clientVisibleOnly?: boolean): Promise<Agent[]>;
+  selectList(
+    keyword?: string | null,
+    includeDisabled?: boolean,
+    clientVisibleOnly?: boolean,
+    missingGitAllowedDomains?: boolean,
+  ): Promise<Agent[]>;
   selectPage(
     pageNum: number,
     pageSize: number,
@@ -77,7 +84,9 @@ export interface AgentRepository {
     includeDisabled?: boolean,
     clientVisibleOnly?: boolean,
     enabled?: boolean,
+    missingGitAllowedDomains?: boolean,
   ): Promise<{ records: Agent[]; total: number }>;
+  selectGitAllowedDomainsById(id: number): Promise<{ domains: string | null } | null>;
   findById(id: number): Promise<Agent | null>;
   findDefault(): Promise<Agent | null>;
   insert(agent: Agent): Promise<number>;

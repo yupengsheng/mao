@@ -30,6 +30,11 @@
             <el-option label="停用" value="disabled" />
           </el-select>
         </el-form-item>
+        <el-form-item label="Git 凭据域">
+          <el-select v-model="gitDomainFilter" clearable placeholder="全部" style="width: 120px" @change="handleGitDomainFilter">
+            <el-option label="未配置" value="missing" />
+          </el-select>
+        </el-form-item>
         <el-form-item>
           <el-button type="primary" @click="handleSearch">查询</el-button>
         </el-form-item>
@@ -75,6 +80,9 @@
         </el-table-column>
         <el-table-column label="Skills" width="84" align="right">
           <template #default="{ row }">{{ row.skillNames?.length || 0 }}</template>
+        </el-table-column>
+        <el-table-column label="Git 凭据域" width="110">
+          <template #default="{ row }">{{ gitDomainText(row.gitAllowedDomains) }}</template>
         </el-table-column>
         <el-table-column label="经验数" width="84" align="right">
           <template #default="{ row }">{{ row.experiences?.length || 0 }}</template>
@@ -128,6 +136,10 @@
           <div class="mobile-card-row">
             <span class="mobile-card-label">Skills</span>
             <span>{{ row.skillNames?.length || 0 }}</span>
+          </div>
+          <div class="mobile-card-row">
+            <span class="mobile-card-label">Git 凭据域</span>
+            <span>{{ gitDomainText(row.gitAllowedDomains) }}</span>
           </div>
           <div class="mobile-card-actions">
             <template v-if="canWrite">
@@ -212,6 +224,7 @@ const loadingDetail = ref(false)
 const agents = ref<any[]>([])
 const searchQuery = ref('')
 const statusFilter = ref('')
+const gitDomainFilter = ref<'' | 'missing'>('')
 const currentPage = ref(1)
 const pageSize = ref(10)
 const total = ref(0)
@@ -246,6 +259,7 @@ async function fetchAgents() {
         pageNum: currentPage.value,
         pageSize: pageSize.value,
         enabled: statusFilter.value === 'enabled' ? true : statusFilter.value === 'disabled' ? false : undefined,
+        ...(gitDomainFilter.value === 'missing' ? { missingGitDomains: true } : {}),
       }
     })
     if (seq !== fetchAgentsSeq) return
@@ -293,6 +307,18 @@ function handleSearch() {
 function handleStatusFilter() {
   currentPage.value = 1
   fetchAgents()
+}
+
+function handleGitDomainFilter() {
+  currentPage.value = 1
+  fetchAgents()
+}
+
+/** 三态文案：null/undefined=未配置，[]=已禁止，非空=N 个域。 */
+function gitDomainText(domains: string[] | null | undefined): string {
+  if (domains == null) return '未配置'
+  if (domains.length === 0) return '已禁止'
+  return `${domains.length} 个域`
 }
 
 function handleSizeChange() {

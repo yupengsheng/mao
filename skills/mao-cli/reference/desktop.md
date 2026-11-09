@@ -323,6 +323,8 @@ REST 非对话操作统一用 `mao` CLI（本 Skill），见 [SKILL.md](../SKILL
 
 「设置 → Git 凭证」：按**完整主机名**（如 `git.example.com`）存 Access Token，用于 HTTPS clone 与云端 git 操作。仅 HTTPS；push 需写权限。
 
+会话实际可用的凭据还受所属 Agent 的 Git 凭据域限制：最终注入「用户已保存域 ∩ Agent 允许域」。管理员可在管理后台 Agent 编辑页配置白名单；未配置时跟随系统设置「Git 凭据域策略」（宽松 / 严格），显式禁止则不注入任何凭据。
+
 CLI：`mao git ...`（见 [git.md](git.md)）。
 
 ## Git 管理器（中央 Tab）

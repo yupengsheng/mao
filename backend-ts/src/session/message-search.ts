@@ -224,6 +224,90 @@ export function normalizeSearchListParams(input: {
   };
 }
 
+/**
+ * 管理端会话列表的「活跃时间」窗口。
+ *
+ * 关键词匹配此前是全局消息检索（`id IN (SELECT ... MATCH ...)` / 全表 LIKE），
+ * 会话上的过滤传不进消息子查询；改为「先按活跃时间筛会话，再在这些会话的窗口内消息里匹配」，
+ * 扫描面随窗口收敛。`last_activity_at` 与消息 `created_at` 都按 Asia/Shanghai 日历日切分，
+ * 与既有 dateFrom/dateTo 一致（含起始日 00:00:00，结束日次日 00:00:00 开区间）。
+ */
+export const ACTIVITY_RANGE_ALL = 'ALL';
+export const ACTIVITY_RANGE_DEFAULT = '7D';
+export const ACTIVITY_RANGE_PRESET_DAYS: Readonly<Record<string, number>> = { '7D': 7, '30D': 30, '90D': 90 };
+
+export interface ActivityWindow {
+  /** 起始（含），'YYYY-MM-DD HH:MM:SS'；null = 不设下界 */
+  from: string | null;
+  /** 上界（不含）；null = 不设上界 */
+  toExclusive: string | null;
+}
+
+/** 上海时区当天 YYYY-MM-DD（默认时间窗口径，不随宿主机时区漂移）。 */
+export function shanghaiYmd(now: Date): string {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(now);
+  const get = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)!.value;
+  return `${get('year')}-${get('month')}-${get('day')}`;
+}
+
+/** 日历日加减（纯日历运算，不做时区换算）。 */
+export function shiftCalendarDay(ymd: string, days: number): string {
+  const [year, month, day] = ymd.split('-').map(Number);
+  const utc = new Date(Date.UTC(year!, month! - 1, day! + days));
+  const mm = String(utc.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(utc.getUTCDate()).padStart(2, '0');
+  return `${utc.getUTCFullYear()}-${mm}-${dd}`;
+}
+
+/**
+ * 解析「活跃时间」窗口：
+ * - 传了 dateFrom/dateTo → 用显式区间（可单边），优先于任何预设；
+ * - `range=ALL` → null（不限时间，管理端显式放宽，慢查询由调用方自行承担）；
+ * - 传了 range 预设（7D/30D/90D）→ 最近 N 天（含今天）；
+ * - 都没传 → 默认最近 7 天，避免任何客户端直连 API 打到全表消息扫描。
+ */
+export function resolveActivityWindow(input: {
+  range?: string | null;
+  dateFrom?: string | null;
+  dateTo?: string | null;
+  now?: Date;
+}): ActivityWindow | null {
+  const rawRange = input.range?.trim().toUpperCase() ?? '';
+  const rawFrom = input.dateFrom?.trim() ?? '';
+  const rawTo = input.dateTo?.trim() ?? '';
+  // 显式日期优先于任何预设（含 ALL）：调用方同时给出时按具体区间查询。
+  if (rawFrom !== '' || rawTo !== '') {
+    const fromDay = rawFrom === '' ? null : parseCalendarDate(rawFrom);
+    const toDay = rawTo === '' ? null : parseCalendarDate(rawTo);
+    if ((rawFrom !== '' && fromDay == null) || (rawTo !== '' && toDay == null)) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '日期不合法');
+    }
+    if (fromDay != null && toDay != null && fromDay > toDay) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '开始日期不能晚于结束日期');
+    }
+    return {
+      from: fromDay == null ? null : `${fromDay} 00:00:00`,
+      toExclusive: toDay == null ? null : nextCalendarDayStart(toDay),
+    };
+  }
+  if (rawRange === ACTIVITY_RANGE_ALL) return null;
+  const presetDays = rawRange === '' ? null : ACTIVITY_RANGE_PRESET_DAYS[rawRange] ?? null;
+  if (rawRange !== '' && presetDays == null) {
+    throw new BusinessException(ErrorCode.PARAM_INVALID, '时间范围不合法');
+  }
+  const days = presetDays ?? ACTIVITY_RANGE_PRESET_DAYS[ACTIVITY_RANGE_DEFAULT]!;
+  const today = shanghaiYmd(input.now ?? new Date());
+  return {
+    from: `${shiftCalendarDay(today, -(days - 1))} 00:00:00`,
+    toExclusive: nextCalendarDayStart(today),
+  };
+}
+
 export function indexOfIgnoreCase(text: string, keyword: string): number {
   return text.toLowerCase().indexOf(keyword.toLowerCase());
 }

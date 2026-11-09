@@ -102,3 +102,15 @@ mao git delete --id 2
 - 克隆地址（`workspace-mode=git` 的 `gitCloneUrl`）**不要携带账号或 Token**，服务端会直接拒绝；鉴权统一由该域名的凭证经 `GIT_ASKPASS` 与 `GIT_TOKEN_<域名>` 环境变量完成
 - 凭证会被写进工作区 `.git/config`、会话日志与对话历史，因此任何位置都不要把 Token 拼进仓库 URL
 - CLOUD `workspace-mode=git` 前应确保对应域名凭证已配置，否则私有仓库克隆会失败
+
+## Agent 级凭据域
+
+会话所属 Agent 可限制本次会话能注入哪些域名的 Git 凭据。最终注入集合为「当前用户的已保存凭据域 ∩ Agent 允许域」；Shell、终端、CLOUD 容器、文件读写与 Git 操作走同一套解析。
+
+| Agent 配置 | 行为 |
+|------|------|
+| 未配置 | 跟随系统设置 `gitToken.scopePolicy`：`lenient`（默认）注入用户全部凭据，`strict` 不注入 |
+| `[]` | 显式禁止，任何策略下都不注入 |
+| 非空域名列表 | 只注入列表内且该用户已保存的凭据 |
+
+管理后台入口：Agent 编辑页 →「Git 凭据域」；列表可按「未配置」筛选。系统策略入口：系统设置 →「Git 凭据域策略」。会话或 Agent 解析异常时按空集处理，不会回退到全量凭据。

@@ -72,12 +72,12 @@ describe('AgentService', () => {
     vi.mocked(agentRepo.findById).mockResolvedValue(existing);
 
     expect(await service.listAgents(7, 'old')).toEqual([existing]);
-    expect(agentRepo.selectList).toHaveBeenCalledWith('old', false, false);
+    expect(agentRepo.selectList).toHaveBeenCalledWith('old', false, false, false);
     vi.mocked(agentRepo.selectPage).mockResolvedValue({ records: [existing], total: 12 });
     expect(await service.listAgentsPage(7, 'old', true, false, 2, 10, false)).toEqual({ records: [existing], total: 12 });
-    expect(agentRepo.selectPage).toHaveBeenCalledWith(2, 10, 'old', true, false, false);
+    expect(agentRepo.selectPage).toHaveBeenCalledWith(2, 10, 'old', true, false, false, false);
     await service.listAgentsPage(7, null, false, false, 0, 999);
-    expect(agentRepo.selectPage).toHaveBeenLastCalledWith(1, 200, null, false, false, undefined);
+    expect(agentRepo.selectPage).toHaveBeenLastCalledWith(1, 200, null, false, false, undefined, false);
     expect(await service.getAgent(1)).toBe(existing);
 
     const experiences = [experienceInputOf(null, 'tip', 0, true)];
@@ -268,7 +268,7 @@ describe('AgentService', () => {
     it('passes clientVisibleOnly through to the repository', async () => {
       vi.mocked(agentRepo.selectList).mockResolvedValue([]);
       await service.listAgents(7, null, false, true);
-      expect(agentRepo.selectList).toHaveBeenCalledWith(null, false, true);
+      expect(agentRepo.selectList).toHaveBeenCalledWith(null, false, true, false);
     });
 
     it('defaults new agents to visible and persists hidden when requested', async () => {
@@ -301,6 +301,67 @@ describe('AgentService', () => {
 
       await service.updateAgent(7, 1, null, null, null, null, null, null, null, null, null, undefined, undefined, true);
       expect(agentRepo.updateById.mock.calls.at(-1)![0]).toMatchObject({ clientVisible: 1 });
+    });
+  });
+
+  describe('gitAllowedDomains', () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+      vi.mocked(agentRepo.insert).mockImplementation(async (a) => {
+        a.id = a.id ?? 1;
+        return a.id;
+      });
+    });
+
+    it('createAgent keeps whitelist and explicit denial without collapsing [] to null', async () => {
+      const withList = await service.createAgent(
+        7, 'a', null, 'p', null, null, null, null, null, 0, null,
+        undefined, undefined, undefined, ['git.acg.team'],
+      );
+      expect(withList.gitAllowedDomains).toBe('["git.acg.team"]');
+
+      const withEmpty = await service.createAgent(
+        7, 'a', null, 'p', null, null, null, null, null, 0, null,
+        undefined, undefined, undefined, [],
+      );
+      expect(withEmpty.gitAllowedDomains).toBe('[]');
+
+      const omitted = await service.createAgent(7, 'a', null, 'p', null, null, null, null, null, 0, null);
+      expect(omitted.gitAllowedDomains).toBeUndefined();
+    });
+
+    it('updateAgent treats undefined, null, [] and a whitelist differently', async () => {
+      vi.mocked(agentRepo.findById).mockResolvedValue({
+        ...agent(1, 'a', 0), gitAllowedDomains: '["github.com"]',
+      });
+
+      const keep = await service.updateAgent(7, 1, null, null, null, null, null, null, null, null, null, undefined);
+      expect(keep.gitAllowedDomains).toBe('["github.com"]');
+
+      const cleared = await service.updateAgent(
+        7, 1, null, null, null, null, null, null, null, null, null, undefined,
+        undefined, undefined, undefined, null,
+      );
+      expect(cleared.gitAllowedDomains).toBeNull();
+
+      const forbidden = await service.updateAgent(
+        7, 1, null, null, null, null, null, null, null, null, null, undefined,
+        undefined, undefined, undefined, [],
+      );
+      expect(forbidden.gitAllowedDomains).toBe('[]');
+
+      const listed = await service.updateAgent(
+        7, 1, null, null, null, null, null, null, null, null, null, undefined,
+        undefined, undefined, undefined, ['git.acg.team', 'git.zizaitianye.com'],
+      );
+      expect(listed.gitAllowedDomains).toBe('["git.acg.team","git.zizaitianye.com"]');
+      expect(agentRepo.updateById).toHaveBeenCalled();
+    });
+
+    it('listAgents passes the unconfigured filter through to the repository', async () => {
+      vi.mocked(agentRepo.selectList).mockResolvedValue([]);
+      await service.listAgents(7, null, true, false, true);
+      expect(agentRepo.selectList).toHaveBeenCalledWith(null, true, false, true);
     });
   });
 });

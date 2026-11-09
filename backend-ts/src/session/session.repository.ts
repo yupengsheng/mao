@@ -434,12 +434,16 @@ export class SessionRepository {
     params: unknown[],
     orderSql: string,
   ): Promise<{ records: Session[]; total: number }> {
-    const total = await this.count(whereSql, params);
     const offset = (page - 1) * size;
-    const records = await this.db.query<Session>(
-      `SELECT * FROM \`session\` WHERE ${whereSql} AND ${notDeleted()} ${orderSql} LIMIT ? OFFSET ?`,
-      [...params, size, offset],
-    );
+    // count 与分页查询互不依赖，并行下发；关键词搜索时 count 同样要扫窗口内消息，
+    // 串行会让总耗时近乎翻倍。
+    const [total, records] = await Promise.all([
+      this.count(whereSql, params),
+      this.db.query<Session>(
+        `SELECT * FROM \`session\` WHERE ${whereSql} AND ${notDeleted()} ${orderSql} LIMIT ? OFFSET ?`,
+        [...params, size, offset],
+      ),
+    ]);
     return { records, total };
   }
 
@@ -1083,11 +1087,23 @@ export class MessageRepository {
     sessionIds: number[],
     escapedKeyword: string,
     messageScope: MessageSearchScope = 'CONVERSATION',
+    createdFrom: string | null = null,
+    createdToExclusive: string | null = null,
   ): Promise<Array<{ sessionId: number; content: string | null }>> {
     if (sessionIds.length === 0) {
       return Promise.resolve([]);
     }
     const placeholders = sessionIds.map(() => '?').join(',');
+    let createdClause = '';
+    const windowParams: string[] = [];
+    if (createdFrom != null) {
+      createdClause += ' AND m.created_at >= ?';
+      windowParams.push(createdFrom);
+    }
+    if (createdToExclusive != null) {
+      createdClause += ' AND m.created_at < ?';
+      windowParams.push(createdToExclusive);
+    }
     return this.db.query<{ sessionId: number; content: string | null }>(
       `SELECT t.sessionId AS sessionId, t.content AS content
        FROM (
@@ -1095,11 +1111,12 @@ export class MessageRepository {
                 ROW_NUMBER() OVER (PARTITION BY m.session_id ORDER BY m.id ASC) AS rn
          FROM message m
          WHERE m.deleted = 0${messageRoleClause(messageScope)}
+           ${createdClause}
            AND m.session_id IN (${placeholders})
            AND m.content LIKE CONCAT('%', ?, '%') ESCAPE '\\\\'
        ) t
        WHERE t.rn = 1`,
-      [...sessionIds, escapedKeyword],
+      [...windowParams, ...sessionIds, escapedKeyword],
     );
   }
 

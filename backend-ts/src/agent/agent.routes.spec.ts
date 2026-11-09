@@ -122,12 +122,12 @@ describe('CRUD routes', () => {
     expect((await app.inject({
       method: 'POST', url: '/v1/agents', payload: { name: 'A', systemPrompt: 'p', avatarUrl: agent.avatarUrl },
     })).json().data.avatarUrl).toBe(agent.avatarUrl);
-    expect(agentService.createAgent.mock.calls[0]?.at(-3)).toBe(agent.avatarUrl);
+    expect(agentService.createAgent.mock.calls[0]?.at(-4)).toBe(agent.avatarUrl);
     expect(agentService.createAgent.mock.calls[0]?.at(-1)).toBeUndefined();
     expect((await app.inject({
       method: 'PUT', url: '/v1/agents/1', payload: { name: 'B', avatarUrl: null },
     })).statusCode).toBe(200);
-    expect(agentService.updateAgent.mock.calls[0]?.at(-3)).toBeNull();
+    expect(agentService.updateAgent.mock.calls[0]?.at(-4)).toBeNull();
     expect((await app.inject({ method: 'DELETE', url: '/v1/agents/1' })).statusCode).toBe(200);
     expect((await app.inject({ method: 'GET', url: '/v1/agents/1/experiences' })).statusCode).toBe(200);
     expect((await app.inject({
@@ -137,7 +137,7 @@ describe('CRUD routes', () => {
       method: 'PUT', url: '/v1/agents/1/experiences/1', payload: { content: 'u' },
     })).statusCode).toBe(200);
     expect((await app.inject({ method: 'DELETE', url: '/v1/agents/1/experiences/1' })).statusCode).toBe(200);
-    expect(agentService.listAgents).toHaveBeenCalledWith(7, undefined, false, false);
+    expect(agentService.listAgents).toHaveBeenCalledWith(7, undefined, false, false, false);
     await app.close();
   });
 
@@ -167,7 +167,7 @@ describe('CRUD routes', () => {
       const cleared = await app.inject({ method: 'PUT', url: '/v1/agents/1', payload: { mcpServerIds: [] } });
       expect(cleared.statusCode).toBe(200);
       expect(agentService.updateAgent).toHaveBeenCalledWith(
-        7, 1, undefined, undefined, undefined, undefined, [], undefined, null, null, undefined, undefined, undefined, undefined, undefined,
+        7, 1, undefined, undefined, undefined, undefined, [], undefined, null, null, undefined, undefined, undefined, undefined, undefined, undefined,
       );
       expect(mcpServerValidator.validateForAgent).not.toHaveBeenCalled();
 
@@ -210,17 +210,17 @@ describe('CRUD routes', () => {
     }));
     try {
       await app.inject({ method: 'GET', url: '/v1/agents?includeDisabled=true' });
-      expect(agentService.listAgents).toHaveBeenCalledWith(7, undefined, false, false);
+      expect(agentService.listAgents).toHaveBeenCalledWith(7, undefined, false, false, false);
       expect((await app.inject({ method: 'PATCH', url: '/v1/agents/1/enabled', payload: { enabled: false } })).statusCode).toBe(403);
       expect(agentService.setEnabled).not.toHaveBeenCalled();
 
       permissionService.hasPermission.mockImplementation(async (_userId: number, code: string) => code === 'agent:read' || code === 'agent:write');
       await app.inject({ method: 'GET', url: '/v1/agents?includeDisabled=true&keyword=coder' });
-      expect(agentService.listAgents).toHaveBeenLastCalledWith(7, 'coder', true, false);
+      expect(agentService.listAgents).toHaveBeenLastCalledWith(7, 'coder', true, false, false);
 
       // 客户端新建会话：只取客户端可见的 Agent
       await app.inject({ method: 'GET', url: '/v1/agents?scope=client' });
-      expect(agentService.listAgents).toHaveBeenLastCalledWith(7, undefined, false, true);
+      expect(agentService.listAgents).toHaveBeenLastCalledWith(7, undefined, false, true, false);
 
       // 非法 scope 直接拒绝，避免拼写错误静默退化成全量（项目约定：业务错误 HTTP 200 + code≠0）
       const badScope = await app.inject({ method: 'GET', url: '/v1/agents?scope=admin' });
@@ -259,7 +259,7 @@ describe('CRUD routes', () => {
       const legacy = await app.inject({ method: 'GET', url: '/v1/agents' });
       expect(legacy.json().data).toEqual([expect.objectContaining({ name: 'coder' })]);
       expect(legacy.headers['x-total-count']).toBeUndefined();
-      expect(agentService.listAgents).toHaveBeenCalledWith(7, undefined, false, false);
+      expect(agentService.listAgents).toHaveBeenCalledWith(7, undefined, false, false, false);
       expect(agentService.listAgentsPage).not.toHaveBeenCalled();
 
       const paged = await app.inject({
@@ -268,14 +268,14 @@ describe('CRUD routes', () => {
       });
       expect(paged.json().data).toEqual([expect.objectContaining({ name: 'coder' })]);
       expect(paged.headers['x-total-count']).toBe('12');
-      expect(agentService.listAgentsPage).toHaveBeenCalledWith(7, 'co', true, false, 2, 10, false);
+      expect(agentService.listAgentsPage).toHaveBeenCalledWith(7, 'co', true, false, 2, 10, false, false);
 
       const disabledOnly = await app.inject({
         method: 'GET',
         url: '/v1/agents?pageNum=1&pageSize=5&enabled=false',
       });
       expect(disabledOnly.json().data).toEqual([expect.objectContaining({ name: 'coder' })]);
-      expect(agentService.listAgentsPage).toHaveBeenLastCalledWith(7, undefined, false, false, 1, 5, false);
+      expect(agentService.listAgentsPage).toHaveBeenLastCalledWith(7, undefined, false, false, 1, 5, false, false);
     } finally {
       await app.close();
     }
@@ -468,6 +468,100 @@ describe('CRUD routes', () => {
       }
       expect(agentService.updateAgent).not.toHaveBeenCalled();
       expect(validator.validateForAgent).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('normalizes gitAllowedDomains and keeps the four-state update semantics', async () => {
+    const agent = { id: 1, name: 'A', systemPrompt: 'p', isDefault: 0, gitAllowedDomains: null };
+    const agentService = {
+      getAgent: vi.fn(async () => agent),
+      createAgent: vi.fn(async () => agent),
+      updateAgent: vi.fn(async () => agent),
+      getAgentExperiences: vi.fn(async () => []),
+      getAgentSuggestedQuestions: vi.fn(async () => []),
+    };
+    const app = await appWithUser(f => registerAgentRoutes(f, {
+      agentService: agentService as never,
+      experienceService: {} as never,
+      suggestedQuestionService: {} as never,
+      userRepo: { findById: vi.fn(async () => null) } as never,
+      mcpServerValidator: {} as never,
+      httpToolValidator: {} as never,
+      permissionService: { hasPermission: vi.fn(async () => true) },
+    }));
+    try {
+      // 规范化：去协议 / 去路径 / 小写 / 去重；请求体最后一位参数为规范化结果
+      const normalized = await app.inject({
+        method: 'PUT', url: '/v1/agents/1',
+        payload: { gitAllowedDomains: ['https://Git.ACG.Team/foo', 'git.acg.team'] },
+      });
+      expect(normalized.statusCode).toBe(200);
+      expect(agentService.updateAgent.mock.calls.at(-1)?.at(-1)).toEqual(['git.acg.team']);
+
+      // null 清空 / [] 显式禁止 / 未传不改
+      await app.inject({ method: 'PUT', url: '/v1/agents/1', payload: { gitAllowedDomains: null } });
+      expect(agentService.updateAgent.mock.calls.at(-1)?.at(-1)).toBeNull();
+      await app.inject({ method: 'PUT', url: '/v1/agents/1', payload: { gitAllowedDomains: [] } });
+      expect(agentService.updateAgent.mock.calls.at(-1)?.at(-1)).toEqual([]);
+      await app.inject({ method: 'PUT', url: '/v1/agents/1', payload: { name: 'B' } });
+      expect(agentService.updateAgent.mock.calls.at(-1)?.at(-1)).toBeUndefined();
+
+      const callsBefore = agentService.updateAgent.mock.calls.length;
+      for (const payload of [
+        [''],
+        ['not a domain'],
+        [123],
+        Array.from({ length: 33 }, (_, i) => `git${i}.example.com`),
+        Array.from({ length: 14 }, (_, i) => `${'a'.repeat(60)}${i}.example.com`),
+      ]) {
+        const res = await app.inject({
+          method: 'PUT', url: '/v1/agents/1', payload: { gitAllowedDomains: payload },
+        });
+        expect(res.json().code, JSON.stringify(payload)).not.toBe(0);
+      }
+      expect(agentService.updateAgent.mock.calls.length).toBe(callsBefore);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('only exposes gitAllowedDomains and the missing filter to agent managers', async () => {
+    const agent = {
+      id: 1, name: 'A', systemPrompt: 'p', isDefault: 0, enabled: 1,
+      gitAllowedDomains: '["git.acg.team"]',
+    };
+    const agentService = {
+      listAgents: vi.fn(async () => [agent]),
+      getAgent: vi.fn(async () => agent),
+      listAgentsPage: vi.fn(async () => ({ records: [agent], total: 1 })),
+      getAgentExperiences: vi.fn(async () => []),
+      getAgentSuggestedQuestions: vi.fn(async () => []),
+    };
+    const permissionService = { hasPermission: vi.fn(async () => false) };
+    const app = await appWithUser(f => registerAgentRoutes(f, {
+      agentService: agentService as never,
+      experienceService: {} as never,
+      suggestedQuestionService: {} as never,
+      userRepo: { findById: vi.fn(async () => null) } as never,
+      mcpServerValidator: {} as never,
+      httpToolValidator: {} as never,
+      permissionService,
+    }));
+    try {
+      const list = await app.inject({ method: 'GET', url: '/v1/agents?missingGitDomains=true' });
+      expect(list.json().data[0]).not.toHaveProperty('gitAllowedDomains');
+      expect(agentService.listAgents).toHaveBeenLastCalledWith(7, undefined, false, false, false);
+      const detail = await app.inject({ method: 'GET', url: '/v1/agents/1' });
+      expect(detail.json().data).not.toHaveProperty('gitAllowedDomains');
+
+      permissionService.hasPermission.mockResolvedValue(true);
+      const managed = await app.inject({ method: 'GET', url: '/v1/agents?missingGitDomains=true' });
+      expect(managed.json().data[0]?.gitAllowedDomains).toEqual(['git.acg.team']);
+      expect(agentService.listAgents).toHaveBeenLastCalledWith(7, undefined, false, false, true);
+      await app.inject({ method: 'GET', url: '/v1/agents?pageNum=1&missingGitDomains=true' });
+      expect(agentService.listAgentsPage).toHaveBeenLastCalledWith(7, undefined, false, false, 1, undefined, undefined, true);
     } finally {
       await app.close();
     }

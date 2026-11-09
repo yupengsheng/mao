@@ -8,7 +8,7 @@ import { useTmpDir } from '../testing/tmp-dir.js';
 import { PathSandbox } from '../harness/safety/path-sandbox.js';
 import type { RuntimeDataResolver } from '../harness/runtime/runtime-data-resolver.js';
 import type { ActivityService } from '../session/activity.service.js';
-import type { GitCredentialLookup, Session } from '../session/types.js';
+import type { GitTokenResolver, Session } from '../session/types.js';
 import { GitCommitMessageService, MAX_DIFF_BYTES } from './git-commit-message.service.js';
 import { GitWriteOperationService } from './git-write-operation.service.js';
 import { WorkspaceGitService } from './workspace-git.service.js';
@@ -30,13 +30,19 @@ function session(repo: string): Session {
   return { id: 1, userId: 1, workspace: repo };
 }
 
+function tokenResolver(tokens: Record<string, string> = {}): GitTokenResolver {
+  return {
+    resolveForSession: vi.fn(async () => tokens),
+    resolveForAgent: vi.fn(async () => tokens),
+  };
+}
+
 function newService(dir: string, repo: string): GitWriteOperationService {
   const workspace = new WorkspaceGitService(new PathSandbox(join(dir, 'refresh-sandbox')));
-  const credentials: GitCredentialLookup = { getTokenMapByUser: vi.fn(async () => ({})) };
   return new GitWriteOperationService(
     workspace,
     { generate: vi.fn() } as unknown as GitCommitMessageService,
-    credentials,
+    tokenResolver(),
     {} as RuntimeDataResolver,
     { record: vi.fn() } as unknown as ActivityService,
   );
@@ -101,7 +107,7 @@ describeGit('GitWriteOperationService git', () => {
     const service = new GitWriteOperationService(
       workspace,
       { generate: vi.fn() } as unknown as GitCommitMessageService,
-      { getTokenMapByUser: vi.fn(async () => ({})) },
+      tokenResolver(),
       {} as RuntimeDataResolver,
       { record: vi.fn() } as unknown as ActivityService,
     );
@@ -131,7 +137,7 @@ describeGit('GitWriteOperationService git', () => {
     const service = new GitWriteOperationService(
       workspace,
       { generate: vi.fn() } as unknown as GitCommitMessageService,
-      { getTokenMapByUser: vi.fn(async () => ({})) },
+      tokenResolver(),
       {} as RuntimeDataResolver,
       { record: vi.fn() } as unknown as ActivityService,
     );
@@ -351,7 +357,7 @@ describeGit('GitWriteOperationService git', () => {
     const service = new GitWriteOperationService(
       workspace,
       { generate: vi.fn(async () => ({ message: 'update base', title: 'update' })) } as unknown as GitCommitMessageService,
-      { getTokenMapByUser: vi.fn(async () => ({})) },
+      tokenResolver(),
       {} as RuntimeDataResolver,
       activity as unknown as ActivityService,
     );
@@ -388,7 +394,7 @@ describeGit('GitWriteOperationService git', () => {
     const service = new GitWriteOperationService(
       workspace,
       { generate } as unknown as GitCommitMessageService,
-      { getTokenMapByUser: vi.fn(async () => ({})) },
+      tokenResolver(),
       {} as RuntimeDataResolver,
       { record: vi.fn() } as unknown as ActivityService,
     );
@@ -410,7 +416,7 @@ describeGit('GitWriteOperationService git', () => {
     const service = new GitWriteOperationService(
       new WorkspaceGitService(new PathSandbox(join(dir, 'sandbox'))),
       { generate: vi.fn() } as unknown as GitCommitMessageService,
-      { getTokenMapByUser: vi.fn(async () => ({})) },
+      tokenResolver(),
       {} as RuntimeDataResolver,
       { record: vi.fn() } as unknown as ActivityService,
     );
@@ -429,7 +435,7 @@ describeGit('GitWriteOperationService git', () => {
     const service = new GitWriteOperationService(
       workspace,
       { generate } as unknown as GitCommitMessageService,
-      { getTokenMapByUser: vi.fn(async () => ({})) },
+      tokenResolver(),
       {} as RuntimeDataResolver,
       { record: vi.fn() } as unknown as ActivityService,
     );
@@ -456,7 +462,7 @@ describeGit('GitWriteOperationService git', () => {
     const service = new GitWriteOperationService(
       new WorkspaceGitService(new PathSandbox(join(dir, 'sandbox'))),
       { generate: vi.fn() } as unknown as GitCommitMessageService,
-      { getTokenMapByUser: vi.fn(async () => ({})) },
+      tokenResolver(),
       {} as RuntimeDataResolver,
       { record: vi.fn() } as unknown as ActivityService,
     );
@@ -749,7 +755,7 @@ describeGit('GitWriteOperationService git', () => {
     const service = new GitWriteOperationService(
       workspace,
       { generate: vi.fn() } as unknown as GitCommitMessageService,
-      { getTokenMapByUser: vi.fn(async () => ({})) },
+      tokenResolver(),
       {} as RuntimeDataResolver,
       activity as unknown as ActivityService,
     );

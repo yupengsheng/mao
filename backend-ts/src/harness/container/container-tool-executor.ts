@@ -15,6 +15,7 @@ import { harnessLog } from '../log.js';
 import { ExperienceIndexStore, EXPERIENCE_ROOT_SUBDIR } from '../shared/experience-index-store.js';
 import { parseExperienceFrontmatterLite } from '../shared/experience-frontmatter-lite.js';
 import type { RuntimeEnvelope } from './runtime-channel-protocol.js';
+import type { GitTokenResolver } from '../../session/types.js';
 
 /** 容器内允许根清单（技术方案 §5.5）。 */
 export interface ContainerRoots {
@@ -106,15 +107,19 @@ export class ContainerToolExecutor {
       // 三级环境变量走 envelope 下发（容器内零查库）：与 deps env 完全同构的注入路径
       () => this.currentEnvelope?.envVars ?? null,
     );
-    const envelopeGitLookup = {
-      getTokenMapByUser: async (_userId: number) => this.currentEnvelope?.gitTokens ?? {},
+    // 容器内数据源仍是过滤后的 envelope.gitTokens，仅把接口形态换成 GitTokenResolver。
+    const envelopeTokenResolver: GitTokenResolver = {
+      resolveForSession: async (_userId: number, _sessionId: number | null) =>
+        this.currentEnvelope?.gitTokens ?? {},
+      resolveForAgent: async (_userId: number, _agentId: number | null) =>
+        this.currentEnvelope?.gitTokens ?? {},
     };
     const shellTool = new ShellSessionTool(
       this.pathSandbox,
       this.shellManager,
       this.outputManager,
       this.backgroundTasks,
-      envelopeGitLookup,
+      envelopeTokenResolver,
       this.envelopeTokenIssuer(),
       this.envelopeUserLookup(),
       this.envelopeEcpInjector(),

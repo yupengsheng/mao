@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { BusinessException } from '../common/business-exception.js';
 import { ErrorCode } from '../common/error-code.js';
 import { hasText } from '../common/case.js';
+import { normalizeAndValidateGitDomain } from '../common/git-domain.js';
 import { requirePermission, requireUserId, sendOk } from '../common/http-error.js';
 import { bodyOf, pathId, queryOptBool, queryOptInt, queryOptStr } from '../common/request.js';
 import type { UserRepository } from '../user/types.js';
@@ -42,6 +43,7 @@ interface CreateAgentRequest {
   skillNames?: string[];
   mcpServerIds?: number[];
   httpToolIds?: number[];
+  gitAllowedDomains?: string[] | null;
   experiences?: ExperienceVO[];
   suggestedQuestions?: SuggestedQuestionVO[];
   isDefault?: number | null;
@@ -58,6 +60,8 @@ interface UpdateAgentRequest {
   skillNames?: string[] | null;
   mcpServerIds?: number[] | null;
   httpToolIds?: number[] | null;
+  /** 四态：undefined=不修改；null=清空；[]=显式禁止注入；非空=白名单。 */
+  gitAllowedDomains?: string[] | null;
   experiences?: ExperienceVO[] | null;
   suggestedQuestions?: SuggestedQuestionVO[] | null;
   isDefault?: number | null;
@@ -70,6 +74,41 @@ interface ExperienceRequest {
   content?: string;
   sortOrder?: number | null;
   enabled?: boolean | null;
+}
+
+const MAX_GIT_DOMAINS = 32;
+const MAX_GIT_DOMAIN_LENGTH = 253;
+const MAX_GIT_DOMAINS_JSON_LENGTH = 1024;
+
+/**
+ * 校验并规范化 Git 凭据域白名单。
+ * 四态：undefined=不修改；null=清空；[]=显式禁止注入；非空=白名单。
+ * 顺序：逐项规范化/校验 → 去重 → 数量/单长 → JSON 总长（最终闸门）。
+ */
+function normalizeGitDomains(input: string[] | null | undefined): string[] | null | undefined {
+  if (input === undefined) return undefined;
+  if (input === null) return null;
+  if (!Array.isArray(input)) {
+    throw new BusinessException(ErrorCode.PARAM_INVALID, 'gitAllowedDomains 必须是字符串数组或 null');
+  }
+  const normalized: string[] = [];
+  for (const raw of input) {
+    if (typeof raw !== 'string') {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, 'Git 凭据域必须是字符串');
+    }
+    const domain = normalizeAndValidateGitDomain(raw);
+    if (!normalized.includes(domain)) normalized.push(domain);
+  }
+  if (normalized.length > MAX_GIT_DOMAINS) {
+    throw new BusinessException(ErrorCode.PARAM_INVALID, `Git 凭据域最多 ${MAX_GIT_DOMAINS} 条`);
+  }
+  if (normalized.some((domain) => domain.length > MAX_GIT_DOMAIN_LENGTH)) {
+    throw new BusinessException(ErrorCode.PARAM_INVALID, `单个域名不能超过 ${MAX_GIT_DOMAIN_LENGTH} 字符`);
+  }
+  if (JSON.stringify(normalized).length > MAX_GIT_DOMAINS_JSON_LENGTH) {
+    throw new BusinessException(ErrorCode.PARAM_INVALID, `Git 凭据域配置总长度不能超过 ${MAX_GIT_DOMAINS_JSON_LENGTH} 字符`);
+  }
+  return normalized;
 }
 
 export function registerAgentRoutes(app: FastifyInstance, deps: AgentRouteDeps): void {
@@ -89,10 +128,11 @@ export function registerAgentRoutes(app: FastifyInstance, deps: AgentRouteDeps):
       throw new BusinessException(ErrorCode.PARAM_INVALID, "scope 仅支持 'client'");
     }
     const wantDisabled = queryOptBool(request, 'includeDisabled') === true;
-    const includeDisabled = wantDisabled && (
-      await permissionService.hasPermission(userId, 'agent:read')
-      || await permissionService.hasPermission(userId, 'agent:write')
-    );
+    const missingGitDomains = queryOptBool(request, 'missingGitDomains') === true;
+    // 最小暴露：gitAllowedDomains 与「未配置」筛选仅对具备 Agent 管理权限的用户开放
+    const canManage = await permissionService.hasPermission(userId, 'agent:read')
+      || await permissionService.hasPermission(userId, 'agent:write');
+    const includeDisabled = wantDisabled && canManage;
     const pageNum = queryOptInt(request, 'pageNum');
     const pageSize = queryOptInt(request, 'pageSize');
     const enabled = queryOptBool(request, 'enabled');
@@ -100,20 +140,29 @@ export function registerAgentRoutes(app: FastifyInstance, deps: AgentRouteDeps):
     if (paginated) {
       const page = await agentService.listAgentsPage(
         userId, keyword, includeDisabled, scope === 'client', pageNum, pageSize, enabled,
+        missingGitDomains && canManage,
       );
       reply.header('x-total-count', String(page.total));
-      const voList = await Promise.all(page.records.map((agent) => toVO(agent, agentService, userRepo)));
+      const voList = await Promise.all(
+        page.records.map((agent) => toVO(agent, agentService, userRepo, { includeGitDomains: canManage })),
+      );
       return sendOk(reply, voList);
     }
-    const agents = await agentService.listAgents(userId, keyword, includeDisabled, scope === 'client');
-    const voList = await Promise.all(agents.map((agent) => toVO(agent, agentService, userRepo)));
+    const agents = await agentService.listAgents(
+      userId, keyword, includeDisabled, scope === 'client', missingGitDomains && canManage,
+    );
+    const voList = await Promise.all(
+      agents.map((agent) => toVO(agent, agentService, userRepo, { includeGitDomains: canManage })),
+    );
     return sendOk(reply, voList);
   });
 
   app.get('/v1/agents/:id', async (request, reply) => {
-    requireUserId(request);
+    const userId = requireUserId(request);
+    const canManage = await permissionService.hasPermission(userId, 'agent:read')
+      || await permissionService.hasPermission(userId, 'agent:write');
     const agent = await agentService.getAgent(pathId(request));
-    return sendOk(reply, await toVO(agent, agentService, userRepo));
+    return sendOk(reply, await toVO(agent, agentService, userRepo, { includeGitDomains: canManage }));
   });
 
   app.post('/v1/agents', async (request, reply) => {
@@ -127,6 +176,7 @@ export function registerAgentRoutes(app: FastifyInstance, deps: AgentRouteDeps):
     }
     const mcpServerIds = await resolveMcpServerIds(mcpServerValidator, body.mcpServerIds);
     const httpToolIds = await resolveHttpToolIds(httpToolValidator, body.httpToolIds);
+    const gitAllowedDomains = normalizeGitDomains(body.gitAllowedDomains);
     const agent = await agentService.createAgent(
       userId,
       body.name!,
@@ -142,6 +192,7 @@ export function registerAgentRoutes(app: FastifyInstance, deps: AgentRouteDeps):
       body.avatarUrl,
       body.clientVisible,
       body.experienceLibraryEnabled,
+      gitAllowedDomains,
     );
     return sendOk(reply, await toVO(agent, agentService, userRepo));
   });
@@ -162,6 +213,7 @@ export function registerAgentRoutes(app: FastifyInstance, deps: AgentRouteDeps):
       body.httpToolIds ?? undefined,
       existingHttpToolIds,
     );
+    const gitAllowedDomains = normalizeGitDomains(body.gitAllowedDomains);
     const agent = await agentService.updateAgent(
       userId,
       agentId,
@@ -178,6 +230,7 @@ export function registerAgentRoutes(app: FastifyInstance, deps: AgentRouteDeps):
       body.avatarUrl,
       body.clientVisible,
       body.experienceLibraryEnabled,
+      gitAllowedDomains,
     );
     return sendOk(reply, await toVO(agent, agentService, userRepo));
   });
@@ -318,7 +371,12 @@ async function resolveHttpToolIds(
   return validator.validateForAgent(normalized, existingIds);
 }
 
-async function toVO(agent: Agent, agentService: AgentService, userRepo: UserRepository): Promise<AgentVO> {
+async function toVO(
+  agent: Agent,
+  agentService: AgentService,
+  userRepo: UserRepository,
+  opts?: { includeGitDomains?: boolean },
+): Promise<AgentVO> {
   const vo: AgentVO = {
     id: agent.id,
     name: agent.name,
@@ -364,6 +422,20 @@ async function toVO(agent: Agent, agentService: AgentService, userRepo: UserRepo
       vo.httpToolIds = JSON.parse(agent.httpToolIds) as number[];
     } catch {
       // ignore deserialization error
+    }
+  }
+
+  // Git 凭据域：仅对具备 Agent 管理权限的调用方返回（最小暴露）；
+  // null（未配置）与 []（显式禁止）必须原样透出，前端据此区分「关闭开关」与「开启+空列表」。
+  if (opts?.includeGitDomains !== false) {
+    if (agent.gitAllowedDomains == null) {
+      vo.gitAllowedDomains = null;
+    } else {
+      try {
+        vo.gitAllowedDomains = JSON.parse(agent.gitAllowedDomains) as string[];
+      } catch {
+        // ignore deserialization error
+      }
     }
   }
 
