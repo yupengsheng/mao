@@ -47,6 +47,8 @@
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/v1/admin/signal-watchers` | 全站分页清单，筛选 `status` / `userId` / `compareMode`，需 `signal:read` 权限 |
+| GET | `/v1/admin/signal-watchers/:id` | 任意哨兵配置详情（脱敏，附属主展示名），需 `signal:read` 权限 |
+| GET | `/v1/admin/signal-watchers/:id/checks` | 任意哨兵轮询记录分页（`page` / `size`，默认 20，上限 100），需 `signal:read` 权限 |
 
 ## CLI 用法（mao-cli）
 
