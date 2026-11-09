@@ -8,6 +8,7 @@
         :file-path="activeTab.filePath || ''"
         :provider="activeProvider"
         :workspace-root="activeTab.workspaceRoot"
+        @add-file-to-chat="onAddFileToChat"
       />
       <FileDiffViewer
         v-else-if="activeTab?.type === 'diff' && activeTab.fileChange"
