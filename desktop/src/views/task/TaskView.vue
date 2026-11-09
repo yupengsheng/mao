@@ -45,6 +45,7 @@
         :workspace="workspace"
         @open-file="handleOpenFile"
         @add-file-to-chat="handleAddFileToChat"
+        @add-commit-to-chat="quoteReplyToChat"
         @paths-changed="applyWorkspacePathChange"
         @tree-refresh="refreshFileTree"
         @locate-in-tree="revealInFileTree"
