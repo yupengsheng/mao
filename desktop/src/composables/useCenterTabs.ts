@@ -762,6 +762,30 @@ export function useCenterTabs(activeSessionId: Ref<string | null>) {
     notifyTabsChanged()
   }
 
+  /** 重排非主会话页签；摘除后重新定位目标，兼容向前 / 向后两个方向。 */
+  function reorderTab(dragId: string, targetId: string, place: 'before' | 'after') {
+    if (dragId === targetId || dragId === 'chat' || targetId === 'chat') return
+    const state = getSessionState()
+    const from = state.tabs.findIndex(t => t.id === dragId)
+    if (from === -1 || !state.tabs.some(t => t.id === targetId)) return
+    const [moved] = state.tabs.splice(from, 1)
+    const targetIdx = state.tabs.findIndex(t => t.id === targetId)
+    state.tabs.splice(place === 'before' ? targetIdx : targetIdx + 1, 0, moved)
+    notifyTabsChanged()
+  }
+
+  /** 关闭目标右侧的文件类页签；边路任务与子代理保留，逐个走 closeTab 以维持既有副作用。 */
+  function closeRightTabs(tabId: string) {
+    const state = getSessionState()
+    const startIdx = tabId === 'chat' ? -1 : state.tabs.findIndex(t => t.id === tabId)
+    if (tabId !== 'chat' && startIdx === -1) return
+    const closing = state.tabs
+      .slice(startIdx + 1)
+      .filter(t => t.type !== 'side_task' && t.type !== 'subagent')
+      .map(t => t.id)
+    for (const id of closing) closeTab(id)
+  }
+
   // 与菜单文案「关闭其他文件」对齐：只关文件/diff Tab，保留边路任务与子代理 Tab。
   // 早期实现是 state.tabs = [当前 tab]，会连带关掉边路任务，且漏掉 closeTab 里的
   // markSideTaskClosed 记账，导致用户关掉的边路 Tab 在 restoreSideTaskTabs 时又冒出来。
@@ -806,6 +830,8 @@ export function useCenterTabs(activeSessionId: Ref<string | null>) {
     closeTab,
     applyWorkspacePathChange,
     closeAllFileTabs,
+    reorderTab,
+    closeRightTabs,
     closeOtherTabs,
     activateTab,
     restoreActiveTab,

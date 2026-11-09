@@ -20,6 +20,8 @@
         @close="closeTab"
         @close-all="closeAllFileTabs"
         @close-others="closeOtherTabs"
+        @close-right="closeRightTabs"
+        @reorder="reorderTab"
       />
       <CenterTabContainer
         :tabs="tabs"
@@ -361,7 +363,26 @@ provide('quoteFileRangeToChat', quoteFileRangeToChat)
 
 // Center tabs
 const activeSessionIdRef = computed(() => sessionStore.activeSessionId ?? '')
-const { tabs, activeTab, activeTabId, openFileTab, openDiffTab, closeTab, closeAllFileTabs, closeOtherTabs, activateTab, openSideTaskTab, setSideTaskFork, openSubagentTab, openTraceTab, openFileManagerTab, openWorkspaceFileManagerTab, openGitTab, updateSideTaskTab, restoreSideTaskTabs, restoreSubagentTabs, restoreTraceTab, restoreActiveTab, applyWorkspacePathChange } = useCenterTabs(activeSessionIdRef)
+const { tabs, activeTab, activeTabId, openFileTab, openDiffTab, closeTab, closeAllFileTabs, closeOtherTabs, reorderTab, closeRightTabs, activateTab, openSideTaskTab, setSideTaskFork, openSubagentTab, openTraceTab, openFileManagerTab, openWorkspaceFileManagerTab, openGitTab, updateSideTaskTab, restoreSideTaskTabs, restoreSubagentTabs, restoreTraceTab, restoreActiveTab, applyWorkspacePathChange } = useCenterTabs(activeSessionIdRef)
+
+function isTypingTarget(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement
+    && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)
+}
+
+/** Ctrl/Cmd+Alt+←/→ 在中心页签间循环切换，输入焦点内不拦截。 */
+function handleTabCycleKeydown(e: KeyboardEvent) {
+  if (e.repeat) return
+  if (!(e.ctrlKey || e.metaKey) || !e.altKey) return
+  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return
+  if (isTypingTarget(e.target)) return
+  const idx = tabs.value.findIndex(t => t.id === activeTabId.value)
+  if (idx === -1) return
+  e.preventDefault()
+  const delta = e.key === 'ArrowRight' ? 1 : -1
+  const next = (idx + delta + tabs.value.length) % tabs.value.length
+  activateTab(tabs.value[next].id)
+}
 
 /** 总览页签「用于新任务」：项目目录带 cloudProjectKey（下拉/复用链路同形态），临时 / 其他目录直接预填路径 */
 function handleUseForNewTask(entry: WorkspaceOverviewEntry) {
@@ -1580,6 +1601,7 @@ watch(getRouteWatchState, async (state, prev) => {
 })
 
 onMounted(async () => {
+  document.addEventListener('keydown', handleTabCycleKeydown)
   // 首启向导判定：就绪数据与任务索引并行拉取，先到先渲染
   void readinessStore.fetch()
   if (!await loadTaskIndex()) return
@@ -1588,6 +1610,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   disposed = true
+  document.removeEventListener('keydown', handleTabCycleKeydown)
   window.removeEventListener('side_session_created', handleSideSessionCreated)
   window.removeEventListener('subagent_session_created', handleSubagentSessionCreated)
 })

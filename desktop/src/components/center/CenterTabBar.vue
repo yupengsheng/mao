@@ -1,12 +1,30 @@
 <template>
-  <div ref="barEl" class="center-tab-bar">
+  <div
+    ref="barEl"
+    class="center-tab-bar"
+    @dragover="onBarReorderDragover"
+    @dragleave="onBarDragLeave"
+    @drop="onBarReorderDrop"
+  >
     <div
       v-for="tab in tabs"
       :key="tab.id"
       class="tab-item"
-      :class="{ active: tab.id === activeTabId }"
+      :class="{
+        active: tab.id === activeTabId,
+        'drop-before': reorderHint?.tabId === tab.id && reorderHint?.place === 'before',
+        'drop-after': reorderHint?.tabId === tab.id && reorderHint?.place === 'after',
+      }"
+      :draggable="tab.type !== 'chat'"
       @click="$emit('activate', tab.id)"
       @contextmenu.prevent="onContextMenu($event, tab)"
+      @mousedown="onTabMousedown($event)"
+      @auxclick="onTabAuxclick($event, tab.id)"
+      @dragstart="onTabDragstart($event, tab)"
+      @dragover="onTabDragover($event, tab)"
+      @dragleave="onTabDragleave($event)"
+      @dragend="onTabDragend"
+      @drop="onTabDrop($event, tab)"
     >
       <AgentAvatar
         v-if="tab.type === 'chat' && agentIdentity.id"
@@ -55,6 +73,9 @@
         <div class="context-menu-item" @click="$emit('close-others', contextMenu.tabId!)">
           关闭其他文件
         </div>
+        <div class="context-menu-item" @click="$emit('close-right', contextMenu.tabId!)">
+          关闭右侧文件
+        </div>
       </div>
     </Teleport>
   </div>
@@ -88,11 +109,13 @@ const agentIdentity = computed(() =>
   }),
 )
 
-defineEmits<{
+const emit = defineEmits<{
   activate: [tabId: string]
   close: [tabId: string]
   'close-all': []
   'close-others': [tabId: string]
+  'close-right': [tabId: string]
+  reorder: [dragId: string, targetId: string, place: 'before' | 'after']
 }>()
 
 const contextMenu = reactive({
@@ -106,6 +129,110 @@ const barEl = ref<HTMLElement | null>(null)
 const menuRef = ref<HTMLDivElement>()
 const adjustedX = ref(0)
 const adjustedY = ref(0)
+
+const TAB_REORDER_MIME = 'application/x-mao-tab-reorder'
+const draggingTabId = ref<string | null>(null)
+const reorderHint = ref<{ tabId: string; place: 'before' | 'after' } | null>(null)
+
+function onTabMousedown(e: MouseEvent) {
+  if (e.button === 1) e.preventDefault()
+}
+
+function onTabAuxclick(e: MouseEvent, tabId: string) {
+  if (e.button === 1 && tabId !== 'chat') emit('close', tabId)
+}
+
+function onTabDragstart(e: DragEvent, tab: Tab) {
+  if (tab.type === 'chat') return
+  const dt = e.dataTransfer
+  if (!dt) return
+  dt.setData(TAB_REORDER_MIME, tab.id)
+  dt.effectAllowed = 'move'
+  draggingTabId.value = tab.id
+}
+
+function onTabDragover(e: DragEvent, tab: Tab) {
+  if (tab.type === 'chat') return
+  const dt = e.dataTransfer
+  if (!dt || !dt.types.includes(TAB_REORDER_MIME)) return
+  e.preventDefault()
+  dt.dropEffect = 'move'
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+  reorderHint.value = {
+    tabId: tab.id,
+    place: e.clientX < rect.left + rect.width / 2 ? 'before' : 'after',
+  }
+}
+
+function onTabDragleave(e: DragEvent) {
+  const next = e.relatedTarget as Node | null
+  const item = e.currentTarget as HTMLElement | null
+  if (next && item?.contains(next)) return
+  reorderHint.value = null
+}
+
+function onTabDragend() {
+  draggingTabId.value = null
+  reorderHint.value = null
+}
+
+function onTabDrop(e: DragEvent, tab: Tab) {
+  if (tab.type === 'chat') return
+  const dt = e.dataTransfer
+  if (!dt || !dt.types.includes(TAB_REORDER_MIME)) return
+  e.preventDefault()
+  e.stopPropagation()
+  const dragId = draggingTabId.value || dt.getData(TAB_REORDER_MIME)
+  if (dragId) {
+    const place = reorderHint.value?.tabId === tab.id ? reorderHint.value.place : 'after'
+    emit('reorder', dragId, tab.id, place)
+  }
+  draggingTabId.value = null
+  reorderHint.value = null
+}
+
+function lastNonChatTabId(): string | null {
+  for (let i = props.tabs.length - 1; i >= 0; i--) {
+    if (props.tabs[i].type !== 'chat') return props.tabs[i].id
+  }
+  return null
+}
+
+function onBarReorderDragover(e: DragEvent) {
+  const dt = e.dataTransfer
+  if (!dt || !dt.types.includes(TAB_REORDER_MIME)) return
+  if ((e.target as HTMLElement | null)?.closest?.('.tab-item')) return
+  const lastId = lastNonChatTabId()
+  if (!lastId) return
+  e.preventDefault()
+  dt.dropEffect = 'move'
+  reorderHint.value = { tabId: lastId, place: 'after' }
+}
+
+function onBarReorderDrop(e: DragEvent) {
+  const dt = e.dataTransfer
+  if (!dt || !dt.types.includes(TAB_REORDER_MIME)) return
+  if ((e.target as HTMLElement | null)?.closest?.('.tab-item')) return
+  const lastId = lastNonChatTabId()
+  if (!lastId) return
+  e.preventDefault()
+  const dragId = draggingTabId.value || dt.getData(TAB_REORDER_MIME)
+  if (dragId) emit('reorder', dragId, lastId, 'after')
+  draggingTabId.value = null
+  reorderHint.value = null
+}
+
+function onBarDragLeave(e: DragEvent) {
+  const next = e.relatedTarget as Node | null
+  if (next && barEl.value?.contains(next)) return
+  draggingTabId.value = null
+  reorderHint.value = null
+}
+
+function onWindowDragEnd() {
+  draggingTabId.value = null
+  reorderHint.value = null
+}
 
 function onContextMenu(e: MouseEvent, tab: Tab) {
   if (tab.type === 'chat') return
@@ -149,10 +276,12 @@ function onWindowScroll(e: Event) {
 onMounted(() => {
   document.addEventListener('click', hideContextMenu)
   window.addEventListener('scroll', onWindowScroll, true)
+  document.addEventListener('dragend', onWindowDragEnd)
 })
 onUnmounted(() => {
   document.removeEventListener('click', hideContextMenu)
   window.removeEventListener('scroll', onWindowScroll, true)
+  document.removeEventListener('dragend', onWindowDragEnd)
 })
 </script>
 
@@ -205,6 +334,26 @@ onUnmounted(() => {
   right: 0;
   height: 2px;
   background: var(--aw-primary);
+}
+
+.tab-item.drop-before::before,
+.tab-item.drop-after::after {
+  content: '';
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  width: 2px;
+  background: var(--aw-primary, #409eff);
+}
+
+.tab-item.drop-before::before {
+  left: -1px;
+}
+
+.tab-item.drop-after::after {
+  left: auto;
+  right: -1px;
+  height: auto;
 }
 
 .tab-icon {
