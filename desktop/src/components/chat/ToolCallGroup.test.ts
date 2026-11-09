@@ -121,4 +121,33 @@ describe('ToolCallGroup', () => {
     expect(document.querySelector('.group-summary')?.textContent).toBe('2次读取文件、执行命令')
     m.destroy()
   })
+
+  it('组内有执行中调用：组头显示最早开始的 running 调用耗时', async () => {
+    const m = mountGroup([
+      makeCall('tc-1', { status: 'success', startedAtMs: Date.now() - 5_000 }),
+      makeCall('tc-2', { status: 'running', result: undefined, startedAtMs: Date.now() - 90_000 }),
+      makeCall('tc-3', { status: 'running', result: undefined, startedAtMs: Date.now() - 30_000 }),
+    ])
+    await nextTick()
+
+    // 已成功的不参与；两个 running 取更早开始的 90s
+    expect(document.querySelector('.tool-group-header .tool-elapsed')?.textContent).toBe('1m30s')
+    m.destroy()
+  })
+
+  it('没有 running 调用、或 running 缺少起表时刻：组头不显示耗时', async () => {
+    const done = mountGroup([
+      makeCall('tc-1', { status: 'success', startedAtMs: Date.now() - 90_000 }),
+    ])
+    await nextTick()
+    expect(document.querySelector('.tool-elapsed')).toBeNull()
+    done.destroy()
+
+    const noStart = mountGroup([
+      makeCall('tc-2', { name: 'read_file', status: 'running', result: undefined }),
+    ])
+    await nextTick()
+    expect(document.querySelector('.tool-elapsed')).toBeNull()
+    noStart.destroy()
+  })
 })

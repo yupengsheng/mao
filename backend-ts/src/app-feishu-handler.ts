@@ -126,6 +126,7 @@ export function assembleFeishuHandler(deps: FeishuHandlerDeps): FeishuHandlerRes
   const relayPlatformQueues = createPlatformQueueRelay({ sessionService: d.sessionService, wsHandler: d.wsHandler });
   const feishuInboundHandler = new AgentFeishuInboundHandler({
     registry: d.wsRegistry,
+    cardToolTickMs: cfg.feishu.bot.cardToolTickMs,
     resolveStreamUserId: async (sessionId: number) => {
       const session = await d.sessionService.getSession(sessionId).catch(() => null);
       return session?.userId ?? null;
