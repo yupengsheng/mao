@@ -287,6 +287,8 @@ describe('ScheduledTaskService', () => {
 
   it('detects one-shot cron shapes', () => {
     expect(isOneShotCron('0 0 8 15 8 ?')).toBe(true);
+    expect(isOneShotCron('0 8 15 8 *')).toBe(true);
+    expect(isOneShotCron('0 9 * * *')).toBe(false);
     expect(isOneShotCron('23 0 18 13 8 *')).toBe(true);
     expect(isOneShotCron('0 0 9 * * ?')).toBe(false);
     expect(isOneShotCron('0 0 10 ? * MON-FRI')).toBe(false);
@@ -294,6 +296,19 @@ describe('ScheduledTaskService', () => {
     expect(isOneShotCron('0 */30 * * * ?')).toBe(false);
     expect(isOneShotCron('0 0 10 * * MON')).toBe(false);
     expect(isOneShotCron('bad cron')).toBe(false);
+  });
+
+  it('rejects cron without a computable next fire time', async () => {
+    await expect(service.createTask(7, 5, 11, 'never', 'hello', '0 0 9 30 2 ?'))
+      .rejects.toThrow('该表达式没有可计算的下次触发时间');
+  });
+
+  it('rejects updating to cron without a computable next fire time', async () => {
+    vi.mocked(store.selectById).mockResolvedValue({
+      id: 1, userId: 7, sessionId: 11, cronExpression: '0 0 9 * * *', status: 'ACTIVE', fireCount: 0, prompt: 'hello', once: 0,
+    });
+    await expect(service.updateTask(1, 7, null, null, '0 0 9 30 2 ?'))
+      .rejects.toThrow('该表达式没有可计算的下次触发时间');
   });
 
   it('pushesFinalAssistantReplyToFeishuPusher', async () => {    stubs.getSession.mockResolvedValue({ id: 11, phase: 'IDLE' });

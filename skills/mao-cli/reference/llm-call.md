@@ -14,7 +14,7 @@
 - 单批最多删除 5000 条、单轮最多 20 批；达到上限的剩余记录留到下一小时继续清理。
 - 清理幂等，多实例重复执行安全；异常只记录日志，不阻断服务。
 - 被清理的调用不可恢复，列表、分页总数、用量分析报表与运行轨迹中的对应调用都会从查询结果中消失；会话消息与任务记录不随之删除。运行轨迹工具明细来自 `session_activity`，另有独立保留期（默认 180 天、最低 90 天，后台每小时清理），两者保留期不一致时可能出现「有调用、无工具明细」或反之。
-- 自定义日期范围仍可查询保留期之前的日期，但只会返回仍在库中的记录，不会因为超期而报错。
+- 自定义日期范围仍可查询保留期之前的日期，但只会返回仍在库中的记录，不会因为超期而报错；日期必须是真实公历日，`2026-02-31`、非闰年 `2026-02-29`、`2026-13-01` 会被视为非法入参。
 
 ## 命令选择
 
@@ -55,7 +55,7 @@
 | `GET /llm-calls/me/trends?range=last30&granularity=day` | 趋势序列（按天/小时分桶） |
 
 - `range`：统计周期，取值 `today` / `yesterday` / `week` / `lastWeek` / `month` / `lastMonth` / `last7` / `last30` / `custom`，参数缺失时回落 `last30`（客户端抽屉默认传 `today`）；均为 Asia/Shanghai 日历口径（本周按周一起算，本月从 1 号起算至今天）。`lastWeek` 为上一个完整自然周（周一至周日），`lastMonth` 为上一个完整自然月。
-- `startDate` / `endDate`：自定义周期（`range=custom`）的起止日，格式 `YYYY-MM-DD`，闭区间含首尾全天；两个参数只在 `range=custom` 时读取，其他周期传了也忽略。缺失、格式非法或起晚于止时回落 `last30`。
+- `startDate` / `endDate`：自定义周期（`range=custom`）的起止日，格式 `YYYY-MM-DD`，且必须是真实公历日，闭区间含首尾全天；两个参数只在 `range=custom` 时读取，其他周期传了也忽略。缺失、格式或真实日期非法、起晚于止时回落 `last30`。调用流水列表的起止日期同样按真实公历日校验，非法边界按未传处理。
 - `granularity`：`day`（默认）或 `hour`；客户端对今日/昨日自动传 `hour`。`hour` 桶在窗口含今天时不超过当前整点，窗口已结束（如昨日）则补满全天 24 个整点。
 - 趋势由后端补零：返回的 `buckets[]` 是连续完整序列，无数据时段为 0，前端不做日期运算。每桶字段 `{ bucket, callCount, failCount, cancelledCount, promptTokens, cachedTokens, totalTokens, cost }`，`promptTokens`/`cachedTokens` 支撑前端算每个时间点的缓存命中率。`failCount` 不含取消，取消数看 `cancelledCount`。
 - 成本口径：`SUM(cost_micros)/1e6`，未配价的调用不计入（总账 cost 可能为 0）。

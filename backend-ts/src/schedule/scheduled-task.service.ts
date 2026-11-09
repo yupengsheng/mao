@@ -170,13 +170,18 @@ export function normalizeSpringCron(expression: string): string {
 /**
  * 判断 cron 是否为一次性任务：固定了「日」与「月」且「周」为通配（如 `0 0 8 15 8 ?`）。
  * 这类表达式下一次触发永远在明年同一天，任务实际只会执行一次。
+ *
+ * croner 同时接受 6 段（秒 分 时 日 月 周）和标准 5 段（分 时 日 月 周）。
+ * 5 段先补秒位 0，再与 6 段用同一套字段判定，避免 `0 8 15 8 *` 与 `0 0 8 15 8 ?`
+ * 被当成不同任务。
  */
 export function isOneShotCron(expression: string): boolean {
   const parts = expression.trim().replace(/\s+/g, ' ').split(' ');
-  if (parts.length !== 6) return false;
-  const [sec, min, hour, dom, month, dow] = parts;
-  const fixed = (p: string) => /^\d+$/.test(p);
-  const any = (p: string) => p === '*' || p === '?';
+  const fields = parts.length === 5 ? ['0', ...parts] : parts;
+  if (fields.length !== 6) return false;
+  const [sec, min, hour, dom, month, dow] = fields;
+  const fixed = (p: string | undefined) => p != null && /^\d+$/.test(p);
+  const any = (p: string | undefined) => p === '*' || p === '?';
   // 秒/分/时/日/月全部固定、周为通配，才会只触发一次
   return fixed(sec) && fixed(min) && fixed(hour) && fixed(dom) && fixed(month) && any(dow);
 }
@@ -427,12 +432,13 @@ export class ScheduledTaskService {
     const validName = normalizeTaskName(name);
     const validPrompt = normalizeTaskPrompt(prompt);
     this.parseCron(cronExpression);
+    const nextFireTime = this.requireNextFireTime(cronExpression);
     const task: ScheduledTask = {
       userId, agentId, sessionId, name: validName, prompt: validPrompt, cronExpression,
       // 显式 once 优先；未指定时按 cron 形态自动判定（固定月+日视为一次性）
       once: once != null ? (once ? 1 : 0) : (isOneShotCron(cronExpression) ? 1 : 0),
       status: 'ACTIVE', fireCount: 0,
-      nextFireTime: this.calculateNextFireTime(cronExpression),
+      nextFireTime,
       ...this.reliabilityPatch(reliability),
     };
     task.id = await this.store.insert(task);
@@ -477,12 +483,10 @@ export class ScheduledTaskService {
       // 新档期由旧档期的收尾链按最新 cron 重排，避免 listDue 与重试/队列入口重复执行。
       // 关掉一次性之后要按循环任务重算下一档，否则重试成功后没有档期。
       if (!(pendingOnceWork && task.once === 1)) {
-        const next = this.calculateNextFireTime(cronExpression);
+        const next = this.requireNextFireTime(cronExpression);
         task.nextFireTime = next;
-        if (next != null) {
-          task.finished = 0;
-          task.finishedAt = null;
-        }
+        task.finished = 0;
+        task.finishedAt = null;
       }
     }
     // 已完结任务的 nextFireTime 为空。只改名称/提示词不得把它拉起来；
@@ -493,12 +497,10 @@ export class ScheduledTaskService {
       && task.status === 'ACTIVE' && task.nextFireTime == null
       && (once != null || status === 'ACTIVE');
     if (reactivate) {
-      const next = this.calculateNextFireTime(task.cronExpression!);
+      const next = this.requireNextFireTime(task.cronExpression!);
       task.nextFireTime = next;
-      if (next != null) {
-        task.finished = 0;
-        task.finishedAt = null;
-      }
+      task.finished = 0;
+      task.finishedAt = null;
     }
     const reliability = this.reliabilityPatch(opts);
     if (reliability.retryMax != null) task.retryMax = reliability.retryMax;
@@ -999,6 +1001,19 @@ export class ScheduledTaskService {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * 创建/更新落库前的档期校验，与 `buildCronPreview` 的 valid=false 对齐：
+   * croner 能解析但 `nextRun()` 为空（如 2 月 30 日）时拒绝，避免留下
+   * ACTIVE 且 nextFireTime 永远为空、调度与补偿都捞不到的死任务。
+   */
+  private requireNextFireTime(cronExpression: string): string {
+    const next = this.calculateNextFireTime(cronExpression);
+    if (next == null) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '该表达式没有可计算的下次触发时间');
+    }
+    return next;
   }
 
   private parseCron(cronExpression: string): void {
