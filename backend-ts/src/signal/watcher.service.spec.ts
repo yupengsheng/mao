@@ -118,6 +118,7 @@ function harness(options: {
     consecutiveFailures: number;
     lastChangeOldSnippet?: string | null;
     lastChangeNewSnippet?: string | null;
+    resetFailures?: boolean;
   }) => {
     const row = watchers.get(id);
     if (row == null) return;
@@ -126,10 +127,10 @@ function harness(options: {
     if ('lastChangeOldSnippet' in patch) row.lastChangeOldSnippet = patch.lastChangeOldSnippet ?? null;
     if ('lastChangeNewSnippet' in patch) row.lastChangeNewSnippet = patch.lastChangeNewSnippet ?? null;
     row.lastChangedAt = patch.lastChangedAt;
-    if (row.consecutiveFailures === patch.consecutiveFailures) row.consecutiveFailures = 0;
+    if (patch.resetFailures !== false && row.consecutiveFailures === patch.consecutiveFailures) row.consecutiveFailures = 0;
   });
-  // 真实 recordFailure 是「单条 UPDATE 后重新读行」：失败状态放在独立槽位，
-  // 且绝不改调用方持有的更新前快照（否则「是否刚从 ACTIVE 变 DISABLED」判定失效）。
+  // 真实 recordFailure 是「单条 UPDATE 后重新读行」：同步更新库内行与独立失败状态，
+  // 但返回副本、不改调用方持有的更新前快照（否则「是否刚从 ACTIVE 变 DISABLED」判定失效）。
   const failureState = new Map<number, { consecutiveFailures: number; status: string }>();
   const recordFailure = vi.fn(async (id: number, _backoff: number, _threshold: number) => {
     const snapshot = watchers.get(id);
@@ -138,6 +139,8 @@ function harness(options: {
     const consecutiveFailures = prev.consecutiveFailures + 1;
     const status = consecutiveFailures >= WATCHER_DISABLE_AFTER_FAILURES ? 'DISABLED' : 'ACTIVE';
     failureState.set(id, { consecutiveFailures, status });
+    snapshot.consecutiveFailures = consecutiveFailures;
+    snapshot.status = status;
     return { ...snapshot, consecutiveFailures, status };
   });
   const watcherRepo = {
@@ -287,11 +290,19 @@ describe('WatcherService CRUD', () => {
   });
 
   it('resets the baseline when a compare-affecting field changes', async () => {
-    const h = harness({ watcher: watcher({ lastValueHash: 'abc', lastChangedAt: '2026-10-11 10:00:00' }) });
+    const h = harness({
+      watcher: watcher({
+        lastValueHash: 'abc',
+        lastChangedAt: '2026-10-11 10:00:00',
+        lastCheckedAt: '2099-01-01 00:00:00',
+      }),
+    });
     await h.service.update(7, 1, { url: 'https://example.com/api2' });
     const row = h.watchers.get(1)!;
     expect(row.lastValueHash).toBeNull();
     expect(row.lastChangedAt).toBeNull();
+    // 只清哈希不清退避时刻，改完判定字段仍要等完退避才重建基线
+    expect(row.lastCheckedAt).toBeNull();
   });
 
   it('keeps the baseline when only cosmetic fields change', async () => {
@@ -303,12 +314,35 @@ describe('WatcherService CRUD', () => {
   });
 
   it('resets failures and baseline when re-enabling a disabled watcher', async () => {
-    const h = harness({ watcher: watcher({ status: 'DISABLED', consecutiveFailures: 5, lastValueHash: 'abc' }) });
+    const h = harness({
+      watcher: watcher({
+        status: 'DISABLED',
+        consecutiveFailures: 5,
+        lastValueHash: 'abc',
+        lastCheckedAt: '2099-01-01 00:00:00',
+      }),
+    });
     await h.service.setStatus(7, 1, 'ACTIVE');
     const row = h.watchers.get(1)!;
     expect(row.status).toBe('ACTIVE');
     expect(row.consecutiveFailures).toBe(0);
     expect(row.lastValueHash).toBeNull();
+    // 失败退避写入的未来时刻必须清掉，否则重新启用后仍要等完退避才轮询
+    expect(row.lastCheckedAt).toBeNull();
+  });
+
+  it('PAUSED → ACTIVE 只清未来 lastCheckedAt，历史时刻保留', async () => {
+    const future = harness({
+      watcher: watcher({ status: 'PAUSED', lastCheckedAt: '2099-01-01 00:00:00' }),
+    });
+    await future.service.setStatus(7, 1, 'ACTIVE');
+    expect(future.watchers.get(1)!.lastCheckedAt).toBeNull();
+
+    const past = harness({
+      watcher: watcher({ status: 'PAUSED', lastCheckedAt: '2020-01-01 00:00:00' }),
+    });
+    await past.service.setStatus(7, 1, 'ACTIVE');
+    expect(past.watchers.get(1)!.lastCheckedAt).toBe('2020-01-01 00:00:00');
   });
 
   it('rejects status values other than ACTIVE/PAUSED', async () => {
@@ -347,6 +381,21 @@ describe('WatcherService.runCheck', () => {
     expect(h.watchers.get(1)!.lastValueHash).toBeTruthy();
     expect(h.checks).toHaveLength(1);
     expect(h.checks[0]!.changed).toBe(0);
+  });
+
+  it('执行路径解密失败按本轮失败处理：不照发探针、计入连败', async () => {
+    const h = harness({ watcher: watcher({ headersJson: 'corrupted-ciphertext' }) });
+    await h.service.runCheck(1);
+    expect(h.probeExecute).not.toHaveBeenCalled();
+    expect(h.recordFailure).toHaveBeenCalledTimes(1);
+    expect(h.checks[0]!.error).toContain('解密失败');
+  });
+
+  it('展示路径解密失败仍可打开列表：回显空请求头而不是抛错', async () => {
+    const h = harness({ watcher: watcher({ headersJson: 'corrupted-ciphertext' }) });
+    const view = await h.service.get(7, 1);
+    expect(view.headers).toEqual({});
+    await expect(h.service.test(7, 1)).rejects.toThrow(/解密失败/);
   });
 
   it('does not trigger when the value is unchanged', async () => {
@@ -675,6 +724,29 @@ describe('信号哨兵新旧值摘要（V202/V203 回归）', () => {
     expect(h.watchers.get(1)!.lastChangeOldSnippet).toBe('prev-old');
     expect(h.watchers.get(1)!.lastChangeNewSnippet).toBe('prev-new');
     expect(h.watchers.get(1)!.lastChangedAt).toBe('2026-10-11 10:00:00');
+  });
+
+  it('触发失败连续 5 次达到阈值自动停用（markChecked 不得把连败清零）', async () => {
+    let round = 0;
+    const h = harness({
+      watcher: watcher({ lastValueHash: 'seed', lastValueSnippet: 'seed' }),
+      probe: () => {
+        round += 1;
+        const body = `body-${round}`;
+        return probeResult({ body, bodyBytes: Buffer.from(body, 'utf8') });
+      },
+    });
+    h.openRun.run.mockRejectedValue(new Error('budget blocked'));
+
+    for (let i = 0; i < WATCHER_DISABLE_AFTER_FAILURES; i += 1) {
+      await h.service.runCheck(1);
+    }
+
+    const row = h.watchers.get(1)!;
+    expect(row.consecutiveFailures).toBe(WATCHER_DISABLE_AFTER_FAILURES);
+    expect(row.status).toBe('DISABLED');
+    expect(h.recordFailure).toHaveBeenCalledTimes(WATCHER_DISABLE_AFTER_FAILURES);
+    expect(h.notify).toHaveBeenCalledTimes(1);
   });
 
   it('编辑判定字段重置基线时清空「上次变化」新旧值对', async () => {
@@ -1567,5 +1639,41 @@ describe('WatcherService 凭据占位符解析', () => {
     await h.service.runCheck(copy.id);
     expect(h.probeExecute).toHaveBeenCalledTimes(1);
     expect(h.probeExecute.mock.calls[0]![0].headers).toEqual({ Authorization: 'Bearer tok-copy' });
+  });
+});
+
+describe('存量 {{...}} 字面量头的兼容', () => {
+  function legacyLiteralWatcher(): SignalWatcher {
+    return watcher({ headersJson: makeCipher().encrypt(JSON.stringify({ 'X-Tpl': '{{EVIL}}', Accept: 'json' })) });
+  }
+
+  it('改名与未修改行回传不被 D4 卡死，新填写值仍拒绝', async () => {
+    const h = harness({ watcher: legacyLiteralWatcher() });
+    await h.service.update(7, 1, { name: 'renamed' });
+    expect(h.watchers.get(1)!.name).toBe('renamed');
+    expect(h.service.decryptHeadersForCompare(h.watchers.get(1)!.headersJson))
+      .toEqual({ 'X-Tpl': '{{EVIL}}', Accept: 'json' });
+
+    const untouched = await h.service.update(7, 1, { headers: { 'X-Tpl': '{{EVIL}}', Accept: 'json' } });
+    expect(untouched.headers).toEqual({ 'X-Tpl': '{{EVIL}}', Accept: 'json' });
+
+    await expect(h.service.update(7, 1, { headers: { 'X-Tpl': '{{EVIL}}2' } }))
+      .rejects.toThrow(/不支持的占位符/);
+    await expect(h.service.create(7, { ...baseInput, headers: { 'X-A': '{{EVIL}}' } }))
+      .rejects.toThrow(/不支持的占位符/);
+  });
+
+  it('复制：源行字面量继承到副本，副本执行态仍原样直发', async () => {
+    const h = harness({ watcher: legacyLiteralWatcher() });
+    const copy = await h.service.create(7, {
+      ...baseInput, name: 'copy', headers: { 'X-Tpl': '{{EVIL}}', Accept: 'json' }, copyFrom: 1,
+    });
+    expect(copy.id).not.toBe(1);
+    expect(h.service.decryptHeadersForCompare(h.watchers.get(copy.id)!.headersJson))
+      .toEqual({ 'X-Tpl': '{{EVIL}}', Accept: 'json' });
+
+    await h.service.runCheck(copy.id);
+    expect(h.probeExecute).toHaveBeenCalledTimes(1);
+    expect(h.probeExecute.mock.calls[0]![0].headers).toEqual({ 'X-Tpl': '{{EVIL}}', Accept: 'json' });
   });
 });

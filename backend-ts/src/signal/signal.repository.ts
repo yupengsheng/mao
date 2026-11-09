@@ -109,6 +109,7 @@ export class MysqlSignalWatcherRepository {
     if (patch.lastChangeOldSnippet !== undefined) row.lastChangeOldSnippet = patch.lastChangeOldSnippet;
     if (patch.lastChangeNewSnippet !== undefined) row.lastChangeNewSnippet = patch.lastChangeNewSnippet;
     if (patch.lastChangedAt !== undefined) row.lastChangedAt = patch.lastChangedAt;
+    if (patch.lastCheckedAt !== undefined) row.lastCheckedAt = patch.lastCheckedAt;
     if (patch.consecutiveFailures !== undefined) row.consecutiveFailures = patch.consecutiveFailures;
     if (patch.triggerMode !== undefined) row.triggerMode = patch.triggerMode;
     if (patch.reuseSessionId !== undefined) row.reuseSessionId = patch.reuseSessionId;
@@ -150,9 +151,10 @@ export class MysqlSignalWatcherRepository {
   /**
    * 轮询成功/建基线后回写（含失败清零与 last_checked_at 推进到当前时刻）。
    *
-   * `consecutive_failures` 只在「库里仍是本次读到的值」时才清零：探针在途 10~15 秒内
-   * 可能有并发失败把库里累加到更大值，此时不能把在途的失败计数打回 0，否则
-   * 「连续 N 次自动停用」永远达不到（BUG-G）。若库内值没被并发改动（常态），照常清零。
+   * `consecutive_failures` 只在 resetFailures 不为 false、且「库里仍是本次读到的值」时才清零：
+   * 探针在途 10~15 秒内可能有并发失败把库里累加到更大值，此时不能把在途的失败计数打回 0，
+   * 否则「连续 N 次自动停用」永远达不到（BUG-G）。若库内值没被并发改动（常态），照常清零。
+   * 触发失败路径传 resetFailures=false：这次本来就要接着 recordFailure +1，先清零会让连败停在 1。
    */
   async markChecked(
     id: number,
@@ -164,6 +166,11 @@ export class MysqlSignalWatcherRepository {
       /** 「上次变化」新旧值对（V203）：带了键才写，不带键保持原值（缺省行为不变）。 */
       lastChangeOldSnippet?: string | null;
       lastChangeNewSnippet?: string | null;
+      /**
+       * 默认 true：库内值仍等于本次快照时清零（成功路径）。
+       * 触发失败路径必须传 false——随后还会 recordFailure +1，先清零会让连败永远停在 1。
+       */
+      resetFailures?: boolean;
     },
   ): Promise<void> {
     const changes: string[] = [];
@@ -172,6 +179,7 @@ export class MysqlSignalWatcherRepository {
       patch.lastValueSnippet == null ? null : patch.lastValueSnippet.slice(0, 1024),
       patch.lastChangedAt,
       ts(Date.now()),
+      patch.resetFailures === false ? 0 : 1,
       patch.consecutiveFailures,
     ];
     // 带了键才参与 SET：不带键的老调用方行为逐字不变。
@@ -187,7 +195,7 @@ export class MysqlSignalWatcherRepository {
     await this.db.execute(
       `UPDATE signal_watcher
        SET last_value_hash = ?, last_value_snippet = ?, last_changed_at = ?, last_checked_at = ?,
-           consecutive_failures = IF(consecutive_failures = ?, 0, consecutive_failures)${changes.length > 0 ? `, ${changes.join(', ')}` : ''}
+           consecutive_failures = IF(? = 0, consecutive_failures, IF(consecutive_failures = ?, 0, consecutive_failures))${changes.length > 0 ? `, ${changes.join(', ')}` : ''}
        WHERE id = ?`,
       params,
     );

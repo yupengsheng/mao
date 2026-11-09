@@ -167,10 +167,14 @@ export class WatcherService {
     // 复制（copyFrom）：敏感请求头与 body 从源行解密继承。必须在 normalizeInput 之前——
     // create 原首行即 normalizeInput，POST 缺 body 会先抛「POST 方法必须填写请求体」，
     // 写在 normalize 之后的继承逻辑够不着（技术方案 2026-10-27 §3.6.3）。
-    const effective = input.copyFrom != null
-      ? await this.applyCopyInheritance(userId, input)
-      : input;
-    const normalized = this.normalizeInput(effective);
+    let effective = input;
+    let legacyHeaderValues: ReadonlySet<string> | undefined;
+    if (input.copyFrom != null) {
+      const inherited = await this.applyCopyInheritance(userId, input);
+      effective = inherited.input;
+      legacyHeaderValues = inherited.legacyHeaderValues;
+    }
+    const normalized = this.normalizeInput(effective, legacyHeaderValues);
     const id = await this.deps.watcherRepo.insert({
       userId,
       agentId: normalized.agentId,
@@ -207,6 +211,10 @@ export class WatcherService {
     const headers = input.headers !== undefined
       ? this.restoreMaskedHeaders(input.headers, storedHeaders)
       : storedHeaders;
+    // 存量字面量豁免：库内已存的旧值随编辑回传（未修改行 / 掩码行还原）或未下发
+    // headers 时沿用，不应被新 D4 校验卡死——否则含 `{{...}}` 字面量的存量哨兵
+    // 连改名都做不到。豁免按「值精确等于任一库内存量值」判定，新填写的值不受豁免。
+    const legacyHeaderValues = new Set(Object.values(storedHeaders));
     const merged: WatcherInput = {
       name: input.name ?? existing.name,
       agentId: input.agentId ?? existing.agentId,
@@ -220,7 +228,7 @@ export class WatcherService {
       promptTemplate: input.promptTemplate ?? existing.promptTemplate,
       triggerMode: input.triggerMode ?? existing.triggerMode,
     };
-    const normalized = this.normalizeInput(merged);
+    const normalized = this.normalizeInput(merged, legacyHeaderValues);
     // 基线重置判定用「本次实际生效的值」而非原始入参：normalizeInput 会把
     // method/compareMode 转大写、jsonPath 去首尾空白、url 规范化（主机转小写），
     // 落库值与库内一致、存储内容零变化，拿原始入参（'get' / ' data.price '）与库内
@@ -258,6 +266,9 @@ export class WatcherService {
       patch.lastChangeOldSnippet = null;
       patch.lastChangeNewSnippet = null;
       patch.lastChangedAt = null;
+      // 失败退避会把 last_checked_at 写成未来时刻。只清哈希不清这个时刻，
+      // 改完判定字段后 listDue 仍要等完退避（日更最长约 17 天）才重建基线。
+      patch.lastCheckedAt = null;
     }
     await this.deps.watcherRepo.update(id, userId, patch);
     return this.get(userId, id);
@@ -273,6 +284,10 @@ export class WatcherService {
   /**
    * 启停：ACTIVE ↔ PAUSED 手动互切；DISABLED → ACTIVE 时清零失败并重置基线。
    * DISABLED 是系统终态，不可由用户直接设置（入参类型已收窄，此处兜底防 as-never 调用）。
+   *
+   * 重新启用必须清掉 last_checked_at：第 5 次失败的退避会把它写成未来
+   * （间隔 × 16），listDue 还要再等一个间隔才会到期。日更哨兵修复后启用，
+   * 最长约 17 天不轮询。PAUSED → ACTIVE 时只在该时刻仍处于未来才清。
    */
   async setStatus(userId: number, id: number, status: 'ACTIVE' | 'PAUSED'): Promise<SignalWatcherView> {
     if (status !== 'ACTIVE' && status !== 'PAUSED') {
@@ -287,6 +302,9 @@ export class WatcherService {
       patch.lastChangeOldSnippet = null;
       patch.lastChangeNewSnippet = null;
       patch.lastChangedAt = null;
+      patch.lastCheckedAt = null;
+    } else if (status === 'ACTIVE' && existing.status === 'PAUSED' && isFutureCheckedAt(existing.lastCheckedAt)) {
+      patch.lastCheckedAt = null;
     }
     await this.deps.watcherRepo.update(id, userId, patch);
     return this.get(userId, id);
@@ -333,11 +351,11 @@ export class WatcherService {
     // 否则「测试通过但轮询一直 401」会变成新的排查成本。resolveProbeHeaders 不抛错
     // （resolver 异常按 D2 跳对应头），失败只丢凭据头、探针照常执行。
     const headers = await resolveProbeHeaders(
-      this.decryptHeaders(watcher.headersJson),
+      this.decryptHeadersStrict(watcher.headersJson),
       watcher.userId,
       this.deps.credentialResolver,
     );
-    const body = this.decryptBody(watcher.body);
+    const body = this.decryptBodyStrict(watcher.body);
     const probe = this.deps.probe ?? { execute: executeProbe };
     const result = await probe.execute({
       url: watcher.url,
@@ -394,8 +412,8 @@ export class WatcherService {
     let headers: Record<string, string>;
     let body: string | null;
     try {
-      headers = this.decryptHeaders(watcher.headersJson);
-      body = this.decryptBody(watcher.body);
+      headers = this.decryptHeadersStrict(watcher.headersJson);
+      body = this.decryptBodyStrict(watcher.body);
       assertProbeUrl(watcher.url);
     } catch (e) {
       await this.recordFailure(watcher, e);
@@ -579,6 +597,8 @@ export class WatcherService {
     // 传 checkId 复用已落的行：该轮已 markChanged，若另起一行，用户会看到一条「变化」加一条
     // 「失败」两行自相矛盾的记录。同时把基线 hash 推进到本次读到的值——否则目标值不变时
     // 下一轮仍判为「变化」，每轮都重新发起一次 Agent 运行（退避期内重复触发 N 次）。
+    // resetFailures 必须为 false：markChecked 默认在「库内值 == 传入快照」时把连败清零，
+    // 紧接着 recordFailure 再 +1，连败会永远停在 1，到不了自动停用阈值。
     await this.markCheckError(checkId, failure);
     // 列表卡「上次变化」与 lastChangedAt 同义：只表示上一次成功触发。
     // 触发失败不改这两列，否则时间仍停在上次成功（或「从未」），内容却已换成这一轮。
@@ -588,6 +608,7 @@ export class WatcherService {
       lastValueSnippet: newText,
       lastChangedAt: watcher.lastChangedAt,
       consecutiveFailures: watcher.consecutiveFailures ?? 0,
+      resetFailures: false,
     });
     await this.recordFailure(watcher, failure, result.httpStatus, result.durationMs, checkId);
   }
@@ -650,7 +671,7 @@ export class WatcherService {
     }
   }
 
-  private normalizeInput(input: WatcherInput): {
+  private normalizeInput(input: WatcherInput, legacyHeaderValues?: ReadonlySet<string>): {
     name: string;
     agentId: number;
     url: string;
@@ -676,7 +697,7 @@ export class WatcherService {
     if (!SIGNAL_PROBE_METHODS.includes(method)) {
       throw new BusinessException(ErrorCode.PARAM_INVALID, '方法仅支持 GET/POST');
     }
-    const headers = input.headers == null ? null : assertProbeHeaders(input.headers);
+    const headers = input.headers == null ? null : assertProbeHeaders(input.headers, legacyHeaderValues);
     // body 只对 POST 有意义：切到 GET 时强制清空，避免库里残留一段用户看不见、
     // 探针却仍会发送的请求体（BUG-E）。method 先归一化再判。
     const isPost = method === 'POST';
@@ -751,7 +772,7 @@ export class WatcherService {
    *   （源行无 body 时继承 null，由 normalizeInput 的 POST 必填校验拦住）；
    * - 其余字段（含 triggerMode）随请求体原样下发，reuseSessionId 不继承（create 置空）。
    */
-  private async applyCopyInheritance(userId: number, input: WatcherInput): Promise<WatcherInput> {
+  private async applyCopyInheritance(userId: number, input: WatcherInput): Promise<{ input: WatcherInput; legacyHeaderValues: ReadonlySet<string> }> {
     const source = await this.requireOwned(userId, input.copyFrom!);
     const storedHeaders = this.decryptHeaders(source.headersJson);
     // 键未下发（undefined）= 整体继承源行解密值；显式 null = 清空，与 body 语义对齐。
@@ -762,7 +783,9 @@ export class WatcherService {
     if (body === undefined && (input.method ?? 'GET').trim().toUpperCase() === 'POST') {
       body = this.decryptBody(source.body);
     }
-    return { ...input, headers, body };
+    // 源行存量值全部豁免 D4：源哨兵头里的旧 `{{...}}` 字面量随复制继承落到副本，
+    // 副本落库的仍是同样的字面量，执行态与源哨兵一致（原样直发）。
+    return { input: { ...input, headers, body }, legacyHeaderValues: new Set(Object.values(storedHeaders)) };
   }
 
   /**
@@ -827,19 +850,29 @@ export class WatcherService {
     return result;
   }
 
+  /**
+   * 展示 / 比对路径：解密失败吞成空请求头，避免密钥轮换后列表和编辑页打不开。
+   * 执行路径必须用 {@link decryptHeadersStrict}，否则会丢掉 Authorization 照发探针。
+   */
   private decryptHeaders(ciphertext: string | null): Record<string, string> {
-    if (ciphertext == null || ciphertext === '') return {};
     try {
-      const parsed = JSON.parse(this.deps.cipher.decrypt(ciphertext)) as unknown;
-      if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-      const result: Record<string, string> = {};
-      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-        result[key] = typeof value === 'string' ? value : String(value ?? '');
-      }
-      return result;
+      return this.decryptHeadersStrict(ciphertext);
     } catch {
       return {};
     }
+  }
+
+  private decryptHeadersStrict(ciphertext: string | null): Record<string, string> {
+    if (ciphertext == null || ciphertext === '') return {};
+    const parsed = JSON.parse(this.deps.cipher.decrypt(ciphertext)) as unknown;
+    if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '哨兵凭据解密失败');
+    }
+    const result: Record<string, string> = {};
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      result[key] = typeof value === 'string' ? value : String(value ?? '');
+    }
+    return result;
   }
 
   /** 入参吃 undefined：WatcherInput.body 可选（键未下发=复制时沿用源行）。 */
@@ -848,13 +881,18 @@ export class WatcherService {
     return this.deps.cipher.encrypt(body);
   }
 
+  /** 展示路径容错；执行路径用 {@link decryptBodyStrict}。 */
   private decryptBody(ciphertext: string | null): string | null {
-    if (ciphertext == null || ciphertext === '') return null;
     try {
-      return this.deps.cipher.decrypt(ciphertext);
+      return this.decryptBodyStrict(ciphertext);
     } catch {
       return null;
     }
+  }
+
+  private decryptBodyStrict(ciphertext: string | null): string | null {
+    if (ciphertext == null || ciphertext === '') return null;
+    return this.deps.cipher.decrypt(ciphertext);
   }
 
   /** 供 existingRaw 比对用的公开包装（私有方法的窄暴露）。 */
@@ -921,6 +959,12 @@ function existingRaw(existing: SignalWatcher, field: keyof WatcherInput, service
     case 'jsonPath': return existing.jsonPath;
     default: return undefined;
   }
+}
+
+/** 退避把 last_checked_at 写成未来时刻时，字典序比较即可（库内是 `YYYY-MM-DD HH:mm:ss`）。 */
+function isFutureCheckedAt(value: string | null): boolean {
+  if (value == null || value === '') return false;
+  return value > formatDateTime(new Date());
 }
 
 function errorMessage(error: unknown): string {
