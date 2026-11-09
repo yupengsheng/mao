@@ -57,7 +57,7 @@
 | `APP_GIT_CREDENTIAL_SECRET` | **是** | Git Token AES 密钥；未配置拒绝启动 |
 | `APP_NOTIFICATION_WEBHOOK_SECRET` | 建议 | 任务通知 Webhook 加密；同时加密开放接口（Webhook 触发器 / 出站订阅）的 secret。未配置时回退内置默认密钥，生产建议显式设置 |
 | `APP_MCP_SECRET` | MCP 时建议 | MCP 环境变量加密 |
-| `APP_SIGNAL_SECRET` | 哨兵时建议 | 信号哨兵请求头 / 请求体加密。未配置时回退内置默认密钥，生产建议显式设置；轮换后已存哨兵需重新填写请求头与请求体 |
+| `APP_SIGNAL_SECRET` | 哨兵时建议 | 信号哨兵请求头 / 请求体加密。未配置时回退内置默认密钥，生产建议显式设置；轮换后已存哨兵需重新填写请求头与请求体。凭据占位符（`{{MAO_TOKEN}}` / `{{ECP_TOKEN}}`）本身不含明文、落库即密文，轮换密钥只影响已存明文凭据，不影响占位符配置 |
 | `APP_USER_TOOL_SECRET` | 自定义工具时建议 | 自定义 HTTP 工具请求头敏感值加密。未配置时回退内置默认密钥，生产建议显式设置；轮换后已存工具的敏感请求头需重新填写 |
 | `EXECUTION_WAIT_PERSISTENCE_ENABLED` | 否 | 任务域二期等待态双写，默认 false。开启后把提问 / 工具审批写入 `execution_wait`，回答 / 审批 / 取消 / 超时按首次终态释放；摘要只存脱敏投影与 SHA-256，写库失败不影响现有流程 |
 | `EXECUTION_LEASE_ENABLED` | 否 | 任务域二期执行租约，默认 false。开启后普通执行先过单会话门禁并检查 `PENDING` 等待，终态结算校验 fencing token，崩溃恢复按过期租约接管；恢复后的等待只读，不自动回答或审批。建议先开启等待持久化并观察后再开本开关 |
