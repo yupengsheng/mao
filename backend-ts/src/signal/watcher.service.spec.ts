@@ -1283,6 +1283,33 @@ describe('WatcherService.create 复制继承（copyFrom）', () => {
     expect(stored.reuseSessionId).toBeNull();
   });
 
+  it('未下发 headers 键 → 整体继承源行解密请求头', async () => {
+    const h = harness({ watcher: sourceWatcher() });
+    const view = await h.service.create(7, {
+      ...baseInput,
+      headers: undefined,
+      body: undefined,
+      name: 'src 副本',
+      method: 'POST',
+      copyFrom: 50,
+    });
+    const stored = h.watchers.get(view.id)!;
+    expect(JSON.parse(cipher.decrypt(stored.headersJson!))).toEqual(sourceHeaders);
+  });
+
+  it('显式 headers: null → 清空而不继承', async () => {
+    const h = harness({ watcher: sourceWatcher() });
+    const view = await h.service.create(7, {
+      ...baseInput,
+      body: undefined,
+      name: 'src 副本',
+      method: 'POST',
+      headers: null,
+      copyFrom: 50,
+    });
+    expect(h.watchers.get(view.id)!.headersJson).toBeNull();
+  });
+
   it('改名后的掩码键报错，不把 ****** 当凭据落库', async () => {
     const h = harness({ watcher: sourceWatcher() });
     await expect(h.service.create(7, {

@@ -96,7 +96,7 @@ mao-agent -p "检查本次 PR 是否有明显的安全问题" \
 
 已定稿的对话逐行写入终端 scrollback（可用终端原生滚动回看，**不使用备用屏**），只有输入框、状态行和正在流式输出的尾部属于活动区，活动区高度始终小于终端高度，所以不会整屏重绘、也不会清掉历史。用户消息以 `❯` 回显；工具调用显示为 `⏺ name  args` + `⎿` 摘要。
 
-- 执行中可排队输入下一条；`/cancel` 或 Ctrl+C 取消当前任务
+- 执行中可排队输入下一条；`/cancel` 或 Ctrl+C 取消当前任务。启动时若自动续接正在运行的任务，续接结束后会继续消费排队输入
 - Agent 提问与 LOCAL 审批共用输入通道，多个请求按先后顺序排队（方向键 / y n a；带危险原因的审批需再按 Enter 确认）
 - 输入 `/` 弹出命令面板，↑↓ 选择、Enter 执行、Tab 填入
 - 输入历史存 `~/.mao/agent-cli/history`（0600，最近 200 条），↑↓ 翻历史
@@ -191,6 +191,8 @@ emoji / CJK 按整字符删除；粘贴多行文本原样进入草稿。
 | `--token <jwt>` | 一次性覆盖本地 token（更推荐 `MAO_TOKEN`） |
 | `--timeout-ms <n>` | 单次 REST 请求超时，默认 30000 |
 
+失败回合的 text 模式会在 stderr 输出 `执行失败：<原因>`，stdout 只保留正文；json / stream-json 终态对象在失败时带 `error` 字段，成功时不输出该字段。
+
 **LOCAL 模式**（非 `--local` 时使用会报错）
 
 | 选项 | 说明 |
@@ -225,7 +227,7 @@ emoji / CJK 按整字符删除；粘贴多行文本原样进入草稿。
 - **写回保留原文件行尾**：已有文件的 CRLF / BOM 会在 `write_file` / `edit_file` 时保留（云端工具同样如此）；新建文件按模型给出的 LF 写入
 - **工作区以本地为权威**：服务端下发的 workspace 只能等于本地工作区或位于其内部，否则该次工具调用直接失败（`拒绝服务端下发的工作区 ...`）
 - **shell 内不注入 token**：子进程环境只有登录 shell 的 PATH 加 `TERM=dumb` / `PS1=''`，不含 `MAO_TOKEN` / `MAO_REFRESH_TOKEN`。要在 shell 工具里调 `mao` / `mao-agent`，需先 `mao login`（读 `~/.mao/auth.json`）。这与桌面 Electron（会注入 token）是有意差异
-- **MCP**：本地 stdio 服务器启动前需过审批；子进程环境为白名单（PATH / HOME / LANG / LC_* / TERM / TMPDIR / TZ / USER / LOGNAME + Windows 若干 + 该 server 显式声明的 `env`）；stdio 传输为行分隔 JSON；单服务器连接超时 45s、工具调用 120s；超时或退出杀整个进程组
+- **MCP**：本地 stdio 服务器启动前需过审批；子进程环境为白名单（PATH / HOME / LANG / LC_* / TERM / TMPDIR / TZ / USER / LOGNAME + Windows 若干 + 该 server 显式声明的 `env`）；stdio 传输为行分隔 JSON；单服务器连接超时 45s、工具调用 120s（HTTP transport 同样按 120s 中止）；超时或退出杀整个进程组
 - **技能同步**：技能包只能从当前 `baseUrl` 同源地址下载，跨源 `syncUrl` 会被拒绝；包内含 `../`、绝对路径或符号链接的条目会被拒绝
 - **`AGENTS.md`** 注入系统提示时上限 100KB（与云端一致），超出截断
 - 读取图片上限 5MB，终端版不做缩放，超限需先本地压缩或裁剪

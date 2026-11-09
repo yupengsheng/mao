@@ -44,7 +44,7 @@ describe('container tool executor', () => {
     writeFileSync(join(userWorkspace, 'a.txt'), 'hello container');
     writeFileSync(join(otherUser, 'secret.txt'), 'foreign');
 
-    const executor = new ContainerToolExecutor({ workspaceRoot, runtimeDir, userHomeDir, userSkillsDir, skillViewsDir: join(base, 'skill-views'), uploadDir: join(base, 'uploads'), shareDir: join(base, 'share') }, USER_ID);
+    const executor = new ContainerToolExecutor({ workspaceRoot, runtimeDir, userHomeDir, userSkillsDir, skillViewsDir: join(base, 'skill-views'), uploadDir: join(base, 'uploads'), shareDir: join(base, 'share'), experienceAgentDir: join(base, 'share', 'agent-experience', String(USER_ID)) }, USER_ID);
 
     // read_file 工作区相对路径
     const read = await executor.handleToolCall('read_file', JSON.stringify({ path: 'a.txt' }), envelopeOf(userWorkspace));
@@ -81,7 +81,7 @@ describe('container tool executor', () => {
       mkdirSync(dir, { recursive: true });
       writeFileSync(join(dir, 'secret.txt'), 'foreign');
     }
-    const executor = new ContainerToolExecutor({ workspaceRoot, runtimeDir, userHomeDir, userSkillsDir, skillViewsDir: join(base, 'skill-views'), uploadDir: join(base, 'uploads'), shareDir: join(base, 'share') }, USER_ID);
+    const executor = new ContainerToolExecutor({ workspaceRoot, runtimeDir, userHomeDir, userSkillsDir, skillViewsDir: join(base, 'skill-views'), uploadDir: join(base, 'uploads'), shareDir: join(base, 'share'), experienceAgentDir: join(base, 'share', 'agent-experience', String(USER_ID)) }, USER_ID);
     const env = envelopeOf(userWorkspace);
 
     for (const path of [
@@ -113,6 +113,45 @@ describe('container tool executor', () => {
     expect(JSON.parse(own).content).toBe('mine');
   });
 
+  it('crossMemberReadsGetSpecializedDiagnosticsThroughExecutor', async () => {
+    // 接线守护（评审 P2）：identity 由 ContainerToolExecutor 构造时注入 PathSandbox，
+    // 若有人删掉那一行，这里读他人 runtime/uploads 会回落通用越界文案、断言失败。
+    const base = useTmpDir('mao-exec-identity-');
+    const workspaceRoot = join(base, 'workspace');
+    const runtimeDir = join(base, 'runtime');
+    const userHomeDir = join(base, 'users');
+    const userSkillsDir = join(base, 'userskills');
+    const uploadDir = join(base, 'uploads');
+    const userWorkspace = join(workspaceRoot, '7');
+    mkdirSync(userWorkspace, { recursive: true });
+    mkdirSync(join(runtimeDir, '8', '1607', 'shellOutput'), { recursive: true });
+    writeFileSync(join(runtimeDir, '8', '1607', 'shellOutput', 'x.out'), 'foreign');
+    mkdirSync(join(uploadDir, '8'), { recursive: true });
+    writeFileSync(join(uploadDir, '8', 'gen.png'), 'foreign');
+    mkdirSync(join(uploadDir, 'releases'), { recursive: true });
+    writeFileSync(join(uploadDir, 'releases', 'latest.yml'), 'release');
+    const executor = new ContainerToolExecutor({
+      workspaceRoot, runtimeDir, userHomeDir, userSkillsDir,
+      skillViewsDir: join(base, 'skill-views'), uploadDir, shareDir: join(base, 'share'), experienceAgentDir: join(base, 'share', 'agent-experience', String(USER_ID)),
+    }, USER_ID);
+    const env = envelopeOf(userWorkspace);
+
+    const runtimeRead = await executor.handleToolCall(
+      'read_file', JSON.stringify({ path: join(runtimeDir, '8', '1607', 'shellOutput', 'x.out') }), env,
+    );
+    expect(JSON.parse(runtimeRead).error).toContain('其他用户的会话运行目录');
+    const uploadRead = await executor.handleToolCall(
+      'read_file', JSON.stringify({ path: join(uploadDir, '8', 'gen.png') }), env,
+    );
+    expect(JSON.parse(uploadRead).error).toContain('其他成员的产物目录');
+    // 非身份目录（releases）回落通用越界文案，不误报为「其他成员」
+    const genericRead = await executor.handleToolCall(
+      'read_file', JSON.stringify({ path: join(uploadDir, 'releases', 'latest.yml') }), env,
+    );
+    const genericError = JSON.parse(genericRead).error as string;
+    expect(genericError).toBeDefined();
+    expect(genericError).not.toContain('其他成员');
+  });
   it('readBytesEnforcesSandboxAndSizeLimit', () => {
     const base = useTmpDir('mao-exec-bytes-');
     const workspaceRoot = join(base, 'workspace');
@@ -126,7 +165,7 @@ describe('container tool executor', () => {
       userSkillsDir: join(base, 'userskills'),
       skillViewsDir: join(base, 'skill-views'),
       uploadDir: join(base, 'uploads'),
-      shareDir: join(base, 'share'),
+      shareDir: join(base, 'share'), experienceAgentDir: join(base, 'share', 'agent-experience', String(USER_ID)),
     }, USER_ID);
     const env = envelopeOf(userWorkspace);
 
@@ -170,6 +209,7 @@ describe('container tool executor', () => {
       skillViewsDir: join(base, 'skill-views'),
       uploadDir,
       shareDir,
+      experienceAgentDir: join(shareDir, 'agent-experience', String(USER_ID)),
     }, USER_ID);
     const env = envelopeOf(userWorkspace);
 
@@ -185,20 +225,27 @@ describe('container tool executor', () => {
     expect(otherBytes.ok).toBe(false);
   });
 
-  it('readsFileUnderShareRoot', async () => {
-    // 共享目录方案 §4.2：shareDir 是唯一跨用户共享的允许根，容器内 read_file 传绝对
-    // 路径可读；share 内指向外部的 symlink 被 strict resolve + realpath 逃逸检测拒绝
+  it('readsFileUnderExperienceAgentRoot', async () => {
+    // 2026-11-07 复合容器方案 §5.5：经验库允许根从 shareDir 整根收窄为当前 Agent 的
+    // agent-experience/{agentId} 子目录（容器也只挂该子目录）——本 Agent 的经验文档可读，
+    // 其他 Agent 的库目录与 share 根下的其他内容都在允许根之外；经验目录内指向外部的
+    // symlink 被 strict resolve + realpath 逃逸检测拒绝
     const base = useTmpDir('mao-exec-share-');
     const workspaceRoot = join(base, 'workspace');
     const shareDir = join(base, 'share');
+    const experienceAgentDir = join(shareDir, 'agent-experience', String(USER_ID));
+    const otherAgentDir = join(shareDir, 'agent-experience', '6');
     const userWorkspace = join(workspaceRoot, '7');
     const outside = join(base, 'outside');
     mkdirSync(userWorkspace, { recursive: true });
-    mkdirSync(shareDir, { recursive: true });
+    mkdirSync(experienceAgentDir, { recursive: true });
+    mkdirSync(otherAgentDir, { recursive: true });
     mkdirSync(outside, { recursive: true });
-    writeFileSync(join(shareDir, 'public.txt'), 'shared-content');
+    writeFileSync(join(experienceAgentDir, 'doc.md'), 'shared-content');
+    writeFileSync(join(otherAgentDir, 'doc.md'), 'other-agent');
+    writeFileSync(join(shareDir, 'public.txt'), 'platform-content');
     writeFileSync(join(outside, 'secret.txt'), 'secret');
-    symlinkSync(join(outside, 'secret.txt'), join(shareDir, 'escape.txt'));
+    symlinkSync(join(outside, 'secret.txt'), join(experienceAgentDir, 'escape.txt'));
     const executor = new ContainerToolExecutor({
       workspaceRoot,
       runtimeDir: join(base, 'runtime'),
@@ -207,31 +254,40 @@ describe('container tool executor', () => {
       skillViewsDir: join(base, 'skill-views'),
       uploadDir: join(base, 'uploads'),
       shareDir,
+      experienceAgentDir,
     }, USER_ID);
     const env = envelopeOf(userWorkspace);
 
-    // share 内公共文件按绝对路径可读
-    const read = await executor.handleToolCall('read_file', JSON.stringify({ path: join(shareDir, 'public.txt') }), env);
+    // 本 Agent 经验库内文档按绝对路径可读
+    const read = await executor.handleToolCall('read_file', JSON.stringify({ path: join(experienceAgentDir, 'doc.md') }), env);
     expect(JSON.parse(read).content).toBe('shared-content');
     // read_bytes 桥同口径
-    const bytes = executor.handleReadBytes(join(shareDir, 'public.txt'), 1000, env);
+    const bytes = executor.handleReadBytes(join(experienceAgentDir, 'doc.md'), 1000, env);
     expect(bytes.ok).toBe(true);
-    // share 内指向外部的 symlink 被逃逸检测拒绝
-    const escape = await executor.handleToolCall('read_file', JSON.stringify({ path: join(shareDir, 'escape.txt') }), env);
+    // 其他 Agent 的经验库在允许根之外（容器挂载面也不存在，双重隔离）
+    const otherAgent = await executor.handleToolCall('read_file', JSON.stringify({ path: join(otherAgentDir, 'doc.md') }), env);
+    expect(JSON.parse(otherAgent).error).toBeDefined();
+    // share 根下的其他内容（平台投放）同样不在允许根
+    const platform = await executor.handleToolCall('read_file', JSON.stringify({ path: join(shareDir, 'public.txt') }), env);
+    expect(JSON.parse(platform).error).toBeDefined();
+    // 经验目录内指向外部的 symlink 被逃逸检测拒绝
+    const escape = await executor.handleToolCall('read_file', JSON.stringify({ path: join(experienceAgentDir, 'escape.txt') }), env);
     expect(JSON.parse(escape).error).toBeDefined();
   });
 
   it('readsSessionSkillSymlinkUnderSkillViewsRoot', async () => {
-    // 技术方案 2026-11-03 §7.1：会话技能是 {runtimeDir}/{u}/{s}/skills/{name} ->
-    // {skillViewsDir}/{u}/{name} 的符号链接（SkillSyncService 指向用户级只读视图），
+    // 技术方案 2026-11-03 §7.1（2026-11-07 按 agent 收窄）：会话技能是 {runtimeDir}/{u}/{s}/skills/{name} ->
+    // {skillViewsDir}/{u}/{a}/{name} 的符号链接（SkillSyncService 指向用户+Agent 级只读视图），
     // 视图按用户登记为允许根后经 strict 校验可读；指向视图之外的链接仍被拒绝。
     const base = useTmpDir('mao-exec-skills-');
     const workspaceRoot = join(base, 'workspace');
     const runtimeDir = join(base, 'runtime');
     const userWorkspace = join(workspaceRoot, '7');
-    const skillViewsDir = join(base, 'skill-views');
-    const viewDir = join(skillViewsDir, '7', 'bigdata-cli');
-    const otherViewDir = join(skillViewsDir, '8', 'bigdata-cli');
+    // 2026-11-07：MAO_SKILL_VIEWS_DIR 注入值即当前 (user, agent) 的视图目录，
+    // 允许根 = 该目录；其他 Agent 的视图目录天然在允许根之外
+    const skillViewsDir = join(base, 'skill-views', '7', '5');
+    const viewDir = join(skillViewsDir, 'bigdata-cli');
+    const otherViewDir = join(base, 'skill-views', '8', '5', 'bigdata-cli');
     const sessionSkillsDir = join(runtimeDir, '7', '11', 'skills');
     const outside = join(base, 'outside');
     mkdirSync(userWorkspace, { recursive: true });
@@ -252,7 +308,7 @@ describe('container tool executor', () => {
       userSkillsDir: join(base, 'userskills'),
       skillViewsDir,
       uploadDir: join(base, 'uploads'),
-      shareDir: join(base, 'share'),
+      shareDir: join(base, 'share'), experienceAgentDir: join(base, 'share', 'agent-experience', String(USER_ID)),
     }, USER_ID);
     const env = envelopeOf(userWorkspace);
 
@@ -268,15 +324,17 @@ describe('container tool executor', () => {
     expect(JSON.parse(escape).error).toBeDefined();
   });
 
-  it('shellWorkdirUnderShareRootIsAllowed', async () => {
-    // 设计 §1.2 目标 2 / CHANGELOG：shell 对 share 可达（与 read_file 同一
-    // resolveLenient 代码路径）。补 shell workdir 一例（round-02 review 观察 2：
-    // 此前只有 read_file 有覆盖）
+  it('shellWorkdirUnderExperienceAgentRootIsAllowed', async () => {
+    // 设计 §1.2 目标 2 / CHANGELOG（2026-11-07 收口后）：shell workdir 对当前 Agent 的
+    // 经验库子目录可达（与 read_file 同一 resolveLenient 代码路径）；share 根下其他
+    // 目录不在允许根。补 shell workdir 一例（round-02 review 观察 2：此前只有 read_file
+    // 有覆盖）
     const base = useTmpDir('mao-exec-share-shell-');
     const workspaceRoot = join(base, 'workspace');
     const userWorkspace = join(workspaceRoot, '7');
     const shareDir = join(base, 'share');
-    const shareSub = join(shareDir, 'docs');
+    const experienceAgentDir = join(shareDir, 'agent-experience', String(USER_ID));
+    const shareSub = join(experienceAgentDir, 'docs');
     mkdirSync(userWorkspace, { recursive: true });
     mkdirSync(shareSub, { recursive: true });
     const executor = new ContainerToolExecutor({
@@ -287,6 +345,7 @@ describe('container tool executor', () => {
       skillViewsDir: join(base, 'skill-views'),
       uploadDir: join(base, 'uploads'),
       shareDir,
+      experienceAgentDir,
     }, USER_ID);
     const result = await executor.handleToolCall('shell', JSON.stringify({
       action: 'exec', command: 'pwd', workdir: shareSub,
@@ -310,7 +369,7 @@ describe('container tool executor', () => {
       userSkillsDir: join(base, 'userskills'),
       skillViewsDir: join(base, 'skill-views'),
       uploadDir: join(base, 'uploads'),
-      shareDir: join(base, 'share'),
+      shareDir: join(base, 'share'), experienceAgentDir: join(base, 'share', 'agent-experience', String(USER_ID)),
     }, USER_ID);
     // workdir 越界（他人目录）被严格 resolve 拒绝
     const result = await executor.handleToolCall('shell', JSON.stringify({
@@ -335,7 +394,7 @@ describe('container tool executor', () => {
       userSkillsDir: join(base, 'userskills'),
       skillViewsDir: join(base, 'skill-views'),
       uploadDir: join(base, 'uploads'),
-      shareDir: join(base, 'share'),
+      shareDir: join(base, 'share'), experienceAgentDir: join(base, 'share', 'agent-experience', String(USER_ID)),
     }, USER_ID);
     const read = await executor.handleToolCall('read_file', JSON.stringify({ path: 'leak.txt' }), envelopeOf(userWorkspace));
     expect(JSON.parse(read).error).toBeDefined();
@@ -356,7 +415,7 @@ describe('container tool executor', () => {
       userSkillsDir: join(base, 'userskills'),
       skillViewsDir: join(base, 'skill-views'),
       uploadDir: join(base, 'uploads'),
-      shareDir: join(base, 'share'),
+      shareDir: join(base, 'share'), experienceAgentDir: join(base, 'share', 'agent-experience', String(USER_ID)),
     }, USER_ID);
     const depsEnv = {
       NPM_CONFIG_PREFIX: join(depsUserDir, 'npm'),
@@ -391,7 +450,7 @@ describe('container tool executor', () => {
       userSkillsDir: join(base, 'userskills'),
       skillViewsDir: join(base, 'skill-views'),
       uploadDir: join(base, 'uploads'),
-      shareDir: join(base, 'share'),
+      shareDir: join(base, 'share'), experienceAgentDir: join(base, 'share', 'agent-experience', String(USER_ID)),
     }, USER_ID);
     const result = await executor.handleToolCall('shell', JSON.stringify({
       action: 'exec',
@@ -422,7 +481,7 @@ describe('container tool executor', () => {
       userSkillsDir: join(base, 'userskills'),
       skillViewsDir: join(base, 'skill-views'),
       uploadDir: join(base, 'uploads'),
-      shareDir: join(base, 'share'),
+      shareDir: join(base, 'share'), experienceAgentDir: join(base, 'share', 'agent-experience', String(USER_ID)),
     }, USER_ID);
     const depsBin = join(depsUserDir, 'npm', 'bin');
     const depsEnv = {
@@ -466,7 +525,7 @@ describe('container tool executor', () => {
       userSkillsDir: join(base, 'userskills'),
       skillViewsDir: join(base, 'skill-views'),
       uploadDir: join(base, 'uploads'),
-      shareDir: join(base, 'share'),
+      shareDir: join(base, 'share'), experienceAgentDir: join(base, 'share', 'agent-experience', String(USER_ID)),
     }, USER_ID);
     const depsEnv = {
       NPM_CONFIG_PREFIX: join(depsUserDir, 'npm'),

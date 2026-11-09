@@ -202,13 +202,16 @@ export class MysqlSignalWatcherRepository {
    * 若写成 `consecutive_failures + 1 >= ?`，等于多算一次，实际第 4 次失败就停用（BUG-I）。
    */
   async recordFailure(id: number, backoffMinutes: number, threshold: number): Promise<SignalWatcher | null> {
+    // 与 markChecked 的成功路径同源：退避时刻用 Node 时钟算好再传库，避免 DB 会话时区
+    // 与应用时区不一致时（DATE_ADD(NOW())）导致退避整体漂移。
+    const backoffUntil = ts(Date.now() + backoffMinutes * 60_000);
     const result = await this.db.execute(
       `UPDATE signal_watcher
        SET consecutive_failures = consecutive_failures + 1,
-           last_checked_at = DATE_ADD(NOW(), INTERVAL ? MINUTE),
+           last_checked_at = ?,
            status = IF(consecutive_failures >= ?, 'DISABLED', status)
        WHERE id = ? AND status = 'ACTIVE'`,
-      [backoffMinutes, threshold, id],
+      [backoffUntil, threshold, id],
     );
     if (result.affectedRows !== 1) return null;
     return this.findById(id);

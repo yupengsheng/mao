@@ -1468,6 +1468,9 @@ export class StreamingWsHandler {
   private async handleRetryExecution(userId: number, root: Record<string, unknown>): Promise<void> {
     const sessionId = this.getLong(root, 'sessionId');
     if (sessionId == null) return;
+    // 本次重试入口时间：只消费入口之后登记的停止标记，既接住 beginRetry / 清理尾巴等
+    // await 窗口内的取消，也避免历史残留标记误杀本次重试。
+    const retryStartedAt = Date.now();
     const session = await this.requireOwnedSession(userId, sessionId);
     if (!session) return;
     // 只有终态（FAILED）且没有正在运行的其他执行时才能重试
@@ -1545,6 +1548,12 @@ export class StreamingWsHandler {
       // 分配新的 executionId
       const executionId = randomUUID();
       const cancelFlag = this.deps.agentLoop.registerCancelFlag(sessionId);
+      // 与其它执行入口同口径：注册 cancelFlag 前用户已点停止时，按取消收敛而不是照跑。
+      if (this.takePendingCancel(sessionId, retryStartedAt, cancelFlag)) {
+        await this.rollbackSubagentRetry(session, retryTaskId, 'CANCELLED');
+        await this.finishCancelledSession(sessionId, userId, executionId);
+        return;
+      }
       this.cancelFlags.set(sessionId, cancelFlag);
       this.runningExecutionIds.set(sessionId, executionId);
       // 清除残留的 tool calls 和 ask questions 状态
@@ -1687,11 +1696,15 @@ export class StreamingWsHandler {
     });
   }
 
-  /** beginRetry 成功但重试未能启动时的收敛：execution 置回 FAILED，释放运行跟踪。 */
-  private async rollbackSubagentRetry(session: Session, retryTaskId: number | null): Promise<void> {
+  /** beginRetry 成功但重试未能启动（或提交前被取消）时收敛 execution 终态。 */
+  private async rollbackSubagentRetry(
+    session: Session,
+    retryTaskId: number | null,
+    status: 'FAILED' | 'CANCELLED' = 'FAILED',
+  ): Promise<void> {
     if (retryTaskId == null || session.parentSessionId == null) return;
     try {
-      await this.deps.backgroundSubagentManager?.completeRetry?.(session.parentSessionId, retryTaskId, 'FAILED');
+      await this.deps.backgroundSubagentManager?.completeRetry?.(session.parentSessionId, retryTaskId, status);
     } catch (e) {
       console.error(`Failed to roll back subagent retry for task ${retryTaskId}`, e);
     }

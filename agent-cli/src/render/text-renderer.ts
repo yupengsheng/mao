@@ -18,6 +18,9 @@ export class TextRenderer implements Renderer {
   finish(result: RunResult): void {
     const text = result.result || this.last;
     if (text) process.stdout.write(text.endsWith('\n') ? text : text + '\n');
+    if (result.status === 'FAILED' && result.error) {
+      process.stderr.write(`执行失败：${result.error}\n`);
+    }
   }
 
   peek(): string {

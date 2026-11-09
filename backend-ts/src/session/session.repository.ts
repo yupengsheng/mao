@@ -350,7 +350,23 @@ export class SessionRepository {
     ).then((rows) => rows.map((r) => r.workspace).filter((w): w is string => typeof w === 'string' && w.length > 0));
   }
 
+  /**
+   * 指定 (user, agent) 的会话工作区去重集合（2026-11-07 复合容器方案 §5.2）：容器键为
+   * (userId, agentId) 后，通道会话工作区只挂进服务该 (user, agent) 组合的容器——
+   * 新群会话只影响其所属 Agent 的容器，不放大到该用户的全部 Agent 容器。
+   * (user_id, agent_id) 双列过滤即归属校验。
+   */
+  listWorkspacesByUserAndAgent(userId: number, agentId: number): Promise<string[]> {
+    return this.db.query<{ workspace: string | null }>(
+      `SELECT DISTINCT workspace FROM \`session\`
+       WHERE user_id = ? AND agent_id = ? AND ${notDeleted()} AND workspace IS NOT NULL AND workspace <> ''`,
+      [userId, agentId],
+    ).then((rows) => rows.map((r) => r.workspace).filter((w): w is string => typeof w === 'string' && w.length > 0));
+  }
+
   async lockActiveSessionById(sessionId: number): Promise<number | null> {
+    // 注意：在事务外调用时，语句结束即释放行锁，不能把返回结果当作互斥保护；
+    // 需要「读相位 + 更新」原子性的调用方应在 transaction 内用 findByIdForUpdate 复查。
     const row = await this.db.queryOne<{ id: number }>(
       `SELECT id FROM \`session\` WHERE id = ? AND ${notDeleted()} FOR UPDATE`,
       [sessionId],

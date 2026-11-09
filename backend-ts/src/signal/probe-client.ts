@@ -13,6 +13,12 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_READ_TIMEOUT_MS = 15_000;
 const MAX_BODY_BYTES = 1024 * 1024;
 
+/** 请求头名大小写不敏感匹配。 */
+function hasHeader(headers: Record<string, string>, name: string): boolean {
+  const lower = name.toLowerCase();
+  return Object.keys(headers).some((key) => key.toLowerCase() === lower);
+}
+
 export interface ProbeRequest {
   url: string;
   /** GET / POST。 */
@@ -84,13 +90,19 @@ export function executeProbe(
     }
 
     const lib = parsed.protocol === 'https:' ? https : http;
+    // 有 body 且调用方未给 Content-Length 时按 UTF-8 实际字节数代填。Node 默认走 chunked，
+    // 要求定长的网关/旧服务会直接 411；输入校验仍禁止用户手填，长度只由执行器掌握。
+    const headers: Record<string, string> = { ...req.headers };
+    if (req.body != null && !hasHeader(headers, 'content-length')) {
+      headers['Content-Length'] = String(Buffer.byteLength(req.body, 'utf8'));
+    }
     let request: http.ClientRequest;
     try {
       // 注意：`redirect` 不是 http.RequestOptions 的合法字段，禁重定向由响应回调里
       // 对 3xx 直接判失败实现（见下方 response 分支）。
       request = lib.request(parsed, {
         method: req.method,
-        headers: req.headers,
+        headers,
       });
     } catch (e) {
       finish({ ok: false, httpStatus: null, body: null, bodyBytes: null, error: safeError(e) });

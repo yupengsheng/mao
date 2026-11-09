@@ -83,6 +83,7 @@ export class JsonRenderer implements Renderer {
         fileChanges: result.fileChanges,
         durationMs: result.durationMs,
         reconnected: result.reconnected,
+        ...(result.error ? { error: result.error } : {}),
       });
       return;
     }
@@ -97,6 +98,7 @@ export class JsonRenderer implements Renderer {
       fileChanges: result.fileChanges,
       durationMs: result.durationMs,
       ...(result.reconnected ? { reconnected: true } : {}),
+      ...(result.error ? { error: result.error } : {}),
     });
   }
 

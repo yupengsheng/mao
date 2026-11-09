@@ -220,6 +220,12 @@ function withTimeout<T>(task: Promise<T>, timeoutMs: number, message: string): P
   });
 }
 
+/** fetch / body 读取被 AbortSignal.timeout 中止时归一为超时；主动 abort 同样按超时处理。 */
+function isAbortError(e: unknown): boolean {
+  const name = (e as { name?: unknown } | null)?.name;
+  return name === 'TimeoutError' || name === 'AbortError';
+}
+
 interface McpEntry {
   conn?: McpConn;
   tools: McpToolDef[];
@@ -272,18 +278,27 @@ export class McpManager {
     if (entry.httpUrl) {
       const headers: Record<string, string> = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' };
       if (entry.mcpSessionId) headers['mcp-session-id'] = entry.mcpSessionId;
-      const res = await fetch(entry.httpUrl, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: Date.now(),
-          method: 'tools/call',
-          params: { name: toolName, arguments: args },
-        }),
-      });
-      if (!res.ok) throw new Error(`HTTP MCP call failed: ${res.status}`);
-      const body = await res.json() as { result?: unknown; error?: { message?: string } };
+      let body: { result?: unknown; error?: { message?: string } };
+      try {
+        const res = await fetch(entry.httpUrl, {
+          method: 'POST',
+          headers,
+          signal: AbortSignal.timeout(MCP_CALL_TIMEOUT_MS),
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: Date.now(),
+            method: 'tools/call',
+            params: { name: toolName, arguments: args },
+          }),
+        });
+        if (!res.ok) throw new Error(`HTTP MCP call failed: ${res.status}`);
+        body = await res.json() as { result?: unknown; error?: { message?: string } };
+      } catch (e) {
+        if (isAbortError(e)) {
+          throw new Error(`MCP tool call timed out after ${MCP_CALL_TIMEOUT_MS / 1000}s: ${toolName}`);
+        }
+        throw e;
+      }
       if (body.error) throw new Error(body.error.message || 'MCP error');
       return formatCallResult(body.result);
     }

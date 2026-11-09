@@ -912,7 +912,7 @@ describe('ToolDispatcher runtime identity routing', () => {
       askUserQuestionsRegistry as never, localToolSessionRegistry as never, treeSignalPublisher as never,
       null, null, null, null, null, null, null, null, dockerRouter as never,
     );
-    return { dispatcher, feishuSend, generate, task, readFile, dockerRouter, localToolExecutor };
+    return { dispatcher, feishuSend, generate, task, readFile, dockerRouter, localToolExecutor, sessionMapper };
   }
   function invocation(toolName: string, extra: Record<string, unknown> = {}) {
     return {
@@ -939,8 +939,26 @@ describe('ToolDispatcher runtime identity routing', () => {
   });
   it('docker 分支按运行身份路由容器', async () => {
     const { dispatcher, dockerRouter } = build({ docker: true });
-    await dispatcher.dispatchInvocation(invocation('read_file') as never);
-    expect(dockerRouter.dispatch).toHaveBeenCalledWith('read_file', '{}', { userId: 67, sessionId: 7, workspace: 'ws' });
+    // agentId 按轮快照：ToolInvocation 携带、透传给路由
+    await dispatcher.dispatchInvocation(invocation('read_file', { agentId: 5 }) as never);
+    expect(dockerRouter.dispatch).toHaveBeenCalledWith('read_file', '{}', { userId: 67, agentId: 5, sessionId: 7, workspace: 'ws' });
+  });
+  it('docker 分支 agentId 缺省时按会话查库兜底', async () => {
+    const { dispatcher, dockerRouter, sessionMapper } = build({ docker: true });
+    sessionMapper.selectById.mockResolvedValue({ agentId: 9 });
+    const inv = invocation('read_file');
+    delete (inv as Record<string, unknown>).agentId;
+    await dispatcher.dispatchInvocation(inv as never);
+    expect(dockerRouter.dispatch).toHaveBeenCalledWith('read_file', '{}', { userId: 67, agentId: 9, sessionId: 7, workspace: 'ws' });
+  });
+  it('docker 分支会话不存在（agentId 不可得）时明确报错不派发', async () => {
+    const { dispatcher, dockerRouter, sessionMapper } = build({ docker: true });
+    sessionMapper.selectById.mockResolvedValue(null);
+    const inv = invocation('read_file');
+    delete (inv as Record<string, unknown>).agentId;
+    const result = await dispatcher.dispatchInvocation(inv as never);
+    expect(JSON.parse(result.content ?? '{}').error).toContain('无法确定会话 Agent');
+    expect(dockerRouter.dispatch).not.toHaveBeenCalled();
   });
   it('runtimeUserId 缺省时回落 executionUserId（兼容旧调用）', async () => {
     const { dispatcher, feishuSend } = build();
@@ -1111,10 +1129,12 @@ describe('ToolDispatcher docker routing', () => {
 
   it('routesDockerOnlyToolsToContainer', async () => {
     const router = { enabledFor: vi.fn(async () => true), dispatch: vi.fn(async () => 'container-result') };
+    // invocation 无 agentId 时按会话查库兜底（2026-11-07 复合容器方案 §5.6）
+    sessionMapper.selectById.mockResolvedValue({ agentId: 5 });
     const dockerDispatcher = makeDockerDispatcher(router);
     const result = await dockerDispatcher.dispatch('read_file', '{"path":"a.txt"}', 'CLOUD', 11, 7, '/ws', null, null, null);
     expect(result).toBe('container-result');
-    expect(router.dispatch).toHaveBeenCalledWith('read_file', '{"path":"a.txt"}', { userId: 7, sessionId: 11, workspace: '/ws' });
+    expect(router.dispatch).toHaveBeenCalledWith('read_file', '{"path":"a.txt"}', { userId: 7, agentId: 5, sessionId: 11, workspace: '/ws' });
     // 宿主机工具未被触碰
     expect(cloudTool.execute).not.toHaveBeenCalled();
   });
@@ -1331,5 +1351,93 @@ describe('ToolDispatcher 自定义 HTTP 工具执行位置（2026-10-20 方案�
     expect(result).toBe('no-approval');
     expect(assessSpy).not.toHaveBeenCalled();
     expect(localToolExecutor.execute).not.toHaveBeenCalled();
+  });
+});
+describe('ToolDispatcher runtime identity routing', () => {
+  function build(opts: { docker?: boolean } = {}) {
+    const feishuSend = mockTool('feishu_send_image');
+    const generate = mockTool('generate_image');
+    const task = mockTool('task_create');
+    const readFile = mockTool('read_file');
+    const registry = new ToolRegistry([feishuSend, generate, task, readFile]);
+    const localToolExecutor = { execute: vi.fn(async () => 'local-ok') };
+    const dangerAssessor = new DangerAssessor({ chat: vi.fn(), stream: vi.fn() } as unknown as LlmAdapter);
+    vi.spyOn(dangerAssessor, 'assess').mockResolvedValue({ needApproval: false, dangerReason: null });
+    const sessionMapper = { selectById: vi.fn(async () => null) };
+    const streamingWsRegistry = { hasConnection: vi.fn(() => true), send: vi.fn() };
+    const askUserQuestionsRegistry = { register: vi.fn(), waitForAnswer: vi.fn() };
+    const localToolSessionRegistry = { getUserIdForSession: vi.fn(async () => 9), isConnected: vi.fn(() => true) };
+    const treeSignalPublisher = { publishForSession: vi.fn() };
+    const dockerRouter = {
+      enabledFor: vi.fn(async () => opts.docker === true),
+      dispatch: vi.fn(async () => 'docker-ok'),
+    };
+    const dispatcher = new ToolDispatcher(
+      registry, localToolExecutor as never, dangerAssessor, sessionMapper as never, streamingWsRegistry as never,
+      askUserQuestionsRegistry as never, localToolSessionRegistry as never, treeSignalPublisher as never,
+      null, null, null, null, null, null, null, null, dockerRouter as never,
+    );
+    return { dispatcher, feishuSend, generate, task, readFile, dockerRouter, localToolExecutor, sessionMapper };
+  }
+
+  function invocation(toolName: string, extra: Record<string, unknown> = {}) {
+    return {
+      callId: 'c', toolName, argumentsJson: '{}',
+      executionMode: 'CLOUD', sessionId: 7, userId: 17, executionUserId: 67,
+      runtimeUserId: 67, workspace: 'ws', permissionLevel: 'FULL', modelConfig: null, sessionTools: null,
+      ...extra,
+    };
+  }
+
+  it('feishu_send_image（宿主回退分支）按运行身份读字节', async () => {
+    const { dispatcher, feishuSend } = build();
+    feishuSend.execute.mockResolvedValue('ok');
+    await dispatcher.dispatchInvocation(invocation('feishu_send_image') as never);
+    expect(feishuSend.execute).toHaveBeenCalledWith('{}', 7, 67, 'ws');
+  });
+
+  it('generate_image（SERVER_ONLY 分支）按运行身份落盘；task_create 保持归属身份', async () => {
+    const { dispatcher, generate, task } = build();
+    generate.execute.mockResolvedValue('ok');
+    task.execute.mockResolvedValue('ok');
+    await dispatcher.dispatchInvocation(invocation('generate_image') as never);
+    expect(generate.execute).toHaveBeenCalledWith('{}', 7, 67, 'ws');
+    await dispatcher.dispatchInvocation(invocation('task_create') as never);
+    expect(task.execute).toHaveBeenCalledWith('{}', 7, 17, 'ws');
+  });
+
+  it('docker 分支按运行身份路由容器', async () => {
+    const { dispatcher, dockerRouter } = build({ docker: true });
+    // agentId 按轮快照（2026-11-07 复合容器方案 §5.6）：ToolInvocation 携带、透传给路由
+    await dispatcher.dispatchInvocation(invocation('read_file', { agentId: 5 }) as never);
+    expect(dockerRouter.dispatch).toHaveBeenCalledWith('read_file', '{}', { userId: 67, agentId: 5, sessionId: 7, workspace: 'ws' });
+  });
+
+  it('docker 分支 agentId 缺省时按会话查库兜底', async () => {
+    const { dispatcher, dockerRouter, sessionMapper } = build({ docker: true });
+    sessionMapper.selectById.mockResolvedValue({ agentId: 9 });
+    const inv = invocation('read_file');
+    delete (inv as Record<string, unknown>).agentId;
+    await dispatcher.dispatchInvocation(inv as never);
+    expect(dockerRouter.dispatch).toHaveBeenCalledWith('read_file', '{}', { userId: 67, agentId: 9, sessionId: 7, workspace: 'ws' });
+  });
+
+  it('docker 分支会话不存在（agentId 不可得）时明确报错不派发', async () => {
+    const { dispatcher, dockerRouter, sessionMapper } = build({ docker: true });
+    sessionMapper.selectById.mockResolvedValue(null);
+    const inv = invocation('read_file');
+    delete (inv as Record<string, unknown>).agentId;
+    const result = await dispatcher.dispatchInvocation(inv as never);
+    expect(JSON.parse(result.content ?? '{}').error).toContain('无法确定会话 Agent');
+    expect(dockerRouter.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('runtimeUserId 缺省时回落 executionUserId（兼容旧调用）', async () => {
+    const { dispatcher, feishuSend } = build();
+    feishuSend.execute.mockResolvedValue('ok');
+    const inv = invocation('feishu_send_image');
+    delete (inv as Record<string, unknown>).runtimeUserId;
+    await dispatcher.dispatchInvocation(inv as never);
+    expect(feishuSend.execute).toHaveBeenCalledWith('{}', 7, 67, 'ws');
   });
 });

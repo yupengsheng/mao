@@ -37,6 +37,8 @@ export class SessionRunner {
   private reconnected = false;
   private currentText = '';
   private lastAssistantText = '';
+  /** 本轮 error 帧原文：打印 / JSON 模式据此输出失败原因，而不只给状态。 */
+  private lastErrorMessage: string | null = null;
   private usage: UsageRecord = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
   private toolCalls = new Map<string, ToolCallRecord>();
   private fileChanges: FileChangeRecord[] = [];
@@ -269,6 +271,7 @@ export class SessionRunner {
     this.busyRejectedEid = null;
     this.currentText = '';
     this.lastAssistantText = '';
+    this.lastErrorMessage = null;
     this.usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
     this.toolCalls.clear();
     this.fileChanges = [];
@@ -564,7 +567,8 @@ export class SessionRunner {
         this.emit({ type: 'activity', summary: d.summary != null ? String(d.summary) : undefined, status: d.status != null ? String(d.status) : undefined });
         break;
       case 'error':
-        this.emit({ type: 'error', message: String(d.message ?? 'Agent 执行异常') });
+        this.lastErrorMessage = String(d.message ?? 'Agent 执行异常');
+        this.emit({ type: 'error', message: this.lastErrorMessage });
         this.terminal = { phase: 'FAILED' };
         this.flushWaiters();
         break;
@@ -695,6 +699,7 @@ export class SessionRunner {
       durationMs: Math.max(0, this.now() - this.startedAt),
     };
     if (this.reconnected) result.reconnected = true;
+    if (this.lastErrorMessage != null) result.error = this.lastErrorMessage;
     this.renderer.finish?.(result);
     return result;
   }

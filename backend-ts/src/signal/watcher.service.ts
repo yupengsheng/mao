@@ -82,7 +82,8 @@ export interface WatcherInput {
   agentId: number;
   url: string;
   method: string;
-  headers: Record<string, string> | null;
+  /** 可选：undefined=请求头键未下发（复制时=沿用源行解密值），null=显式清空。 */
+  headers?: Record<string, string> | null;
   /** 可选：undefined=请求体键未下发（复制时=沿用源行），null=显式清空。 */
   body?: string | null;
   intervalMinutes: number;
@@ -714,9 +715,10 @@ export class WatcherService {
   private async applyCopyInheritance(userId: number, input: WatcherInput): Promise<WatcherInput> {
     const source = await this.requireOwned(userId, input.copyFrom!);
     const storedHeaders = this.decryptHeaders(source.headersJson);
-    const headers = input.headers != null
+    // 键未下发（undefined）= 整体继承源行解密值；显式 null = 清空，与 body 语义对齐。
+    const headers = input.headers !== undefined
       ? this.restoreMaskedHeaders(input.headers, storedHeaders)
-      : null;
+      : storedHeaders;
     let body = input.body;
     if (body === undefined && (input.method ?? 'GET').trim().toUpperCase() === 'POST') {
       body = this.decryptBody(source.body);

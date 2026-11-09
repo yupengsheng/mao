@@ -399,7 +399,13 @@ function summarizeAskUserQuestions(result: string | null | undefined): string {
   if (result == null) return '向用户提问';
   const node = asObj(parseJson(result));
   if (!node) return '向用户提问';
-  if (has(node, 'error')) return '向用户提问 (超时或取消)';
+  if (has(node, 'error')) {
+    // 只有结构化标记才能认定是「等用户回包」超时或会话取消；参数非法、通道不支持等
+    // 即时失败显示为错误，避免把真正的问题误报成用户未响应。
+    return node.cancelled === true || node.timed_out === true
+      ? '向用户提问 (超时或取消)'
+      : '向用户提问 (错误)';
+  }
   if (Array.isArray(node.answers)) return `向用户提问 (${node.answers.length} 个问题已回答)`;
   return '向用户提问';
 }
@@ -788,6 +794,7 @@ function summarizeWaitSubagents(result: string | null | undefined): string {
   if (!node) return '等待后台子代理';
   if (has(node, 'error')) return '等待后台子代理 (错误)';
   const completed = has(node, 'completed') ? Number(node.completed) : (Array.isArray(node.results) ? node.results.length : 0);
+  if (node.timed_out === true) return `等待后台子代理 (已超时，${completed} 个结果)`;
   return `后台子代理已完成 (${completed} 个结果)`;
 }
 

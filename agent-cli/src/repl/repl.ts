@@ -96,10 +96,27 @@ export async function runRepl(opts: ReplOptions): Promise<void> {
     }
   };
 
+  /** 消费排队输入：普通回合结束与启动续接结束共用，兑现「本轮结束自动发送」。 */
+  const drainQueuedPrompts = async (): Promise<void> => {
+    while (!closing && queue.length > 0) {
+      const next = queue.shift();
+      if (!next) break;
+      if (next.startsWith('/')) {
+        const handled = await handleSlash(next, opts, queue, { hint, print }, drainQueuedPrompts);
+        if (handled === 'exit') {
+          await requestExit();
+          return;
+        }
+        continue;
+      }
+      await runOne(next);
+    }
+  };
+
   const handleSubmit = async (text: string) => {
     if (!text) return;
     if (text.startsWith('/')) {
-      const handled = await handleSlash(text, opts, queue, { hint, print });
+      const handled = await handleSlash(text, opts, queue, { hint, print }, drainQueuedPrompts);
       if (handled === 'exit') await requestExit();
       return;
     }
@@ -113,19 +130,7 @@ export async function runRepl(opts: ReplOptions): Promise<void> {
       return;
     }
     await runOne(text);
-    while (!closing && queue.length > 0) {
-      const next = queue.shift();
-      if (!next) break;
-      if (next.startsWith('/')) {
-        const handled = await handleSlash(next, opts, queue, { hint, print });
-        if (handled === 'exit') {
-          await requestExit();
-          return;
-        }
-        continue;
-      }
-      await runOne(next);
-    }
+    await drainQueuedPrompts();
   };
 
   opts.renderer.setInputHandlers({
@@ -163,6 +168,7 @@ export async function runRepl(opts: ReplOptions): Promise<void> {
     } catch (err) {
       print(err instanceof Error ? err.message : String(err), 'err');
     }
+    await drainQueuedPrompts();
   }
 
   // 挂住直到退出：由 requestExit 直接 resolve，不做轮询
@@ -185,6 +191,7 @@ export async function handleSlash(
   opts: ReplOptions,
   queue: PromptQueue,
   io: SlashIo,
+  drainQueue?: () => Promise<void>,
 ): Promise<'exit' | void> {
   const [cmd, ...rest] = text.slice(1).split(/\s+/);
   const arg = rest.join(' ').trim();

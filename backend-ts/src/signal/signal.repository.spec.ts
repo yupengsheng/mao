@@ -40,8 +40,9 @@ describe('recordFailure 停用阈值（BUG-I 回归）', () => {
     expect(update).toBeDefined();
     expect(update!.sql).toContain("status = IF(consecutive_failures >= ?, 'DISABLED', status)");
     expect(update!.sql).not.toContain('consecutive_failures + 1 >=');
-    // 参数顺序：backoffMinutes, threshold, id
-    expect(update!.params).toEqual([30, 5, 1]);
+    // 参数顺序：backoffUntil, threshold, id
+    expect(update!.params[1]).toBe(5);
+    expect(update!.params[2]).toBe(1);
   });
 
   it('WHERE 仍限定 status = ACTIVE（PAUSED 不被误停用）', async () => {
@@ -49,6 +50,18 @@ describe('recordFailure 停用阈值（BUG-I 回归）', () => {
     await h.repo.recordFailure(1, 30, 5).catch(() => undefined);
     const update = h.calls.find((c) => c.sql.includes('consecutive_failures = consecutive_failures + 1'));
     expect(update!.sql).toContain("WHERE id = ? AND status = 'ACTIVE'");
+  });
+
+  it('退避时刻用 Node 时钟算好传参，不再混用 DATE_ADD(NOW())', async () => {
+    const h = capture();
+    await h.repo.recordFailure(1, 30, 5).catch(() => undefined);
+    const update = h.calls.find((c) => c.sql.includes('consecutive_failures = consecutive_failures + 1'));
+    expect(update).toBeDefined();
+    expect(update!.sql).not.toMatch(/NOW\(\)|DATE_ADD|INTERVAL/i);
+    expect(update!.sql).toContain('last_checked_at = ?');
+    const parsed = Date.parse(String(update!.params[0]).replace(' ', 'T') + '+08:00');
+    expect(Number.isNaN(parsed)).toBe(false);
+    expect(Math.abs(parsed - (Date.now() + 30 * 60_000))).toBeLessThan(3000);
   });
 });
 
