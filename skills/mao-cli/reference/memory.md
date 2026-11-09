@@ -12,7 +12,7 @@
 只沉淀明确的长期事实或偏好（如「输出报告用中文」「该仓库测试用 Vitest」）。猜测、闲聊、一次性任务细节不抽取；任务失败 / 取消不抽取。
 
 **在哪里管理？**
-桌面 / Web / 安卓设置页 →「长期记忆」。可新增、编辑、删除、忽略、恢复，以及一键关闭「任务完成后自动收集记忆」。
+桌面 / Web / 安卓设置页 →「长期记忆」。可新增、编辑、删除、忽略、恢复，以及一键关闭「任务完成后自动收集记忆」；列表支持按内容或项目关键词搜索，自动沉淀的记忆可从卡片跳回来源会话。
 
 **忽略（DISMISSED）和删除有什么区别？**
 忽略是软拒：条目保留、不再注入，自动抽取再次遇到相同内容时直接丢弃且不复活；删除是物理删除，后续任务再次抽到相同事实时允许重新插入为新记忆。
@@ -44,6 +44,7 @@
 | `scope` | 否 | `USER` / `PROJECT` |
 | `projectKey` | 否 | 项目标识过滤 |
 | `status` | 否 | `ACTIVE` / `DISMISSED` |
+| `keyword` | 否 | 关键词，对 `content` / `project_key` 做包含匹配（通配符按字面转义），可与 scope / status 叠加 |
 
 返回 `{ records, total, current, size }`，条目含 `id`、`scope`、`projectKey`、`content`、`source`（AUTO=自动抽取 / MANUAL=手写）、`status`、`originSessionId`、`createdAt`、`updatedAt`。
 
