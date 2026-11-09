@@ -433,7 +433,7 @@ export class SessionService {
       throw new BusinessException(ErrorCode.FORBIDDEN, '无权操作该会话');
     }
     if (source !== 'embed') {
-      throw new BusinessException(ErrorCode.PARAM_INVALID, "source 仅允许设置为 'embed'");
+      throw new BusinessException(ErrorCode.PARAM_INVALID, "source 仅允许 'embed'");
     }
     if (session.source === 'embed') {
       return session;
@@ -816,6 +816,8 @@ export class SessionService {
         // 边路提升继承执行端绑定：LOCAL 提升后保持设备名与定向投递。
         targetDeviceId: source.targetDeviceId,
         targetDeviceName: source.targetDeviceName,
+        // 边路提升继承来源，避免父会话与提升后的会话来源不一致。
+        source: source.source,
       };
       await txSessionRepo.insert(target);
       const targetId = target.id!;

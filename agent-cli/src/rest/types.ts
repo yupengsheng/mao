@@ -108,6 +108,8 @@ export interface CreateSessionRequest {
   targetDeviceId?: string | null;
   /** 执行端设备名快照（hostname），服务端仅用于离线展示。 */
   targetDeviceName?: string | null;
+  /** 客户端形态来源：终端 CLI 固定自报 'cli'（管理后台按来源筛选）。 */
+  source?: 'cli';
 }
 
 export interface CloudProject {

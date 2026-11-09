@@ -1450,6 +1450,8 @@ export class StreamingWsHandler {
       // 边路任务继承父会话执行端绑定：认领结果优先，其次父会话快照。
       targetDeviceId: sideTarget?.deviceId ?? parentSession.targetDeviceId ?? null,
       targetDeviceName: sideTarget?.deviceName ?? parentSession.targetDeviceName ?? null,
+      // 边路任务继承父会话来源：admin 按来源筛选时整棵子树保持一致。
+      source: parentSession.source,
     };
     await this.deps.sessionService.save(sideSession);
     const sideSessionId = sideSession.id!;

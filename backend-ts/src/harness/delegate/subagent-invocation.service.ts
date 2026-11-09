@@ -42,6 +42,8 @@ export class SubagentInvocationService {
         projectKey: parent.projectKey,
         parentSessionId: parent.id,
         sessionType: 'SUBAGENT',
+        // 子代理跟随父会话来源，admin 按来源筛选时与父保持一致。
+        source: parent.source,
         // 运行身份继承（技术方案 2026-11-04 §5.8）：子代理跟随父会话「本次执行身份」，
         // 缺失回落父会话归属；buildSubContext 按该身份构建子会话上下文（不回落 owner）。
         lastRuntimeUserId: parent.lastRuntimeUserId ?? parent.userId ?? null,

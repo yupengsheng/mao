@@ -31,6 +31,8 @@ export interface Session {
   targetDeviceId?: string | null;
   /** 执行端设备名快照（hostname，创建或认领时写入）。 */
   targetDeviceName?: string | null;
+  /** 会话来源（web / embed / desktop / cli / android / 系统来源），子代理继承父会话。 */
+  source?: string | null;
 }
 
 export interface Message {
