@@ -53,6 +53,11 @@
       </div>
 
       <div class="panel-content">
+        <!-- 索引加载失败错误条：仅列表确实为空时渲染，有数据（如手动刷新后恢复）不挡列表 -->
+        <div v-if="loadError && indexListEmpty" class="index-error-strip" role="alert">
+          <span class="index-error-text">任务列表加载失败</span>
+          <button type="button" class="index-error-retry" @click="emit('retry')">重试</button>
+        </div>
         <template v-if="listMode === 'standard'">
           <TaskSessionGroupList
             :loading="loading"
@@ -229,11 +234,14 @@ import { shouldDismissContextMenuForScroll } from '../../utils/contextMenuDismis
 const props = defineProps<{
   collapsed: boolean
   listMode?: 'standard' | 'focus'
+  /** 任务索引初始加载失败（TaskView 传入）：列表区顶部渲染错误条（静默失败可见化） */
+  loadError?: boolean
 }>()
 
 const emit = defineEmits<{
   toggle: []
   newTask: []
+  retry: []
   'update:listMode': [mode: 'standard' | 'focus']
   newTaskFromGroup: [payload: { agentId: string; executionMode: string; workspace?: string; cloudProjectKey?: string; permissionLevel?: string; modelId?: number }]
 }>()
@@ -252,6 +260,12 @@ const HISTORY_DAYS = 3
 
 const loading = computed(() => sessionStore.loading)
 const focusLoading = computed(() => sessionStore.focusLoading)
+/** 两种模式下的任务列表是否整体为空（错误条只在空列表时展示，避免盖住已有数据） */
+const indexListEmpty = computed(() =>
+  groupedSessions.value.length === 0
+  && focusedSessions.value.length === 0
+  && archivedSessions.value.length === 0
+)
 const archivedLoading = computed(() => sessionStore.archivedLoading)
 const activeSessionId = computed(() => sessionStore.activeSessionId)
 const confirmingDeleteId = ref<string | null>(null)
