@@ -794,7 +794,7 @@ describe('session and admin routes', () => {
     expect(created.code).toBe(0);
     expect(created.data.source).toBe('web'); // mock 返回默认 session()，真实落库在 service 层测
     const args = vi.mocked(sessionService.createSession).mock.calls[0];
-    expect(args[args.length - 1]).toBe('embed');
+    expect(args[args.length - 3]).toBe('embed');
     const bad = JSON.parse((await fastify.inject({
       method: 'POST', url: '/v1/sessions', payload: { title: 't', source: 'mobile' },
     })).body);
@@ -805,6 +805,28 @@ describe('session and admin routes', () => {
       method: 'POST', url: '/v1/sessions', payload: { title: 't', agentId: 9, source: 'signal' },
     })).body);
     expect(forged.code).toBe(2001);
+    expect(vi.mocked(sessionService.createSession).mock.calls).toHaveLength(1);
+    await fastify.close();
+  });
+
+  it('binds LOCAL target device on create and rejects invalid ids', async () => {
+    const { fastify, sessionService } = await app();
+    const ok = JSON.parse((await fastify.inject({
+      method: 'POST', url: '/v1/sessions', payload: {
+        title: 't', agentId: 9, executionMode: 'LOCAL', targetDeviceId: 'dev-a_1', targetDeviceName: '  Mac  ',
+      },
+    })).body);
+    expect(ok.code).toBe(0);
+    const args = vi.mocked(sessionService.createSession).mock.calls[0];
+    expect(args[16]).toBe('dev-a_1');
+    expect(args[17]).toBe('Mac');
+
+    for (const targetDeviceId of ['bad id!', 'x'.repeat(65)]) {
+      const bad = JSON.parse((await fastify.inject({
+        method: 'POST', url: '/v1/sessions', payload: { title: 't', agentId: 9, targetDeviceId },
+      })).body);
+      expect(bad.code, `targetDeviceId=${targetDeviceId}`).toBe(2001);
+    }
     expect(vi.mocked(sessionService.createSession).mock.calls).toHaveLength(1);
     await fastify.close();
   });

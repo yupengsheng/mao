@@ -38,7 +38,11 @@ describe('StreamingWsHandler', () => {
     closeConnection: vi.fn((socket: WsSocket, reason: string) => socket.close(1003, reason)),
     getUserId: vi.fn(), send: vi.fn(), subscribe: vi.fn(), unsubscribe: vi.fn(),
     register: vi.fn(), unregister: vi.fn(), hasLocalClientConnection: vi.fn(),
-    sendToLocalClients: vi.fn(), getActiveToolCalls: vi.fn(() => []), clearActiveToolCalls: vi.fn(),
+    sendToLocalClients: vi.fn(), sendToDevice: vi.fn(() => ({ targetCount: 0, successCount: 0, failureCount: 0 })),
+    sendToDeviceFamily: vi.fn(() => ({ targetCount: 1, successCount: 1, failureCount: 0 })),
+    hasDeviceConnection: vi.fn(() => false), getDeviceExecutorSocket: vi.fn(() => null), getDeviceId: vi.fn(() => null), getDeviceInfo: vi.fn(() => null),
+    getDevice: vi.fn(() => null), getOnlineDeviceIds: vi.fn(() => []), getRefreshResult: vi.fn(),
+    refreshAuthentication: vi.fn(() => false), getActiveToolCalls: vi.fn(() => []), clearActiveToolCalls: vi.fn(),
     isSessionThinking: vi.fn(() => false), setSessionThinking: vi.fn(),
     getSessionExecution: vi.fn(() => undefined), setSessionExecution: vi.fn(), clearSessionExecution: vi.fn(),
     getClientType: vi.fn(() => 'browser'), bindEmbedSession: vi.fn(), unbindEmbedSession: vi.fn(),
@@ -55,6 +59,7 @@ describe('StreamingWsHandler', () => {
     cleanupIncompleteTail: vi.fn(async () => 0), updateContextTokens: vi.fn(),
     getLastUserMessage: vi.fn(async () => message(3, 'USER')),
     deleteMessageById: vi.fn(async () => undefined),
+    claimTargetDevice: vi.fn(async () => null),
   };
   const taskTerminalService = {
     finishExecution: vi.fn(),
@@ -66,7 +71,8 @@ describe('StreamingWsHandler', () => {
     delete: vi.fn(), moveToIndex: vi.fn(), enqueueHead: vi.fn(async () => undefined),
   };
   const localToolSessionRegistry = {
-    setUserForSession: vi.fn(), isConnected: vi.fn(), failAllForSession: vi.fn(), failAllForUser: vi.fn(),
+    setTargetForSession: vi.fn(), resolveTarget: vi.fn(async () => null), isConnected: vi.fn(),
+    failAllForSession: vi.fn(), failAllForUser: vi.fn(), failAllForDevice: vi.fn(), failAllForSocket: vi.fn(),
     completeToolRequest: vi.fn(), completeToolRequestError: vi.fn(),
   };
   const embedPageToolRegistry = {
@@ -77,7 +83,7 @@ describe('StreamingWsHandler', () => {
     failAllForSession: vi.fn(), getPendingForSession: vi.fn(() => []), complete: vi.fn(),
   };
   const treeSignalPublisher = { publishIfSideTask: vi.fn(), publishForSession: vi.fn() };
-  const approvalRegistry = { unregister: vi.fn() };
+  const approvalRegistry = { unregister: vi.fn(), getPendingForSession: vi.fn(() => []) };
   const activityService = { record: vi.fn() };
   const activityHeartbeat = { touch: vi.fn(), clear: vi.fn() };
   const sessionTodoMapper = { deleteBySessionId: vi.fn(), selectBySessionId: vi.fn(async () => []) };
@@ -636,10 +642,10 @@ describe('StreamingWsHandler', () => {
     await handler.handleTextMessage(ws, JSON.stringify({ type: 'send_message', sessionId: 11, data: { content: 'hello', images: ['img'] } }));
     expect(registry.send).toHaveBeenCalled();
     expect(harnessService.executeFromEvent).not.toHaveBeenCalled();
-    sessionService.getSession.mockResolvedValue(session('LOCAL', 'IDLE'));
+    sessionService.getSession.mockResolvedValue({ ...session('LOCAL', 'IDLE'), id: 12 });
     localToolSessionRegistry.isConnected.mockReturnValue(false);
     await handler.handleTextMessage(ws, JSON.stringify({ type: 'send_message', sessionId: 12, data: { content: 'hello' } }));
-    expect(localToolSessionRegistry.setUserForSession).toHaveBeenCalledWith(12, 7);
+    expect(localToolSessionRegistry.setTargetForSession).toHaveBeenCalledWith(12, 7, null);
   });
 
   it('releases the execution claim when the local client is disconnected', async () => {
@@ -775,9 +781,24 @@ describe('StreamingWsHandler', () => {
     sessionService.getSession.mockResolvedValue(session('LOCAL', 'WAITING_APPROVAL'));
     await handler.handleTextMessage(ws, JSON.stringify({ type: 'subscribe', sessionId: 11 }));
     expect(registry.subscribe).toHaveBeenCalledWith(7, 11);
-    expect(localToolSessionRegistry.setUserForSession).toHaveBeenCalledWith(11, 7);
+    expect(localToolSessionRegistry.setTargetForSession).toHaveBeenCalledWith(11, 7, null);
     expect(registry.send).toHaveBeenCalledWith(7, expect.objectContaining({
       type: 'session_snapshot', sessionId: 11, data: expect.objectContaining({ phase: 'WAITING_APPROVAL' }),
+    }));
+  });
+
+  it('replaysPendingApprovalsOnSubscribe', async () => {
+    vi.clearAllMocks();
+    registry.getUserId.mockReturnValue(7);
+    sessionService.getSession.mockResolvedValue(session('LOCAL', 'WAITING_APPROVAL'));
+    approvalRegistry.getPendingForSession.mockReturnValueOnce([{
+      requestId: 'req-replay', toolName: 'shell', arguments: '{}', argumentsTruncated: false, workspace: '/repo',
+    }]);
+    await handler.handleTextMessage(ws, JSON.stringify({ type: 'subscribe', sessionId: 11 }));
+    expect(approvalRegistry.getPendingForSession).toHaveBeenCalledWith(11);
+    expect(registry.send).toHaveBeenCalledWith(7, expect.objectContaining({
+      type: 'tool_approval_request', sessionId: 11,
+      data: expect.objectContaining({ requestId: 'req-replay' }),
     }));
   });
 
@@ -896,7 +917,7 @@ describe('StreamingWsHandler', () => {
     registry.hasLocalClientConnection.mockReturnValue(false);
     const connected: WsSocket = { id: 'ws-1', readyState: WS_OPEN, send: vi.fn(), close: vi.fn() };
     await handler.handleTextMessage(connected, JSON.stringify({ type: 'auth', token: 'valid.jwt.token', client: 'electron' }));
-    expect(registry.register).toHaveBeenCalledWith(connected, 7, 'electron', authMetadata, true);
+    expect(registry.register).toHaveBeenCalledWith(connected, 7, 'electron', authMetadata, true, null);
     expect(registry.sendToConnection).toHaveBeenCalledWith(connected, expect.objectContaining({ type: 'connected' }));
     // 已认证连接再次发 auth 应为无害 no-op（不重复注册）
     registry.register.mockClear();
@@ -906,6 +927,76 @@ describe('StreamingWsHandler', () => {
     handler.handleTransportError(connected);
     expect(localToolSessionRegistry.failAllForUser).toHaveBeenCalledTimes(2);
     expect(askUserQuestionsRegistry.failAllForSession).not.toHaveBeenCalled();
+  });
+
+  it('failsOnlyPendingToolRequestsDispatchedToClosingSocket', () => {
+    vi.clearAllMocks();
+    registry.getUserId.mockReturnValue(7);
+    registry.getDeviceId.mockReturnValue('dev-a');
+    registry.hasDeviceConnection.mockReturnValue(true);
+    registry.hasLocalClientConnection.mockReturnValue(true);
+    handler.afterConnectionClosed(ws);
+    expect(localToolSessionRegistry.failAllForSocket).toHaveBeenCalledWith(ws);
+    expect(localToolSessionRegistry.failAllForDevice).not.toHaveBeenCalled();
+    expect(localToolSessionRegistry.failAllForUser).not.toHaveBeenCalled();
+  });
+
+  it('failsAllDeviceRequestsWhenDeviceHasNoConnectionLeft', () => {
+    vi.clearAllMocks();
+    registry.getUserId.mockReturnValue(7);
+    registry.getDeviceId.mockReturnValue('dev-a');
+    registry.hasDeviceConnection.mockReturnValue(false);
+    registry.hasLocalClientConnection.mockReturnValue(false);
+    handler.afterConnectionClosed(ws);
+    expect(localToolSessionRegistry.failAllForSocket).toHaveBeenCalledWith(ws);
+    expect(localToolSessionRegistry.failAllForDevice).toHaveBeenCalledWith(7, 'dev-a');
+    expect(localToolSessionRegistry.failAllForUser).toHaveBeenCalledWith(7);
+  });
+
+  it('claimsUnboundLocalSessionWhenElectronSubscribesToIdleSession', async () => {
+    vi.clearAllMocks();
+    registry.getUserId.mockReturnValue(7);
+    registry.getDeviceInfo.mockReturnValue({ id: 'dev-a', name: 'Mac A', platform: 'darwin' });
+    registry.getOnlineDeviceIds.mockReturnValue([]);
+    localToolSessionRegistry.resolveTarget.mockResolvedValue(null);
+    sessionService.getSession.mockResolvedValue({ ...session('LOCAL', 'IDLE'), id: 11, platform: 'darwin' });
+    sessionService.claimTargetDevice.mockResolvedValue({ targetDeviceId: 'dev-a', targetDeviceName: 'Mac A' });
+
+    await handler.handleTextMessage(ws, JSON.stringify({ type: 'subscribe', sessionId: 11 }));
+
+    expect(sessionService.claimTargetDevice).toHaveBeenCalledWith(11, 'dev-a', 'Mac A');
+    expect(localToolSessionRegistry.setTargetForSession).toHaveBeenCalledWith(11, 7, 'dev-a');
+  });
+
+  it('doesNotClaimOnBrowserSubscribeToIdleSession', async () => {
+    vi.clearAllMocks();
+    registry.getUserId.mockReturnValue(7);
+    registry.getDeviceInfo.mockReturnValue(null);
+    registry.getOnlineDeviceIds.mockReturnValue(['dev-a']);
+    registry.getDevice.mockReturnValue({ id: 'dev-a', name: 'Mac A', platform: 'darwin' });
+    localToolSessionRegistry.resolveTarget.mockResolvedValue(null);
+    sessionService.getSession.mockResolvedValue({ ...session('LOCAL', 'IDLE'), id: 11, platform: 'darwin' });
+
+    await handler.handleTextMessage(ws, JSON.stringify({ type: 'subscribe', sessionId: 11 }));
+
+    expect(sessionService.claimTargetDevice).not.toHaveBeenCalled();
+    expect(localToolSessionRegistry.setTargetForSession).not.toHaveBeenCalled();
+  });
+
+  it('claimsOnBrowserSubscribeToActiveSessionViaUniqueOnlineDevice', async () => {
+    vi.clearAllMocks();
+    registry.getUserId.mockReturnValue(7);
+    registry.getDeviceInfo.mockReturnValue(null);
+    registry.getOnlineDeviceIds.mockReturnValue(['dev-a']);
+    registry.getDevice.mockReturnValue({ id: 'dev-a', name: 'Mac A', platform: 'darwin' });
+    localToolSessionRegistry.resolveTarget.mockResolvedValue(null);
+    sessionService.getSession.mockResolvedValue({ ...session('LOCAL', 'RUNNING'), id: 11, platform: 'darwin' });
+    sessionService.claimTargetDevice.mockResolvedValue({ targetDeviceId: 'dev-a', targetDeviceName: 'Mac A' });
+
+    await handler.handleTextMessage(ws, JSON.stringify({ type: 'subscribe', sessionId: 11 }));
+
+    expect(sessionService.claimTargetDevice).toHaveBeenCalledWith(11, 'dev-a', 'Mac A');
+    expect(localToolSessionRegistry.setTargetForSession).toHaveBeenCalledWith(11, 7, 'dev-a');
   });
 
   it('closes unauthenticated connections that send non-auth messages', async () => {
@@ -924,7 +1015,7 @@ describe('StreamingWsHandler', () => {
     const connected: WsSocket = { id: 'ws-embed', readyState: WS_OPEN, send: vi.fn(), close: vi.fn() };
     // 大小写不敏感归一化为 'embed'
     await handler.handleTextMessage(connected, JSON.stringify({ type: 'auth', token: 'valid.jwt.token', client: 'Embed' }));
-    expect(registry.register).toHaveBeenCalledWith(connected, 7, 'embed', authMetadata, true);
+    expect(registry.register).toHaveBeenCalledWith(connected, 7, 'embed', authMetadata, true, null);
   });
 
   it('authFramePageEnabledFalseIsPassedToRegistry', async () => {
@@ -935,7 +1026,7 @@ describe('StreamingWsHandler', () => {
     await handler.handleTextMessage(connected, JSON.stringify({
       type: 'auth', token: 'valid.jwt.token', client: 'embed', pageEnabled: false,
     }));
-    expect(registry.register).toHaveBeenCalledWith(connected, 7, 'embed', authMetadata, false);
+    expect(registry.register).toHaveBeenCalledWith(connected, 7, 'embed', authMetadata, false, null);
   });
 
   it('authFramePageEnabledNonBooleanFallsBackToTrue', async () => {
@@ -947,7 +1038,7 @@ describe('StreamingWsHandler', () => {
     await handler.handleTextMessage(connected, JSON.stringify({
       type: 'auth', token: 'valid.jwt.token', client: 'embed', pageEnabled: 'false',
     }));
-    expect(registry.register).toHaveBeenCalledWith(connected, 7, 'embed', authMetadata, true);
+    expect(registry.register).toHaveBeenCalledWith(connected, 7, 'embed', authMetadata, true, null);
   });
 
   it('subscribeRePushesPendingAskUserQuestionsOnReconnect', async () => {
@@ -1000,7 +1091,7 @@ describe('StreamingWsHandler', () => {
     registry.getUserId.mockReturnValue(null);
     jwtService.getAccessTokenMetadata.mockReturnValue(authMetadata);
     await handler.handleTextMessage(ws, JSON.stringify({ type: 'auth', token: 'ok', client: 'cli' }));
-    expect(registry.register).toHaveBeenCalledWith(ws, 7, 'cli', authMetadata, true);
+    expect(registry.register).toHaveBeenCalledWith(ws, 7, 'cli', authMetadata, true, null);
   });
 
   it('autoConsumesQueuedMessageAfterExecutionCompletes', async () => {
@@ -1371,6 +1462,84 @@ describe('StreamingWsHandler', () => {
     }));
     registry.hasLocalClientConnection.mockReset();
     localToolSessionRegistry.isConnected.mockReset();
+  });
+
+  it('localSessionSkillSyncReachesEveryConnectionOfTheDeviceSoDesktopCanAnswerForAnOfflineCliConnection', async () => {
+    // 回归：mao-agent 建的 LOCAL 会话绑定 CLI 的设备，用户在桌面端对话。
+    // 桌面端与 mao-agent 共用 ~/.mao/agent-cli/device.json 拿到同一个 deviceId，但它们是
+    // 两条独立 WS 连接；mao-agent 退出后它的连接可能仍在（半死空壳，收到请求也不回报）。
+    // 只按 deviceExecutors 里那一条投递时桌面端收不到 skill_sync_required，
+    // 60s 后会话失败（线上 session 2297）。
+    vi.clearAllMocks();
+    executor.tasks.length = 0;
+    registry.getUserId.mockReturnValue(7);
+    sessionService.getSession.mockResolvedValue(session('LOCAL', 'IDLE'));
+    sessionService.saveMessage.mockResolvedValue(message(130, 'USER'));
+    harnessService.prepareMessage.mockResolvedValue('local-echo');
+    localToolSessionRegistry.isConnected.mockResolvedValue(true);
+    registry.hasLocalClientConnection.mockReturnValue(true);
+    // 会话已绑定 CLI 设备（离线）。绑定不可改绑，但桌面端与 mao-agent 共用同一 deviceId，
+    // 同步帧仍按 deviceId 投给该设备下所有存活连接，桌面端可直接接手响应。
+    localToolSessionRegistry.resolveTarget.mockResolvedValue({ userId: 7, deviceId: 'shared-device' });
+    registry.hasDeviceConnection.mockReturnValue(false);
+    // 客户端回报完成：echo 服务端刚下发的 syncId（handleSkillSyncDone 按轮次匹配）
+    registry.sendToDeviceFamily.mockImplementationOnce((_userId: number, _deviceId: string, event: { data?: { syncId?: string } }) => {
+      void handler.handleTextMessage(ws, JSON.stringify({
+        type: 'skill_sync_done', sessionId: 11, success: true, syncId: event?.data?.syncId,
+      }));
+      return { targetCount: 1, successCount: 1, failureCount: 0 };
+    });
+    harnessService.executeFromEvent.mockImplementation(async () => undefined);
+
+    await handler.handleTextMessage(ws, JSON.stringify({
+      type: 'send_message', sessionId: 11, data: { content: '看下我电脑的硬盘情况' },
+    }));
+    await executor.runAll();
+
+    // 技能同步帧必须按 deviceId 覆盖同机所有连接，而不是只发给 deviceExecutors 里那一条
+    expect(registry.sendToDeviceFamily).toHaveBeenCalledWith(
+      7, 'shared-device', expect.objectContaining({ type: 'skill_sync_required', sessionId: 11 }),
+    );
+    // 同步成功，执行继续
+    expect(harnessService.executeFromEvent).toHaveBeenCalled();
+    expect(taskTerminalService.finishExecution).not.toHaveBeenCalledWith(
+      11, 7, 'FAILED', expect.anything(), expect.anything(),
+    );
+    registry.hasLocalClientConnection.mockReset();
+    localToolSessionRegistry.isConnected.mockReset();
+    localToolSessionRegistry.resolveTarget.mockReset();
+    localToolSessionRegistry.resolveTarget.mockResolvedValue(null);
+  });
+
+  it('localSessionSkillSyncFailsFastInsteadOfWaiting60sWhenNoLocalClientCanBeDelivered', async () => {
+    // 回归：设备族里一个可投递连接都没有（整机离线）时，必须立刻以真实原因失败，
+    // 不再空等 60s 超时（超时文案会把「客户端没连上」误导成「客户端没回应」）。
+    vi.clearAllMocks();
+    executor.tasks.length = 0;
+    registry.getUserId.mockReturnValue(7);
+    sessionService.getSession.mockResolvedValue(session('LOCAL', 'IDLE'));
+    sessionService.saveMessage.mockResolvedValue(message(131, 'USER'));
+    harnessService.prepareMessage.mockResolvedValue('local-no-delivery');
+    localToolSessionRegistry.isConnected.mockResolvedValue(true);
+    registry.hasLocalClientConnection.mockReturnValue(true);
+    localToolSessionRegistry.resolveTarget.mockResolvedValue({ userId: 7, deviceId: 'cli-device' });
+    registry.hasDeviceConnection.mockReturnValue(false);
+    registry.sendToDeviceFamily.mockReturnValueOnce({ targetCount: 0, successCount: 0, failureCount: 0 });
+
+    await handler.handleTextMessage(ws, JSON.stringify({
+      type: 'send_message', sessionId: 11, data: { content: 'hello' },
+    }));
+    await executor.runAll();
+
+    expect(harnessService.executeFromEvent).not.toHaveBeenCalled();
+    expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(
+      11, 7, 'FAILED', 'local-no-delivery', expect.stringContaining('没有可用的本地执行端连接'),
+      'MANUAL', null,
+    );
+    registry.hasLocalClientConnection.mockReset();
+    localToolSessionRegistry.isConnected.mockReset();
+    localToolSessionRegistry.resolveTarget.mockReset();
+    localToolSessionRegistry.resolveTarget.mockResolvedValue(null);
   });
 
   it('localSessionFailsWithConnectionReasonWhenNoLocalClientIsRegistered', async () => {
@@ -2013,7 +2182,11 @@ describe('StreamingWsHandler tool_approval.alwaysAllow（V135）', () => {
     closeConnection: vi.fn((socket: WsSocket, reason: string) => socket.close(1003, reason)),
     getUserId: vi.fn(), send: vi.fn(), subscribe: vi.fn(), unsubscribe: vi.fn(),
     register: vi.fn(), unregister: vi.fn(), hasLocalClientConnection: vi.fn(),
-    sendToLocalClients: vi.fn(), getActiveToolCalls: vi.fn(() => []), clearActiveToolCalls: vi.fn(),
+    sendToLocalClients: vi.fn(), sendToDevice: vi.fn(() => ({ targetCount: 0, successCount: 0, failureCount: 0 })),
+    sendToDeviceFamily: vi.fn(() => ({ targetCount: 1, successCount: 1, failureCount: 0 })),
+    hasDeviceConnection: vi.fn(() => false), getDeviceExecutorSocket: vi.fn(() => null), getDeviceId: vi.fn(() => null), getDeviceInfo: vi.fn(() => null),
+    getDevice: vi.fn(() => null), getOnlineDeviceIds: vi.fn(() => []), getRefreshResult: vi.fn(),
+    refreshAuthentication: vi.fn(() => false), getActiveToolCalls: vi.fn(() => []), clearActiveToolCalls: vi.fn(),
     isSessionThinking: vi.fn(() => false), setSessionThinking: vi.fn(),
     getClientType: vi.fn(() => 'browser'), bindEmbedSession: vi.fn(), unbindEmbedSession: vi.fn(),
     getEmbedSessionsForConnection: vi.fn(() => []), getEmbedSessionConnection: vi.fn(() => null),
@@ -2027,6 +2200,7 @@ describe('StreamingWsHandler tool_approval.alwaysAllow（V135）', () => {
     findOwnedMessage: vi.fn(async () => null), listSubagentSessions: vi.fn(async () => []),
     cleanupIncompleteTail: vi.fn(async () => 0), updateContextTokens: vi.fn(),
     getLastUserMessage: vi.fn(async () => null), deleteMessageById: vi.fn(async () => undefined),
+    claimTargetDevice: vi.fn(async () => null),
   };
   const taskTerminalService = { finishExecution: vi.fn() };
   const messageQueueService = {
@@ -2034,14 +2208,20 @@ describe('StreamingWsHandler tool_approval.alwaysAllow（V135）', () => {
     delete: vi.fn(), moveToIndex: vi.fn(), enqueueHead: vi.fn(async () => undefined),
   };
   const localToolSessionRegistry = {
-    setUserForSession: vi.fn(), isConnected: vi.fn(), failAllForSession: vi.fn(), failAllForUser: vi.fn(),
+    setTargetForSession: vi.fn(), resolveTarget: vi.fn(async () => null), isConnected: vi.fn(),
+    failAllForSession: vi.fn(), failAllForUser: vi.fn(), failAllForDevice: vi.fn(), failAllForSocket: vi.fn(),
     completeToolRequest: vi.fn(), completeToolRequestError: vi.fn(),
   };
   const embedPageToolRegistry = { request: vi.fn(), complete: vi.fn(), failSession: vi.fn(), isEmbedSession: vi.fn(() => false) };
   const askUserQuestionsRegistry = { failAllForSession: vi.fn(), getPendingForSession: vi.fn(() => []), complete: vi.fn() };
   const treeSignalPublisher = { publishIfSideTask: vi.fn(), publishForSession: vi.fn() };
-  const approvalRegistry = { unregister: vi.fn(), takeHint: vi.fn() };
-  const takeHint = approvalRegistry.takeHint;
+  const approvalRegistry = {
+    unregister: vi.fn(),
+    has: vi.fn(() => true),
+    claim: vi.fn(async () => ({ removed: true, hint: null as { ruleType: string; ruleValue: string; label: string } | null })),
+    getRecentResolution: vi.fn(() => null),
+    getPendingForSession: vi.fn(() => []),
+  };
   const activityService = { record: vi.fn() };
   const activityHeartbeat = { touch: vi.fn(), clear: vi.fn() };
   const sessionTodoMapper = { deleteBySessionId: vi.fn(), selectBySessionId: vi.fn(async () => []) };
@@ -2086,7 +2266,9 @@ describe('StreamingWsHandler tool_approval.alwaysAllow（V135）', () => {
     }));
     expect(suppressByRequest).toHaveBeenCalledWith(11, 'req-esc');
     expect(localToolSessionRegistry.completeToolRequest).not.toHaveBeenCalled();
-    expect(approvalRegistry.unregister).toHaveBeenCalledWith(11, 'req-esc', 'APPROVED');
+    expect(approvalRegistry.claim).toHaveBeenCalledWith(
+      11, 'req-esc', { approved: true, alwaysAllow: false }, 'APPROVED',
+    );
   });
 
   it('deniedApprovalAlsoSuppressesEscalation', async () => {
@@ -2108,34 +2290,40 @@ describe('StreamingWsHandler tool_approval.alwaysAllow（V135）', () => {
     await buildHandler({ approvalEscalationSuppressor: { suppressByRequest } }).handleTextMessage(ws, JSON.stringify({
       type: 'tool_approval', sessionId: 11, requestId: 'req-err', approved: true,
     }));
-    expect(approvalRegistry.unregister).toHaveBeenCalledWith(11, 'req-err', 'APPROVED');
+    expect(approvalRegistry.claim).toHaveBeenCalledWith(
+      11, 'req-err', { approved: true, alwaysAllow: false }, 'APPROVED',
+    );
   });
 
-  it('approvedAlwaysAllowConsumesHintAndCreatesSessionRule', async () => {
+  it('approvedAlwaysAllowConsumesHintFromClaimAndCreatesSessionRule', async () => {
     vi.clearAllMocks();
     registry.getUserId.mockReturnValue(7);
     sessionService.getSession.mockResolvedValue(session('LOCAL', 'WAITING_APPROVAL'));
     const hint = { ruleType: 'SHELL_PREFIX' as const, ruleValue: 'npm run', label: '本会话总是允许以 npm run 开头的命令' };
-    takeHint.mockReturnValue(hint);
+    approvalRegistry.claim.mockResolvedValueOnce({ removed: true, hint });
     await buildHandler().handleTextMessage(ws, JSON.stringify({
       type: 'tool_approval', sessionId: 11, requestId: 'req-1', approved: true, alwaysAllow: true,
     }));
-    expect(takeHint).toHaveBeenCalledWith(11, 'req-1');
     expect(createSessionRuleFromAlwaysAllow).toHaveBeenCalledWith(7, 11, hint);
-    expect(approvalRegistry.unregister).toHaveBeenCalledWith(11, 'req-1', 'APPROVED');
+    expect(approvalRegistry.claim).toHaveBeenCalledWith(
+      11, 'req-1', { approved: true, alwaysAllow: true }, 'APPROVED',
+    );
   });
 
   it('denyFrameNeverCreatesRuleEvenWithAlwaysAllow', async () => {
     vi.clearAllMocks();
     registry.getUserId.mockReturnValue(7);
     sessionService.getSession.mockResolvedValue(session('LOCAL', 'WAITING_APPROVAL'));
-    takeHint.mockReturnValue({ ruleType: 'SHELL_PREFIX', ruleValue: 'npm run', label: 'x' });
+    approvalRegistry.claim.mockResolvedValueOnce({
+      removed: true, hint: { ruleType: 'SHELL_PREFIX', ruleValue: 'npm run', label: 'x' },
+    });
     await buildHandler().handleTextMessage(ws, JSON.stringify({
       type: 'tool_approval', sessionId: 11, requestId: 'req-2', approved: false, alwaysAllow: true,
     }));
-    expect(takeHint).not.toHaveBeenCalled();
     expect(createSessionRuleFromAlwaysAllow).not.toHaveBeenCalled();
-    expect(approvalRegistry.unregister).toHaveBeenCalledWith(11, 'req-2', 'DENIED');
+    expect(approvalRegistry.claim).toHaveBeenCalledWith(
+      11, 'req-2', { approved: false, alwaysAllow: true }, 'DENIED',
+    );
   });
 
   it('missingHintOrMissingRuleServiceFallsBackToPlainExecution', async () => {
@@ -2143,23 +2331,59 @@ describe('StreamingWsHandler tool_approval.alwaysAllow（V135）', () => {
     registry.getUserId.mockReturnValue(7);
     sessionService.getSession.mockResolvedValue(session('LOCAL', 'WAITING_APPROVAL'));
     // hint 不在缓存（超时/重启/重发已消费）→ 忽略 alwaysAllow 只执行
-    takeHint.mockReturnValue(null);
+    approvalRegistry.claim.mockResolvedValueOnce({ removed: true, hint: null });
     await buildHandler().handleTextMessage(ws, JSON.stringify({
       type: 'tool_approval', sessionId: 11, requestId: 'req-3', approved: true, alwaysAllow: true,
     }));
     expect(createSessionRuleFromAlwaysAllow).not.toHaveBeenCalled();
-    expect(approvalRegistry.unregister).toHaveBeenCalledWith(11, 'req-3', 'APPROVED');
+    expect(approvalRegistry.claim).toHaveBeenCalledWith(
+      11, 'req-3', { approved: true, alwaysAllow: true }, 'APPROVED',
+    );
   });
 
   it('ruleCreationFailureDoesNotBlockUnregister', async () => {
     vi.clearAllMocks();
     registry.getUserId.mockReturnValue(7);
     sessionService.getSession.mockResolvedValue(session('LOCAL', 'WAITING_APPROVAL'));
-    takeHint.mockReturnValue({ ruleType: 'SHELL_PREFIX', ruleValue: 'npm run', label: 'x' });
+    approvalRegistry.claim.mockResolvedValueOnce({
+      removed: true, hint: { ruleType: 'SHELL_PREFIX', ruleValue: 'npm run', label: 'x' },
+    });
     createSessionRuleFromAlwaysAllow.mockRejectedValueOnce(new Error('db down'));
     await buildHandler().handleTextMessage(ws, JSON.stringify({
       type: 'tool_approval', sessionId: 11, requestId: 'req-4', approved: true, alwaysAllow: true,
     }));
-    expect(approvalRegistry.unregister).toHaveBeenCalledWith(11, 'req-4', 'APPROVED');
+    expect(approvalRegistry.claim).toHaveBeenCalledWith(
+      11, 'req-4', { approved: true, alwaysAllow: true }, 'APPROVED',
+    );
+  });
+
+  it('losingFrameSkipsRuleTreeAndSuppress', async () => {
+    vi.clearAllMocks();
+    registry.getUserId.mockReturnValue(7);
+    sessionService.getSession.mockResolvedValue(session('LOCAL', 'WAITING_APPROVAL'));
+    const suppressByRequest = vi.fn(async () => undefined);
+    approvalRegistry.claim.mockResolvedValueOnce({ removed: false, hint: null });
+    await buildHandler({ approvalEscalationSuppressor: { suppressByRequest } }).handleTextMessage(ws, JSON.stringify({
+      type: 'tool_approval', sessionId: 11, requestId: 'req-5', approved: true, alwaysAllow: true,
+    }));
+    expect(createSessionRuleFromAlwaysAllow).not.toHaveBeenCalled();
+    expect(treeSignalPublisher.publishForSession).not.toHaveBeenCalled();
+    expect(suppressByRequest).not.toHaveBeenCalled();
+  });
+
+  it('nonPendingFrameResendsRecentResolutionOnlyToItsConnection', async () => {
+    vi.clearAllMocks();
+    registry.getUserId.mockReturnValue(7);
+    sessionService.getSession.mockResolvedValue(session('LOCAL', 'WAITING_APPROVAL'));
+    approvalRegistry.has.mockReturnValueOnce(false);
+    approvalRegistry.getRecentResolution.mockReturnValueOnce({ approved: true, alwaysAllow: false });
+    await buildHandler().handleTextMessage(ws, JSON.stringify({
+      type: 'tool_approval', sessionId: 11, requestId: 'req-6', approved: true,
+    }));
+    expect(approvalRegistry.claim).not.toHaveBeenCalled();
+    expect(registry.sendToConnection).toHaveBeenCalledWith(
+      ws,
+      expect.objectContaining({ type: 'tool_approval_resolved', sessionId: 11, data: { requestId: 'req-6', approved: true } }),
+    );
   });
 });

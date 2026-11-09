@@ -34,6 +34,7 @@ interface RunnerOptions {
   executeError?: Error;
   recoveryDeps?: CrashRecoveryDeps;
   lastRuntimeUserId?: number | null;
+  executionMode?: 'LOCAL' | 'CLOUD';
 }
 
 function makeRunner(
@@ -45,6 +46,7 @@ function makeRunner(
   const session = {
     id: 7, userId: 42, sessionType: 'DEFAULT', phase: 'RUNNING', modelId: null,
     lastRuntimeUserId: options.lastRuntimeUserId ?? null,
+    executionMode: options.executionMode,
   };
   const sessionMapper = {
     selectByPhase: vi.fn().mockResolvedValue([session]),
@@ -351,6 +353,40 @@ describe('CrashRecoveryRunner.recoverFailedSessions', () => {
     const third = await runner.recoverFailedSessions([7, 7]);
     expect(third.accepted).toEqual([7]);
     expect(submitted).toHaveLength(2);
+    await Promise.all(submitted.map((fn) => fn()));
+  });
+
+  it('rejectsConcurrentDuplicateSubmitsAcrossAwaitGap', async () => {
+    // 并发回归：recovering 检查与占位之间隔着 selectById 的 await——两笔并发请求若都
+    // 在对方 add 前通过 has 检查，同一会话会被提交两次（执行池多 worker 下双跑）。
+    const { runner, sessionMapper, submitted } = makeFailedRunner();
+    interface SessionRow {
+      id: number;
+      userId: number;
+      sessionType: string;
+      phase: string;
+      executionMode: string;
+      modelId: null;
+      lastRuntimeUserId: number;
+    }
+    let resolveSelect!: (session: SessionRow) => void;
+    const session: SessionRow = {
+      id: 7, userId: 42, sessionType: 'NORMAL', phase: 'FAILED',
+      executionMode: 'CLOUD', modelId: null, lastRuntimeUserId: 67,
+    };
+    (sessionMapper.selectById as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      () => new Promise<SessionRow>((resolve) => { resolveSelect = resolve; }),
+    );
+    const first = runner.recoverFailedSessions([7]);
+    // 让 first 通过 has 检查、同步占位并挂起在 selectById 上
+    await Promise.resolve();
+    const second = await runner.recoverFailedSessions([7]);
+    expect(second.accepted).toEqual([]);
+    expect(second.skipped).toEqual([{ id: 7, reason: 'RECOVERING' }]);
+    resolveSelect(session);
+    const firstResult = await first;
+    expect(firstResult.accepted).toEqual([7]);
+    expect(submitted).toHaveLength(1);
     await Promise.all(submitted.map((fn) => fn()));
   });
 
@@ -1125,7 +1161,63 @@ describe('CrashRecoveryRunner orphan sweep', () => {
     expect(sessionMapper.selectById).toHaveBeenCalledWith(14);
   });
 
-  it('recoversOrphanOnIntervalAndStopsAfterStopPeriodicSweep', async () => {    vi.useFakeTimers();
+  describe('LOCAL 会话恢复前的执行端可达性预检', () => {
+    it('skipsRecoveryAndFailsFastWhenTheLocalExecutorIsUnreachable', async () => {
+      // 回归（线上 session 2297）：后端重启后恢复执行跑到技能同步才失败，用户看到的是
+      // 60s 等待 + 误导性超时文案。设备离线时应直接判失败并给出可执行文案。
+      const localToolSessions = { isConnected: vi.fn(async () => false) };
+      const { runner, pending, taskTerminalService, harnessService, onExecutionFinished } = makeRunner(
+        undefined,
+        { executionMode: 'LOCAL', recoveryDeps: { localToolSessions } },
+      );
+
+      await runner.run();
+      await Promise.all(pending);
+
+      expect(localToolSessions.isConnected).toHaveBeenCalledWith(7);
+      expect(harnessService.execute).not.toHaveBeenCalled();
+      expect(taskTerminalService.finishExecution).toHaveBeenCalledWith(
+        7, 42, 'FAILED', expect.any(String), expect.stringContaining('本地执行端未连接'),
+        'MANUAL', null,
+      );
+      // fail-fast 也是 FAILED 终态：必须走收尾回调（定时任务运行记录收敛 / IM 队列接力），
+      // 与同终态的异常路径口径一致，否则 scheduled_task_run 停在 RUNNING、队列滞留。
+      expect(onExecutionFinished).toHaveBeenCalledWith(7, 42, 'FAILED');
+    });
+
+    it('stillRecoversWhenTheLocalExecutorIsOnline', async () => {
+      const localToolSessions = { isConnected: vi.fn(async () => true) };
+      const { runner, pending, taskTerminalService, harnessService } = makeRunner(
+        undefined,
+        { executionMode: 'LOCAL', recoveryDeps: { localToolSessions } },
+      );
+
+      await runner.run();
+      await Promise.all(pending);
+
+      expect(harnessService.execute).toHaveBeenCalled();
+      expect(taskTerminalService.finishExecution).not.toHaveBeenCalledWith(
+        7, 42, 'FAILED', expect.anything(), expect.anything(),
+      );
+    });
+
+    it('doesNotGateCloudSessionsOnLocalReachability', async () => {
+      const localToolSessions = { isConnected: vi.fn(async () => false) };
+      const { runner, pending, harnessService } = makeRunner(
+        undefined,
+        { executionMode: 'CLOUD', recoveryDeps: { localToolSessions } },
+      );
+
+      await runner.run();
+      await Promise.all(pending);
+
+      expect(localToolSessions.isConnected).not.toHaveBeenCalled();
+      expect(harnessService.execute).toHaveBeenCalled();
+    });
+  });
+
+  it('recoversOrphanOnIntervalAndStopsAfterStopPeriodicSweep', async () => {
+    vi.useFakeTimers();
     try {
       const dir = useTmpDir('mao-sweep-periodic-');
       writeActivePort(dir, 9081);

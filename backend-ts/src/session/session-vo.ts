@@ -31,6 +31,10 @@ export interface SessionVO {
   executionMode?: string | null;
   workspace?: string | null;
   source?: string | null;
+  /** LOCAL 会话绑定的执行端设备 id / 设备名快照；在线态由 enrich 层按注册表实时计算（请求时快照）。 */
+  targetDeviceId?: string | null;
+  targetDeviceName?: string | null;
+  targetDeviceOnline?: boolean | null;
   isGit?: boolean | null;
   platform?: string | null;
   shell?: string | null;
@@ -195,6 +199,8 @@ export function toSessionVO(
     executionMode: session.executionMode,
     workspace: session.workspace,
     source: session.source ?? 'web',
+    targetDeviceId: session.targetDeviceId ?? null,
+    targetDeviceName: session.targetDeviceName ?? null,
     platform: session.platform,
     shell: session.shellPath,
     osVersion: session.osVersion,

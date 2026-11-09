@@ -19,6 +19,10 @@ export interface Session {
   platform?: string | null;
   shellPath?: string | null;
   osVersion?: string | null;
+  /** LOCAL 会话绑定的执行端设备 id（空=未绑定）。 */
+  targetDeviceId?: string | null;
+  /** 执行端设备名快照（hostname）。 */
+  targetDeviceName?: string | null;
   createdAt?: string | null;
   updatedAt?: string | null;
 }

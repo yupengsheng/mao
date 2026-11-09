@@ -21,6 +21,7 @@ import { LocalExecutor } from '../local/executor';
 import { addTrustedWorkspace, isWorkspaceTrusted, workspaceExists } from '../local/trust';
 import { collectLocalUnsyncedSkills, readAgentsMd } from '../local/local-skills';
 import { buildOsVersion, detectShell, isGitWorkspace } from '../local/paths';
+import { resolveDeviceIdentity } from '../local/device-identity';
 import type { ApprovalPolicy } from '../local/approval';
 import { formatHistorySummary, formatSessionBanner, formatWelcomeHints } from '../ui/welcome';
 import type { InkTuiRenderer } from '../tui/ink-renderer';
@@ -147,6 +148,10 @@ export async function cmdChat(ctx: ChatContext): Promise<number> {
           }
         : undefined,
       onApprovalDenied: () => runnerHolder.current?.markApprovalDenied(),
+      // 多端审批：本地按键后由 TUI 交出选择，executor 负责上行投票并等回声；收尾关模态也走这里
+      deliverApproval: (requestId, choice) => {
+        tuiHolder.ink?.deliverApproval(requestId, choice);
+      },
     });
   }
 
@@ -173,6 +178,10 @@ export async function cmdChat(ctx: ChatContext): Promise<number> {
     maxDurationSec: cfg.maxDurationSec,
     includeToolIo: cfg.includeToolIo,
     localExecutor,
+    // 多端审批能力位：只跟本次连接（旧后端不带 approvalRelay → false，投票后立即本地放行）
+    onApprovalRelaySupported: (supported) => {
+      localExecutor?.setApprovalRelaySupported(supported);
+    },
     localExtras: localMode
       ? () => ({
           localSkills: collectLocalUnsyncedSkills(),
@@ -215,6 +224,10 @@ export async function cmdChat(ctx: ChatContext): Promise<number> {
         modelNames,
       });
       tuiHolder.ink = inkRenderer;
+      // 多端审批：审批模态的本地按键交给 executor 去上行投票（模态保持在「已提交」状态）
+      inkRenderer.setApprovalSubmitHandler((requestId, choice) => {
+        void localExecutor?.submitApprovalVote(requestId, choice);
+      });
       // SessionRunner 事件 → MultiRenderer（TraceRenderer + inkRenderer），
       // 保证 --trace-file 在交互模式仍记录完整执行事件，同时 Ink 正常渲染。
       runner.setRenderer(new MultiRenderer([...renderers, inkRenderer]));
@@ -417,6 +430,10 @@ async function resolveTargetSession(ctx: ChatContext): Promise<SessionVO> {
     req.shell = detectShell();
     req.osVersion = buildOsVersion();
     req.isGit = isGitWorkspace(workspace);
+    // LOCAL 创建即绑定本机执行端：CLI 进程与 WS 连接同源设备。
+    const device = resolveDeviceIdentity();
+    req.targetDeviceId = device.id;
+    req.targetDeviceName = device.name;
   }
   const session = await rest.createSession(req);
   return session;

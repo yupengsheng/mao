@@ -57,7 +57,9 @@ describe('LocalToolExecutor', () => {
     } as unknown as LocalToolSessionRegistry;
     await executor(registry, 900).execute(7, 'shell', '{}', 'workspace', true, 'reason');
     expect(approvalRegistry.register).toHaveBeenCalledWith(
-      7, 'req-1', undefined, expect.objectContaining({ payloadDigest: expect.stringMatching(/^[a-f0-9]{64}$/) }),
+      7, 'req-1', undefined,
+      expect.objectContaining({ payloadDigest: expect.stringMatching(/^[a-f0-9]{64}$/) }),
+      { toolName: 'shell', arguments: '{}', workspace: 'workspace', dangerReason: 'reason' },
     );
     expect(approvalRegistry.unregister).toHaveBeenCalledWith(7, 'req-1', 'CANCELLED');
     expect(treeSignalPublisher.publishForSession).toHaveBeenCalledTimes(2);
@@ -194,7 +196,9 @@ describe('LocalToolExecutor', () => {
     await expect(executor(null).execute(7, 'shell', '{}', 'workspace', true, 'reason'))
       .resolves.toBe('{"ok":true}');
     expect(approvalRegistry.register).toHaveBeenCalledWith(
-      7, 'req-inbox', undefined, expect.objectContaining({ payloadSummary: expect.stringContaining('shell') }),
+      7, 'req-inbox', undefined,
+      expect.objectContaining({ payloadSummary: expect.stringContaining('shell') }),
+      { toolName: 'shell', arguments: '{}', workspace: 'workspace', dangerReason: 'reason' },
     );
   });
 
@@ -322,7 +326,9 @@ describe('LocalToolExecutor', () => {
     await executor(null, reg).execute(7, 'shell', '{"command":"npm run build"}', 'workspace', true, null, hint);
     expect(reg.sendToolRequest).toHaveBeenCalledWith(7, 'shell', '{"command":"npm run build"}', 'workspace', true, null, hint);
     expect(approvalRegistry.register).toHaveBeenCalledWith(
-      7, 'req-hint', hint, expect.objectContaining({ payloadSummary: expect.stringContaining('npm run build') }),
+      7, 'req-hint', hint,
+      expect.objectContaining({ payloadSummary: expect.stringContaining('npm run build') }),
+      { toolName: 'shell', arguments: '{"command":"npm run build"}', workspace: 'workspace', dangerReason: null },
     );
   });
 
@@ -335,7 +341,9 @@ describe('LocalToolExecutor', () => {
     await executor(null, reg).execute(7, 'shell', '{}', 'workspace', true, 'reason');
     expect(reg.sendToolRequest).toHaveBeenCalledWith(7, 'shell', '{}', 'workspace', true, 'reason');
     expect(approvalRegistry.register).toHaveBeenCalledWith(
-      7, 'req-nohint', undefined, expect.objectContaining({ payloadDigest: expect.any(String) }),
+      7, 'req-nohint', undefined,
+      expect.objectContaining({ payloadDigest: expect.any(String) }),
+      { toolName: 'shell', arguments: '{}', workspace: 'workspace', dangerReason: 'reason' },
     );
   });
 });

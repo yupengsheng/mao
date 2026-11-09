@@ -104,6 +104,10 @@ export interface CreateSessionRequest {
   platform?: string | null;
   shell?: string | null;
   osVersion?: string | null;
+  /** LOCAL 会话绑定的执行端设备：创建时绑定，不可改绑。 */
+  targetDeviceId?: string | null;
+  /** 执行端设备名快照（hostname），服务端仅用于离线展示。 */
+  targetDeviceName?: string | null;
 }
 
 export interface CloudProject {

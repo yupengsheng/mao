@@ -27,6 +27,10 @@ export interface Session {
   lastActivityAt?: string | null;
   lastPromptTokens?: number | null;
   contextAnchorMsgId?: number | null;
+  /** LOCAL 会话绑定的执行端设备 id（客户端自报，空=未绑定走广播回退）；创建即定不可改。 */
+  targetDeviceId?: string | null;
+  /** 执行端设备名快照（hostname，创建或认领时写入）。 */
+  targetDeviceName?: string | null;
 }
 
 export interface Message {
@@ -280,6 +284,15 @@ export interface StreamingWsRegistry {
   hasLocalClientConnection(userId: number): boolean;
   send(userId: number, event: WsEvent): void;
   sendToLocalClients(userId: number, event: WsEvent): void;
+  /** 定向投递到指定设备；连接不存在 / 非 OPEN 时返回全零结果。 */
+  sendToDevice(userId: number, deviceId: string, event: WsEvent): { targetCount: number; successCount: number; failureCount: number };
+  /**
+   * 指定设备当前可用的执行连接（工具请求下发时记录归属，断线清理按「请求 → 下发连接」精确失败）；
+   * 缺省 / 无可用连接返回 null。
+   */
+  getDeviceExecutorSocket?(userId: number, deviceId: string): { id: string } | null;
+  /** 指定设备当前是否有可用执行连接。 */
+  hasDeviceConnection(userId: number, deviceId: string): boolean;
   subscribe?(userId: number, sessionId: number): void;
 }
 

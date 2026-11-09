@@ -71,6 +71,12 @@ export class LocalToolExecutor {
           pending.requestId,
           approvalHint ?? undefined,
           approvalWaitPayload(toolName, argumentsJson, dangerReason),
+          {
+            toolName,
+            arguments: argumentsJson ?? '{}',
+            workspace: workspace ?? '',
+            dangerReason: dangerReason ?? null,
+          },
         ));
         await Promise.resolve(this.treeSignalPublisher.publishForSession(sessionId));
         // 站内收件箱：审批待办（userId 由 InboxService 内部按 session 兜底解析，

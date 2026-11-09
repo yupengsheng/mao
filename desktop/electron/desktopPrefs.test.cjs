@@ -11,9 +11,34 @@ const {
   normalizeDesktopPrefs,
   readDesktopPrefs,
   writeDesktopPrefs,
+  ensureDesktopDeviceId,
   clearDesktopPrefsCache,
   DEFAULT_GLOBAL_SHORTCUT,
+  DEVICE_ID_PATTERN,
 } = require('./desktopPrefs.cjs')
+
+/** 共享设备文件路径：与 mao-agent 的 ~/.mao/agent-cli/device.json 同一个文件。 */
+function sharedDevicePath() {
+  return path.join(process.env.MAO_TEST_HOME, '.mao', 'agent-cli', 'device.json')
+}
+
+/**
+ * 隔离共享设备文件的 home：desktopPrefs 用 MAO_TEST_HOME 解析共享路径，
+ * 用例之间互不影响，也不污染真实 ~/.mao。
+ */
+function withIsolatedHome(t, body) {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'mao-shared-device-')))
+  const previous = process.env.MAO_TEST_HOME
+  process.env.MAO_TEST_HOME = home
+  clearDesktopPrefsCache()
+  t.after(() => {
+    if (previous == null) delete process.env.MAO_TEST_HOME
+    else process.env.MAO_TEST_HOME = previous
+    fs.rmSync(home, { recursive: true, force: true })
+    clearDesktopPrefsCache()
+  })
+  return body(home)
+}
 
 function tempUserData(t) {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'mao-desktop-prefs-')))
@@ -146,4 +171,89 @@ test('写盘后缓存生效：同 dir 二次读盘不重复解析文件（clearD
   writeDesktopPrefs(dir, { closeToTray: 'quit' })
   fs.writeFileSync(getDesktopPrefsPath(dir), JSON.stringify({ closeToTray: 'tray' }))
   assert.equal(readDesktopPrefs(dir, { force: true }).closeToTray, 'tray')
+})
+
+test('设备 ID：ensure 时本机生成并落盘，后续读取稳定不变', (t) => {
+  const dir = tempUserData(t)
+  // 读路径不落盘：仅查看偏好不应凭空创建文件
+  const readOnly = readDesktopPrefs(dir)
+  assert.match(readOnly.deviceId, DEVICE_ID_PATTERN)
+  assert.equal(fs.existsSync(getDesktopPrefsPath(dir)), false)
+
+  const id = ensureDesktopDeviceId(dir)
+  assert.match(id, DEVICE_ID_PATTERN)
+  const persisted = JSON.parse(fs.readFileSync(getDesktopPrefsPath(dir), 'utf8'))
+  assert.equal(persisted.deviceId, id)
+  clearDesktopPrefsCache()
+  assert.equal(readDesktopPrefs(dir).deviceId, id, '设备 ID 必须跨读取稳定')
+  assert.equal(ensureDesktopDeviceId(dir), id, '重复 ensure 不改写设备 ID')
+})
+
+test('设备 ID：patch 不可改写（desktopPrefsSet 无法改绑设备）', (t) => {
+  const dir = tempUserData(t)
+  const first = readDesktopPrefs(dir)
+  const written = writeDesktopPrefs(dir, { deviceId: 'attacker-dev', closeToTray: 'quit' })
+  assert.equal(written.prefs.deviceId, first.deviceId)
+  assert.equal(written.prefs.closeToTray, 'quit')
+  const persisted = JSON.parse(fs.readFileSync(getDesktopPrefsPath(dir), 'utf8'))
+  assert.equal(persisted.deviceId, first.deviceId)
+})
+
+test('设备 ID：旧文件缺字段 / 脏值 → 重新生成本机 ID，其余字段照常读入', (t) => {
+  const dir = tempUserData(t)
+  fs.writeFileSync(getDesktopPrefsPath(dir), JSON.stringify({ deviceId: 'bad id!', closeToTray: 'quit' }))
+  const prefs = readDesktopPrefs(dir)
+  assert.match(prefs.deviceId, DEVICE_ID_PATTERN)
+  assert.notEqual(prefs.deviceId, 'bad id!')
+  assert.equal(prefs.closeToTray, 'quit')
+  // ensure 后脏值被替换为新 ID 落盘
+  const id = ensureDesktopDeviceId(dir)
+  assert.match(id, DEVICE_ID_PATTERN)
+  const persisted = JSON.parse(fs.readFileSync(getDesktopPrefsPath(dir), 'utf8'))
+  assert.equal(persisted.deviceId, id)
+  assert.equal(persisted.closeToTray, 'quit')
+})
+
+test('设备 ID：与 mao-agent 共用 ~/.mao/agent-cli/device.json，两端同机同 ID', (t) => {
+  withIsolatedHome(t, (home) => {
+    const dir = tempUserData(t)
+    // CLI 先装过：共享文件里已有 ID，桌面端必须复用它（不再自生成第二个）
+    const cliId = '11111111-2222-4333-8444-555555555555'
+    fs.mkdirSync(path.dirname(sharedDevicePath()), { recursive: true })
+    fs.writeFileSync(sharedDevicePath(), JSON.stringify({ id: cliId }, null, 2) + '\n')
+
+    const id = ensureDesktopDeviceId(dir)
+    assert.equal(id, cliId, '桌面端必须复用 CLI 已登记的设备 ID')
+    // 桌面偏好同步改绑，避免下次又从旧值出发
+    clearDesktopPrefsCache()
+    assert.equal(readDesktopPrefs(dir).deviceId, cliId)
+  })
+})
+
+test('设备 ID：CLI 未装时桌面端创建共享文件，之后 CLI 直接读到同一个 ID', (t) => {
+  withIsolatedHome(t, () => {
+    const dir = tempUserData(t)
+    assert.equal(fs.existsSync(sharedDevicePath()), false)
+
+    const id = ensureDesktopDeviceId(dir)
+    assert.match(id, DEVICE_ID_PATTERN)
+    assert.equal(fs.existsSync(sharedDevicePath()), true, '桌面端应把设备 ID 写进共享文件')
+    assert.equal(JSON.parse(fs.readFileSync(sharedDevicePath(), 'utf8')).id, id)
+
+    // CLI 侧 resolveDeviceIdentity 读同一文件 → 同机两端同一个 deviceId
+    clearDesktopPrefsCache()
+    assert.equal(ensureDesktopDeviceId(dir), id, '重复 ensure 保持稳定')
+  })
+})
+
+test('设备 ID：共享文件损坏时回落桌面自己的 ID，不抛错', (t) => {
+  withIsolatedHome(t, () => {
+    const dir = tempUserData(t)
+    fs.mkdirSync(path.dirname(sharedDevicePath()), { recursive: true })
+    fs.writeFileSync(sharedDevicePath(), '{not json')
+
+    const id = ensureDesktopDeviceId(dir)
+    assert.match(id, DEVICE_ID_PATTERN)
+    assert.equal(readDesktopPrefs(dir).deviceId, id)
+  })
 })

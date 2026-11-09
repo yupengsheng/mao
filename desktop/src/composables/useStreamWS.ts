@@ -9,10 +9,23 @@ import { mapCompactionEvents } from '../utils/chatMessage'
 import { isAndroidCapacitor } from '../utils/capacitor'
 import { stripImageUrlLines } from '../utils/imageUrlAnnotation'
 import { isElectronClient } from '../utils/platform'
+import { getLocalDeviceInfo } from '../utils/device-info'
 import { updateSideTaskTabTitleFor } from './useCenterTabs'
 import { notifyInboxSystemUpdate, setupDesktopNotifyBridge } from './useInboxSystemNotify'
 import { ensureDesktopShellBridgeFromWs } from './useDesktopShell'
 import { resolveFileChangeWorkspace } from '../utils/file-change-workspace'
+import { getToolInputPreview } from '../utils/toolDisplay'
+import {
+  clearApprovalVoted,
+  clearLocallyReleased,
+  drainApprovalEcho,
+  removeApproval,
+  replayApprovalEcho,
+  resolveApprovalEcho,
+  setApprovalRelaySupported,
+  upsertApproval,
+  wasLocallyReleased,
+} from './approvalQueue'
 import type { SideTaskContextMode } from '../types/file-browser'
 
 /// <reference types="vite/client" />
@@ -246,6 +259,20 @@ export function useStreamWS() {
     ws = socket
     intentionalClose = false
 
+    // 设备身份（仅 Electron）：IPC 异步取（模块级缓存），拿到后发首帧。
+    // 浏览器没有设备身份，auth 帧同步发出、不带 device，保持旧广播行为。
+    const sendAuth = () => {
+      if (!isElectronClient()) {
+        socket.send(JSON.stringify({ type: 'auth', token, client }))
+        return
+      }
+      void getLocalDeviceInfo().then((device) => {
+        // 等待期间连接可能已被更新的连接 / disconnect() 取代，或已断开
+        if (socket !== ws || socket.readyState !== WebSocket.OPEN) return
+        socket.send(JSON.stringify({ type: 'auth', token, client, ...(device ? { device } : {}) }))
+      })
+    }
+
     connectPromise = new Promise<void>((resolve, reject) => {
       pendingSettle = { resolve, reject, socket }
       socket.onopen = () => {
@@ -254,7 +281,7 @@ export function useStreamWS() {
         // 鉴权首帧：必须是新连接发出的第一条消息，先于任何 subscribe 等业务帧。
         // 此刻还不算「已连接」——等服务端 connected 确认帧（handleAuthenticated）后
         // 才置 connected、重置退避并补订阅，避免业务帧与异步鉴权竞争。
-        socket.send(JSON.stringify({ type: 'auth', token, client }))
+        sendAuth()
         // 心跳与静默判死从握手起生效：鉴权迟迟无响应时由 30s 静默兜底触发重连
         startHeartbeat()
         // 通知点击桥接尽早注册（幂等）：等首条 inbox_updated 再注册会丢掉这期间
@@ -375,7 +402,10 @@ export function useStreamWS() {
    * 服务端确认首帧鉴权（connected 帧）：这一刻起连接才可收发业务帧。
    * 重连退避也在此刻复位——鉴权被拒时退避持续增长，避免 1s 一次的热循环。
    */
-  function handleAuthenticated() {
+  function handleAuthenticated(data?: any) {
+    // 能力协商：审批是否等回声放行只看本次连接。
+    // 旧后端不带 approvalRelay → false → 投票后立即本地放行，不会等一个永远不来的回声。
+    setApprovalRelaySupported(data?.approvalRelay === true)
     connected.value = true
     everConnected.value = true
     // 任一次连接成功：失败计数与鉴权拒绝态归零，断线终态立即恢复自动重连文案（D1）
@@ -406,6 +436,8 @@ export function useStreamWS() {
     // 收件箱未读数重拉兜底（刻意不放进 focusLoaded 分支：聚焦列表未加载时徽标也要能更新）。
     // inbox_updated 已在 CRITICAL_EVENT_TYPES，这里是双保险。
     void inboxStore.fetchUnreadCount()
+    // 重连后立即补发仍在等回声的审批票（投票帧可能随旧连接丢失）
+    replayApprovalEcho()
   }
 
   function startHeartbeat() {
@@ -658,6 +690,19 @@ export function useStreamWS() {
     return sendReliable(payload)
   }
 
+  /**
+   * 会话进入终态（或用户离开会话）时，把「已投票但一直没等到回声」的审批按拒绝兜底放行，
+   * 避免主进程 requestToolApproval Promise 永久悬挂。
+   */
+  function releaseApprovalsOnTerminal(sessionId: string) {
+    const drained = drainApprovalEcho((entry) => entry.sessionId === sessionId)
+    if (drained.length === 0 || !isElectronClient()) return
+    const electronAPI = (window as any).electronAPI
+    for (const requestId of drained) {
+      void electronAPI?.respondToolApprovalRemote?.(requestId, false, false)
+    }
+  }
+
   function routeEvent(msg: any) {
     const { type, sessionId: rawSid, data } = msg
     const sessionId = rawSid != null ? String(rawSid) : null
@@ -672,7 +717,7 @@ export function useStreamWS() {
     switch (type) {
       case 'connected':
         // 首帧 auth 的服务端确认：此刻连接才可收发业务帧
-        handleAuthenticated()
+        handleAuthenticated(data)
         break
 
       case 'pong':
@@ -834,6 +879,7 @@ export function useStreamWS() {
             }
           }
           if (terminalPhases.includes(phase)) {
+            releaseApprovalsOnTerminal(sessionId)
             // 服务端对被中止的轮次不会补发工具结果（agent-loop 命中 cancelFlag 后直接丢弃），
             // CANCELLED/FAILED 必须就地终结仍在 running 的工具，否则转圈永久残留
             if (phase === 'CANCELLED' || phase === 'FAILED') {
@@ -874,6 +920,9 @@ export function useStreamWS() {
           sessionStore.updateSessionPhase(sessionId, phase)
           sessionStore.updateSideTaskPhase(Number(sessionId), phase)
           sessionStore.updateSubagentPhase(Number(sessionId), phase)
+          if (['COMPLETED', 'FAILED', 'CANCELLED', 'IDLE'].includes(phase)) {
+            releaseApprovalsOnTerminal(sessionId)
+          }
         }
         break
 
@@ -1068,6 +1117,7 @@ export function useStreamWS() {
           sessionStore.updateSideTaskPhase(Number(sessionId), phase, startedAt)
           sessionStore.updateSubagentPhase(Number(sessionId), phase)
           if (['COMPLETED', 'FAILED', 'CANCELLED', 'IDLE'].includes(phase)) {
+            releaseApprovalsOnTerminal(sessionId)
             // 与 session_status 终态分支一致：断线期间错过结果事件的工具需要就地终结
             if (phase === 'FAILED' || phase === 'CANCELLED') {
               sessionStore.finishInterruptedStreamingMessage(
@@ -1272,6 +1322,65 @@ export function useStreamWS() {
       case 'ask_user_questions_cancelled': {
         if (sessionId && data?.requestId) {
           sessionStore.removeAskQuestion(sessionId, data.requestId)
+        }
+        break
+      }
+
+      // 多端审批：服务端把待审批请求广播给该用户全部在线端
+      case 'tool_approval_request': {
+        if (sessionId && data && typeof data.requestId === 'string') {
+          const toolName = typeof data.toolName === 'string' ? data.toolName : ''
+          const rawArguments = typeof data.arguments === 'string' ? data.arguments : ''
+          let parsedArguments: Record<string, unknown> | null = null
+          try {
+            const parsed = JSON.parse(rawArguments)
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              parsedArguments = parsed as Record<string, unknown>
+            }
+          } catch {
+            parsedArguments = null
+          }
+          // 截断 / 解析失败时展示截断原文（前缀），可解析时走与聊天区一致的参数摘要
+          let description = parsedArguments
+            ? getToolInputPreview(toolName, parsedArguments) || rawArguments
+            : rawArguments
+          if (data.argumentsTruncated === true) {
+            description = `${description}（参数过长已截断，仅展示前缀）`
+          }
+          upsertApproval({
+            requestId: data.requestId,
+            toolName,
+            description,
+            sessionId,
+            dangerReason: typeof data.dangerReason === 'string' ? data.dangerReason : undefined,
+            approvalHint: data.approvalHint ?? undefined,
+            source: 'remote',
+            deviceName: typeof data.deviceName === 'string' ? data.deviceName : undefined,
+          })
+        }
+        break
+      }
+
+      // 多端审批：认领结果 / 撤卡；对执行端这就是唯一放行信号
+      case 'tool_approval_resolved': {
+        if (data && typeof data.requestId === 'string') {
+          const requestId = data.requestId
+          const released = wasLocallyReleased(requestId)
+          removeApproval(requestId)
+          clearApprovalVoted(requestId)
+          resolveApprovalEcho(requestId)
+          clearLocallyReleased(requestId)
+          // Electron 主进程里可能还挂着 requestToolApproval 的 Promise：必须按回声解锁。
+          // 不做「卡片是否存在」判断，否则决策早到（卡片还没渲染）会漏；主进程无对应 pending
+          // 时由早到缓冲兜住。旧后端本地放行过的 id 不再回调，避免自己挡住自己。
+          if (isElectronClient() && !released) {
+            const electronAPI = (window as any).electronAPI
+            void electronAPI?.respondToolApprovalRemote?.(
+              requestId,
+              data.approved === true,
+              data.alwaysAllow === true,
+            )
+          }
         }
         break
       }

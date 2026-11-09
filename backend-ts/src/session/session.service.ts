@@ -140,6 +140,8 @@ export class SessionService {
     gitCloneUrl?: string | null,
     gitBranch?: string | null,
     source?: SessionSource | null,
+    targetDeviceId?: string | null,
+    targetDeviceName?: string | null,
   ): Promise<Session> {
     let resolvedAgentId = parseEntityId(agentId);
     if (resolvedAgentId == null) {
@@ -153,12 +155,23 @@ export class SessionService {
       throw new BusinessException(ErrorCode.PARAM_INVALID, '该 Agent 已停用');
     }
 
+    const resolvedExecutionMode = executionMode != null ? executionMode : 'CLOUD';
+    // LOCAL 创建即绑定执行端设备：仅 LOCAL 落库，CLOUD 忽略；创建后没有改写路径
+    // （惰性认领只补 NULL 行），即「不可改绑」。
+    const resolvedTargetDeviceId = resolvedExecutionMode === 'LOCAL' && targetDeviceId != null && targetDeviceId.trim() !== ''
+      ? targetDeviceId.trim()
+      : null;
+    const resolvedTargetDeviceName = resolvedExecutionMode === 'LOCAL' && targetDeviceName != null && targetDeviceName.trim() !== ''
+      ? targetDeviceName.trim()
+      : null;
     const session: Session = {
       userId,
       agentId: resolvedAgentId,
       title: title != null ? title : '未命名会话',
       status: 'ACTIVE',
-      executionMode: executionMode != null ? executionMode : 'CLOUD',
+      executionMode: resolvedExecutionMode,
+      targetDeviceId: resolvedTargetDeviceId,
+      targetDeviceName: resolvedTargetDeviceName,
       permissionLevel: permissionLevel != null ? permissionLevel : 'READ_ONLY',
       isGit: isGit ?? null,
       platform: platform ?? null,
@@ -216,6 +229,25 @@ export class SessionService {
     }
 
     return session;
+  }
+
+  /**
+   * 历史 LOCAL 会话惰性认领：条件更新，只在 target_device_id 为空时写入。
+   * 返回生效后的绑定；影响行数为 0 表示已被其他连接认领，读回现值（不覆盖）。
+   */
+  async claimTargetDevice(
+    sessionId: number,
+    deviceId: string,
+    deviceName: string | null,
+  ): Promise<{ targetDeviceId: string | null; targetDeviceName: string | null } | null> {
+    if (deviceId == null || deviceId === '') return null;
+    await this.sessionRepo.claimTargetDevice(sessionId, deviceId, deviceName);
+    const session = await this.sessionRepo.findById(sessionId);
+    if (!session) return null;
+    return {
+      targetDeviceId: session.targetDeviceId ?? null,
+      targetDeviceName: session.targetDeviceName ?? null,
+    };
   }
 
   /**
@@ -781,6 +813,9 @@ export class SessionService {
         unread: 0,
         parentSessionId: null,
         sessionType: 'NORMAL',
+        // 边路提升继承执行端绑定：LOCAL 提升后保持设备名与定向投递。
+        targetDeviceId: source.targetDeviceId,
+        targetDeviceName: source.targetDeviceName,
       };
       await txSessionRepo.insert(target);
       const targetId = target.id!;

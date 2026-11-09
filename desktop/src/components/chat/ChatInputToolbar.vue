@@ -122,7 +122,7 @@ import WorkspaceChip from './WorkspaceChip.vue'
 import ModelSelector from './ModelSelector.vue'
 import type { CloudProject } from '../../stores/session'
 
-defineProps<{
+const props = defineProps<{
   disabled: boolean
   executionMode: string
   isNewTask: boolean

@@ -473,7 +473,7 @@ describe('LOCAL 模式浏览器边界', () => {
     const chat = useChat(ref('1'), ref('LOCAL'))
     await chat.sendMessage('hi')
 
-    expect(ElMessage.error).toHaveBeenCalledWith(expect.stringContaining('不支持本地模式'))
+    expect(ElMessage.error).toHaveBeenCalledWith(expect.stringContaining('不能新建本地任务'))
     expect(ws.connect).not.toHaveBeenCalled()
   })
 

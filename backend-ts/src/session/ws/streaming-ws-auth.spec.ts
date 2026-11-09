@@ -33,7 +33,7 @@ describe('WS SSO authentication lifecycle', () => {
     };
     handler = new StreamingWsHandler({
       registry, jwtService, agentLoop: { requestCancel },
-      localToolSessionRegistry: { failAllForUser },
+      localToolSessionRegistry: { failAllForUser, failAllForSocket: vi.fn() },
       embedPageToolRegistry: { failSession: vi.fn(), complete: vi.fn(() => true) },
     } as unknown as WsHandlerDeps);
   });
@@ -55,7 +55,10 @@ describe('WS SSO authentication lifecycle', () => {
     const peer = socket('peer');
     registry.register(peer, 7, 'browser');
     await auth();
-    expect(JSON.parse(vi.mocked(ws.send).mock.calls[0]![0]).type).toBe('connected');
+    const connected = JSON.parse(vi.mocked(ws.send).mock.calls[0]![0]);
+    expect(connected.type).toBe('connected');
+    // 能力协商：声明支持审批广播 + 回声放行（技术方案 2026-11-06 §4.1）
+    expect(connected.data.approvalRelay).toBe(true);
     expect(peer.send).not.toHaveBeenCalled();
     registry.subscribe(7, 11);
     registry.trackActiveToolCall(11, 'exec', 'tool', 'shell', '{}');

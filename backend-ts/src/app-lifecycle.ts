@@ -310,6 +310,7 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
       executionLeaseService: d.executionLeaseService ?? null,
       ownerInstance: d.executionOwnerInstance ?? '',
       executionLeaseEnabled: d.executionLeaseEnabled === true,
+      localToolSessions: d.localToolSessions,
     },
   );
   // 批量恢复与崩溃恢复共用同一续跑流程与并发防护：内核构造完成后注入服务。

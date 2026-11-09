@@ -254,6 +254,8 @@ export interface RouteDeps {
   askUserQuestionsRegistry: AskUserQuestionsRegistry;
   /** 正在执行的工具调用（内存态），管理后台会话详情补进行中卡片 */
   inFlightToolRegistry: InFlightToolRegistry;
+  /** LOCAL 设备在线判定：会话 VO 的 targetDeviceOnline 快照用。 */
+  hasDeviceConnection?: (userId: number, deviceId: string) => boolean;
   /** 因 402/403 失败会话的批量恢复：可选，未注入时管理端入口返回空清单/报错。 */
   failedSessionRecovery?: FailedSessionRecoveryService;
   treeSignalPublisher: SessionTreeSignalPublisher;
@@ -512,6 +514,7 @@ export async function registerAllRoutes(deps: RouteDeps): Promise<void> {
       askUserQuestionsRegistry,
       treeSignalPublisher,
       existsSessionUnderWorkspace: (userId: number, path: string) => sessionRepo.existsSessionUnderWorkspace(userId, path),
+      hasDeviceConnection: deps.hasDeviceConnection,
       executionWaitRepository,
     });
     registerTaskRoutes(api, taskService);

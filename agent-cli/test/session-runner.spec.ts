@@ -59,6 +59,7 @@ async function attached(opts?: {
   ifRunning?: 'wait' | 'cancel' | 'fail';
   maxDurationSec?: number;
   snapshot?: WsEvent;
+  onApprovalRelaySupported?: (supported: boolean) => void;
 }) {
   const ws = new FakeWs();
   if (opts?.snapshot) ws.snapshot = opts.snapshot;
@@ -73,6 +74,7 @@ async function attached(opts?: {
     askHandler: opts?.askHandler,
     includeToolIo: true,
     maxDurationSec: opts?.maxDurationSec,
+    onApprovalRelaySupported: opts?.onApprovalRelaySupported,
   });
   await runner.attach(session());
   return { ws, renderer, runner };
@@ -400,5 +402,27 @@ describe('resolveModelId', () => {
   it('returns the fallback id without a spec and undefined with neither', async () => {
     expect(await resolveModelId(modelRest(), undefined, 50)).toBe(50);
     expect(await resolveModelId(modelRest())).toBeUndefined();
+  });
+});
+
+describe('SessionRunner 多端审批', () => {
+  it('connected 帧的 approvalRelay 能力位透传给宿主（每次连接重新判定）', async () => {
+    const values: boolean[] = [];
+    const { ws } = await attached({ onApprovalRelaySupported: (v) => values.push(v) });
+    ws.emit({ type: 'connected', sessionId: null, data: { userId: 7, approvalRelay: true } });
+    ws.emit({ type: 'connected', sessionId: null, data: { userId: 7 } });
+    expect(values).toEqual([true, false]);
+  });
+
+  it('本轮终态时通知 TUI 关闭审批模态（approval_aborted，只发一次）', async () => {
+    const { ws, renderer, runner } = await attached();
+    const p = runner.runPrompt('x');
+    await Promise.resolve();
+    const eid = (ws.sent.find((m) => (m as { type: string }).type === 'send_message') as { data: { eventId: string } })
+      .data.eventId;
+    terminal(ws, eid, 'COMPLETED');
+    terminal(ws, eid, 'COMPLETED');
+    await p;
+    expect(renderer.events.filter((e) => e.type === 'approval_aborted')).toHaveLength(1);
   });
 });
