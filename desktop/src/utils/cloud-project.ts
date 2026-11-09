@@ -71,15 +71,41 @@ export function isSharedCloudProject(session: Pick<Session, 'executionMode' | 'w
   return session.executionMode === 'CLOUD' && !!session.workspace?.includes('/projects/')
 }
 
-/** Cloud project slug to carry into a new CLOUD task (undefined for independent workspaces). */
+/** 通道（飞书 / 钉钉）会话工作区路径：{workspaceRoot}/feishu-chat|dingtalk-chat/{accountId}/{leaf}。 */
+export function isChannelWorkspacePath(workspace: string | undefined | null): boolean {
+  return isFeishuChatWorkspace(workspace) || isDingtalkChatWorkspace(workspace)
+}
+
+/**
+ * 新建态要沿用的会话工作区：LOCAL 所选目录，以及通道（飞书群/私聊、钉钉）共享工作区。
+ *
+ * 通道会话的 projectKey 是通道标识而非 projects/ 下的项目 slug，只能靠显式 workspace
+ * 预填才能让新会话继续落在同一目录（与总览「新任务」同链路，后端对本人参与过的通道
+ * 工作区放行）。临时工作区与其他自定义目录不预填，仍由后端自动建独立目录。
+ */
+export function newTaskWorkspaceFromSession(session: Pick<Session, 'executionMode' | 'workspace'>): string {
+  if (session.executionMode === 'LOCAL') return session.workspace || ''
+  return isChannelWorkspacePath(session.workspace) ? (session.workspace || '') : ''
+}
+
+/**
+ * Cloud project slug to carry into a new CLOUD task (undefined for independent workspaces).
+ *
+ * 只有共享云项目（工作区在 projects/ 下）才带回 projectKey。通道会话（飞书群/私聊、钉钉）
+ * 的 projectKey 是通道工作区标识，不是项目 slug：带进新建态会把工作区来源切成「选择工作区」，
+ * 首条消息按 existing 解析 {root}/{userId}/projects/<通道key>，目录不存在直接报「工作区不存在」。
+ */
 export function cloudProjectKeyForNewTask(
-  session: Pick<Session, 'executionMode' | 'projectKey' | 'id'>
+  session: Pick<Session, 'executionMode' | 'projectKey' | 'id' | 'workspace'>
 ): string | undefined {
   if (session.executionMode !== 'CLOUD' || !session.projectKey) {
     return undefined
   }
   // Independent CLOUD sessions derive projectKey from session id — not a shared project slug.
   if (String(session.projectKey) === String(session.id)) {
+    return undefined
+  }
+  if (!isSharedCloudProject(session)) {
     return undefined
   }
   return session.projectKey
