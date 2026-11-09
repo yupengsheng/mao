@@ -1,4 +1,4 @@
-// 管理后台侧边菜单的配置与纯逻辑：分组定义、可见性过滤、扁平化。
+// 管理后台侧边菜单的配置与纯逻辑：分组定义、可见性过滤、搜索过滤、命中高亮、扁平化。
 // SideMenu.vue 只负责渲染与交互；这里保持无 DOM 依赖，便于 vitest 单测。
 import type { Component } from 'vue'
 import {
@@ -111,7 +111,48 @@ export function applyMenuVisibility(groups: MenuGroupDef[], hidden: readonly str
     .filter(group => group.items.length > 0)
 }
 
-/** 展开的扁平菜单项（附分组 id），供空态判断等场景使用 */
+/** 按关键词过滤分组：label 或路由路径命中即保留，无命中项的分组整体剔除；空关键词原样返回 */
+export function filterMenuGroups(groups: MenuGroupDef[], query: string): MenuGroupDef[] {
+  const keyword = query.trim().toLowerCase()
+  if (!keyword) return groups
+  return groups
+    .map(group => ({
+      ...group,
+      items: group.items.filter(
+        item =>
+          item.label.toLowerCase().includes(keyword) ||
+          item.index.toLowerCase().includes(keyword)
+      )
+    }))
+    .filter(group => group.items.length > 0)
+}
+
+export interface HighlightSegment {
+  text: string
+  hit: boolean
+}
+
+/** 把 label 按关键词命中位置切段，供无 v-html 的高亮渲染（大小写不敏感，命中段连续合并） */
+export function highlightSegments(label: string, query: string): HighlightSegment[] {
+  const keyword = query.trim().toLowerCase()
+  if (!keyword) return [{ text: label, hit: false }]
+  const lower = label.toLowerCase()
+  const segments: HighlightSegment[] = []
+  let cursor = 0
+  while (cursor < label.length) {
+    const hit = lower.indexOf(keyword, cursor)
+    if (hit === -1) {
+      segments.push({ text: label.slice(cursor), hit: false })
+      break
+    }
+    if (hit > cursor) segments.push({ text: label.slice(cursor, hit), hit: false })
+    segments.push({ text: label.slice(hit, hit + keyword.length), hit: true })
+    cursor = hit + keyword.length
+  }
+  return segments
+}
+
+/** 展开的扁平菜单项（附分组 id），供键盘选择与空态判断 */
 export function flattenMenuItems(groups: MenuGroupDef[]): Array<MenuItemDef & { groupId: string }> {
   return groups.flatMap(group => group.items.map(item => ({ ...item, groupId: group.id })))
 }

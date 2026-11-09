@@ -1,7 +1,7 @@
 <template>
   <el-container class="layout-container">
     <el-aside v-if="!isMobile" :width="asideWidth" class="layout-aside">
-      <SideMenu :show-logo="true" :collapsed="collapsed" />
+      <SideMenu :show-logo="true" :collapsed="collapsed" @expand="expandSidebar" />
     </el-aside>
 
     <el-drawer
@@ -118,9 +118,17 @@ const crumbs = computed(() => {
   return [{ title: currentTitle.value }]
 })
 
+function setCollapsed(value: boolean) {
+  collapsed.value = value
+  localStorage.setItem(SIDEBAR_KEY, value ? '1' : '0')
+}
+
 function toggleCollapsed() {
-  collapsed.value = !collapsed.value
-  localStorage.setItem(SIDEBAR_KEY, collapsed.value ? '1' : '0')
+  setCollapsed(!collapsed.value)
+}
+
+function expandSidebar() {
+  setCollapsed(false)
 }
 
 watch(
