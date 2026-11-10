@@ -168,8 +168,8 @@ describe('CenterTabBar wiring', () => {
   it('supports dropping on the bar tail and clears hints on drag end or leave', () => {
     expect(functionBody(tabBarSrc, 'function onBarReorderDragover')).toContain('TAB_REORDER_MIME')
     expect(functionBody(tabBarSrc, 'function onBarReorderDrop')).toContain('TAB_REORDER_MIME')
-    expect(tabBarSrc).toContain('@dragover="onBarReorderDragover"')
-    expect(tabBarSrc).toContain('@drop="onBarReorderDrop"')
+    expect(tabBarSrc).toMatch(/@dragover="[^"]*\bonBarReorderDragover\(/)
+    expect(tabBarSrc).toMatch(/@drop(?:\.prevent)?="[^"]*\bonBarReorderDrop\(/)
     expect(tabBarSrc).toContain("document.addEventListener('dragend', onWindowDragEnd)")
     expect(tabBarSrc).toContain("document.removeEventListener('dragend', onWindowDragEnd)")
     expect(tabBarSrc).toContain('.tab-item.drop-before::before')
