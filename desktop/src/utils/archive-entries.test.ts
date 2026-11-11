@@ -140,6 +140,19 @@ describe('classifyArchiveEntry', () => {
     }
   })
 
+  it('点文件与无点整名 → text（BUG-6）', () => {
+    expect(classifyArchiveEntry('.gitignore')).toBe('text')
+    expect(classifyArchiveEntry('.gitattributes')).toBe('text')
+    expect(classifyArchiveEntry('.editorconfig')).toBe('text')
+    expect(classifyArchiveEntry('.env')).toBe('text')
+    expect(classifyArchiveEntry('Dockerfile')).toBe('text')
+    expect(classifyArchiveEntry('dockerfile')).toBe('text')
+    expect(classifyArchiveEntry('Makefile')).toBe('text')
+    expect(classifyArchiveEntry('.gitignore.old')).toBe('other')
+    expect(classifyArchiveEntry('.hidden')).toBe('other')
+    expect(classifyArchiveEntry('.pdf')).toBe('pdf')
+  })
+
   it('未知扩展名与无扩展名 → other（下载，不猜）', () => {
     expect(classifyArchiveEntry('binary.bin')).toBe('other')
     expect(classifyArchiveEntry('Makefile.old')).toBe('other')
