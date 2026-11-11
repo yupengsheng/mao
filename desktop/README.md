@@ -17,7 +17,7 @@ npm run build   # Web 静态资源
 npm run dist    # Electron 打包（需自行处理代码签名）
 ```
 
-部署前请修改 `.env.production` 中的 `VITE_API_BASE_URL` 为你的后端地址。
+当前仓库生产构建默认指向 `https://mao.yupengsheng.cn`，出厂默认服务器与自动更新源也使用该站点。部署到其他域名时，请同时修改 `.env.production` 中的 `VITE_API_BASE_URL`，以及 `package.json` 的 `build.publish[0].url`。
 
 ## 自动更新
 

@@ -1,7 +1,7 @@
 {
   "name": "desktop",
   "private": true,
-  "version": "0.0.513",
+  "version": "1.0.0",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -74,7 +74,7 @@
     "publish": [
       {
         "provider": "generic",
-        "url": "https://mao.etarch.cn/api/uploads/releases/"
+        "url": "https://mao.yupengsheng.cn/api/uploads/releases/"
       }
     ],
     "files": [

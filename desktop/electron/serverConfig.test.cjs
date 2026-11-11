@@ -200,5 +200,12 @@ test('readServerHistory tolerates missing or corrupt file', (t) => {
 test('defaultServerConfig shape', () => {
   const config = defaultServerConfig()
   assert.equal(config.version, 1)
+  assert.equal(config.serverBaseUrl, 'https://mao.yupengsheng.cn')
   assert.equal(config.configured, false)
+  assert.equal(deriveUpdateFeedUrl(config.serverBaseUrl), 'https://mao.yupengsheng.cn/api/uploads/releases/')
+})
+
+test('package publish feed matches the default server', () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'))
+  assert.equal(pkg.build.publish[0].url, deriveUpdateFeedUrl(DEFAULT_SERVER_BASE_URL))
 })

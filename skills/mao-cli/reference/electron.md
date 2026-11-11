@@ -63,7 +63,7 @@ Electron 的本地 Shell / MCP 终端会随当前连接站点注入 `MAO_BASE_UR
 
 ## 自动更新
 
-Electron 壳支持自动更新。默认检查 `https://mao.example.com/uploads/releases/`（与 Web 同域 `uploads`）。私有部署修改 `desktop/package.json` 的 `build.publish[0].url` 后再打包。
+Electron 壳支持自动更新。当前仓库默认检查 `https://mao.yupengsheng.cn/api/uploads/releases/`（与 Web 同域 `uploads`）。私有部署修改 `desktop/.env.production`、`desktop/package.json` 的 `build.publish[0].url` 及 `desktop/electron/serverConfig.cjs` 的默认服务器后再打包。
 
 通用包推荐更新源策略 `follow-site`：从**当前配置的服务器**拉取壳安装包；若某站未托管 releases，更新会失败并降级提示，可在设置中改为 `package-default` 或关闭。
 
@@ -101,6 +101,8 @@ LOCAL 模式下可发送非图片文件：发送时懒拷贝到 `~/.mao/attachme
 3. Harness 将工具调用通过 `tool_execute` 事件发给 Electron
 4. `electron/main.cjs` 执行 Shell/文件/MCP，结果回传后端
 5. 高风险操作按权限档位弹出审批（preload 桥接）
+
+执行通道断开或半死时，后端不会干等满 900 秒：设备无可写连接直接回「本地执行端未连接」；无审批调用在 60 秒内既无 `tool_approval` 空表态也无结果即快速失败并提示「本地执行端未响应」；同一设备的多条连接会在主执行连接不可写时自动回退。需审批调用仍由审批卡片超时 / 升级通知兜底。
 
 ## 权限与审批
 
