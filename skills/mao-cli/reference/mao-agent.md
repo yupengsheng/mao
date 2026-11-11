@@ -224,6 +224,7 @@ emoji / CJK 按整字符删除；粘贴多行文本原样进入草稿。
 
 - **需要 bash**：shell 工具固定通过 bash 执行，启动时按 PATH → `/bin` → `/usr/bin` → `/usr/local/bin` → `/opt/homebrew/bin` 解析绝对路径，找不到即报错。容器镜像需自带可执行 bash。技能包解压为内置 Node 实现，**不需要 python3 或 unzip**
 - **路径规则（与云端一致，宽松解析）**：`read_file` / `write_file` / `edit_file` 与 `glob_search` / `grep_search` 的搜索根都用相对路径按工作区解析、绝对路径直达任意位置；符号链接目标一律拒绝（`拒绝操作符号链接`），同路径并行写按绝对路径串行化
+- **搜索路径展示**：Windows 上 rg 输出的 `.\` 前缀会被剥掉，返回的相对路径统一用 `/`；Linux 输出保持原样
 - **本地 shell 的 `workdir` 仍受边界约束**：必须落在已信任工作区或本会话 runtime 目录内，`../` 越界、边界外的绝对路径、指向外部的符号链接一律拒绝
 - **同文件并行写串行化**：同一轮对同一路径的 `write_file` / `edit_file` 按绝对路径排队，避免后写者基于旧内容覆盖先写者
 - **用户消息文件化（`dump_user_messages`）**：服务端调用该工具时委托本机写 `~/.mao/agent-cli/runtime/<sessionId>/userMessages/user-message-<消息id>.txt`（同名覆盖、按消息 id 幂等；落点固定在会话 runtime 内，无需审批），返回的绝对路径可直接用 `read_file` / `grep_search` 或 shell 读取
