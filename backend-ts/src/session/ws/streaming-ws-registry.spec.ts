@@ -211,6 +211,34 @@ describe('StreamingWsRegistry', () => {
     expect(resolved).toEqual({ targetCount: 0, successCount: 0, failureCount: 0 });
   });
 
+  // 线上事故回归（2026-11-10 会话 2316）：执行连接还在 deviceExecutors 里但已不可写
+  // （半死空壳），tool_execute 只按这一条投就会进黑洞。此时须回落到同 deviceId 的
+  // 另一条存活连接（桌面端），让请求真正有人接手；零投递则由调用方立即判通道失效。
+  it('sendToDevice falls back to another live connection of the same device', () => {
+    const dead = mockSocket('ws-dead');
+    dead.readyState = 3; // CLOSED：仍在 deviceExecutors，但已不可写
+    const live = mockSocket('ws-live');
+    const device = { id: 'dev-a', name: 'Host', platform: 'linux' };
+    registry.register(dead, 7, 'cli', undefined, true, device);
+    registry.register(live, 7, 'cli', undefined, true, device);
+    // 再次注册 dead 使其成为执行连接，live 作为同设备另一条连接留存
+    registry.register(dead, 7, 'cli', undefined, true, device);
+
+    const result = registry.sendToDevice(7, 'dev-a', wsEvent('tool_execute', 10, { requestId: 'r1' }));
+    expect(result).toMatchObject({ targetCount: 1, successCount: 1 });
+    expect(dead.send).not.toHaveBeenCalled();
+    expect(live.send).toHaveBeenCalled();
+  });
+
+  it('sendToDevice reports zero delivery when no same-device connection is writable', () => {
+    const dead = mockSocket('ws-dead');
+    dead.readyState = 3;
+    registry.register(dead, 7, 'cli', undefined, true, { id: 'dev-a', name: 'Host', platform: 'linux' });
+    const result = registry.sendToDevice(7, 'dev-a', wsEvent('tool_execute', 10, { requestId: 'r1' }));
+    expect(result).toEqual({ targetCount: 0, successCount: 0, failureCount: 0 });
+    expect(dead.send).not.toHaveBeenCalled();
+  });
+
   describe('页面操作能力声明（pageEnabled）', () => {
     it('缺省注册按开启：绑定 embed 会话后 isEmbedPageSession 为 true', () => {
       const socket = mockSocket('ws-1');
