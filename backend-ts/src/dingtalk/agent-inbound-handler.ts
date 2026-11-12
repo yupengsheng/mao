@@ -112,7 +112,7 @@ export class AgentDingtalkInboundHandler implements DingtalkInboundHandler {
      * 覆盖「定时任务在会话忙时入队 → 该会话后续只有钉钉执行」导致的永久排队。
      */
     onQueuesDrained?: (sessionId: number) => void;
-    createQueueCard?: (context: DingtalkInboundContext, queueId: number, sessionId: number) => Promise<string | null>;
+    createQueueCard?: (context: DingtalkInboundContext, queueId: number, sessionId: number, rankNo?: number) => Promise<string | null>;
     resolveBotId?: (accountId: string) => number;
     p2pSessionControl?: DingtalkP2pSessionControl;
     onReply?: (context: DingtalkInboundContext, text: string, sessionId?: number) => Promise<void>;
@@ -366,23 +366,27 @@ export class AgentDingtalkInboundHandler implements DingtalkInboundHandler {
       if (cancelFlag.get()) {
         const wasInterrupted = this.interrupted.has(sessionId);
         await this.options.sessionService.cleanupIncompleteTail?.(sessionId);
-        await cardListener?.cancel(wasInterrupted);
+        const cancelled = await cardListener?.cancel(wasInterrupted);
         if (this.canSettle(started, lease)) {
           await this.options.onExecutionFinished?.(sessionId, context, executionId, 'CANCELLED', undefined, lease);
         }
-        return { text: cardListener == null ? (wasInterrupted ? '任务已被下一条消息中断。' : '任务已取消。') : null, phase: 'CANCELLED' };
+        const text = cardListener == null || cancelled === false
+          ? (wasInterrupted ? '任务已被下一条消息中断。' : '任务已取消。')
+          : null;
+        return { text, phase: 'CANCELLED' };
       }
       if (this.canSettle(started, lease)) {
         await this.options.onExecutionFinished?.(sessionId, context, executionId, 'COMPLETED', undefined, lease);
       }
       const text = await this.options.sessionService.getLatestAssistantReply(sessionId);
-      await cardListener?.complete(text);
-      return { text, phase: 'COMPLETED' };
+      // 卡片终态更新成功就靠卡片呈现结果，不再另发一条消息；更新失败才回落文本。
+      const completed = await cardListener?.complete(text);
+      return { text: cardListener == null || completed === false ? text : null, phase: 'COMPLETED' };
     } catch (error) {
       console.error(`钉钉 Agent 执行失败, sessionId=${sessionId}`, error);
       await this.options.sessionService.cleanupIncompleteTail?.(sessionId);
       const failText = error instanceof Error ? error.message : 'Agent 执行异常';
-      await cardListener?.fail(failText);
+      const failed = await cardListener?.fail(failText);
       if (this.canSettle(started, lease)) {
         await this.options.onExecutionFinished?.(sessionId, context, executionId, 'FAILED', failText, lease);
       } else {
@@ -391,7 +395,7 @@ export class AgentDingtalkInboundHandler implements DingtalkInboundHandler {
         }
         await this.options.taskTerminalService?.releaseExecutionLease?.(lease).catch(() => undefined);
       }
-      return { text: failText, phase: 'FAILED' };
+      return { text: cardListener == null || failed === false ? failText : null, phase: 'FAILED' };
     } finally {
       if (swap && savedId != null) {
         await this.options.sessionService.replaceMessageContent?.(savedId, built.persisted).catch((error) => {
@@ -449,31 +453,36 @@ export class AgentDingtalkInboundHandler implements DingtalkInboundHandler {
       else await this.options.harnessService.execute(sessionId, null, executeListener, cancelFlag, retryRuntimeUserId, lease);
       if (cancelFlag.get()) {
         await this.options.sessionService.cleanupIncompleteTail?.(sessionId);
-        await cardListener.cancel(this.interrupted.has(sessionId));
+        const cancelled = await cardListener.cancel(this.interrupted.has(sessionId));
         if (this.canSettle(started, lease)) {
           await this.options.onExecutionFinished?.(sessionId, stub, executionId, 'CANCELLED', undefined, lease);
         }
         await this.options.afterDelivery?.(sessionId, 'CANCELLED');
+        if (!cancelled) await this.reply(await this.replyContext(sessionId, stub), '任务已取消。', sessionId);
         return 'CANCELLED';
       }
       if (this.canSettle(started, lease)) {
         await this.options.onExecutionFinished?.(sessionId, stub, executionId, 'COMPLETED', undefined, lease);
       }
       const text = await this.options.sessionService.getLatestAssistantReply(sessionId);
-      await cardListener.complete(text);
-      if (text) await this.reply(await this.replyContext(sessionId, stub), text, sessionId);
+      const completed = await cardListener.complete(text);
+      if (!completed && text !== '') {
+        await this.reply(await this.replyContext(sessionId, stub), text, sessionId);
+      }
       await this.options.afterDelivery?.(sessionId, 'COMPLETED');
       return 'COMPLETED';
     } catch (error) {
       const failText = error instanceof Error ? error.message : 'Agent 执行异常';
-      await cardListener?.fail(failText);
+      const failed = await cardListener?.fail(failText);
       if (this.canSettle(started, lease)) {
         await this.options.onExecutionFinished?.(sessionId, stub, executionId, 'FAILED', failText, lease);
       } else {
         await this.options.sessionService.updatePhase?.(sessionId, previousPhase).catch(() => undefined);
         await this.options.taskTerminalService?.releaseExecutionLease?.(lease).catch(() => undefined);
       }
-      if (failText) await this.reply(await this.replyContext(sessionId, stub), failText, sessionId);
+      if (failed === false && failText !== '') {
+        await this.reply(await this.replyContext(sessionId, stub), failText, sessionId);
+      }
       await this.options.afterDelivery?.(sessionId, 'FAILED');
       return 'FAILED';
     } finally {
@@ -489,9 +498,9 @@ export class AgentDingtalkInboundHandler implements DingtalkInboundHandler {
     }
     const botId = this.options.resolveBotId?.(context.accountId) ?? Number(context.accountId);
     const payload = JSON.stringify(buildQueuePayload(botId, context, built));
-    let queueId: number;
+    let queued: { id: number; rankNo: number | null };
     try {
-      queueId = await queueService.enqueue({
+      queued = await queueService.enqueue({
         sessionId, botId, messageId: context.messageId, senderUserid: context.senderUserid ?? '',
         maoUserId: session.executionUserId ?? context.maoUserId ?? null, payload,
       });
@@ -500,7 +509,8 @@ export class AgentDingtalkInboundHandler implements DingtalkInboundHandler {
       await this.reply(context, '当前任务正在执行中，消息排队失败，请稍后重试。', sessionId);
       return;
     }
-    const outTrackId = await this.options.createQueueCard?.(context, queueId, sessionId).catch(() => null) ?? null;
+    const queueId = queued.id;
+    const outTrackId = await this.options.createQueueCard?.(context, queueId, sessionId, queued.rankNo ?? undefined).catch(() => null) ?? null;
     if (outTrackId != null) await queueService.setOutTrackId(queueId, outTrackId);
     else await this.reply(context, '当前任务执行中，你的消息已排队等待处理。', sessionId);
   }
@@ -767,13 +777,16 @@ function buildQueuePayload(botId: number, context: DingtalkInboundContext, built
   return { persisted: built.persisted, forModel: built.forModel, context: stored, botId };
 }
 
-function contextFromQueue(payload: DingtalkQueuePayload, row: DingtalkInboundQueueRow): DingtalkInboundContext {
+/** 队列行 → 入站上下文（含一卡到底的 progressCardOutTrackId 透传）。导出仅为单测（仓库纯函数可测惯例）。 */
+export function contextFromQueue(payload: DingtalkQueuePayload, row: DingtalkInboundQueueRow): DingtalkInboundContext {
   const s = payload.context;
   return {
     accountId: s.accountId, chatType: s.chatType, conversationId: s.conversationId, messageId: s.messageId,
     senderUserid: s.senderUserid, senderUnionId: s.senderUnionId, senderName: s.senderName,
     msgtype: s.msgtype, text: s.text, downloadCodes: [], fileName: s.fileName, quotedText: s.quotedText ?? null,
     isInAtList: true, maoUserId: row.maoUserId ?? s.maoUserId, groupContext: s.groupContext, senderLabel: s.senderLabel,
+    // 一卡到底：排队卡实例 ID 随上下文进入 createProgressCard，就地升级为进度卡（飞书 progressCardMessageId 同义）
+    progressCardOutTrackId: row.outTrackId,
   };
 }
 

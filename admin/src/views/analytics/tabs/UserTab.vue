@@ -75,9 +75,12 @@
         <el-table-column label="最后登录" width="170" class-name="hide-on-mobile">
           <template #default="{ row }">{{ formatDateTime(row.lastLoginAt) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="100" class-name="hide-on-mobile">
+        <el-table-column label="操作" width="180" class-name="hide-on-mobile">
           <template #default="{ row }">
-            <button class="linkish" type="button" @click="go(`/llm-calls?userId=${row.userId}`)">调用流水</button>
+            <div class="row-actions">
+              <button class="linkish" type="button" @click="go(`/llm-calls?userId=${row.userId}`)">调用流水</button>
+              <button class="linkish" type="button" @click="go(`/users?detail=${row.userId}&tab=usage`)">用量详情</button>
+            </div>
           </template>
         </el-table-column>
       </el-table>
@@ -203,6 +206,13 @@ export default { name: 'UserTab' }
 .pagination {
   margin-top: 12px;
   justify-content: flex-end;
+}
+
+.row-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  white-space: nowrap;
 }
 
 .linkish {

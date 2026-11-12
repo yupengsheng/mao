@@ -177,3 +177,50 @@ describe('AgentDingtalkInboundHandler sessions', () => {
       20, null, expect.anything(), expect.anything(), 67);
   });
 });
+
+describe('AgentDingtalkInboundHandler 终态回复', () => {
+  function progressSpy(updateFails: boolean) {
+    const updates: Array<{ status: string }> = [];
+    return {
+      updates,
+      createProgressCard: vi.fn(async () => ({
+        update: async (status: string) => {
+          updates.push({ status });
+          // listener 的 safeUpdate 会吞掉这里的异常并把结果折算成 false，
+          // 与生产里卡片更新失败（网络/模板）的路径一致。
+          if (updateFails) throw new Error('卡片更新失败');
+        },
+      })),
+    };
+  }
+
+  it('卡片终态更新成功时不再另发一条消息：结果由卡片呈现', async () => {
+    const card = progressSpy(false);
+    const reply = vi.fn(async () => undefined);
+    const { handler: inbound } = handler({ createProgressCard: card.createProgressCard as never, onReply: reply });
+
+    await inbound.onMessage(context({ text: '你好' }));
+
+    expect(card.updates.map((item) => item.status)).toContain('COMPLETED');
+    expect(reply).not.toHaveBeenCalled();
+  });
+
+  it('卡片终态更新失败时回落文本回复，避免用户两边都收不到', async () => {
+    const card = progressSpy(true);
+    const reply = vi.fn(async () => undefined);
+    const { handler: inbound } = handler({ createProgressCard: card.createProgressCard as never, onReply: reply });
+
+    await inbound.onMessage(context({ text: '你好' }));
+
+    expect(reply).toHaveBeenCalledWith(expect.anything(), '回复', expect.anything());
+  });
+
+  it('没有进度卡时仍按原样发文本回复', async () => {
+    const reply = vi.fn(async () => undefined);
+    const { handler: inbound } = handler({ onReply: reply });
+
+    await inbound.onMessage(context({ text: '你好' }));
+
+    expect(reply).toHaveBeenCalledWith(expect.anything(), '回复', expect.anything());
+  });
+});

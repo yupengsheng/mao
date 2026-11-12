@@ -22,7 +22,20 @@ export type {
   InboxPreference,
 } from './inbox';
 export type { QuickCommandItem, QuickCommandsVO } from './command';
-export type { LlmCallScene } from './usage';
+export type {
+  LlmCallScene,
+  UsageRange,
+  UsageDateRange,
+  UsageWindow,
+  TrendGranularity,
+  LlmCallSummaryRow,
+  LlmCallModelAggRow,
+  LlmCallSceneAggRow,
+  LlmCallAgentAggRow,
+  LlmCallTrendRow,
+  MyUsageSummary,
+  MyUsageTrends,
+} from './usage';
 export type { SignalCompareMode, SignalWatcherStatus, SignalTriggerMode, SignalWatcherWarning, SignalWhenChangeInput, SignalCheckDetailInput } from './signal';
 export { SIGNAL_SNIPPET_MAX_CHARS, truncateSignalSnippet, formatSignalChangeValue, formatSignalCheckDetail } from './signal';
 export type { MemoryScope, MemoryStatus, MemorySource } from './memory';
@@ -37,6 +50,7 @@ export type { OnboardingState, ReadinessVO, OnboardingCompleteInput } from './re
 export type { BudgetScope, BudgetLimitType, BudgetAction, BudgetStatus, MyBudgetItemVO, MyBudgetsVO } from './budget';
 export type { AuditLog, AuditListFilter } from './audit';
 export type { MessageSearchGroup, MessageSearchHit, MessageSearchResult, SessionSource } from './session';
+export type { OnlineDeviceConnection, OnlineDeviceDeviceInfo, OnlineDevicesVo } from './statistics';
 export type { TaskStage, TaskSource, TaskWaitKind, TaskWaitStatus, TaskWaitReleaseReason, TaskWaitVO, AgentTaskVO, TaskExecutionVO, TaskTriggerVO, TaskListQuery, TaskPageVO, TaskDetailVO } from './task';
 export type { WorkspaceKind, WorkspaceChannel, WorkspaceChatType } from './workspace';
 export type {

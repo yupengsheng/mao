@@ -5,6 +5,15 @@ const TITLES = {
   cancelled: '任务已取消',
 } as const;
 
+/** 卡片正文上限，与飞书进度卡正文（CARD_TEXT_MAX）同为 6000。状态行、回复、工具列表共用这一段。 */
+const BODY_MAX = 6000;
+
+/** 点踩按钮文案（飞书 FEISHU_DISLIKE_BUTTON 同款文案）：idle 为初始，disliked 为已点踩翻转态。 */
+export const DINGTALK_DISLIKE_LABELS = {
+  idle: '👎 不满意',
+  disliked: '👎 已点踩 · 再点取消',
+} as const;
+
 export type DingtalkProgressStatus = keyof typeof TITLES;
 
 export function formatDingtalkDuration(ms: number): string {
@@ -20,6 +29,12 @@ export function formatDingtalkDuration(ms: number): string {
   return restMinutes === 0 ? `${hours} 小时` : `${hours} 小时 ${restMinutes} 分`;
 }
 
+/**
+ * 进度卡正文：`**状态：处理完成** · 共 3 轮 · 耗时 44 秒` + 空行 + 正文 + 工具列表。
+ * 与飞书进度卡同构（feishu/progress-card.ts 的 statusLineOf + content + tools），
+ * 区别是飞书分三个 markdown 元素，钉钉模板只有一个 markdown 变量，故拼接成单串。
+ * @param detail 本轮/终态正文；running 态为流式累积的 assistant 文本，终态为最终回复。
+ */
 export function progressCardParams(input: {
   status: DingtalkProgressStatus;
   round: number;
@@ -29,48 +44,89 @@ export function progressCardParams(input: {
   sessionUrl?: string;
   sessionId: number;
   senderUserid: string;
+  /** 完成卡点踩态：true 时「👎 不满意」按钮文案翻转为「已点踩 · 再点取消」（飞书同款 toggle）。 */
+  disliked?: boolean;
 }): Record<string, string> {
-  const meta: string[] = [];
-  if (input.round > 0) meta.push(input.status === 'running' ? `第 ${input.round} 轮` : `共 ${input.round} 轮`);
-  if (input.status !== 'running' && input.elapsedMs != null) meta.push(`耗时 ${formatDingtalkDuration(input.elapsedMs)}`);
-  const lines = [meta.join(' · ')];
+  const sections: string[] = [statusLineOf(input.status, input.round, input.elapsedMs)];
+  const detail = input.detail?.trim() ?? '';
+  if (detail !== '') sections.push(detail);
   const tools = (input.tools ?? []).filter((tool) => tool.trim() !== '');
-  if (tools.length > 0) lines.push(tools.map((tool) => `- ${tool}`).join('\n'));
-  if (input.detail != null && input.detail.trim() !== '') lines.push(input.detail.trim());
+  if (tools.length > 0) sections.push(`**本轮工具**\n${tools.map((tool) => `- ${tool}`).join('\n')}`);
   return {
     title: TITLES[input.status],
-    body: lines.filter((line) => line !== '').join('\n').slice(0, 1500),
+    body: sections.join('\n\n').slice(0, BODY_MAX),
     status: input.status,
+    // 按钮可见性用 boolean 变量：钉钉卡片平台只把「boolean 变量 + isTrue/isFalse」
+    // 渲染成可用的 @data{...} 条件，字符串 isEqual 比较导入后会被抹成空条件
+    // （@triple{'' , 'visible', 'gone'} 恒假），按钮永远不显示。
+    canCancel: String(input.status === 'running'),
+    canRetry: String(input.status === 'failed'),
+    // 合并模板（V192）下三个按钮的可见性变量都要显式下发，无关态置 false——
+    // 任何一次 updateCard 都不会留下未声明的 undefined（技术方案 §5.3）。
+    canRun: 'false',
+    // 完成态显示「👎 不满意」点踩（与桌面/飞书汇入同一张统计表）；会话详情按钮恒显示。
+    canFeedback: String(input.status === 'completed'),
+    canOpenSession: 'true',
+    dislikeText: input.disliked ? DINGTALK_DISLIKE_LABELS.disliked : DINGTALK_DISLIKE_LABELS.idle,
     sessionUrl: input.sessionUrl ?? '',
     sessionId: String(input.sessionId),
     senderUserid: input.senderUserid,
   };
 }
 
+
+/** 状态行：`**状态：处理完成** · 共 3 轮 · 耗时 44 秒`（与飞书 statusLineOf 同口径）。 */
+function statusLineOf(status: DingtalkProgressStatus, round: number, elapsedMs?: number): string {
+  const meta: string[] = [];
+  if (round > 0) meta.push(status === 'running' ? `第 ${round} 轮` : `共 ${round} 轮`);
+  if (status !== 'running' && elapsedMs != null) meta.push(`耗时 ${formatDingtalkDuration(elapsedMs)}`);
+  return `**状态：${TITLES[status]}**${meta.length > 0 ? ` · ${meta.join(' · ')}` : ''}`;
+}
+
+/** 排队卡参数：合并模板（V192）下与进度卡共用 body/status/三 boolean 变量，`preview` 变量已删除。
+ *  body 自拼 markdown（状态行 + 队列位次（可选）+ 消息摘要）；rankNo 由调用方在可得时传入（入队时无位次数据则省略）。 */
 export function queueCardParams(input: {
   status: 'queued' | 'started' | 'cancelled';
   preview: string;
   queueId: number;
   senderUserid: string;
+  rankNo?: number;
 }): Record<string, string> {
   const title = input.status === 'queued' ? '排队中' : input.status === 'started' ? '已开始处理' : '已取消';
+  const position = input.status === 'queued' && input.rankNo != null && input.rankNo > 0 ? `当前排在第 ${input.rankNo} 位\n\n` : '';
   return {
     title,
-    preview: input.preview.slice(0, 80),
+    body: `**状态：${title}**\n\n${position}${input.preview.slice(0, 80)}`,
     status: input.status,
     queueId: String(input.queueId),
     senderUserid: input.senderUserid,
+    canRun: String(input.status === 'queued'),
+    canCancel: 'false',
+    canRetry: 'false',
+    canFeedback: 'false',
+    canOpenSession: 'false',
+    dislikeText: DINGTALK_DISLIKE_LABELS.idle,
+    sessionUrl: '',
   };
 }
 
+/**
+ * 按钮 Toast 的成败看 `requestOk`，不看 `status`。
+ * 卡片平台会把字符串 `isEqual`（如 `status == cancelled`）编译成空条件，
+ * `dtConditionalHandler` 的第一参变成 `''`，恒走失败 Toast——卡片内容仍按回包更新，
+ * 于是会出现「卡已变成已取消，同时提示取消失败」。
+ * 成功回包（有 cardParamMap）带 `requestOk=true`；失败回包只把 `requestOk` 置 false，不改其余字段。
+ * 模板按钮的成功判定是 `isTrue(requestOk)`，与可见性一样能被编译成 `@data{...}`。
+ */
 export function cardCallbackResponse(cardParamMap: Record<string, string> | null, tips?: string): Record<string, unknown> {
+  const accepted = cardParamMap != null;
   const response: Record<string, unknown> = {
     cardUpdateOptions: {
-      updateCardDataByKey: cardParamMap != null,
+      updateCardDataByKey: true,
       updatePrivateDataByKey: tips != null && tips !== '',
     },
+    cardData: { cardParamMap: { ...(cardParamMap ?? {}), requestOk: accepted ? 'true' : 'false' } },
   };
-  if (cardParamMap != null) response.cardData = { cardParamMap };
   if (tips != null && tips !== '') response.userPrivateData = { cardParamMap: { tips } };
   return response;
 }

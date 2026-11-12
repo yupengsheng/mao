@@ -99,6 +99,8 @@ export function parseUsageRange(value: string | undefined): UsageRange {
 /** 用户端用量总览：窗口总账 + 按模型 + 按场景 + 按 Agent（一次请求给全，前端同周期展示）。 */
 export interface MyUsageSummary {
   range: UsageRange;
+  /** 解析后的窗口（Asia/Shanghai 日历日闭区间）：深链调用流水等需要具体日期时直接取用。 */
+  window: { startYmd: string; endYmd: string };
   totals: LlmCallSummaryRow;
   byModel: LlmCallModelAggRow[];
   byScene: LlmCallSceneAggRow[];
@@ -109,6 +111,7 @@ export interface MyUsageSummary {
 export interface MyUsageTrends {
   range: UsageRange;
   granularity: TrendGranularity;
+  window: { startYmd: string; endYmd: string };
   buckets: LlmCallTrendRow[];
 }
 
@@ -369,7 +372,12 @@ export class LlmCallService {
       this.repo.aggregateByScene(userId, window),
       this.repo.aggregateByAgent(userId, window),
     ]);
-    return { range: resolved, totals, byModel, byScene, byAgent: await this.resolveAgentNames(byAgent) };
+    return {
+      range: resolved,
+      window: { startYmd: window.startYmd, endYmd: window.endYmd },
+      totals, byModel, byScene,
+      byAgent: await this.resolveAgentNames(byAgent),
+    };
   }
 
   /** 按 Agent 汇总补名字：agent_id 为 null（压缩/标题等无归属调用）或已删 Agent 时名字为 null，前端兜底展示。 */
@@ -399,7 +407,12 @@ export class LlmCallService {
     const window = rangeWindow(resolved, dateRange);
     const rows = await this.repo.aggregateTrend(userId, window, granularity);
     const keys = buildTrendKeys(window.startYmd, window.endYmd, granularity);
-    return { range: resolved, granularity, buckets: fillTrendBuckets(rows, keys) };
+    return {
+      range: resolved,
+      granularity,
+      window: { startYmd: window.startYmd, endYmd: window.endYmd },
+      buckets: fillTrendBuckets(rows, keys),
+    };
   }
 
   private async enrichRecords(records: LlmCallRow[]): Promise<LlmCallListItem[]> {

@@ -65,6 +65,11 @@
           </div>
         </el-tab-pane>
 
+        <!-- 用量 -->
+        <el-tab-pane v-if="canViewUsage" label="用量" name="usage" lazy>
+          <UserUsageTab :user-id="user.id" />
+        </el-tab-pane>
+
         <!-- 定时任务 -->
         <el-tab-pane label="定时任务" name="tasks">
           <el-table :data="tasks" v-loading="loadingTabs['tasks']" size="small" stripe>
@@ -251,6 +256,7 @@ import { formatDateTime, formatDateTimeColumn } from '../../utils/datetime'
 // 复用全站统一的阶段文案（含 IDLE / WAITING_APPROVAL），勿在本页自造映射
 import { phaseLabel } from '../../utils/labels'
 import { useAuthStore } from '../../stores/auth'
+import UserUsageTab from './components/UserUsageTab.vue'
 
 interface UserRow {
   id: number
@@ -266,6 +272,8 @@ interface UserRow {
 const props = defineProps<{
   visible: boolean
   user: UserRow | null
+  /** 深链入口要定位的 Tab（如 analytics 用户用量页的「用量详情」）。 */
+  initialTab?: string
 }>()
 
 defineEmits<{
@@ -285,6 +293,8 @@ const loadingTabs = reactive<Record<string, boolean>>({})
 const canWrite = computed(() => authStore.hasPermission('user:write'))
 /** 容器重建（Docker 模式，V177）：独立权限 container:manage，默认仅管理员角色。 */
 const canManageContainer = computed(() => authStore.hasPermission('container:manage'))
+/** 用量 Tab 与用量分析同权限码：无 analytics:read 不渲染，避免点进去 403。 */
+const canViewUsage = computed(() => authStore.hasPermission('analytics:read'))
 const recycling = ref(false)
 
 async function recycleContainer() {
@@ -383,7 +393,7 @@ function readTotalCount(headers: unknown): number {
 }
 
 function handleOpen() {
-  activeTab.value = 'sessions'
+  activeTab.value = props.initialTab === 'usage' && canViewUsage.value ? 'usage' : 'sessions'
   sessionsPage.value = 1
   tasksPage.value = 1
   commandsPage.value = 1

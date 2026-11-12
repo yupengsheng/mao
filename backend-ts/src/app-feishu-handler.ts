@@ -517,8 +517,7 @@ export function assembleFeishuHandler(deps: FeishuHandlerDeps): FeishuHandlerRes
       reconnectMaxMs: cfg.dingtalk.reconnectMaxMs,
       maxConsecutiveFailures: cfg.dingtalk.maxConsecutiveFailures,
       oauth: cfg.dingtalk.oauth,
-      progressCardTemplateId: cfg.dingtalk.progressCardTemplateId,
-      queueCardTemplateId: cfg.dingtalk.queueCardTemplateId,
+      cardTemplateId: cfg.dingtalk.cardTemplateId,
       replyMaxLength: cfg.dingtalk.replyMaxLength,
       groupContextMaxItems: cfg.dingtalk.groupContext.maxItems,
       groupContextMaxMinutes: cfg.dingtalk.groupContext.maxMinutes,
@@ -528,6 +527,7 @@ export function assembleFeishuHandler(deps: FeishuHandlerDeps): FeishuHandlerRes
     workspaceRoot: cfg.app.harness.workspaceRoot,
     jwt: d.jwt,
     permissionService: d.permissionService,
+    feedbackService: d.feedbackService,
     sessionService: d.sessionService,
     sessionRepo: d.sessionRepo,
     harness: d.harness,
@@ -546,10 +546,12 @@ export function assembleFeishuHandler(deps: FeishuHandlerDeps): FeishuHandlerRes
     onQueuesDrained: relayPlatformQueues,
   });
   d.dingtalkMediaHolder.current = dingtalk.mediaSend;
+  d.scheduledService.setDingtalkResultPusher((sessionId: number, text: string) => dingtalk.pushScheduledResult(sessionId, text));
   const feishuMonitor = new FeishuMonitorService(cfg.feishu.bot, d.feishuBots, feishuInboundProcessor, async (data: any) => feishuCardActionService.handle(data, ''));
 
   const analyticsService = new AnalyticsService(new AnalyticsDbStore(db));
-  const statisticsService = new StatisticsService(new StatisticsDbStore(db));
+  // wsRegistry：在线设备页快照来源（create-app 装配时已传入，见 FeishuHandlerDeps 的 any 透传）
+  const statisticsService = new StatisticsService(new StatisticsDbStore(db), d.wsRegistry);
   const adminAnalytics = new AdminAnalyticsService(statisticsService, new AdminAnalyticsDbStore(db));
   const httpToolStatsStore = new AdminAnalyticsDbStore(db);
   const mcpValidator = new McpServerValidatorImpl(d.mcpServerLookup);

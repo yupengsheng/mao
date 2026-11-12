@@ -11,8 +11,7 @@ export interface DingtalkBotConfig {
   reconnectMaxMs: number;
   maxConsecutiveFailures: number;
   oauth: { clientId: string; clientSecret: string; redirectUri: string };
-  progressCardTemplateId: string;
-  queueCardTemplateId: string;
+  cardTemplateId: string;
   replyMaxLength: number;
   groupContext: { maxItems: number; maxMinutes: number };
   /** 入站防抖合并窗口（ms）：同账号+会话+发送者的连续文本消息合并为一次触发；0=禁用。 */
@@ -223,8 +222,7 @@ const DEFAULTS: AppConfig = {
     reconnectMaxMs: 30000,
     maxConsecutiveFailures: 5,
     oauth: { clientId: '', clientSecret: '', redirectUri: '' },
-    progressCardTemplateId: '',
-    queueCardTemplateId: '',
+    cardTemplateId: '',
     replyMaxLength: 2000,
     groupContext: { maxItems: 10, maxMinutes: 120 },
     mergeWindowMs: 1000,
@@ -594,8 +592,7 @@ export function loadConfig(): AppConfig {
   if (process.env.DINGTALK_OAUTH_CLIENT_ID) cfg.dingtalk.oauth.clientId = process.env.DINGTALK_OAUTH_CLIENT_ID;
   if (process.env.DINGTALK_OAUTH_SECRET) cfg.dingtalk.oauth.clientSecret = process.env.DINGTALK_OAUTH_SECRET;
   if (process.env.DINGTALK_OAUTH_REDIRECT_URI) cfg.dingtalk.oauth.redirectUri = process.env.DINGTALK_OAUTH_REDIRECT_URI;
-  if (process.env.DINGTALK_PROGRESS_CARD_TEMPLATE_ID) cfg.dingtalk.progressCardTemplateId = process.env.DINGTALK_PROGRESS_CARD_TEMPLATE_ID;
-  if (process.env.DINGTALK_QUEUE_CARD_TEMPLATE_ID) cfg.dingtalk.queueCardTemplateId = process.env.DINGTALK_QUEUE_CARD_TEMPLATE_ID;
+  if (process.env.DINGTALK_CARD_TEMPLATE_ID) cfg.dingtalk.cardTemplateId = process.env.DINGTALK_CARD_TEMPLATE_ID;
   cached = cfg;
   return cfg;
 }
