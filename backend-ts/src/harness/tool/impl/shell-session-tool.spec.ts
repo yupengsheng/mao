@@ -37,7 +37,7 @@ describe('ShellSessionTool', () => {
       return { output: 'hello\n', truncated: false, completed: true, exitCode: null, matched: null };
     }),
   };
-  const background = { submit: vi.fn(() => 'task-1') };
+  const background = { submit: vi.fn(() => 'task-1'), awaitResult: vi.fn() };
   const git = {
     resolveForSession: vi.fn(async () => ({ 'github.com': 'tok' })),
     resolveForAgent: vi.fn(async () => ({ 'github.com': 'tok' })),
@@ -74,6 +74,20 @@ describe('ShellSessionTool', () => {
     const closed = JSON.parse(await tool.execute(JSON.stringify({ action: 'close', session_id: 'sh-1' }), 11, null, null));
     expect(closed.success).toBe(true);
     expect(sessionManager.close).toHaveBeenCalledWith('sh-1', { conversationId: 11 });
+  });
+
+  it('stale shell / async task errors carry recreate guidance after an agent switch', async () => {
+    sessionManager.getSession.mockReturnValueOnce(null);
+    const gone = JSON.parse(await tool.execute(JSON.stringify({ action: 'write_stdin', session_id: 'x', input: 'a' }), 11, null, null));
+    expect(gone.error).toContain('已失效');
+    expect(gone.error).toContain('切换 Agent');
+    expect(gone.error).toContain('重新创建 shell 会话');
+
+    background.awaitResult.mockResolvedValueOnce({ status: 'not_found' });
+    const taskGone = JSON.parse(await tool.execute(JSON.stringify({ action: 'await_async', task_id: 'task-9' }), 11, null, null));
+    expect(taskGone.error).toContain('已失效');
+    expect(taskGone.error).toContain('切换 Agent');
+    expect(taskGone.error).toContain('重新提交后台任务');
   });
 
   it('submits async exec and reports missing command', async () => {

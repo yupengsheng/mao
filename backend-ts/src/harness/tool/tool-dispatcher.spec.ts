@@ -10,6 +10,7 @@ import type { SessionMapper, StreamingWsRegistry } from '../deps.js';
 import type { SessionTreeSignalPublisher } from '../approval/session-tree-signal-publisher.js';
 import type { LlmAdapter } from '../llm/chat-request.js';
 import { BackgroundTaskManager } from '../core/background-task-manager.js';
+import { sendToolRoundContext } from './impl/send-file-bytes.js';
 
 function mockTool(name: string): Tool & { execute: ReturnType<typeof vi.fn> } {
   return {
@@ -1125,6 +1126,44 @@ describe('ToolDispatcher docker routing', () => {
     cloudTool.execute.mockReset();
     mcpTool.execute.mockReset();
     localToolExecutor.execute.mockReset();
+  });
+
+  it('injects the round agent snapshot for send tools on the fallback path', async () => {
+    let seen: number | null | undefined;
+    const sendTool = mockTool('feishu_send_image');
+    sendTool.execute.mockImplementation(async () => {
+      seen = sendToolRoundContext.getStore()?.agentId ?? null;
+      return 'ok';
+    });
+    const registryWithSend = new ToolRegistry([cloudTool, mcpTool, sendTool]);
+    const dockerRouter = { enabledFor: vi.fn(async () => true), dispatch: vi.fn() };
+    sessionMapper.selectById.mockResolvedValue({ agentId: 9 });
+    const dispatcherWithSend = new ToolDispatcher(
+      registryWithSend, localToolExecutor, dangerAssessor, sessionMapper, streamingWsRegistry,
+      askUserQuestionsRegistry, localToolSessionRegistry, treeSignalPublisher,
+      null, null, null, null, null, null, null, null,
+      dockerRouter as never,
+    );
+    await dispatcherWithSend.dispatchInvocation({
+      callId: 'c', toolName: 'feishu_send_image', argumentsJson: '{}',
+      executionMode: 'CLOUD', sessionId: 11, userId: 7, executionUserId: 7,
+      runtimeUserId: 7, agentId: 5, workspace: '/ws', permissionLevel: null, modelConfig: null, sessionTools: null,
+    } as never);
+    expect(seen).toBe(5);
+
+    seen = undefined;
+    const plainDispatcher = new ToolDispatcher(
+      registryWithSend, localToolExecutor, dangerAssessor, sessionMapper, streamingWsRegistry,
+      askUserQuestionsRegistry, localToolSessionRegistry, treeSignalPublisher,
+      null, null, null, null, null, null, null, null,
+      { enabledFor: vi.fn(async () => false), dispatch: vi.fn() } as never,
+    );
+    await plainDispatcher.dispatchInvocation({
+      callId: 'c', toolName: 'feishu_send_image', argumentsJson: '{}',
+      executionMode: 'CLOUD', sessionId: 11, userId: 7, executionUserId: 7,
+      runtimeUserId: 7, agentId: 5, workspace: '/ws', permissionLevel: null, modelConfig: null, sessionTools: null,
+    } as never);
+    expect(seen).toBeNull();
   });
 
   it('routesDockerOnlyToolsToContainer', async () => {
