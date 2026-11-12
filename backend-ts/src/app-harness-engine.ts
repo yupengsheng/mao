@@ -68,6 +68,7 @@ import type { McpLoadModeResolver } from './harness/mcp/workingset/mcp-load-mode
 import type { McpSyncService } from './harness/mcp/local/mcp-sync-service.js';
 import type { RoutingMcpClientManager } from './harness/container/routing-mcp-client-manager.js';
 import type { Db } from './db/db.js';
+import type { WatcherService } from './signal/watcher.service.js';
 
 import { createDefaultToolRegistry } from './harness/tool/tool-registry.js';
 import { ToolDispatcher } from './harness/tool/tool-dispatcher.js';
@@ -85,6 +86,7 @@ export interface HarnessEngineDeps {
   cfg: AppConfig;
   apiPrefix: string;
   uploadDir: string;
+  getSignalWatcherService: () => WatcherService;
   harnessTuning: HarnessTuningSettings;
   pathSandbox: PathSandbox;
   todoMapper: SessionTodoMapper;
@@ -286,6 +288,7 @@ export function assembleHarnessEngine(deps: HarnessEngineDeps): HarnessEngineRes
     mcpClientManager: d.routingMcpClient,
     httpToolService: d.httpToolService,
     httpApiExecutor: d.httpApiExecutor,
+    getSignalWatcherService: d.getSignalWatcherService,
     agentMapper: d.agentRepo as never,
   });
 

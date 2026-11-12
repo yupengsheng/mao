@@ -40,6 +40,7 @@ import { DumpUserMessagesTool } from './impl/dump-user-messages-tool.js';
 import { GenerateImageTool } from './impl/generate-image-tool.js';
 import { EditImageTool } from './impl/edit-image-tool.js';
 import { TaskCreateTool, TaskDeleteTool, TaskListTool, TaskUpdateTool } from './impl/task-tools.js';
+import { CreateSignalWatcherTool, ListSignalWatchersTool, type SignalWatcherServiceRef } from './impl/signal-watcher-tools.js';
 import {
   CreateScheduledTaskTool, DeleteScheduledTaskTool, ListScheduledTasksTool, UpdateScheduledTaskTool,
 } from './impl/scheduled-task-tools.js';
@@ -130,6 +131,7 @@ export interface DefaultToolRegistryDeps {
    * 未注入时（精简装配/单测）两工具行为与改造前完全一致。
    */
   onFileChanged?: (absPath: string) => void;
+  getSignalWatcherService?: SignalWatcherServiceRef;
 }
 
 /** Instantiates and registers all built-in tools (mirrors Spring Tool bean auto-registration). */
@@ -170,6 +172,10 @@ export function createDefaultToolRegistry(deps: DefaultToolRegistryDeps): ToolRe
     new TaskListTool(deps.sessionTodoMapper),
     new TaskUpdateTool(deps.sessionTodoMapper),
     new TaskDeleteTool(deps.sessionTodoMapper),
+    ...(deps.getSignalWatcherService != null ? [
+      new ListSignalWatchersTool(deps.getSignalWatcherService, deps.sessionService),
+      new CreateSignalWatcherTool(deps.getSignalWatcherService, deps.sessionService),
+    ] : []),
     new CreateScheduledTaskTool(deps.scheduledTaskService, deps.sessionService),
     new ListScheduledTasksTool(deps.scheduledTaskService),
     new UpdateScheduledTaskTool(deps.scheduledTaskService),

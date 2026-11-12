@@ -122,11 +122,12 @@ export interface ContainerOps {
   getRuntimeEnvironment(): Promise<RuntimeEnvironmentSnapshot>;
 }
 
-/** 容器是否处于忙碌状态（有活跃 shell / 在途任务 / 已连接终端）。 */
+/** 容器是否处于忙碌状态（有活跃 shell / 在途任务 / 已连接终端 / 脚本探针）。 */
 function isBusy(entry: ContainerEntry): boolean {
   return entry.inContainer.shellSessions > 0
     || entry.inContainer.pendingTasks > 0
-    || entry.inContainer.attachedTerminals > 0;
+    || entry.inContainer.attachedTerminals > 0
+    || (entry.inContainer.scriptProbes ?? 0) > 0;
 }
 
 export interface DockerCli {
@@ -804,6 +805,17 @@ export class ContainerRegistry {
   }
 
   /**
+   * 脚本探针能否向这只容器发帧：两边闭包版本都非空且一致。
+   * 旧 agent 不认识 script_probe，发了只会干等满超时；不一致时调用方记基础设施失败，不回退宿主。
+   */
+  scriptProbeRuntimeReady(entry: ContainerEntry): boolean {
+    return this.hostRuntimeBuild != null
+      && entry.runtimeBuild != null
+      && entry.runtimeBuild !== ''
+      && entry.runtimeBuild === this.hostRuntimeBuild;
+  }
+
+  /**
    * 处理容器内代码漂移（技术方案 §3.4/§3.5）：重启容器进程加载新 dist（不重建，保挂载/env/容器名）。
    * 返回 true 表示已执行重启。守卫顺序：one-shot → 总开关 → 蓝绿 draining → 忙碌延后。
    */
@@ -1021,7 +1033,8 @@ export class ContainerRegistry {
   }
 
   private isBusy(entry: ContainerEntry): boolean {
-    return entry.inContainer.shellSessions > 0 || entry.inContainer.pendingTasks > 0 || entry.inContainer.attachedTerminals > 0;
+    return entry.inContainer.shellSessions > 0 || entry.inContainer.pendingTasks > 0 || entry.inContainer.attachedTerminals > 0
+      || (entry.inContainer.scriptProbes ?? 0) > 0;
   }
 
   /**

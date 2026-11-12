@@ -333,6 +333,10 @@ describe('container registry', () => {
     registry.reportRuntimeStatus(7, 5, { shellSessions: 2, pendingTasks: 0, attachedTerminals: 0 });
     await registry.reapExpired();
     expect(log.some((line) => line.startsWith('stop -t 10 mao-user-7'))).toBe(false);
+    // 脚本探针进行中同样不算空闲
+    registry.reportRuntimeStatus(7, 5, { shellSessions: 0, pendingTasks: 0, attachedTerminals: 0, scriptProbes: 1 });
+    await registry.reapExpired();
+    expect(log.some((line) => line.startsWith('stop -t 10 mao-user-7'))).toBe(false);
     // 容器内状态归零后 idle 推进 → stop（不 rm）
     registry.reportRuntimeStatus(7, 5, { shellSessions: 0, pendingTasks: 0, attachedTerminals: 0 });
     await registry.reapExpired();
@@ -1241,6 +1245,10 @@ describe('container registry', () => {
     // 忙碌：不打断在跑任务，零 docker 操作
     expect(dockerOps(log)).toEqual([]);
     expect(log.some((line) => line.startsWith('start mao-user-7'))).toBe(false);
+    // 脚本探针进行中同样不打断
+    registry.reportRuntimeStatus(7, 5, { shellSessions: 0, pendingTasks: 0, attachedTerminals: 0, scriptProbes: 1 });
+    await registry.ensureRunning(7, 5);
+    expect(dockerOps(log)).toEqual([]);
     // 解除忙碌 → 下一次调用收敛
     registry.reportRuntimeStatus(7, 5, { shellSessions: 0, pendingTasks: 0, attachedTerminals: 0 });
     await registry.ensureRunning(7, 5);

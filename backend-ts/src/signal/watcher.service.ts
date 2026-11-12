@@ -1,14 +1,19 @@
+import { accessSync, realpathSync, statSync } from 'node:fs';
+import { isAbsolute, resolve } from 'node:path';
 import { BusinessException } from '../common/business-exception.js';
 import { ErrorCode } from '../common/error-code.js';
 import { formatDateTime } from '../common/json.js';
 import type { OpenRunService } from '../openapi/open-run.service.js';
-import type { SignalWatcher, SignalWatcherCheck, SignalCompareMode, SignalTriggerMode, SignalWatcherStatus } from './types.js';
-import { isSignalCompareMode, isSignalTriggerMode, isSignalWatcherStatus, SIGNAL_PROBE_METHODS, WATCHER_WARNING_TRIGGER_RATE_LIMITED } from './types.js';
+import type { SignalWatcher, SignalWatcherCheck, SignalCompareMode, SignalProbeType, SignalTriggerMode, SignalWatcherStatus } from './types.js';
+import { isScriptCompareMode, isSignalCompareMode, isSignalProbeType, isSignalTriggerMode, isSignalWatcherStatus, SIGNAL_PROBE_METHODS, WATCHER_WARNING_TRIGGER_RATE_LIMITED } from './types.js';
 import type { MysqlSignalWatcherRepository, MysqlSignalCheckRepository } from './signal.repository.js';
 import type { SignalSecretCipher } from './signal-cipher.js';
 import { assertProbeHeaders, assertProbeUrl, isSensitiveProbeHeader, maskProbeHeaders, SECRET_MASK } from './probe-validate.js';
 import { executeProbe, type ProbeResult } from './probe-client.js';
+import { executeScriptProbe, type ScriptProbeResult } from './script-probe.js';
+import { ContainerScriptProbe, ScriptProbeInfrastructureError } from '../harness/container/container-script-probe.js';
 import { resolveProbeHeaders, type WatcherCredentialResolver } from './watcher-credential-resolver.js';
+import { isUnder } from '../harness/safety/path-sandbox.js';
 import { harnessLog } from '../harness/log.js';
 import {
   buildDiff,
@@ -32,6 +37,19 @@ export const WATCHER_MAX_INTERVAL_MINUTES = 1440;
 export const WATCHER_RECENT_CHECKS = 50;
 /** 立即测试端点返回的响应体样本长度。 */
 export const WATCHER_TEST_SAMPLE_CHARS = 200;
+/** 立即测试端点脚本探针的 stdout 样本长度（技术方案 §4 步骤 4.2 定案 500 字）。 */
+export const SCRIPT_PROBE_TEST_SAMPLE_CHARS = 500;
+
+// ── Shell 脚本探针（V213，技术方案 §3.3 值表）───────────────────────────────
+/** 脚本超时默认值（script_timeout_seconds 为 NULL 时生效）。 */
+export const SCRIPT_PROBE_DEFAULT_TIMEOUT_SECONDS = 60;
+/** 脚本超时可配范围（秒）。 */
+export const SCRIPT_PROBE_MIN_TIMEOUT_SECONDS = 5;
+export const SCRIPT_PROBE_MAX_TIMEOUT_SECONDS = 300;
+/** 脚本哨兵轮询间隔下限（分钟）：脚本最长 300s，更小的间隔会被单飞持续跳过。 */
+export const SCRIPT_PROBE_MIN_INTERVAL_MINUTES = 5;
+/** 脚本文件大小上限（保存与执行双侧校验）。 */
+export const SCRIPT_PROBE_MAX_FILE_BYTES = 256 * 1024;
 
 /** 哨兵停用通知（收件箱 WATCHER_DISABLED kind），装配层适配 InboxService。 */
 export interface WatcherDisableNotifier {
@@ -69,6 +87,27 @@ export interface WatcherServiceDeps {
   /** 探针执行器（测试可注入假实现）。 */
   probe?: { execute: typeof executeProbe };
   /**
+   * 脚本探针执行器（测试可注入假实现）。生产缺省走 executeScriptProbe。
+   * host 模式，以及未装配容器桥时，走这条。
+   */
+  scriptProbe?: { execute: typeof executeScriptProbe };
+  /**
+   * Docker 模式脚本探针桥。enabledFor 为真时在属主容器内执行，失败不回退宿主。
+   * 未装配（单测、无容器运行时）时始终走 scriptProbe。
+   */
+  containerScriptProbe?: ContainerScriptProbe;
+  /**
+   * 脚本存储根（V213）：`{workspaceRoot}/{userId}/projects`。装配层传
+   * `(userId) => resolve(cfg.app.harness.workspaceRoot, String(userId), 'projects')`。
+   * 仅 SCRIPT 哨兵的保存校验与执行解析使用；未装配而创建脚本哨兵时显式报错（不静默）。
+   */
+  scriptProjectsRoot?: (userId: number) => string;
+  /**
+   * 脚本执行 HOME（V213）：属主运行时目录（装配传 runtimeDataResolver.resolveUserHomeDir，
+   * 可为 null=运行时目录未启用时不设 HOME）。白名单 env 的一部分，绝不透传后端进程全量 env。
+   */
+  scriptUserHome?: (userId: number) => string | null;
+  /**
    * 凭据占位符解析（2026-11-06 方案 D6，可选）：头值里的 {{MAO_TOKEN}} / {{ECP_TOKEN}}
    * 在 runCheck / test 执行探针前按属主身份现取有效 token。缺省（未装配）时占位符
    * 字面量直发——装配遗漏不能静默，resolveProbeHeaders 会在确有占位符时打告警。
@@ -92,6 +131,12 @@ export interface WatcherInput {
   promptTemplate: string;
   /** 触发方式（原始字符串，normalizeInput 白名单校验）；缺省=NEW_SESSION。 */
   triggerMode?: string;
+  /** 探针类型（V213，原始字符串）：缺省=HTTP。 */
+  probeType?: string;
+  /** 脚本路径（V213，仅 SCRIPT）：undefined=未下发（编辑沿用库值），null/string=显式下发。 */
+  scriptPath?: string | null;
+  /** 脚本超时秒数（V213，仅 SCRIPT）：undefined=未下发，null=回到默认 60s。 */
+  scriptTimeoutSeconds?: number | null;
   /** 复制源哨兵 id（仅 create 生效）：敏感请求头与 body 从源行解密继承。 */
   copyFrom?: number | null;
 }
@@ -110,6 +155,12 @@ export interface SignalWatcherView {
   compareMode: SignalCompareMode;
   jsonPath: string | null;
   promptTemplate: string;
+  /** 探针类型（V213）：HTTP / SCRIPT。 */
+  probeType: SignalProbeType;
+  /** 脚本路径（仅 SCRIPT）：项目工作区内相对路径 `<slug>/<子路径>`。 */
+  scriptPath: string | null;
+  /** 脚本超时秒数（仅 SCRIPT；null=默认 60）。 */
+  scriptTimeoutSeconds: number | null;
   status: SignalWatcherStatus;
   lastValueHash: string | null;
   /** 上次判定内容片段（供失败行「上次正常值」用；失败不覆盖它）。 */
@@ -133,6 +184,8 @@ export interface SignalWatcherAdminView extends SignalWatcherView {
 
 export interface WatcherTestResult {
   httpStatus: number | null;
+  /** 脚本探针的退出码（V213）；HTTP 探针恒 null。 */
+  exitCode: number | null;
   durationMs: number;
   valueHash: string | null;
   parseOk: boolean;
@@ -144,9 +197,11 @@ export interface WatcherTestResult {
  * 影响判定值的字段（决策 9：编辑这些字段要重置基线）。
  * 收窄成显式字段联合而非 keyof WatcherInput：WatcherInput 还含 triggerMode/copyFrom
  * 等归一化产物里没有对应键的字段，用 keyof 索引 normalized 会退化成 any。
+ * V213：probeType / scriptPath 影响判定值（换探针或换脚本 = 换判定对象）；
+ * scriptTimeoutSeconds 不影响（不改变判定值本身），不重置基线。
  */
-type BaselineAffectingField = 'url' | 'method' | 'headers' | 'body' | 'compareMode' | 'jsonPath';
-const AFFECTS_BASELINE: ReadonlyArray<BaselineAffectingField> = ['url', 'method', 'headers', 'body', 'compareMode', 'jsonPath'];
+type BaselineAffectingField = 'url' | 'method' | 'headers' | 'body' | 'compareMode' | 'jsonPath' | 'probeType' | 'scriptPath';
+const AFFECTS_BASELINE: ReadonlyArray<BaselineAffectingField> = ['url', 'method', 'headers', 'body', 'compareMode', 'jsonPath', 'probeType', 'scriptPath'];
 
 export class WatcherService {
   constructor(private readonly deps: WatcherServiceDeps) {}
@@ -175,6 +230,10 @@ export class WatcherService {
       legacyHeaderValues = inherited.legacyHeaderValues;
     }
     const normalized = this.normalizeInput(effective, legacyHeaderValues);
+    // 脚本哨兵：保存时校验脚本文件存在/可读/大小/属主边界（执行时还会再验一次，防 TOCTOU）。
+    if (normalized.probeType === 'SCRIPT') {
+      await this.validateScriptFile(userId, normalized.scriptPath);
+    }
     const id = await this.deps.watcherRepo.insert({
       userId,
       agentId: normalized.agentId,
@@ -187,6 +246,9 @@ export class WatcherService {
       compareMode: normalized.compareMode,
       jsonPath: normalized.jsonPath,
       promptTemplate: normalized.promptTemplate,
+      probeType: normalized.probeType,
+      scriptPath: normalized.scriptPath,
+      scriptTimeoutSeconds: normalized.scriptTimeoutSeconds,
       status: 'ACTIVE',
       lastValueHash: null,
       lastValueSnippet: null,
@@ -227,8 +289,16 @@ export class WatcherService {
       jsonPath: input.jsonPath !== undefined ? input.jsonPath : existing.jsonPath,
       promptTemplate: input.promptTemplate ?? existing.promptTemplate,
       triggerMode: input.triggerMode ?? existing.triggerMode,
+      // V213 三键与 headers 同口径：未下发沿用库值，显式下发（含 null）才覆盖
+      probeType: input.probeType ?? existing.probeType,
+      scriptPath: input.scriptPath !== undefined ? input.scriptPath : existing.scriptPath,
+      scriptTimeoutSeconds: input.scriptTimeoutSeconds !== undefined ? input.scriptTimeoutSeconds : existing.scriptTimeoutSeconds,
     };
     const normalized = this.normalizeInput(merged, legacyHeaderValues);
+    // 脚本哨兵：编辑后仍需脚本文件校验（路径可能被改、文件可能已删）
+    if (normalized.probeType === 'SCRIPT') {
+      await this.validateScriptFile(userId, normalized.scriptPath);
+    }
     // 基线重置判定用「本次实际生效的值」而非原始入参：normalizeInput 会把
     // method/compareMode 转大写、jsonPath 去首尾空白、url 规范化（主机转小写），
     // 落库值与库内一致、存储内容零变化，拿原始入参（'get' / ' data.price '）与库内
@@ -251,6 +321,9 @@ export class WatcherService {
       compareMode: normalized.compareMode,
       jsonPath: normalized.jsonPath,
       promptTemplate: normalized.promptTemplate,
+      probeType: normalized.probeType,
+      scriptPath: normalized.scriptPath,
+      scriptTimeoutSeconds: normalized.scriptTimeoutSeconds,
       triggerMode: normalized.triggerMode,
       // 复用指针维护（D8 模型 B：指针系统维护，用户不选会话）：
       // - 切出复用模式（含从复用切到新建）→ 清指针；「REUSE → NEW → REUSE」往返即手动重置入口；
@@ -350,28 +423,50 @@ export class WatcherService {
     // 占位符解析与调度轮询同口径（方案 §8.4）：「立即测试」看到的必须与 runCheck 一致，
     // 否则「测试通过但轮询一直 401」会变成新的排查成本。resolveProbeHeaders 不抛错
     // （resolver 异常按 D2 跳对应头），失败只丢凭据头、探针照常执行。
-    const headers = await resolveProbeHeaders(
-      this.decryptHeadersStrict(watcher.headersJson),
-      watcher.userId,
-      this.deps.credentialResolver,
-    );
-    const body = this.decryptBodyStrict(watcher.body);
-    const probe = this.deps.probe ?? { execute: executeProbe };
-    const result = await probe.execute({
-      url: watcher.url,
-      method: watcher.method,
-      headers,
-      body,
-    });
-    if (!result.ok) {
-      return {
-        httpStatus: result.httpStatus,
-        durationMs: result.durationMs,
-        valueHash: null,
-        parseOk: false,
-        sample: '',
-        error: result.error ?? '探针失败',
-      };
+    let result: ProbeResult;
+    let exitCode: number | null = null;
+    if (watcher.probeType === 'SCRIPT') {
+      // 路径校验失败（文件被删等）以 BusinessException 上抛 → 路由层 400，测试弹窗直接可读
+      const absolute = await this.resolveScriptForExecution(watcher.userId, watcher.scriptPath);
+      let scriptResult: ScriptProbeResult;
+      try {
+        scriptResult = await this.executeOwnedScript(watcher, absolute);
+      } catch (e) {
+        if (e instanceof ScriptProbeInfrastructureError) {
+          return { httpStatus: null, exitCode: null, durationMs: 0, valueHash: null, parseOk: false, sample: '', error: e.message };
+        }
+        throw e;
+      }
+      exitCode = scriptResult.exitCode;
+      result = scriptProbeResultToProbeResult(scriptResult);
+      if (!result.ok) {
+        return { httpStatus: null, exitCode, durationMs: result.durationMs, valueHash: null, parseOk: false, sample: '', error: result.error ?? '探针失败' };
+      }
+    } else {
+      const headers = await resolveProbeHeaders(
+        this.decryptHeadersStrict(watcher.headersJson),
+        watcher.userId,
+        this.deps.credentialResolver,
+      );
+      const body = this.decryptBodyStrict(watcher.body);
+      const probe = this.deps.probe ?? { execute: executeProbe };
+      result = await probe.execute({
+        url: watcher.url,
+        method: watcher.method,
+        headers,
+        body,
+      });
+      if (!result.ok) {
+        return {
+          httpStatus: result.httpStatus,
+          exitCode: null,
+          durationMs: result.durationMs,
+          valueHash: null,
+          parseOk: false,
+          sample: '',
+          error: result.error ?? '探针失败',
+        };
+      }
     }
     let valueHash: string | null = null;
     let parseOk = true;
@@ -388,12 +483,15 @@ export class WatcherService {
       parseOk = false;
       error = e instanceof ProbeValueError ? e.message : '判定值计算失败';
     }
+    // 样本长度按探针类型分流：HTTP=响应体前 200 字（既有口径），SCRIPT=stdout 前 500 字（§4 步骤 4.2）
+    const sampleChars = watcher.probeType === 'SCRIPT' ? SCRIPT_PROBE_TEST_SAMPLE_CHARS : WATCHER_TEST_SAMPLE_CHARS;
     return {
       httpStatus: result.httpStatus,
+      exitCode,
       durationMs: result.durationMs,
       valueHash,
       parseOk,
-      sample: (result.body ?? '').slice(0, WATCHER_TEST_SAMPLE_CHARS),
+      sample: (result.body ?? '').slice(0, sampleChars),
       error,
     };
   }
@@ -409,44 +507,66 @@ export class WatcherService {
     // 行已删 / 已被并发停用：直接返回，不写 check
     if (watcher == null || watcher.id == null || watcher.status !== 'ACTIVE') return;
 
-    let headers: Record<string, string>;
-    let body: string | null;
-    try {
-      headers = this.decryptHeadersStrict(watcher.headersJson);
-      body = this.decryptBodyStrict(watcher.body);
-      assertProbeUrl(watcher.url);
-    } catch (e) {
-      await this.recordFailure(watcher, e);
-      return;
-    }
-
-    // 凭据占位符解析（2026-11-06 方案 §5.1.3）：解密之后、executeProbe 之前替换。
-    // 解析失败只跳对应头（D2/D3），不能把整轮探针判失败——「需要用户重新登录」不是
-    // 「目标服务故障」，计连败会把哨兵误停用。resolveProbeHeaders 契约上不抛错，
-    // 这里单独兜住防将来改动破坏契约后异常冒泡出 runCheck（调度器要求任何异常不上抛）。
-    try {
-      headers = await resolveProbeHeaders(headers, watcher.userId, this.deps.credentialResolver);
-    } catch (e) {
-      harnessLog('warn', `[signal] resolve probe headers failed unexpectedly, keep headers unresolved, watcherId=${watcher.id}: ${errorMessage(e)}`);
-    }
-
-    const probe = this.deps.probe ?? { execute: executeProbe };
+    // 探针执行按类型分流（V213）：HTTP 走既有解密/占位符/URL 校验链路；
+    // SCRIPT 走脚本路径属主校验 + bash 执行。两条分支产出同一 ProbeResult 形状，
+    // 判定 / 记录 / 触发的尾段完全共享。
     let result: ProbeResult;
-    try {
-      result = await probe.execute({ url: watcher.url, method: watcher.method, headers, body });
-    } catch (e) {
-      await this.recordFailure(watcher, e);
-      return;
+    let exitCode: number | null = null;
+    if (watcher.probeType === 'SCRIPT') {
+      try {
+        // 路径校验失败（文件被删等）记一次失败走既有退避，不上抛
+        const absolute = await this.resolveScriptForExecution(watcher.userId, watcher.scriptPath);
+        const scriptResult = await this.executeOwnedScript(watcher, absolute);
+        exitCode = scriptResult.exitCode;
+        result = scriptProbeResultToProbeResult(scriptResult);
+      } catch (e) {
+        if (e instanceof ScriptProbeInfrastructureError) {
+          await this.recordInfrastructure(watcher, e);
+          return;
+        }
+        await this.recordFailure(watcher, e, null, null, null, null);
+        return;
+      }
+    } else {
+      let headers: Record<string, string>;
+      let body: string | null;
+      try {
+        headers = this.decryptHeadersStrict(watcher.headersJson);
+        body = this.decryptBodyStrict(watcher.body);
+        assertProbeUrl(watcher.url);
+      } catch (e) {
+        await this.recordFailure(watcher, e);
+        return;
+      }
+
+      // 凭据占位符解析（2026-11-06 方案 §5.1.3）：解密之后、executeProbe 之前替换。
+      // 解析失败只跳对应头（D2/D3），不能把整轮探针判失败——「需要用户重新登录」不是
+      // 「目标服务故障」，计连败会把哨兵误停用。resolveProbeHeaders 契约上不抛错，
+      // 这里单独兜住防将来改动破坏契约后异常冒泡出 runCheck（调度器要求任何异常不上抛）。
+      try {
+        headers = await resolveProbeHeaders(headers, watcher.userId, this.deps.credentialResolver);
+      } catch (e) {
+        harnessLog('warn', `[signal] resolve probe headers failed unexpectedly, keep headers unresolved, watcherId=${watcher.id}: ${errorMessage(e)}`);
+      }
+
+      const probe = this.deps.probe ?? { execute: executeProbe };
+      try {
+        result = await probe.execute({ url: watcher.url, method: watcher.method, headers, body });
+      } catch (e) {
+        await this.recordFailure(watcher, e);
+        return;
+      }
     }
 
     if (!result.ok) {
-      await this.recordFailure(watcher, new Error(result.error ?? '探针失败'), result.httpStatus, result.durationMs);
+      await this.recordFailure(watcher, new Error(result.error ?? '探针失败'), result.httpStatus, result.durationMs, null, exitCode);
       return;
     }
 
     const checkId = await this.deps.checkRepo.insert({
       watcherId: watcher.id,
       httpStatus: result.httpStatus,
+      exitCode,
       valueHash: null,
       oldValueSnippet: null,
       newValueSnippet: null,
@@ -537,7 +657,8 @@ export class WatcherService {
     let effectiveReuseId: number | null = null;
     try {
       const prompt = renderWatcherPrompt(watcher.promptTemplate, {
-        url: watcher.url,
+        // {url} 占位符（V213）：脚本哨兵渲染脚本路径（判定对象），HTTP 哨兵渲染探测地址
+        url: watcher.probeType === 'SCRIPT' ? (watcher.scriptPath ?? '') : watcher.url,
         name: watcher.name,
         diff: buildDiff({
           compareMode: watcher.compareMode,
@@ -616,6 +737,55 @@ export class WatcherService {
   // ── 内部 ─────────────────────────────────────────────────────────────────
 
   /**
+   * 按属主运行模式执行脚本。Docker 模式进容器；host 模式或未装配容器桥时在后端宿主执行。
+   * 容器侧基础设施失败抛 ScriptProbeInfrastructureError，调用方不得改走宿主。
+   */
+  private async executeOwnedScript(watcher: SignalWatcher, absolute: string): Promise<ScriptProbeResult> {
+    const request = {
+      scriptPath: absolute,
+      timeoutSeconds: watcher.scriptTimeoutSeconds ?? SCRIPT_PROBE_DEFAULT_TIMEOUT_SECONDS,
+      env: this.scriptProbeEnv(watcher),
+    };
+    const bridge = this.deps.containerScriptProbe;
+    if (bridge != null) {
+      let docker = false;
+      try {
+        docker = await bridge.enabledFor(watcher.userId);
+      } catch (e) {
+        throw new ScriptProbeInfrastructureError(`运行模式判定失败：${errorMessage(e)}`);
+      }
+      if (docker) {
+        return bridge.execute({ userId: watcher.userId, agentId: watcher.agentId, ...request });
+      }
+    }
+    return (this.deps.scriptProbe ?? { execute: executeScriptProbe }).execute(request);
+  }
+
+  /**
+   * 容器基础设施失败：写轮询记录并推进 last_checked_at，不增加连败、不停用。
+   */
+  private async recordInfrastructure(watcher: SignalWatcher, error: unknown): Promise<void> {
+    if (watcher.id == null) return;
+    const checkId = await this.deps.checkRepo.insert({
+      watcherId: watcher.id,
+      httpStatus: null,
+      exitCode: null,
+      valueHash: null,
+      oldValueSnippet: null,
+      newValueSnippet: null,
+      changed: 0,
+      triggeredSessionId: null,
+      error: errorMessage(error).slice(0, 500),
+      durationMs: null,
+      warning: null,
+    });
+    const touched = await this.deps.watcherRepo.touchChecked(watcher.id);
+    if (!touched) {
+      await this.deps.checkRepo.remove(checkId).catch(() => undefined);
+    }
+  }
+
+  /**
    * 记录一次失败：写 check 行（若尚无）+ 累加失败计数与退避 + 达阈值自动停用并通知。
    * `existingCheckId` 非 null 时复用该行（取值计算失败、触发失败：runCheck 已落盘并标记 error），
    * 为 null 时新建一行（探针本身失败的场景）。
@@ -626,12 +796,14 @@ export class WatcherService {
     httpStatus: number | null = null,
     durationMs: number | null = null,
     existingCheckId: number | null = null,
+    exitCode: number | null = null,
   ): Promise<void> {
     if (watcher.id == null) return;
     const message = errorMessage(error);
     const checkId = existingCheckId ?? await this.deps.checkRepo.insert({
       watcherId: watcher.id,
       httpStatus,
+      exitCode,
       valueHash: null,
       oldValueSnippet: null,
       newValueSnippet: null,
@@ -671,6 +843,93 @@ export class WatcherService {
     }
   }
 
+  /**
+   * 脚本哨兵保存时校验（V213）：文件存在、可读、为普通文件、大小 ≤256KB、
+   * realpath 后仍在属主项目工作区根内（防软链逃逸）。执行前 resolveScriptForExecution
+   * 还会再验一次（防保存到执行之间的目录变更 / TOCTOU）。
+   */
+  private async validateScriptFile(userId: number, scriptPath: string | null): Promise<string> {
+    const absolute = this.resolveScriptPathWithinProjectsRoot(userId, scriptPath);
+    try {
+      accessSync(absolute);
+    } catch {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, `脚本文件不存在：${scriptPath}（请先在工作区上传或让 Agent 编写）`);
+    }
+    const stat = statSync(absolute);
+    if (!stat.isFile()) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, `脚本路径不是文件：${scriptPath}`);
+    }
+    if (stat.size > SCRIPT_PROBE_MAX_FILE_BYTES) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, `脚本文件过大（上限 ${Math.floor(SCRIPT_PROBE_MAX_FILE_BYTES / 1024)}KB）`);
+    }
+    return absolute;
+  }
+
+  /**
+   * 执行期脚本路径解析（V213）：保存后文件可能被删 / 挪动 / 被软链替换，执行前重新校验。
+   * 校验失败以 BusinessException 上抛，由 runCheck 记一次失败走既有退避。
+   */
+  private async resolveScriptForExecution(userId: number, scriptPath: string | null): Promise<string> {
+    const absolute = this.resolveScriptPathWithinProjectsRoot(userId, scriptPath);
+    const stat = statSync(absolute);
+    if (!stat.isFile()) {
+      throw new Error(`脚本路径不是文件：${scriptPath}`);
+    }
+    if (stat.size > SCRIPT_PROBE_MAX_FILE_BYTES) {
+      throw new Error(`脚本文件过大（上限 ${Math.floor(SCRIPT_PROBE_MAX_FILE_BYTES / 1024)}KB）`);
+    }
+    return absolute;
+  }
+
+  /**
+   * 相对路径 → 属主项目工作区内的绝对路径（双侧共用）：
+   * 格式（非绝对、无 `..` 段）→ resolve → realpath（解析软链）→ isUnder(projectsRoot) 双验。
+   */
+  private resolveScriptPathWithinProjectsRoot(userId: number, scriptPath: string | null): string {
+    const rootResolver = this.deps.scriptProjectsRoot;
+    if (rootResolver == null) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '脚本探针存储根未配置');
+    }
+    if (scriptPath == null || scriptPath.trim() === '') {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '脚本哨兵必须填写脚本路径');
+    }
+    assertScriptPathFormat(scriptPath);
+    const root = rootResolver(userId);
+    const realRoot = realpathSafe(root);
+    if (realRoot == null) {
+      // 用户根 / projects 目录尚未创建：脚本文件必然不存在，给出与「文件缺失」一致的文案
+      //（而不是「存储根不存在」把配置问题甩给用户）
+      throw new BusinessException(ErrorCode.PARAM_INVALID, `脚本文件不存在：${scriptPath}（请先在工作区上传或让 Agent 编写）`);
+    }
+    const full = resolve(root, scriptPath);
+    const realFull = realpathSafe(full);
+    if (realFull == null) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, `脚本文件不存在：${scriptPath}（请先在工作区上传或让 Agent 编写）`);
+    }
+    if (!isUnder(realFull, realRoot)) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, `脚本路径越出项目工作区：${scriptPath}`);
+    }
+    return realFull;
+  }
+
+  /**
+   * 脚本执行环境变量（V213）：白名单构造全新 env，绝不继承后端进程全量 env——
+   * 后端 env 含 APP_SIGNAL_SECRET / 数据库密码等，整包下发即泄露（技术方案 §6 R6）。
+   * HOME 指向属主运行时目录（shell-session-manager configureUserHome 同款）；凭据
+   * 占位符机制不扩展到脚本（非目标），只注入只读标识 MAO_WATCHER_ID / MAO_WATCHER_NAME。
+   */
+  private scriptProbeEnv(watcher: SignalWatcher): Record<string, string> {
+    const env: Record<string, string> = {
+      PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',
+    };
+    if (process.env.TZ != null && process.env.TZ !== '') env.TZ = process.env.TZ;
+    const home = this.deps.scriptUserHome?.(watcher.userId);
+    if (home != null && home !== '') env.HOME = home;
+    if (watcher.id != null) env.MAO_WATCHER_ID = String(watcher.id);
+    env.MAO_WATCHER_NAME = watcher.name;
+    return env;
+  }
+
   private normalizeInput(input: WatcherInput, legacyHeaderValues?: ReadonlySet<string>): {
     name: string;
     agentId: number;
@@ -683,6 +942,9 @@ export class WatcherService {
     compareMode: SignalCompareMode;
     jsonPath: string | null;
     promptTemplate: string;
+    probeType: SignalProbeType;
+    scriptPath: string | null;
+    scriptTimeoutSeconds: number | null;
     triggerMode: SignalTriggerMode;
   } {
     const name = (input.name ?? '').trim();
@@ -692,33 +954,71 @@ export class WatcherService {
     if (!Number.isInteger(input.agentId) || input.agentId <= 0) {
       throw new BusinessException(ErrorCode.PARAM_INVALID, 'agentId 必须为正整数');
     }
-    const url = assertProbeUrl(input.url ?? '');
-    const method = (input.method ?? 'GET').trim().toUpperCase();
-    if (!SIGNAL_PROBE_METHODS.includes(method)) {
+    // 探针类型（V213）：缺省 HTTP（存量入参无此键时行为逐字不变）。
+    const probeTypeRaw = (input.probeType ?? 'HTTP').trim().toUpperCase();
+    if (!isSignalProbeType(probeTypeRaw)) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '探针类型仅支持 HTTP/SCRIPT');
+    }
+    const probeType = probeTypeRaw;
+    // 字段互斥（技术方案 §3.3）：SCRIPT 忽略 url/method/headers/body；HTTP 忽略 script 两键。
+    // 单侧归空防双字段语义漂移（库里永远只留生效侧的值）。
+    const url = probeType === 'HTTP' ? assertProbeUrl(input.url ?? '') : '';
+    const method = probeType === 'HTTP' ? (input.method ?? 'GET').trim().toUpperCase() : 'GET';
+    if (probeType === 'HTTP' && !SIGNAL_PROBE_METHODS.includes(method)) {
       throw new BusinessException(ErrorCode.PARAM_INVALID, '方法仅支持 GET/POST');
     }
-    const headers = input.headers == null ? null : assertProbeHeaders(input.headers, legacyHeaderValues);
+    const headers = probeType === 'HTTP'
+      ? (input.headers == null ? null : assertProbeHeaders(input.headers, legacyHeaderValues))
+      : null;
     // body 只对 POST 有意义：切到 GET 时强制清空，避免库里残留一段用户看不见、
     // 探针却仍会发送的请求体（BUG-E）。method 先归一化再判。
     const isPost = method === 'POST';
-    const body = input.body == null || input.body === '' || !isPost ? null : input.body;
-    if (isPost && body == null) {
+    const body = probeType === 'HTTP'
+      ? (input.body == null || input.body === '' || !isPost ? null : input.body)
+      : null;
+    if (probeType === 'HTTP' && isPost && body == null) {
       throw new BusinessException(ErrorCode.PARAM_INVALID, 'POST 方法必须填写请求体');
     }
-    if (body != null && body.length > 64 * 1024) {
+    if (probeType === 'HTTP' && body != null && body.length > 64 * 1024) {
       throw new BusinessException(ErrorCode.PARAM_INVALID, '请求体过长（上限 64KB）');
     }
     const intervalMinutes = Number(input.intervalMinutes);
-    if (!Number.isInteger(intervalMinutes) || intervalMinutes < WATCHER_MIN_INTERVAL_MINUTES || intervalMinutes > WATCHER_MAX_INTERVAL_MINUTES) {
-      throw new BusinessException(ErrorCode.PARAM_INVALID, `轮询间隔需为 ${WATCHER_MIN_INTERVAL_MINUTES}~${WATCHER_MAX_INTERVAL_MINUTES} 的整数分钟`);
+    // 脚本哨兵间隔下限 5 分钟（技术方案 §3.1）：脚本最长 300s，更小的间隔会被单飞持续跳过。
+    const minInterval = probeType === 'SCRIPT' ? SCRIPT_PROBE_MIN_INTERVAL_MINUTES : WATCHER_MIN_INTERVAL_MINUTES;
+    if (!Number.isInteger(intervalMinutes) || intervalMinutes < minInterval || intervalMinutes > WATCHER_MAX_INTERVAL_MINUTES) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, `轮询间隔需为 ${minInterval}~${WATCHER_MAX_INTERVAL_MINUTES} 的整数分钟`);
     }
     const compareMode = (input.compareMode ?? 'HASH').trim().toUpperCase();
     if (!isSignalCompareMode(compareMode)) {
       throw new BusinessException(ErrorCode.PARAM_INVALID, '判定模式仅支持 HASH/JSON_FIELD/STATUS_CODE');
     }
+    if (probeType === 'SCRIPT' && !isScriptCompareMode(compareMode)) {
+      // exit code 是成败语义（非 0 = 探针失败计连败），不是变化判定输入
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '脚本哨兵判定模式仅支持 HASH/JSON_FIELD');
+    }
     const jsonPath = compareMode === 'JSON_FIELD' ? (input.jsonPath ?? '').trim() : null;
     if (compareMode === 'JSON_FIELD' && (jsonPath == null || jsonPath === '')) {
       throw new BusinessException(ErrorCode.PARAM_INVALID, 'JSON_FIELD 模式必须填写提取路径');
+    }
+    // 脚本路径（仅 SCRIPT）：格式校验在此（纯函数）；文件存在/大小/属主边界在
+    // validateScriptFile（异步，create/update 落库前调用）。
+    let scriptPath: string | null = null;
+    if (probeType === 'SCRIPT') {
+      const raw = (input.scriptPath ?? '').trim();
+      if (raw === '') {
+        throw new BusinessException(ErrorCode.PARAM_INVALID, '脚本哨兵必须填写脚本路径');
+      }
+      assertScriptPathFormat(raw);
+      scriptPath = raw;
+    }
+    // 脚本超时（仅 SCRIPT）：null/缺省 = 默认 60s（落库 NULL，执行时取默认值）
+    let scriptTimeoutSeconds: number | null = null;
+    if (probeType === 'SCRIPT' && input.scriptTimeoutSeconds != null) {
+      const timeout = Number(input.scriptTimeoutSeconds);
+      if (!Number.isInteger(timeout) || timeout < SCRIPT_PROBE_MIN_TIMEOUT_SECONDS || timeout > SCRIPT_PROBE_MAX_TIMEOUT_SECONDS) {
+        throw new BusinessException(ErrorCode.PARAM_INVALID, `脚本超时需为 ${SCRIPT_PROBE_MIN_TIMEOUT_SECONDS}~${SCRIPT_PROBE_MAX_TIMEOUT_SECONDS} 的整数秒`);
+      }
+      scriptTimeoutSeconds = timeout;
     }
     const promptTemplate = (input.promptTemplate ?? '').trim();
     if (promptTemplate.length === 0 || promptTemplate.length > 2000) {
@@ -740,6 +1040,9 @@ export class WatcherService {
       compareMode,
       jsonPath,
       promptTemplate,
+      probeType,
+      scriptPath,
+      scriptTimeoutSeconds,
       triggerMode,
     };
   }
@@ -920,6 +1223,9 @@ export class WatcherService {
       compareMode: row.compareMode,
       jsonPath: row.jsonPath,
       promptTemplate: row.promptTemplate,
+      probeType: row.probeType,
+      scriptPath: row.scriptPath ?? null,
+      scriptTimeoutSeconds: row.scriptTimeoutSeconds ?? null,
       status: row.status,
       lastValueHash: row.lastValueHash,
       lastCheckedAt: row.lastCheckedAt,
@@ -957,8 +1263,42 @@ function existingRaw(existing: SignalWatcher, field: keyof WatcherInput, service
     case 'body': return service.decryptBodyForCompare(existing.body);
     case 'compareMode': return existing.compareMode;
     case 'jsonPath': return existing.jsonPath;
+    // V213 字段存量回落：迁移默认 'HTTP'/NULL，但内存构造的行（测试/旧快照）可能缺键，
+    // undefined 与归一化值比较会被误判成「判定字段变化」而错误重置基线。
+    case 'probeType': return existing.probeType ?? 'HTTP';
+    case 'scriptPath': return existing.scriptPath ?? null;
     default: return undefined;
   }
+}
+
+/** 脚本路径格式校验（V213，纯函数）：项目工作区内相对路径 `<slug>/<子路径>`。 */
+function assertScriptPathFormat(scriptPath: string): void {
+  if (isAbsolute(scriptPath)) {
+    throw new BusinessException(ErrorCode.PARAM_INVALID, '脚本路径必须是项目工作区内的相对路径（如 my-project/sentinels/check.sh）');
+  }
+  const segments = scriptPath.split('/');
+  if (segments.some((segment) => segment === '..')) {
+    throw new BusinessException(ErrorCode.PARAM_INVALID, '脚本路径不允许包含 .. 段');
+  }
+  if (segments.every((segment) => segment === '' || segment === '.')) {
+    throw new BusinessException(ErrorCode.PARAM_INVALID, '脚本路径不能为空');
+  }
+}
+
+/** realpath，路径不存在时返回 null（调用方给出业务错误文案）。 */
+function realpathSafe(target: string): string | null {
+  try {
+    return realpathSync(target);
+  } catch {
+    return null;
+  }
+}
+
+/** ScriptProbeResult → 既有判定管线的 ProbeResult（httpStatus 恒 null，exit code 由 check 行独立记录）。 */
+function scriptProbeResultToProbeResult(script: ScriptProbeResult): ProbeResult {
+  return script.ok
+    ? { ok: true, httpStatus: null, body: script.stdout, bodyBytes: script.stdoutBytes, error: null, durationMs: script.durationMs }
+    : { ok: false, httpStatus: null, body: null, bodyBytes: null, error: script.error, durationMs: script.durationMs };
 }
 
 /** 退避把 last_checked_at 写成未来时刻时，字典序比较即可（库内是 `YYYY-MM-DD HH:mm:ss`）。 */

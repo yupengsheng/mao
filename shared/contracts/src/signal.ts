@@ -14,6 +14,9 @@
 /** 变化判定模式：内容哈希 / JSON 字段（点分路径 + 数组下标）/ HTTP 状态码。 */
 export type SignalCompareMode = 'HASH' | 'JSON_FIELD' | 'STATUS_CODE';
 
+/** 探针类型：HTTP 单接口探针 / SCRIPT Shell 脚本探针。 */
+export type SignalProbeType = 'HTTP' | 'SCRIPT';
+
 /** 哨兵状态：ACTIVE 轮询中 / PAUSED 用户暂停 / DISABLED 连续失败自动停用（系统终态）。 */
 export type SignalWatcherStatus = 'ACTIVE' | 'PAUSED' | 'DISABLED';
 

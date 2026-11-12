@@ -25,6 +25,9 @@ export class MysqlSignalWatcherRepository {
       compareMode: watcher.compareMode,
       jsonPath: watcher.jsonPath,
       promptTemplate: watcher.promptTemplate,
+      probeType: watcher.probeType,
+      scriptPath: watcher.scriptPath,
+      scriptTimeoutSeconds: watcher.scriptTimeoutSeconds,
       status: watcher.status,
       lastValueHash: watcher.lastValueHash,
       lastValueSnippet: watcher.lastValueSnippet,
@@ -103,6 +106,9 @@ export class MysqlSignalWatcherRepository {
     if (patch.compareMode !== undefined) row.compareMode = patch.compareMode;
     if (patch.jsonPath !== undefined) row.jsonPath = patch.jsonPath;
     if (patch.promptTemplate !== undefined) row.promptTemplate = patch.promptTemplate;
+    if (patch.probeType !== undefined) row.probeType = patch.probeType;
+    if (patch.scriptPath !== undefined) row.scriptPath = patch.scriptPath;
+    if (patch.scriptTimeoutSeconds !== undefined) row.scriptTimeoutSeconds = patch.scriptTimeoutSeconds;
     if (patch.status !== undefined) row.status = patch.status;
     if (patch.lastValueHash !== undefined) row.lastValueHash = patch.lastValueHash;
     if (patch.lastValueSnippet !== undefined) row.lastValueSnippet = patch.lastValueSnippet;
@@ -202,6 +208,18 @@ export class MysqlSignalWatcherRepository {
   }
 
   /**
+   * 基础设施失败（容器不可用等）只推进 last_checked_at：不计连败、不停用，
+   * 避免一次运行环境抖动把用户的哨兵直接推入退避甚至停用。
+   */
+  async touchChecked(id: number): Promise<boolean> {
+    const result = await this.db.execute(
+      `UPDATE signal_watcher SET last_checked_at = ? WHERE id = ? AND status = 'ACTIVE'`,
+      [ts(Date.now()), id],
+    );
+    return result.affectedRows === 1;
+  }
+
+  /**
    * 失败累加 + 退避推进 + 达阈值自动停用（单条条件更新）。
    * 退避分钟数 = interval_minutes * min(2^failures, 32)，由调用方算好传入。
    *
@@ -240,6 +258,7 @@ export class MysqlSignalCheckRepository {
     return this.db.insert('signal_watcher_check', {
       watcherId: check.watcherId,
       httpStatus: check.httpStatus,
+      exitCode: check.exitCode,
       valueHash: check.valueHash,
       oldValueSnippet: check.oldValueSnippet,
       newValueSnippet: check.newValueSnippet,

@@ -189,6 +189,8 @@ import { HttpToolService } from './http-tool/http-tool.service.js';
 import { HttpToolValidatorImpl, MysqlHttpToolLookup } from './http-tool/http-tool-validator.js';
 import { HttpToolHeaderCipher } from './http-tool/http-tool-cipher.js';
 import { MysqlSignalCheckRepository, MysqlSignalWatcherRepository } from './signal/signal.repository.js';
+import type { WatcherService } from './signal/watcher.service.js';
+import { ContainerScriptProbe } from './harness/container/container-script-probe.js';
 import { RuntimeModeResolver, RUNTIME_MODE_SETTING_KEY, validateRuntimeModeSave } from './harness/container/runtime-mode.js';
 import { SessionEnvelopeBuilder, buildDepsEnv } from './harness/container/session-envelope-builder.js';
 import {
@@ -879,8 +881,13 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
 
   // harness 必须在 wsHandler / 微信 / 钉钉 / GitCommitMessageService 之前装配：
   // 这些消费者在构造时就读取真实的 harness 与 agentLoop（holder 只是给运行期晚绑定用）。
+  let signalWatcherServiceRef: WatcherService | null = null;
   const harnessEngine = assembleHarnessEngine({
     cfg, apiPrefix, uploadDir, harnessTuning, pathSandbox, todoMapper, scheduledService,
+    getSignalWatcherService: () => {
+      if (signalWatcherServiceRef == null) throw new Error('signal watcher service not assembled yet');
+      return signalWatcherServiceRef;
+    },
     sessionSvc, sessionMap, shellManager, outputManager, backgroundTasks, gitTokenResolver, jwt,
     userRepo, ecpInjector, larkUatInjector, settingService, runtimeResolver, modelService,
     wechatBridges, feishuMessageService, feishuMessageRepository, getFeishuClient,
@@ -957,6 +964,13 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     openTriggerSettle, openCallSettle,
   });
 
+  const containerScriptProbe = new ContainerScriptProbe({
+    enabledFor: (userId) => dockerRouter.enabledFor(userId),
+    ensureRunning: (userId, agentId) => containerRegistry.ensureRunning(userId, agentId),
+    scriptProbeRuntimeReady: (entry) => containerRegistry.scriptProbeRuntimeReady(entry),
+    getConnection: (userId, agentId) => channelServer.getConnection(userId, agentId),
+    depsEnvOf: (userId) => buildDepsEnv(cloudRuntimeCfg.container.depsDir, userId),
+  });
   const openApiServices = assembleOpenApiServices({
     db, cfg, sessionService, messageQueueService, taskTerminal, taskService, agentRepo, wsHandler,
     budgetService, apiTokenService, inboxService, settingService, openApiRateLimiter,
@@ -964,8 +978,11 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     openCallLogHolder, openTriggerSettle, openCallSettle,
     // 哨兵凭据占位符签发依赖（均构造于本调用点之前，时序无碍）
     jwt, userRepo, ecpSessionRepo,
+    runtimeDataResolver: runtimeResolver,
+    containerScriptProbe,
   });
   const { openRunService, callLogService, callLogCleanup, callLogRepair, webhookTriggerService, watcherService, watcherScheduler, signalCheckCleanup, digestService, digestScheduler, signalWatcherRepo } = openApiServices;
+  signalWatcherServiceRef = watcherService;
   ctx.clearWebhookTriggerSessionBindings = (sessionId) => webhookTriggerService.clearSessionBindingBySessionId(sessionId);
 
 
