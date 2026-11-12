@@ -51,12 +51,8 @@
             </button>
           </template>
         </el-table-column>
-        <el-table-column prop="username" label="账号" width="120" class-name="hide-on-mobile" />
         <el-table-column label="会话" width="80" align="right">
           <template #default="{ row }">{{ formatNumber(row.sessionCount) }}</template>
-        </el-table-column>
-        <el-table-column label="消息" width="90" align="right">
-          <template #default="{ row }">{{ formatNumber(row.messageCount) }}</template>
         </el-table-column>
         <el-table-column label="Token" width="120" align="right">
           <template #default="{ row }">
@@ -71,9 +67,6 @@
         </el-table-column>
         <el-table-column label="成本" width="100" align="right" class-name="hide-on-mobile">
           <template #default="{ row }">{{ formatCost(row.cost) }}</template>
-        </el-table-column>
-        <el-table-column label="最后登录" width="170" class-name="hide-on-mobile">
-          <template #default="{ row }">{{ formatDateTime(row.lastLoginAt) }}</template>
         </el-table-column>
         <el-table-column label="操作" width="180" class-name="hide-on-mobile">
           <template #default="{ row }">
@@ -105,7 +98,6 @@ import ResponsivePagination from '../../../components/ResponsivePagination.vue'
 import { CHART_PALETTE } from '../../../utils/echarts'
 import { formatCost, formatNumber, formatTokens, rankBarOption, type RankItem } from '../chart-options'
 import { exportCsv } from '../utils/csv'
-import { formatDateTime } from '../../../utils/datetime'
 import type { UsersPayload } from '../types'
 import { withDrilldownPeriod } from '../utils/drilldown'
 
@@ -149,17 +141,14 @@ function go(path: string) {
 function exportRows() {
   exportCsv(
     `analytics-users-${new Date().toISOString().slice(0, 10)}.csv`,
-    ['用户', '账号', '会话', '消息', 'Token', '调用', '失败调用', '成本', '最后登录'],
+    ['用户', '会话', 'Token', '调用', '失败调用', '成本'],
     userRows.value.map((row) => [
       row.displayName || row.username || '未知',
-      row.username,
       row.sessionCount,
-      row.messageCount,
       row.totalTokens,
       row.callCount ?? 0,
       row.callFailCount ?? 0,
-      row.cost ?? '',
-      row.lastLoginAt ? formatDateTime(row.lastLoginAt) : ''
+      row.cost ?? ''
     ])
   )
 }
