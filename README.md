@@ -8,8 +8,8 @@
 <h1 align="center">Mao</h1>
 
 <p align="center">
-  <strong>Self-hosted AI Agent runtime for individuals and teams.</strong><br/>
-  把能做事的 Agent 放进你自己的环境：双执行边界、RBAC、审计，以及真正的 Think-Act-Observe 引擎。
+  <strong>团队级 AI Agent 自托管平台</strong><br/>
+  一次部署，全员共用。按岗位构建智能体，在 Web、移动端、终端与办公软件中直接工作。
 </p>
 
 <p align="center">
@@ -26,7 +26,7 @@
 
 ## 它是什么
 
-Mao 不是又一个 ChatGPT 套壳，也不是 Dify / n8n 那样的低代码工作流。它是一套**可私有化部署的 Agent 工作台**：集中管理多个 Agent、模型和权限，用内置 Harness 跑 Think-Act-Observe 循环，让模型真正去读文件、跑命令、搜网页、拆子任务。
+Mao 不是又一个 ChatGPT 套壳，也不是 Dify / n8n 那样的低代码工作流。它是一套**面向团队的自托管 Agent 平台**：集中管理多个 Agent、模型和权限，用内置 Harness 跑 Think-Act-Observe 循环，让模型真正去读文件、跑命令、搜网页、拆子任务。
 
 三件事构成产品内核：
 
