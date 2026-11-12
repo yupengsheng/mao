@@ -5,6 +5,7 @@ import { useSessionStore, type Session } from '../stores/session'
 
 const { apiMock, wsMock, FakeTerminal } = vi.hoisted(() => {
   class FakeTerminal {
+    static instances: FakeTerminal[] = []
     options: Record<string, unknown> = {}
     cols = 80
     rows = 24
@@ -17,6 +18,10 @@ const { apiMock, wsMock, FakeTerminal } = vi.hoisted(() => {
     loadAddon = vi.fn()
     onData = vi.fn(() => ({ dispose: () => {} }))
     onResize = vi.fn(() => ({ dispose: () => {} }))
+    constructor(options: Record<string, unknown> = {}) {
+      this.options = options
+      FakeTerminal.instances.push(this)
+    }
   }
   return {
     FakeTerminal,
@@ -131,5 +136,18 @@ describe('useTerminal 关闭最后一个 tab 自动收起面板', () => {
     handlers.onExit()
 
     expect(terminal.isOpen.value).toBe(false)
+  })
+
+  it('暗色终端配色跟随主题令牌', async () => {
+    useCloudSession()
+    const terminal = useTerminal()
+    apiMock.post.mockResolvedValue({ data: remoteInfo('t1') })
+
+    await terminal.createTerminal()
+
+    const theme = FakeTerminal.instances.at(-1)!.options.theme as Record<string, string>
+    expect(theme.background).toBe('#26262a')
+    expect(theme.foreground).toBe('#d0d0d4')
+    expect(theme.black).toBe('#26262a')
   })
 })

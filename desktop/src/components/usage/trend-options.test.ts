@@ -81,10 +81,17 @@ describe('trend-options', () => {
     expect(o.tooltip.formatter([{ dataIndex: 1 }])).toBe('10-10<br/>Token：2000k')
   })
 
-  it('暗色主题切换坐标与 tooltip 配色', () => {
-    const light = optionOf(config()) as unknown as { tooltip: { backgroundColor: string } }
-    const dark = optionOf(config({ isDark: true })) as unknown as { tooltip: { backgroundColor: string } }
+  it('暗色主题切换坐标与 tooltip 配色，并与主题令牌一致', () => {
+    type Colors = {
+      tooltip: { backgroundColor: string; borderColor: string; textStyle: { color: string } }
+      legend: { textStyle: { color: string } }
+    }
+    const light = optionOf(config()) as unknown as Colors
+    const dark = optionOf(config({ isDark: true })) as unknown as Colors
     expect(light.tooltip.backgroundColor).toBe('#ffffff')
-    expect(dark.tooltip.backgroundColor).toBe('#2a2a2e')
+    expect(dark.tooltip.backgroundColor).toBe('#26262a')
+    expect(dark.tooltip.borderColor).toBe('#4a4a50')
+    expect(dark.tooltip.textStyle.color).toBe('#d0d0d4')
+    expect(dark.legend.textStyle.color).toBe('#b0b0b5')
   })
 })

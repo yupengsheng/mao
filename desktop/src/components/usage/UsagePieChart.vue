@@ -19,11 +19,11 @@ const percents = computed(() => pieSlicePercents(props.slices))
 
 /** 主题随 isDark 重算：文字/网格/tooltip 底色/扇区描边（描边取面板底色，暗色下不糊）两套配色。 */
 const chartOption = computed<ChartOption>(() => {
-  const textColor = isDark.value ? '#a1a1a6' : '#86868b'
-  const tooltipBg = isDark.value ? '#2a2a2e' : '#ffffff'
-  const tooltipBorder = isDark.value ? '#3a3a3e' : '#e5e5ea'
-  const tooltipText = isDark.value ? '#f5f5f7' : '#1d1d1f'
-  const sliceBorder = isDark.value ? '#252525' : '#ffffff'
+  const textColor = isDark.value ? '#b0b0b5' : '#86868b'
+  const tooltipBg = isDark.value ? '#26262a' : '#ffffff'
+  const tooltipBorder = isDark.value ? '#4a4a50' : '#e5e5ea'
+  const tooltipText = isDark.value ? '#d0d0d4' : '#1d1d1f'
+  const sliceBorder = isDark.value ? '#26262a' : '#ffffff'
   return {
     color: CHART_PALETTE,
     tooltip: {
