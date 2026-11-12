@@ -738,6 +738,31 @@ describe('ScheduledTaskService', () => {
     expect(oneShot.nextFireTimes[0]).toMatch(/^\d{4}-08-15 08:00:00$/);
   });
 
+  it('treats restricted day-of-month and day-of-week as an intersection (Spring semantics)', () => {
+    const preview = buildCronPreview('0 0 12 1 1 1', 5);
+    expect(preview.valid).toBe(true);
+    expect(preview.nextFireTimes.length).toBeGreaterThan(0);
+    for (const fireTime of preview.nextFireTimes) {
+      const [year, month, day] = fireTime.split(' ')[0]!.split('-').map(Number);
+      expect(month, `触发点 ${fireTime} 不在 1 月`).toBe(1);
+      expect(day, `触发点 ${fireTime} 不是 1 日`).toBe(1);
+      const dow = new Date(Date.UTC(year!, month! - 1, day!)).getUTCDay();
+      expect(dow, `触发点 ${fireTime} 不是周一（POSIX OR 语义把每个周一都排进来了）`).toBe(1);
+    }
+  });
+
+  it('keeps weekday-only cron schedules intact under intersection semantics', () => {
+    const preview = buildCronPreview('0 0 10 ? * MON-FRI', 5);
+    expect(preview.valid).toBe(true);
+    expect(preview.nextFireTimes).toHaveLength(5);
+    for (const fireTime of preview.nextFireTimes) {
+      const [year, month, day] = fireTime.split(' ')[0]!.split('-').map(Number);
+      const dow = new Date(Date.UTC(year!, month! - 1, day!)).getUTCDay();
+      expect(dow, `触发点 ${fireTime} 落在周末`).toBeGreaterThanOrEqual(1);
+      expect(dow, `触发点 ${fireTime} 落在周末`).toBeLessThanOrEqual(5);
+    }
+  });
+
   it('reports invalid cron without throwing and clamps the preview count', () => {
     const invalid = service.previewCron('not-a-cron');
     expect(invalid.valid).toBe(false);
