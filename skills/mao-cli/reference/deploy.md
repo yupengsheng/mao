@@ -427,6 +427,28 @@ FROM message WHERE deleted = 0;
 4. **上传目录**：图片产物（`generate_image` / `edit_image`）落 `{FILE_UPLOAD_DIR}/{userId}/`（宿主机按用户隔离、同名挂入容器），外网经 Nginx `^~ /uploads/` 与 `^~ /api/uploads/` 两个前缀访问；按用户隔离后请确认 Nginx 配置含这两个 location（见上文 Nginx 片段），否则图片类 `file.url` 会被扩展名正则 location 吞掉变 404。
 5. **share 目录（按 Agent 隔离）**：`/opt/mao-data/share`（`MAO_SHARE_DIR` 可覆盖）由后端启动自动创建。目录结构为 `agent-experience/<agentId>/`（各 Agent 团队经验库，Agent 会话可读写沉淀经验，管理后台可维护）与 `agents/<agentId>/`（各 Agent 私有区：投放品、脚本、产物）。**容器内每个 Agent 只挂载自己的这两条子路径**（rw 同名挂载），其他 Agent 目录在容器文件系统层面不存在；挂载清单参与容器指纹，升级后存量容器自动重建。管理员投放：把文件放到目标 Agent 的 `agents/<目标AgentId>/`，目录级挂载即时生效（无需重启或重建容器）；多 Agent 需同一文件时逐个复制（无公共投放区）。建议属主与后端运行用户一致、权限 755（`settings.xml` 等含凭据文件建议 600）。目录不计入用户配额、占满磁盘影响全体服务，建议纳入 `df` 监控；经验库由 Agent 自动写入，建议每日快照兜底（示例：`0 3 * * * tar -czf /opt/mao-data/backup/share-$(date +\%F).tgz -C /opt/mao-data share && find /opt/mao-data/backup -name 'share-*.tgz' -mtime +14 -delete`）。
 
+#### share 按 Agent 隔离的存量迁移
+
+旧布局把 `scripts/`、`tools/`、`settings.xml` / `settings_t.xml` 直接放在 share 根目录，文件与 DB（经验库正文、定时任务 prompt、工作区规则快照）中也记录着这些旧绝对路径。升级到按 Agent 隔离后，新容器只能看到 `agent-experience/<agentId>/` 与 `agents/<agentId>/`，因此存量数据须用 `scripts/migrate-share-per-agent.sh` 一次性迁移。脚本要求 root 执行，默认值面向生产（`SHARE_DIR=/opt/mao-data/share`、`BACKEND_ENV=/opt/mao/backend-ts/.env`、`BACKUP_ROOT=/opt/mao-data/backup`、`AGENTS=1,3,4,5,6,7`、`SETTINGS_MAP=1:settings.xml,3:settings.xml,4:settings.xml,5:settings.xml,6:settings_t.xml`），执行前先复核 `--settings-map` 是否与现网投放一致：
+
+```bash
+cd /opt/mao
+bash scripts/migrate-share-per-agent.sh plan                 # 只读预演：列出将建目录、将复制/替换的文件、DB 命中行
+bash scripts/migrate-share-per-agent.sh apply --phase=1      # 全量备份 + 建 agents/<id>/ + 分发脚本/配置 + README + 删试验副本
+bash scripts/migrate-share-per-agent.sh apply --phase=2      # 更新 DB 与文件引用（逐文件备份，含 DB 前像）
+# 部署包含挂载收窄的后端代码并完成回归
+bash scripts/migrate-share-per-agent.sh verify               # 等价 --pre-phase3；旧根目录残留计 WARN
+# 观察 ≥1 天，确认无任务再引用旧路径
+bash scripts/migrate-share-per-agent.sh apply --phase=3      # 残留先打包再删除根目录 scripts/、settings.xml、settings_t.xml
+bash scripts/migrate-share-per-agent.sh verify --post-phase3 # 旧残留计 FAIL，应为 FAIL=0
+```
+
+- **阶段不可跳步**：phase2 会校验 phase1 产物，phase3 会校验迁移前置提示；代码部署必须落在 phase2 与 phase3 之间。
+- **备份**：默认写入 `/opt/mao-data/backup/share-migrate-<时间戳>/`，含 `share-full.tgz`（phase1 全量）、`files/`（phase2 逐文件前像）、`db-before.sql`（被改行的 `REPLACE` 语句）、`phase3-residual.tgz`（phase3 待删残留）。回滚时先停写，再按需恢复前像。
+- **演练**：`--share-dir` 只改脚本读写的目录，文件与 DB 仍按记录中的原路径匹配，因此可在临时副本上配合假 `id` / `mysql` / `mysqldump` 跑通全流程而不触碰生产；重复执行幂等，0 命中会提示「无需更新」。
+- **例外处理**：`--rules-file` 可追加 `file||old||new` 形式的文件替换规则；规则目标缺失时默认中止，确认可忽略后加 `--allow-missing` 重跑。`verify --no-db` 仅用于显式跳过 DB 校验。
+- **迁移后**：根目录旧 `scripts/`、`settings.xml`、`settings_t.xml` 删除前先确认已有 Agent 副本；新文件投放一律进 `agents/<目标AgentId>/`，多 Agent 需逐个复制。
+
 ### 配置（环境变量，见 config.md）
 
 | 变量 | 默认 | 说明 |

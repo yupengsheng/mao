@@ -4,6 +4,7 @@
 - **常驻本地执行端 `mao-agent local --serve`**：不加入任何会话，凭本机设备身份替全部 LOCAL 会话执行工具。桌面客户端退出后，安卓 / 浏览器上已绑定该设备的本地任务仍能跑。`--workspace` 是信任根（默认当前目录，须已信任，不会静默信任）。需审批时默认等桌面 / 安卓 / Web 任一端投票，超时（默认 300 秒，`--approval-timeout-ms`）后拒绝；附着形态 `mao-agent --local --on-approval=remote` 使用同一个超时。`--yolo` 可全自动。与桌面客户端同时在线时，谁最后连接谁执行：桌面端后启动会夺回，关闭桌面端后执行权回到仍在线的 daemon。信任根外的技能 / MCP 同步不回包，避免失败回包把同机桌面端的成功判负；仅 daemon 在线且工作区在根外时，技能同步会在约 60 秒后失败，MCP 同步超时后该轮工具不可用。无人值守建议加 `--yolo` 或把会话权限设为 `FULL`。守护进程等于把本机 shell 开放给自己账号的会话，只在可信机器上运行。
 
 ### 后端
+- **share 按 Agent 隔离的存量迁移脚本**：新增 `scripts/migrate-share-per-agent.sh`，支持只读预演、全量备份、DB 前像导出、旧路径替换（文件 + DB）、残留清理与迁移后校验；按 phase1 / phase2 / phase3 分阶段执行，phase3 须在代码部署、校验通过并观察不少于 1 天后运行。
 - **非安全图片格式进 prompt 前强制转码**：TIFF、BMP 等上游模型不保证支持的图片，此前只要尺寸和体积合规就会原样以 `data:image/tiff` 形式发给模型，随机路由到不支持该格式的渠道时直接 400 `unsupported image`。现在只让 PNG / JPEG / GIF / WebP 原样通过，其余格式一律转成 PNG；即使转码后体积没有变小也保持转码结果，避免为了省体积把不兼容原图透传出去。尺寸合规的安全格式仍不重编码，前缀缓存不受影响。
 - **share 按 Agent 隔离**：容器内由 `MAO_SHARE_DIR` 整根 rw 挂载改为只挂当前 Agent 的 `agent-experience/<agentId>/`（团队经验库）与 `agents/<agentId>/`（私有区：投放品、脚本、产物）两条子路径，其他 Agent 的目录在容器文件系统层面不可见。挂载计划对两条路径按用途精确校验，整根、其他 Agent 与形似路径均拒绝；容器内文件沙箱允许根同步收窄，share 根不再放行；`runtime-agent` 强制读取 `MAO_CONTAINER_AGENT_ID`，缺失或非法即退出。管理员投放改为放到目标 Agent 的 `agents/<目标AgentId>/`，同一文件需给多个 Agent 时逐个复制；经验库原有路径与工作区 `团队经验/` 软链不变。存量容器随挂载指纹变化自动重建。
 - **执行端类型随 `device_status` 下发**：在线帧带当前执行连接的 `clientType`（`electron` / `cli`）。设备仍在线、只是执行连接从桌面换成 mao-agent（或反过来）时会再推一帧，同类型互顶不推。会话详情和列表增加可选 `executorClientType`，刷新后不用等下一次上下线。无新表、无迁移。

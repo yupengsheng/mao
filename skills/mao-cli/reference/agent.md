@@ -31,7 +31,7 @@
 - 管理后台「Agent 管理 → 经验库」维护：开关启用、浏览 / 新建 / 编辑 / 删除文档、强制重建索引、查看索引原文。REST（相对 `/api/v1`，读需登录、写需 `agent:write`；CLI 暂无子命令）：
   - `PATCH /agents/:id/experience-library` `{ enabled }`；`GET /agents/:id/experience-library/docs`（含 `docs` 元信息列表与 `indexContent`）
   - `GET|PUT /agents/:id/experience-library/docs/content?file=`（读 / upsert 单篇，PUT 传 JSON `{ fileName, content }`；单篇上限 1MB）；`DELETE /agents/:id/experience-library/docs?file=`（禁删 `INDEX.md`）；`POST /agents/:id/experience-library/index/rebuild`
-- 边界：库内容由 Agent 会话写入；share 按 Agent 隔离后，容器内只能读写本 Agent 的经验库与 `agents/<agentId>/` 私有区，其他 Agent 目录在容器文件系统层面不可见，跨 Agent 互写不再成立。建议对整个 share 做每日快照（见 [deploy.md](deploy.md#容器隔离运行时v0295)）。
+- 边界：库内容由 Agent 会话写入；share 按 Agent 隔离后，容器内只能读写本 Agent 的经验库与 `agents/<agentId>/` 私有区，其他 Agent 目录在容器文件系统层面不可见，跨 Agent 互写不再成立。建议对整个 share 做每日快照（见 [deploy.md](deploy.md#容器隔离运行时v0295)）。从旧版整根 share 升级时，经验库正文与定时任务 prompt 中的旧 `scripts/`、`tools/`、`settings*.xml` 绝对路径用 `scripts/migrate-share-per-agent.sh` 分阶段迁移（见 [deploy.md](deploy.md#share-按-agent-隔离的存量迁移)）。
 
 ## 系统提示词版本（REST / 管理后台）
 
