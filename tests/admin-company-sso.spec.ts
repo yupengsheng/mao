@@ -45,7 +45,8 @@ test.describe('Company SSO validation', () => {
       'https://*.localhost', 'https://*.127.0.0.1', 'https://*.127.1', 'https://*.0x7f.1', 'https://*.[::1]',
       'https://*.-bad.team', 'https://*.bad-.team', 'https://*.example..com', 'https://*.acg_team.com',
       `https://*.${'a'.repeat(64)}.team`, `https://*.${Array(4).fill('a'.repeat(63)).join('.')}`,
-      ' https://*.example.com', 'https://*.example.com\n', '* ', ' *', '**', 'null', 'http://example.com',
+      ' https://*.example.com', 'https://*.example.com\n', '* ', ' *', '**', 'null',
+      'http://example.com/', 'http://example.com/path', 'http://example.com:80', 'http://user:pass@example.com', 'ftp://example.com',
     ]
     for (const origin of origins) {
       expect(() => parseCompanySsoConfig(JSON.stringify({ ...defaults, allowedOrigins: [origin] })), origin).toThrow(/allowedOrigins/)
@@ -56,7 +57,7 @@ test.describe('Company SSO validation', () => {
     for (const domain of ['*.example.com', 'https://example.com', 'example.com:443', 'example.com/path', '-bad.com', 'example..com', '']) {
       expect(() => validateCompanySsoConfig({ ...defaults, allowedDomains: [domain] })).toThrow(/allowedDomains/)
     }
-    for (const origin of ['http://example.com', 'https://example.com/', 'https://example.com/a', 'https://example.com?x=1', 'https://example.com#x', 'https://user:pass@example.com', 'https://EXAMPLE.com', 'https://example.com:443']) {
+    for (const origin of ['https://example.com/', 'https://example.com/a', 'https://example.com?x=1', 'https://example.com#x', 'https://user:pass@example.com', 'https://EXAMPLE.com', 'https://example.com:443']) {
       expect(() => validateCompanySsoConfig({ ...defaults, allowedOrigins: [origin] })).toThrow(/allowedOrigins/)
     }
     for (const field of ['allowedDomains', 'allowedOrigins']) {
@@ -156,7 +157,9 @@ test.describe('Company SSO settings UI', () => {
     await expect(origins).toHaveValue('https://*.example.com:8443')
     await expect(panel).toContainText('宿主Origin白名单')
     await expect(panel).toContainText('任意层级子域，不含根域')
-    await expect(panel).toContainText('默认 HTTPS 443')
+    await expect(panel).toContainText('默认端口可省略（HTTP 80、HTTPS 443）')
+    await expect(panel).toContainText('http://localhost:2222')
+    await expect(panel).toContainText('HTTP 来源仅建议本地开发或内网联调使用')
     await expect(panel).toContainText('* 放开全部网页来源（包括 HTTP 和 null Origin）')
     await expect(panel).toContainText('仍须有效 SSO，校验域名白名单限制不变')
     await origins.fill('https://*.example.com, https://*.example.com:8443\n*\nhttps://*.example.com')
@@ -176,6 +179,18 @@ test.describe('Company SSO settings UI', () => {
     await panel.getByRole('button', { name: '保存', exact: true }).click()
     await expect(page.locator('.el-message--error')).toContainText('端口必须为 1–65535')
     expect(writes).toHaveLength(0)
+  })
+
+  test('saves exact HTTP localhost and IP origins without forcing HTTPS', async ({ page }) => {
+    const writes = await openSettings(page, JSON.stringify(defaults))
+    const panel = page.locator('#setting-group-company-sso')
+    await panel.locator('.el-switch').click()
+    await panel.locator('textarea').nth(0).fill('example.com')
+    await panel.locator('textarea').nth(1).fill('http://localhost:2222\nhttp://127.0.0.1:8080')
+    await panel.getByRole('button', { name: '保存', exact: true }).click()
+    await expect(page.locator('.el-message--success')).toBeVisible()
+    expect(writes).toHaveLength(1)
+    expect(JSON.parse(writes[0]!.body.value).allowedOrigins).toEqual(['http://localhost:2222', 'http://127.0.0.1:8080'])
   })
 
   test('missing configuration requires initialization and cannot save', async ({ page }) => {
@@ -223,7 +238,7 @@ test.describe('Company SSO settings UI', () => {
     const panel = page.locator('#setting-group-company-sso')
     await panel.locator('textarea').nth(1).fill('https://portal.example.com/path')
     await panel.getByRole('button', { name: '保存', exact: true }).click()
-    await expect(page.locator('.el-message--error')).toContainText('精确 HTTPS Origin')
+    await expect(page.locator('.el-message--error')).toContainText('精确 HTTP/HTTPS Origin')
     expect(writes).toHaveLength(0)
     await panel.locator('textarea').nth(1).fill('https://*.*.example.com')
     await panel.getByRole('button', { name: '保存', exact: true }).click()

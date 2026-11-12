@@ -47,6 +47,12 @@ cd ../admin && npm run build
 - 原 reviewer 复用两轮：第 1 轮发现 P3 通配端口 0 的前后端差异，已修复并补“零 PUT”UI 回归；第 2 轮无新增 bug。112 组前后端 Origin 配置对比全部一致。报告保留于 `docs/code-review/2026-09-08-code-review-01.md`。
 - SDK 无改动，不需重新生成 SDK 产物。测试使用 mock API，临时 Vite 服务已关闭；未部署、未执行真实 SSO/数据库联调。
 
+## HTTP / localhost / IP Origin 增量验证（2026-11-12）
+
+- 宿主 Origin 白名单的精确项由「仅 HTTPS」放宽为 HTTP/HTTPS 均可：支持 localhost、IPv4/IPv6 与非默认端口（如 `http://localhost:2222`、`http://127.0.0.1:8080`），CORS 预检与换票 POST 共用 `matchesCompanySsoOrigin` 同步放行。子域模式仍仅限 `https://*.example.com`；校验域名白名单仍只接受至少两段的 DNS 域名，checkUrl 与换票入口 HTTPS（`requireHttps`）要求不变。
+- 前后端拒绝规则保持对齐：`http://*.example.com`、带路径、带凭据、大写 scheme、默认端口（`http://host:80`、`https://host:443`）等非规范形态一律拒绝；精确 HTTP Origin 的 scheme、host、port 均严格匹配，`https://localhost:2222` 不能匹配 `http://localhost:2222`。
+- HTTP 来源仅建议本地开发或内网联调使用；未部署、未执行真实环境联调。
+
 ## 隔离 MySQL 集成测试
 
 `backend-ts/src/auth/company-sso.mysql.integration.spec.ts` 默认跳过，只有显式设置 `SSO_TEST_MYSQL_SOCKET` 才执行。它不加载应用数据库配置，要求独立 `sso-mysql-*` 目录下的真实 Unix socket、MySQL 关闭网络监听，使用随机新建的测试数据库，并只删除该测试数据库。
