@@ -30,7 +30,7 @@
 | `--keyword` | 否 | 字符串 | — | 标题/摘要/消息内容关键词（消息范围见 `--search-scope`） | `keyword` |
 | `--search-scope` | 否 | 字符串 | `conversation` | `conversation` 只搜对话双方消息；`all` 连工具输出/系统消息一起搜 | `messageScope` |
 | `--status` | 否 | 字符串 | — | 会话状态 | `status` |
-| `--range` | 否 | 字符串 | `7d` | 活跃时间窗：`7d` / `30d` / `90d` / `all` | `range` |
+| `--range` | 否 | 字符串 | `7d` | 活跃时间窗：`1d` / `3d` / `7d` / `30d` / `90d` / `all` | `range` |
 | `--date-from` | 否 | 字符串 | — | 活跃时间窗起始日（含），优先于 `--range` | `dateFrom` |
 | `--date-to` | 否 | 字符串 | — | 活跃时间窗结束日（含整日） | `dateTo` |
 
@@ -38,7 +38,7 @@
 
 列表按最后活动时间倒序（`last_activity_at DESC, id DESC`；从未产生活动的会话排在末尾，0.0.380 起）。
 
-列表默认只返回最近 7 天有活动的会话（按 `last_activity_at`），避免大表全量扫描；`--range all` 可放宽到全部时间。显式传 `--date-from` / `--date-to` 时按该日期区间过滤，日期优先于预设，可只传单边。关键词消息与命中片段使用同一活跃时间窗；按创建日期下钻（`startDate` / `endDate`）且未显式传活跃时间参数时，不套默认 7 天窗口。
+列表默认只返回最近 7 天有活动的会话（按 `last_activity_at`），避免大表全量扫描；预设档 `1d`/`3d`/`7d`/`30d`/`90d` 分别对应最近 N 天（含今天），`--range all` 可放宽到全部时间。显式传 `--date-from` / `--date-to` 时按该日期区间过滤，日期优先于预设，可只传单边。关键词消息与命中片段使用同一活跃时间窗；按创建日期下钻（`startDate` / `endDate`）且未显式传活跃时间参数时，不套默认 7 天窗口。
 
 关键词会同时匹配标题、摘要与消息正文。消息正文默认只搜对话双方（`USER`/`ASSISTANT`），命中片段 `matchSnippet` 同口径——工具输出、读到的文件内容、`ls` 文件名不再把会话顶上来；要反查工具输出里的词时加 `--search-scope all`（等同旧口径，含 `TOOL`/`SYSTEM`）。记录带 `sessionType`（`NORMAL`/`SIDE_TASK`/`SUBAGENT`）与 `parentSessionId`：管理后台列表「类型」列三种类型都着标签（边路任务橙色、子代理与主会话蓝色），悬停显示来源说明；`parentSessionId` 非空时指向父会话。
 

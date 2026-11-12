@@ -452,7 +452,7 @@ function applyRouteQuery() {
     typeof q.startDate === 'string' && q.startDate && typeof q.endDate === 'string' && q.endDate
       ? [q.startDate, q.endDate]
       : null
-  // 活跃时间：range=7D/30D/90D/ALL；自定义档读 dateFrom/dateTo。
+  // 活跃时间：range=1D/3D/7D/30D/90D/ALL；自定义档读 dateFrom/dateTo。
   // 仅带创建日期下钻（地址里没有活跃时间参数）时视为「全部时间」，避免默认 7 天把下钻结果裁掉。
   const range = typeof q.range === 'string' ? q.range.toUpperCase() : ''
   const dateFrom = typeof q.dateFrom === 'string' ? q.dateFrom : ''
