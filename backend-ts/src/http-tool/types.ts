@@ -148,6 +148,8 @@ export interface HttpToolDraft {
   timeoutMs?: number;
   enabled?: boolean;
   params?: HttpToolParamInput[];
+  /** 复制继承源工具 id：新建时掩码请求头从该工具已存密文解析。 */
+  copyFromId?: number;
 }
 
 /** 试运行入参：完整草稿 + 本次 arguments（不落库）。 */

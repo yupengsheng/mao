@@ -283,11 +283,69 @@ describe('HttpToolService execution resolution', () => {
 
   it('validates test drafts and rejects mask sentinel header values', async () => {
     const { service } = makeService();
-    const resolved = service.resolveDraftForExecution({ ...draft, name: 'draft_tool' });
+    const resolved = await service.resolveDraftForExecution({ ...draft, name: 'draft_tool' });
     expect(resolved.tool).toMatchObject({ name: 'draft_tool', method: 'GET' });
-    expect(() => service.resolveDraftForExecution({ ...draft, headers: { Authorization: '******' } }))
-      .toThrow();
-    expect(() => service.resolveDraftForExecution({ ...draft, url: 'ftp://x' })).toThrow();
+    await expect(service.resolveDraftForExecution({ ...draft, headers: { Authorization: '******' } }))
+      .rejects.toMatchObject({ code: ErrorCode.PARAM_INVALID.code });
+    await expect(service.resolveDraftForExecution({ ...draft, url: 'ftp://x' }))
+      .rejects.toMatchObject({ code: ErrorCode.PARAM_INVALID.code });
+  });
+
+  it('resolves masked headers from the stored tool when toolId is provided', async () => {
+    const { service } = makeService();
+    const created = await service.create({
+      ...draft,
+      headers: { Authorization: 'Bearer secret', 'X-Trace': 'on' },
+    });
+    const resolved = await service.resolveDraftForExecution(
+      { ...draft, name: 'draft_tool', headers: { Authorization: '******', 'X-Trace': 'on' } },
+      created.id,
+    );
+    expect(resolved.tool.headers).toEqual({ Authorization: 'Bearer secret', 'X-Trace': 'on' });
+  });
+
+  it('rejects masked headers when toolId does not exist', async () => {
+    const { service } = makeService();
+    await expect(service.resolveDraftForExecution(
+      { ...draft, name: 'draft_tool', headers: { Authorization: '******' } },
+      999,
+    )).rejects.toMatchObject({ code: ErrorCode.HTTP_TOOL_NOT_FOUND.code });
+  });
+
+  it('inherits stored encrypted headers when copying a tool', async () => {
+    const { service, repo } = makeService();
+    const source = await service.create({
+      ...draft,
+      headers: { Authorization: 'Bearer secret', 'X-Trace': 'on' },
+    });
+    const copied = await service.create({
+      ...draft,
+      name: 'weather_copy',
+      displayName: '天气查询副本',
+      headers: { Authorization: '******', 'X-Trace': 'on' },
+      copyFromId: source.id,
+    });
+    expect(copied.headers).toEqual([
+      { key: 'Authorization', value: '******', sensitive: true },
+      { key: 'X-Trace', value: 'on', sensitive: false },
+    ]);
+    const stored = repo.tools.find((tool) => tool.id === copied.id);
+    expect(stored?.headersJson).toContain('enc:');
+    const resolved = await service.resolveForExecution(
+      { httpToolIds: JSON.stringify([copied.id!]) },
+      'weather_copy',
+    );
+    expect(resolved?.tool.headers).toEqual({ Authorization: 'Bearer secret', 'X-Trace': 'on' });
+  });
+
+  it('rejects copy when the source tool does not exist', async () => {
+    const { service } = makeService();
+    await expect(service.create({
+      ...draft,
+      name: 'weather_copy',
+      headers: { Authorization: '******' },
+      copyFromId: 999,
+    })).rejects.toMatchObject({ code: ErrorCode.HTTP_TOOL_NOT_FOUND.code });
   });
 });
 
