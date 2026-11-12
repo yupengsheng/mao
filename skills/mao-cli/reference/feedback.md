@@ -16,9 +16,9 @@
 
 校验：消息须存在、role=ASSISTANT、所属会话属于当前用户；非本人消息返回 code 3031，消息不存在返回 3030，无效原因返回 2001。每条消息最多 1 条点踩记录，重复 PUT 覆盖原因。
 
-**点踩来源（`source`）**：`desktop`（桌面/Web/安卓端，默认）/ `feishu`（飞书任务完成卡片点踩按钮）。存量记录均为 `desktop`。
+**点踩来源（`source`）**：`desktop`（桌面/Web/安卓端，默认）/ `feishu`（飞书任务完成卡片点踩按钮）/ `dingtalk`（钉钉任务完成卡片点踩按钮）。存量记录均为 `desktop`。
 
-**飞书专属原因 `NO_REASON`**：飞书进度卡点踩不弹原因选项，固定写入 `NO_REASON`，后台展示为「未选择原因（飞书）」。服务端放行该值，桌面端原因选项列表不含它。
+**卡片点踩原因 `NO_REASON`**：飞书 / 钉钉完成卡点踩不弹原因选项，固定写入 `NO_REASON`，后台展示为「未选择原因」。服务端放行该值，桌面端原因选项列表不含它。
 
 **飞书点踩按卡归属**：飞书点踩记录落在**被点那张完成卡对应的** ASSISTANT 消息上（不再固定取会话最后一条）——卡片身份取自回调事件的 `open_message_id`，经 `feishu_card_snapshot` 快照表解析到该卡终态时刻的最后一条 ASSISTANT 消息；同一张卡重复点击即 toggle 该消息的记录，点旧卡不影响最新消息的反馈记录与其它卡片。卡片重绘优先使用内存按卡句柄，未命中时按持久化快照重建；只有事件本身没有卡片身份时才走会话级兜底。带卡片身份但快照已超期、缺失或查询失败时，不退回会话最新回复，而是与消息已清理口径一致返回「未找到可反馈的任务结果」，避免把旧卡反馈错记到新任务。桌面/Web/安卓端点踩链路（按 messageId）不变。
 
@@ -27,9 +27,9 @@
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/feedback/admin/summary?startDate=&endDate=` | 汇总：`{total, byReason:[{reason,label,count}], byDay:[{date,count}], pendingCount, pendingMatrix:[{agentId,agentName,reason,reasonLabel,count}]}`；日期可选。`pendingCount` 为待处理数（`status=PENDING`，不带日期筛选），`pendingMatrix` 为 Agent × 原因的待处理矩阵（按 `agent_id` 快照口径分组，`agentId` 为 null 即飞书点踩的无 Agent 行） |
-| GET | `/feedback/admin/list?reason=&status=&agentId=&startDate=&endDate=&page=&pageSize=` | 分页明细：`{total, items[]}`，单条含 `createdAt/userId/username/displayName/sessionId/agentId/agentName/reason/reasonLabel/source/status/handledBy/handledByName/handledAt/experienceId/sameGroupCount/contentPreview`；`contentPreview` 为消息内容前 100 字摘要（已剥离内部标记），消息已删除时为 null。`source` 为点踩来源：`desktop` / `feishu`。`status` 为处理态：`PENDING` / `CONVERTED` / `DISMISSED`（后两者为终态）；`sameGroupCount` 为同 Agent 同原因的待处理条数（聚集口径）；`agentId` 传具体 id 筛选，缺省不筛选 |
+| GET | `/feedback/admin/list?reason=&status=&agentId=&startDate=&endDate=&page=&pageSize=` | 分页明细：`{total, items[]}`，单条含 `createdAt/userId/username/displayName/sessionId/agentId/agentName/reason/reasonLabel/source/status/handledBy/handledByName/handledAt/experienceId/sameGroupCount/contentPreview`；`contentPreview` 为消息内容前 100 字摘要（已剥离内部标记），消息已删除时为 null。`source` 为点踩来源：`desktop` / `feishu` / `dingtalk`。`status` 为处理态：`PENDING` / `CONVERTED` / `DISMISSED`（后两者为终态）；`sameGroupCount` 为同 Agent 同原因的待处理条数（聚集口径）；`agentId` 传具体 id 筛选，缺省不筛选 |
 
-原因筛选项可用值：`WRONG_RESULT` / `SLOW_RESPONSE` / `NOT_SOLVED` / `OTHER` / `NO_REASON`（飞书）。
+原因筛选项可用值：`WRONG_RESULT` / `SLOW_RESPONSE` / `NOT_SOLVED` / `OTHER` / `NO_REASON`（飞书 / 钉钉卡片，后台展示「未选择原因」）。
 
 ### 管理端写入（需 `feedback:write`，默认仅系统管理员）
 
@@ -43,7 +43,7 @@
 
 ## 数据表
 
-`message_feedback`（V123 迁移，V125 加 `source` 列，V148 加处理态四列）：`message_id` 唯一键，冗余 `session_id/user_id/agent_id` 便于统计；`source` 标识点踩来源（`desktop` / `feishu`）；`status`（`PENDING` / `CONVERTED` / `DISMISSED`，后两者为终态；`CONVERTED` 是已下线的转经验功能留下的存量状态）、`handled_by`、`handled_at`、`experience_id` 记录处理结果，存量行由列默认值回填为 `PENDING`。
+`message_feedback`（V123 迁移，V125 加 `source` 列，V148 加处理态四列）：`message_id` 唯一键，冗余 `session_id/user_id/agent_id` 便于统计；`source` 标识点踩来源（`desktop` / `feishu` / `dingtalk`）；`status`（`PENDING` / `CONVERTED` / `DISMISSED`，后两者为终态；`CONVERTED` 是已下线的转经验功能留下的存量状态）、`handled_by`、`handled_at`、`experience_id` 记录处理结果，存量行由列默认值回填为 `PENDING`。
 
 `feishu_card_snapshot`（V161 迁移，V187 加清理索引）：飞书完成卡终态快照，一行一张 COMPLETED 卡（`card_message_id` 唯一），记录该卡对应的 ASSISTANT `message_id` 与终态 `round` / `elapsed_ms` / `content`（与卡片同口径）。服务于飞书点踩的按卡归属与快照重建：进程重启或点旧完成卡时据此重绘完整卡片。快照保留 180 天，按最后一次终态写入的 `updated_at` 计时；超期后旧卡不再保证完整重绘，带卡片身份的点击也不再按会话最新回复兜底归属。
 
