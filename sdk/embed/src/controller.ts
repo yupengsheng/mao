@@ -65,6 +65,8 @@ export interface UiState {
   unread: number;
   sessionTitle: string;
   agentAvatarUrl: string | null;
+  /** 入口图标待解析（预取中且无缓存）：true 时不渲染占位图标，避免「先品牌图标后换头像」的闪动 */
+  launcherIconPending: boolean;
   /** Agent 推荐问题（新会话空白态展示），boot 时随 Agent 详情拉取 */
   suggestedQuestions: string[];
   sessionError: string | null;
@@ -123,6 +125,7 @@ export function createUiState(options: MaoChatInitOptions): UiState {
     unread: 0,
     sessionTitle: FALLBACK_PANEL_TITLE,
     agentAvatarUrl: null,
+    launcherIconPending: false,
     suggestedQuestions: [],
     sessionError: null,
     llmRetryText: null,
@@ -194,6 +197,12 @@ export function getController(): EmbedController | null {
 
 /** 浮窗标题在 Agent 名称尚未加载或为空时的占位 */
 const FALLBACK_PANEL_TITLE = 'Mao 助手';
+/** 入口图标待解析兜底：超时先结束挂起（显示品牌图标），拿到结果后仍会更新 */
+const LAUNCHER_ICON_FALLBACK_MS = 1200;
+/** 入口图标缓存键：服务地址 + Agent 维度（与身份无关），用于首屏直接展示上次结果 */
+export function agentIdentityCacheKey(serverUrl: string, agentId: number): string {
+  return `mao_embed_agent_identity_${JSON.stringify([resolveApiBase(serverUrl), agentId])}`;
+}
 
 function displayAgentName(name: unknown): string | null {
   if (typeof name !== 'string') return null;
@@ -275,6 +284,10 @@ export class EmbedController {
   private readonly unconfirmedSaves = new Map<string, string>();
   /** 管理后台配置的 Agent 名称；浮窗标题用这个，不跟会话自动标题走 */
   private agentDisplayName: string | null = null;
+  /** Agent 详情在途/已取请求：页面加载预取（入口头像）与首次打开 boot 共用，失败不缓存 */
+  private agentDetails: Promise<AgentVO> | null = null;
+  /** 入口图标待解析兜底计时器（超时先结束挂起，不长期挡住入口图标） */
+  private launcherIconTimer: ReturnType<typeof setTimeout> | null = null;
   /** 页面工具 requestId 幂等：已处理过的请求重发缓存结果，处理中的重复请求直接忽略 */
   private readonly pageToolResults = new Map<string, WsPageToolResultData>();
   private readonly pageToolInFlight = new Set<string>();
@@ -462,6 +475,10 @@ export class EmbedController {
     this.agentDisplayName = null;
     this.applyPanelTitle();
     this.ui.agentAvatarUrl = null;
+    // 身份变化后丢弃旧身份的 Agent 详情缓存与入口挂起态：新身份首次打开需按自身权限重新拉取
+    this.agentDetails = null;
+    this.clearLauncherIconTimer();
+    this.ui.launcherIconPending = false;
     this.ui.suggestedQuestions = [];
     // 身份切换：取消页面任务并清空页面授权/日志，避免跨身份继承
     this.pageEngine?.cancel();
@@ -484,6 +501,102 @@ export class EmbedController {
 
   private applyPanelTitle() {
     this.ui.sessionTitle = this.agentDisplayName ?? FALLBACK_PANEL_TITLE;
+  }
+
+  /**
+   * 页面加载即预取 Agent 详情：入口按钮先展示配置的头像与名称，不必等用户点开浮窗。
+   * 有上次成功缓存时首屏直接落图标（无闪动）；无缓存先进入「待解析」态——不渲染占位图标，
+   * 解析完成（或超时兜底）后直接显示最终图标，避免「先品牌图标、后换头像」的闪动。
+   * 失败静默（保持品牌图标与默认标题），首次打开时 boot 会重新获取并沿用原有错误展示。
+   */
+  prefetchLauncherIdentity(): void {
+    if (this.destroyed || !this.ui.launcherVisible) return;
+    const version = this.identityVersion;
+    const cached = this.readCachedIdentity();
+    if (cached) this.applyCachedIdentity(cached);
+    else this.ui.launcherIconPending = true;
+    const settle = () => {
+      this.clearLauncherIconTimer();
+      if (!this.destroyed && version === this.identityVersion) this.ui.launcherIconPending = false;
+    };
+    this.clearLauncherIconTimer();
+    this.launcherIconTimer = setTimeout(settle, LAUNCHER_ICON_FALLBACK_MS);
+    void this.ensureAgentDetails()
+      .then((agent) => {
+        if (this.destroyed || version !== this.identityVersion) return;
+        this.applyAgentDetails(agent);
+      })
+      .catch(() => {})
+      .finally(settle);
+  }
+
+  /** 上次成功的 Agent 详情（头像/名称）：首屏直接落图标用，避免每页重新等待网络 */
+  private readCachedIdentity(): { avatarUrl: string | null; name: string | null } | null {
+    try {
+      const raw = window.localStorage.getItem(agentIdentityCacheKey(this.options.serverUrl, this.options.agentId));
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as { avatarUrl?: unknown; name?: unknown };
+      return {
+        avatarUrl: typeof parsed.avatarUrl === 'string' && parsed.avatarUrl ? parsed.avatarUrl : null,
+        name: typeof parsed.name === 'string' && parsed.name ? parsed.name : null,
+      };
+    } catch {
+      // 存储不可用或内容损坏：按无缓存处理
+      return null;
+    }
+  }
+
+  private writeCachedIdentity(avatarUrl: string | null, name: string | null): void {
+    try {
+      window.localStorage.setItem(
+        agentIdentityCacheKey(this.options.serverUrl, this.options.agentId),
+        JSON.stringify({ avatarUrl, name }),
+      );
+    } catch { /* 隐私模式等场景：缓存失败不影响功能 */ }
+  }
+
+  private applyCachedIdentity(cached: { avatarUrl: string | null; name: string | null }): void {
+    this.ui.agentAvatarUrl = cached.avatarUrl;
+    this.agentDisplayName = cached.name;
+    this.applyPanelTitle();
+    this.ui.launcherIconPending = false;
+  }
+
+  private clearLauncherIconTimer(): void {
+    if (this.launcherIconTimer != null) {
+      clearTimeout(this.launcherIconTimer);
+      this.launcherIconTimer = null;
+    }
+  }
+
+  /** Agent 详情（头像/名称/推荐问题）：预取与 boot 共用同一在途请求；失败不缓存，便于重试 */
+  private ensureAgentDetails(): Promise<AgentVO> {
+    if (!this.agentDetails) {
+      this.agentDetails = this.rest
+        .request<AgentVO>('GET', `/agents/${this.options.agentId}`)
+        .catch((error: unknown) => {
+          this.agentDetails = null;
+          throw error;
+        });
+    }
+    return this.agentDetails;
+  }
+
+  private applyAgentDetails(agent: AgentVO): void {
+    // SDK 嵌在第三方页面：上传路径必须指向 Mao 服务，不能落到宿主域名。
+    const avatarUrl = agent.avatarUrl
+      ? new URL(agent.avatarUrl, resolveApiBase(this.options.serverUrl)).href
+      : null;
+    const name = displayAgentName(agent.name);
+    this.ui.agentAvatarUrl = avatarUrl;
+    this.agentDisplayName = name;
+    this.applyPanelTitle();
+    // 记住本次结果：下次页面加载首屏直接落图标，不再经历「待解析」窗口
+    this.writeCachedIdentity(avatarUrl, name);
+    // 推荐问题随详情一次拉取；为空或接口未返回时保持空数组（空白态不渲染该区块）
+    this.ui.suggestedQuestions = (agent.suggestedQuestions ?? [])
+      .map((q) => (q.content ?? '').trim())
+      .filter((content) => content.length > 0);
   }
 
   /** 附件大小上限：后台集成配置变更后，下次 boot/重试即可生效 */
@@ -602,21 +715,12 @@ export class EmbedController {
     this.store.sessionError.value = null;
     try {
       const [agent] = await Promise.all([
-        this.rest.request<AgentVO>('GET', `/agents/${this.options.agentId}`),
+        this.ensureAgentDetails(),
         // 附件上限用于输入区即时校验；拉取失败保持默认值，不阻断 boot
         this.loadAttachmentLimit(),
       ]);
       if (stale()) return;
-      // SDK 嵌在第三方页面：上传路径必须指向 Mao 服务，不能落到宿主域名。
-      this.ui.agentAvatarUrl = agent.avatarUrl
-        ? new URL(agent.avatarUrl, resolveApiBase(this.options.serverUrl)).href
-        : null;
-      this.agentDisplayName = displayAgentName(agent.name);
-      this.applyPanelTitle();
-      // 推荐问题随详情一次拉取；为空或接口未返回时保持空数组（空白态不渲染该区块）
-      this.ui.suggestedQuestions = (agent.suggestedQuestions ?? [])
-        .map((q) => (q.content ?? '').trim())
-        .filter((content) => content.length > 0);
+      this.applyAgentDetails(agent);
       // 多 tab 竞态：先问其他 tab 是否已有会话
       const claimed = await this.tabs.inquire();
       if (stale()) return;
@@ -951,6 +1055,7 @@ export class EmbedController {
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.clearLauncherIconTimer();
     this.pageEngine?.destroy();
     this.tokens.destroy();
     this.store.reset();

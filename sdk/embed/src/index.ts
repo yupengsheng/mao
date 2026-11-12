@@ -57,6 +57,8 @@ function createInstance(options: MaoChatInitOptions): MaoChatInstance {
       /* 宿主回调异常不阻断 SDK */
     }
   }, cleanup, host);
+  // 页面加载即预取入口身份：入口按钮先显示配置的头像/名称，不必等用户点开浮窗
+  controller.prefetchLauncherIdentity();
   const instance: EmbeddedInstance = {
     open: () => controller.open(),
     close: () => controller.close(),

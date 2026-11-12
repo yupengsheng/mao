@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { nextTick } from 'vue';
-import { EmbedController, createUiState, type UiState } from './controller';
+import { EmbedController, createUiState, agentIdentityCacheKey, type UiState } from './controller';
 import type { MaoChatEvent, MaoChatInitOptions } from './types';
 
 /** 与 ws-client.spec.ts 同款 fake：静态常量必须保留 */
@@ -175,6 +175,100 @@ describe('EmbedController', () => {
     await boot(h);
     expect(h.fetchCalls).toContain('GET https://mao.example.com/api/v1/agents/3');
     expect(h.ui.agentAvatarUrl).toBe(expected);
+    h.ctl.destroy();
+  });
+
+  it('页面加载预取 Agent 详情：入口先行展示头像与名称，首次打开不再重复请求', async () => {
+    agentAvatarUrl = '/uploads/agents/3.png';
+    const h = await makeHarness();
+    h.ctl.prefetchLauncherIdentity();
+    expect(h.ui.launcherIconPending).toBe(true);
+    await vi.waitFor(() => expect(h.ui.agentAvatarUrl).toBe('https://mao.example.com/uploads/agents/3.png'));
+    await vi.waitFor(() => expect(h.ui.launcherIconPending).toBe(false));
+    expect(h.ui.sessionTitle).toBe('客服助手');
+    expect(JSON.parse(window.localStorage.getItem(agentIdentityCacheKey('https://mao.example.com', 3))!)).toEqual({
+      avatarUrl: 'https://mao.example.com/uploads/agents/3.png', name: '客服助手',
+    });
+    await boot(h);
+    expect(h.fetchCalls.filter((call) => call === 'GET https://mao.example.com/api/v1/agents/3')).toHaveLength(1);
+    h.ctl.destroy();
+  });
+
+  it('再次加载时用上次缓存的图标直接展示，不进入待解析态', async () => {
+    agentAvatarUrl = '/uploads/agents/3.png';
+    window.localStorage.setItem(agentIdentityCacheKey('https://mao.example.com', 3), JSON.stringify({
+      avatarUrl: 'https://mao.example.com/uploads/agents/3.png', name: '客服助手',
+    }));
+    const h = await makeHarness();
+    h.ctl.prefetchLauncherIdentity();
+    expect(h.ui.launcherIconPending).toBe(false);
+    expect(h.ui.agentAvatarUrl).toBe('https://mao.example.com/uploads/agents/3.png');
+    expect(h.ui.sessionTitle).toBe('客服助手');
+    h.ctl.destroy();
+  });
+
+  it('无头像时预取结算后结束待解析态，入口回退品牌图标', async () => {
+    const h = await makeHarness();
+    h.ctl.prefetchLauncherIdentity();
+    expect(h.ui.launcherIconPending).toBe(true);
+    await vi.waitFor(() => expect(h.ui.launcherIconPending).toBe(false));
+    expect(h.ui.agentAvatarUrl).toBeNull();
+    h.ctl.destroy();
+  });
+
+  it('预取超时兜底：长时间无响应时先结束挂起，不长期挡住宿主入口', async () => {
+    const h = await makeHarness();
+    vi.mocked(fetch).mockImplementationOnce(() => new Promise<Response>(() => {}));
+    vi.useFakeTimers();
+    try {
+      h.ctl.prefetchLauncherIdentity();
+      expect(h.ui.launcherIconPending).toBe(true);
+      await vi.advanceTimersByTimeAsync(1200);
+      expect(h.ui.launcherIconPending).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      h.ctl.destroy();
+    }
+  });
+
+  it('预取失败静默：不写错误横幅，首次打开仍重新获取 Agent 详情', async () => {
+    agentAvatarUrl = '/uploads/agents/3.png';
+    const h = await makeHarness();
+    vi.mocked(fetch).mockRejectedValueOnce(new Error('Agent unavailable'));
+    h.ctl.prefetchLauncherIdentity();
+    await vi.waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1));
+    expect(h.ui.sessionError).toBeNull();
+    expect(h.ui.agentAvatarUrl).toBeNull();
+    await boot(h);
+    expect(h.ui.agentAvatarUrl).toBe('https://mao.example.com/uploads/agents/3.png');
+    expect(h.ui.sessionTitle).toBe('客服助手');
+    h.ctl.destroy();
+  });
+
+  it('launcher 隐藏时不预取 Agent 详情', async () => {
+    const h = await makeHarness({ launcher: { visible: false } });
+    h.ctl.prefetchLauncherIdentity();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(h.fetchCalls).toHaveLength(0);
+    h.ctl.destroy();
+  });
+
+  it('身份切换后丢弃旧身份的预取响应，不覆盖新身份入口', async () => {
+    // token subject 决定初始身份；预取请求在途时切换身份，旧响应必须被丢弃
+    const token = `e30.${btoa(JSON.stringify({ sub: 'user-1' }))}.sig`;
+    const h = await makeHarness({ getToken: async () => token });
+    const internals = h.ctl as unknown as { setIdentity(user: string | null): boolean };
+    let finishAgent!: (response: Response) => void;
+    vi.mocked(fetch).mockImplementationOnce(() => new Promise<Response>((resolve) => { finishAgent = resolve; }));
+    h.ctl.prefetchLauncherIdentity();
+    expect(h.ui.launcherIconPending).toBe(true);
+    await vi.waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1));
+    internals.setIdentity('user-2');
+    finishAgent(jsonOk({ id: 3, name: '旧身份', avatarUrl: '/uploads/agents/3.png' }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(h.ui.agentAvatarUrl).toBeNull();
+    expect(h.ui.sessionTitle).toBe('Mao 助手');
+    expect(h.ui.launcherIconPending).toBe(false);
     h.ctl.destroy();
   });
 
