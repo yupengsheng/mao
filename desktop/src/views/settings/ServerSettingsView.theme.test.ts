@@ -39,4 +39,13 @@ describe('设置 → 服务器：暗色主题下的状态卡底色', () => {
     expect(body).toContain('background: var(--aw-canvas-parchment)')
     expect(body).not.toMatch(/var\(\s*--aw-bg\b/)
   })
+
+  it('暗色默认强调色保留历史服务器卡的旧版亮蓝锚点', () => {
+    expect(view).toMatch(
+      /:root\[data-theme="dark"\]:not\(\[data-accent\]\) \.history-row\.current\s*\{[^}]*background:\s*rgba\(0, 102, 204, 0\.08\)[^}]*border-color:\s*rgba\(0, 102, 204, 0\.25\)/s
+    )
+    expect(view).toMatch(
+      /:root\[data-theme="dark"\]:not\(\[data-accent\]\) \.current-badge\s*\{[^}]*border-color:\s*rgba\(0, 102, 204, 0\.4\)/s
+    )
+  })
 })
