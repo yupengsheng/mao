@@ -88,7 +88,9 @@ function has(node: Record<string, unknown> | null, key: string): boolean {
  */
 function failureSuffix(node: Record<string, unknown> | null): string {
   if (!has(node, 'error')) return '';
-  return ` (失败: ${truncate(String(node!.error), 40)})`;
+  const error = node!.error;
+  if (typeof error !== 'string') return '';
+  return ` (失败: ${truncate(error, 40)})`;
 }
 
 export function summarize(toolName: string | null | undefined, argumentsJson: string | null | undefined, result: string | null | undefined): string | null {
