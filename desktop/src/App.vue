@@ -6,8 +6,10 @@
 import { onMounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { dismissSplash, dismissSplashAfterPaint } from './utils/splash'
+import { useAppStatusIndicators } from './composables/useParallelStatus'
 
 const router = useRouter()
+useAppStatusIndicators()
 
 onMounted(async () => {
   // 兜底：异常情况下最多 10 秒后强制移除 Splash

@@ -325,6 +325,24 @@ test('基线：角标仅 macOS 生效且计数归一化', async () => {
   assert.deepEqual(win.state.badgeCounts, [])
 })
 
+test('基线：等待审批任务栏闪烁 IPC 启停，窗口聚焦复位且不重复发', async () => {
+  const h = await loadMain({})
+  assert.deepEqual(await h.invoke('desktop-flash-frame', true), { ok: true })
+  assert.deepEqual(h.state.flashCalls, [{ windowId: 1, on: true }])
+
+  h.win().focus()
+  assert.deepEqual(h.state.flashCalls, [
+    { windowId: 1, on: true },
+    { windowId: 1, on: false },
+  ], '聚焦应停止闪烁')
+
+  h.win().focus()
+  assert.equal(h.state.flashCalls.length, 2, '已复位后再次聚焦不重复发 IPC')
+
+  assert.deepEqual(await h.invoke('desktop-flash-frame', false), { ok: true })
+  assert.deepEqual(h.state.flashCalls.at(-1), { windowId: 1, on: false })
+})
+
 // ─── 基线：自启 / 偏好 ───
 
 test('基线：dev 模式拒绝开启自启且不落盘', async () => {

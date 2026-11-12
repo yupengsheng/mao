@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { BusinessException } from '../common/business-exception.js';
 import { ErrorCode } from '../common/error-code.js';
 import {
+  buildCronPreview,
   isOneShotCron,
   normalizeSpringCron,
   ScheduledTaskScheduler,
@@ -296,6 +297,29 @@ describe('ScheduledTaskService', () => {
     expect(isOneShotCron('0 */30 * * * ?')).toBe(false);
     expect(isOneShotCron('0 0 10 * * MON')).toBe(false);
     expect(isOneShotCron('bad cron')).toBe(false);
+  });
+
+  it('uses Spring AND semantics when day-of-month and day-of-week are both restricted', () => {
+    const preview = buildCronPreview('0 0 12 1 1 1', 3);
+    expect(preview.valid).toBe(true);
+    expect(preview.nextFireTimes).toHaveLength(3);
+    for (const fireTime of preview.nextFireTimes) {
+      const [y, m, d] = fireTime.split(' ')[0]!.split('-').map(Number);
+      const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+      expect([m, d, dow]).toEqual([1, 1, 1]);
+    }
+  });
+
+  it('keeps weekday-only restrictions working with Spring AND semantics', () => {
+    const preview = buildCronPreview('0 0 10 ? * MON-FRI', 5);
+    expect(preview.valid).toBe(true);
+    expect(preview.nextFireTimes).toHaveLength(5);
+    for (const fireTime of preview.nextFireTimes) {
+      const [y, m, d] = fireTime.split(' ')[0]!.split('-').map(Number);
+      const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+      expect(dow).toBeGreaterThanOrEqual(1);
+      expect(dow).toBeLessThanOrEqual(5);
+    }
   });
 
   it('rejects cron without a computable next fire time', async () => {

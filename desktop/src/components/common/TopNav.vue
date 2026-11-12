@@ -140,7 +140,7 @@ import { useVersionCheck } from '../../composables/useVersionCheck'
 import { readScreenFillingWindow, reserveMacTrafficLightInset as shouldReserveMacTrafficLightInset } from '../../utils/macTrafficLightInset'
 import { isElectronClient } from '../../utils/platform'
 import { goBackToWorkbench } from '../../utils/workbench-nav'
-import { openWorkspaceOverviewTabFor } from '../../composables/useCenterTabs'
+import { openWorkspaceOverviewTabFor, useCenterTabs } from '../../composables/useCenterTabs'
 import SessionSearchPopover from '../search/SessionSearchPopover.vue'
 import UsageBell from '../usage/UsageBell.vue'
 import CommandManagerDrawer from '../command/CommandManagerDrawer.vue'
@@ -165,7 +165,7 @@ const shortcutHelpRef = ref()
 const commandsDrawerVisible = ref(false)
 const inboxDrawerVisible = ref(false)
 
-/** 命令面板宿主动作：面板负责展示与过滤，TopNav 复用既有入口函数与 ref。 */
+/** 命令面板宿主动作：面板负责展示与过滤，TopNav 复用既有入口函数、中心 Tab 与事件通道。 */
 const commandHost: CommandHostActions = {
   openSearch: () => searchPopoverRef.value?.toggle(),
   toggleTerminal,
@@ -181,11 +181,18 @@ const commandHost: CommandHostActions = {
   logout: () => {
     void handleCommand('logout')
   },
-  openShortcutHelp: () => shortcutHelpRef.value?.open()
+  openShortcutHelp: () => shortcutHelpRef.value?.open(),
+  openWorkspaceFiles: () => paletteCenterTabs.openFileManagerTab(),
+  openRunTrace: () => paletteCenterTabs.openTraceTab(),
+  openUsage: () => {
+    window.dispatchEvent(new CustomEvent('open_usage_drawer'))
+  }
 }
 
 const sessionStore = useSessionStore()
 const authStore = useAuthStore()
+// useCenterTabs 内部会注册 watch，必须放在 setup 顶层创建并随 TopNav 生命周期存活。
+const paletteCenterTabs = useCenterTabs(computed(() => sessionStore.activeSessionId))
 const { isOpen: terminalOpen, togglePanel } = useTerminal()
 const { toggleLeft, toggleRight } = usePanelLayout()
 

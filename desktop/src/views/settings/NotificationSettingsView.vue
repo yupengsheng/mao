@@ -144,6 +144,20 @@
           aria-label="审批待办收件箱通知"
         />
       </div>
+      <div v-if="isElectronClient()" class="inbox-kind-row">
+        <span class="inbox-kind-label">等待审批时闪烁任务栏</span>
+        <el-switch
+          v-model="approvalFlash"
+          inline-prompt
+          active-text="开"
+          inactive-text="关"
+          aria-label="等待审批时闪烁任务栏"
+          @change="handleApprovalFlashChange"
+        />
+      </div>
+      <p v-if="isElectronClient()" class="field-desc flash-hint">
+        会话等待审批时任务栏图标持续闪烁，切回窗口即停；仅影响本机。
+      </p>
       <div class="inbox-kind-row">
         <span class="inbox-kind-label">子代理完成通知</span>
         <el-switch
@@ -275,6 +289,7 @@ import {
   type YesterdayDigestStatus
 } from '../../api'
 import { isElectronClient } from '../../utils/platform'
+import { isApprovalFlashEnabled, setApprovalFlashEnabled } from '../../utils/approvalFlashPreference'
 import { useAuthStore } from '../../stores/auth'
 
 const authStore = useAuthStore()
@@ -342,6 +357,12 @@ const inboxSaved = reactive<InboxPreference>({
   systemNotifyEnabled: true
 })
 const inboxForm = reactive<InboxPreference>({ ...inboxSaved })
+const approvalFlash = ref(isApprovalFlashEnabled())
+
+function handleApprovalFlashChange(value: string | number | boolean) {
+  setApprovalFlashEnabled(Boolean(value))
+}
+
 const inboxDirty = computed(() => {
   return (Object.keys(inboxForm) as Array<keyof InboxPreference>).some(
     (key) => inboxForm[key] !== inboxSaved[key]

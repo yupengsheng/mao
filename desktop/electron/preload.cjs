@@ -6,11 +6,19 @@ function onIpc(channel, callback) {
   return () => ipcRenderer.removeListener(channel, handler)
 }
 
+// 钉死在本文档加载时的服务器 host。切换后旧页面的刷新回写仍进原槽，不会串到新站。
+let pageAuthHost = ''
+try {
+  pageAuthHost = ipcRenderer.sendSync('auth-current-host') || ''
+} catch {
+  pageAuthHost = ''
+}
+
 contextBridge.exposeInMainWorld('electronAPI', {
   // Auth token persistence (Electron userData/auth.json, all load protocols)
-  getAuthTokens: () => ipcRenderer.invoke('auth-get-tokens'),
-  setAuthTokens: (tokens) => ipcRenderer.invoke('auth-set-tokens', tokens),
-  clearAuthTokens: () => ipcRenderer.invoke('auth-clear-tokens'),
+  getAuthTokens: () => ipcRenderer.invoke('auth-get-tokens', { serverHost: pageAuthHost }),
+  setAuthTokens: (tokens) => ipcRenderer.invoke('auth-set-tokens', { ...(tokens || {}), serverHost: pageAuthHost }),
+  clearAuthTokens: () => ipcRenderer.invoke('auth-clear-tokens', { serverHost: pageAuthHost }),
 
   // Multi-server baseUrl configuration
   serverConfig: {
@@ -169,6 +177,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Desktop shell (P2/P3) — main-process notification / badge / prefs / shortcut / tray
   desktopNotify: (payload) => ipcRenderer.invoke('desktop-notify', payload),
+  flashFrame: (on) => ipcRenderer.invoke('desktop-flash-frame', on),
   onDesktopNotificationClick: (callback) => onIpc('desktop-notification-click', callback),
   // 桥接就绪后主动拉取主进程积存的点击深链（点击时监听未注册会丢）；收到后 ack 清除
   consumePendingDesktopNotificationClick: () => ipcRenderer.invoke('desktop-notification-click-consume'),

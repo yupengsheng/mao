@@ -53,6 +53,13 @@
               @click="runItem(entry.item)"
             >
               <span class="palette-item-title">{{ entry.item.title }}</span>
+              <img
+                v-if="entry.item.avatarUrl"
+                class="palette-item-avatar"
+                :src="entry.item.avatarUrl"
+                alt=""
+                @error="onAvatarError"
+              >
               <span v-if="entry.item.active" class="palette-item-check">✓</span>
             </button>
           </template>
@@ -64,7 +71,9 @@
 
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { Close, Search } from '@element-plus/icons-vue'
+import { useAgentStore } from '../../stores/agent'
 import {
   buildCommands,
   filterCommands,
@@ -83,10 +92,25 @@ const isOpen = ref(false)
 const keyword = ref('')
 const activeIndex = ref(0)
 const items = ref<CommandItem[]>([])
+const showShortcuts = ref(false)
+const route = useRoute()
+const AGENT_GROUP_VISIBLE_MAX = 6
 // 打开面板前的焦点元素：关闭时还原（与 0.0.471 searchJumpFocus 同口径的开合闭环）
 let previouslyFocused: HTMLElement | null = null
 
-const filtered = computed(() => filterCommands(items.value, keyword.value))
+const filtered = computed(() => {
+  const list = filterCommands(items.value, keyword.value)
+  if (keyword.value.trim()) return list
+  // 无关键词时只让前 6 个 Agent 进入可选列表；其余仍留在 items 里供输入关键词后搜索。
+  const visibleAgentIds = new Set(
+    list.filter((item) => item.group === 'agents').slice(0, AGENT_GROUP_VISIBLE_MAX).map((item) => item.id)
+  )
+  return list.filter((item) => item.group !== 'agents' || visibleAgentIds.has(item.id))
+})
+
+const hasHiddenAgents = computed(
+  () => !keyword.value.trim() && items.value.filter((item) => item.group === 'agents').length > AGENT_GROUP_VISIBLE_MAX
+)
 
 /** 过滤结果按分组的视图；entry.index 是该条在 filtered 中的扁平下标（与 activeIndex 配套）。 */
 const grouped = computed(() => {
@@ -95,6 +119,15 @@ const grouped = computed(() => {
   filtered.value.forEach((item, index) => {
     map[item.group].push({ item, index })
   })
+  if (hasHiddenAgents.value) {
+    map.agents = [
+      ...map.agents,
+      {
+        item: { id: 'agent:hint', group: 'agents', title: '输入名称筛选更多 Agent', enabled: false, run: () => undefined },
+        index: -1
+      }
+    ]
+  }
   return map
 })
 
@@ -117,10 +150,26 @@ watch(activeIndex, async () => {
   active?.scrollIntoView({ block: 'nearest' })
 })
 
+function rebuildItems() {
+  const agentStore = useAgentStore()
+  items.value = buildCommands(props.host, {
+    agents: agentStore.agents,
+    inSessionRoute: route.name === 'Task',
+    showShortcuts: showShortcuts.value
+  })
+}
+
 function open() {
-  items.value = buildCommands(props.host)
+  showShortcuts.value = false
   keyword.value = ''
   activeIndex.value = 0
+  const agentStore = useAgentStore()
+  if (!agentStore.agents.length) {
+    void agentStore.fetchAgents().then(() => {
+      if (isOpen.value) rebuildItems()
+    })
+  }
+  rebuildItems()
   previouslyFocused = document.activeElement instanceof HTMLElement && document.activeElement !== document.body
     ? document.activeElement
     : null
@@ -156,6 +205,10 @@ function onItemHover(entry: { item: CommandItem; index: number }) {
   activeIndex.value = entry.index
 }
 
+function onAvatarError(e: Event) {
+  ;(e.target as HTMLElement).style.display = 'none'
+}
+
 /** ArrowUp/Down 在过滤结果上循环移位，跳过置灰项；全部置灰时不动。 */
 function moveSelection(dir: 1 | -1) {
   const list = filtered.value
@@ -180,6 +233,10 @@ function onInputKeydown(e: KeyboardEvent) {
     e.preventDefault()
     const item = filtered.value[activeIndex.value]
     if (item) runItem(item)
+  } else if (e.key === '?' && !e.isComposing && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault()
+    showShortcuts.value = true
+    rebuildItems()
   } else if (e.key === 'Escape') {
     isOpen.value = false
   }
@@ -260,6 +317,14 @@ defineExpose({ toggle, open, close })
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.palette-item-avatar {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  object-fit: cover;
+  flex-shrink: 0;
 }
 
 .palette-item-check {

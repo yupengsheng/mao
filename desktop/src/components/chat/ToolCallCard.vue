@@ -36,6 +36,14 @@
     <div v-if="isExpanded && hasExpandableBody" class="tool-body">
       <div v-if="formattedInput" class="tool-result">
         <template v-if="richView">
+          <!-- 三个文件工具（edit/read/write）的路径行：点击在中心 Tab 打开文件；
+               新建态 / 无 workspace 时 canOpenToolFile 为 false，整行不渲染 -->
+          <button
+            v-if="fileToolPathRow"
+            class="tool-path-row"
+            :title="fileToolPathRow"
+            @click="handleOpenToolFile(fileToolPathRow)"
+          >{{ fileToolPathRow }}</button>
           <!-- 富视图骨架（edit_file / shell / read_file）：默认只渲染自然形态，原始输入/输出
                 JSON 收起在同一个开关后，避免转义噪音盖住命令、输出与文件内容本身 -->
           <ToolCallDiffView v-if="editDiffView" :blocks="editDiffView.blocks" />
@@ -154,6 +162,22 @@
       </div>
       <div v-if="(toolCall.result || imagePreviewUrl) && !richView" class="tool-result">
         <div class="result-label">输出</div>
+        <div v-if="tableView" class="result-view-switch" role="group" aria-label="结果视图切换">
+          <button
+            type="button"
+            class="view-switch-btn"
+            :class="{ active: resultView === 'table' }"
+            :aria-pressed="resultView === 'table'"
+            @click="setResultView('table')"
+          >表格</button>
+          <button
+            type="button"
+            class="view-switch-btn"
+            :class="{ active: resultView === 'text' }"
+            :aria-pressed="resultView === 'text'"
+            @click="setResultView('text')"
+          >原文</button>
+        </div>
         <el-image
           v-if="imagePreviewUrl"
           :src="imagePreviewUrl"
@@ -164,13 +188,24 @@
           :preview-teleported="true"
           @click.stop
         />
-        <div v-if="displayResultText" class="code-block-wrapper">
+        <div v-if="resultView === 'table' && tableView" class="tool-result-table">
+          <div class="tool-result-table-toolbar">
+            <span class="tool-result-table-hint">{{ tableView.length - 1 }} 行 × {{ tableView[0]?.length ?? 0 }} 列</span>
+            <button class="copy-btn" title="复制为 CSV" aria-label="复制为 CSV" @click="copyResultCsv">
+              <el-icon :size="14"><CopyDocument /></el-icon>
+            </button>
+          </div>
+          <div class="tool-result-table-body">
+            <TableGrid :rows="tableView" />
+          </div>
+        </div>
+        <div v-if="displayResultText" v-show="!(resultView === 'table' && tableView)" class="code-block-wrapper">
           <pre class="result-content"><code>{{ displayResultText }}</code></pre>
           <button class="copy-btn" title="复制完整输出" @click="copyText(fullResultText)">
             <el-icon :size="14"><CopyDocument /></el-icon>
           </button>
         </div>
-        <div v-if="isResultTruncated" class="result-expand-row">
+        <div v-if="isResultTruncated" v-show="!(resultView === 'table' && tableView)" class="result-expand-row">
           <button class="expand-result-btn" @click="showFullResult = !showFullResult">
             {{ showFullResult ? '收起完整输出' : '展开完整输出' }}
           </button>
@@ -202,7 +237,9 @@ import ToolWebPageView from './ToolWebPageView.vue'
 import ToolImageGenView from './ToolImageGenView.vue'
 import ToolAskUserView from './ToolAskUserView.vue'
 import ToolSubagentProgressView from './ToolSubagentProgressView.vue'
+import TableGrid from '../center/TableGrid.vue'
 import { parseAskUserPairs, parseImageGenItems, parseSubagentProgressRows } from '../../utils/toolRichView'
+import { getToolResultView, setToolResultView, toCsv, tryParseTable, type ToolResultViewMode } from '../../utils/tool-result-table'
 
 /** 工具结果 JSON 的安全解析：非 JSON / 非对象返回 null，富视图据此回退原始展示。 */
 function parseResultNode(result?: string): Record<string, unknown> | null {
@@ -251,18 +288,21 @@ const props = withDefaults(defineProps<{
 
 const sessionStore = useSessionStore()
 const openSubagent = inject<(payload: { childSessionId: number; title?: string }) => void>('openSubagent', () => {})
-/** 工具卡片里的文件路径（glob/grep 结果、open_web_page 完整内容文件）点击后在中心区打开，
- *  CLOUD/LOCAL 分支与 FileChangePanel.handleFileClick 同口径。 */
+/** 工具卡片里的文件路径（glob/grep 结果、open_web_page 完整内容文件、read/write/edit 路径行）
+ *  点击后在中心区打开，CLOUD/LOCAL 分支与 FileChangePanel.handleFileClick 同口径。 */
 const { openFileTab } = useCenterTabs(computed(() => sessionStore.activeSessionId))
 
+/** 文件能否从工具卡打开：CLOUD 需有活跃会话，LOCAL 需有 workspace。渲染（路径行显隐）与点击共用同一口径。 */
+const canOpenToolFile = computed(() => {
+  const session = sessionStore.activeSession
+  if (!session) return false
+  return session.executionMode === 'CLOUD' ? !!sessionStore.activeSessionId : !!session.workspace
+})
+
 function handleOpenToolFile(path: string) {
-  if (!path) return
+  if (!path || !canOpenToolFile.value) return
   const session = sessionStore.activeSession
   if (!session) return
-  const canOpen = session.executionMode === 'CLOUD'
-    ? !!sessionStore.activeSessionId
-    : !!session.workspace
-  if (!canOpen) return
   const title = path.split(/[/\\]/).pop() || path
   openFileTab(path, title, session.workspace || undefined)
 }
@@ -372,7 +412,7 @@ const editDiffView = computed(() => {
   if (oldStr === '' && newStr === '') return null
   const diff = buildEditDiff(oldStr, newStr)
   if (diff.blocks.length === 0) return null
-  return { ...diff, summary: readEditSummary(props.toolCall.result, diff) }
+  return { ...diff, path: textOf(input.path) || textOf(input.file_path), summary: readEditSummary(props.toolCall.result, diff) }
 })
 
 /**
@@ -478,6 +518,16 @@ const writeView = computed(() => {
     path,
     summary: parts.join(' · '),
   }
+})
+
+/**
+ * 三个文件工具（edit/read/write）富视图的路径行：path 非空且可打开才渲染，点击经
+ * handleOpenToolFile 在中心 Tab 打开（glob/grep/web_page 的文件名链接是既有通道，不走本行）。
+ */
+const fileToolPathRow = computed(() => {
+  const view = editDiffView.value ?? fileView.value ?? writeView.value
+  if (!view?.path || !canOpenToolFile.value) return null
+  return view.path
 })
 
 /** glob_search 富视图：文件路径列表，路径相对搜索根目录，点击可在中心区打开。 */
@@ -632,6 +682,30 @@ const richSummary = computed(() =>
   ?? webSearchView.value?.summary ?? webPageView.value?.summary
   ?? imageGenSummary.value ?? askUserSummary.value ?? subagentSummary.value ?? '')
 const richBadge = computed(() => shellView.value?.badge ?? null)
+
+/** 列表形 JSON 结果 → 表格行（首行表头）；专用视图 / 图片分支 / 形态外 / 超限一律 null（保持原文）。
+ *  解析输入是 result 全文（4000 字截断只影响原文态显示，见 displayResultText），computed 随结果缓存。 */
+const tableView = computed<string[][] | null>(() => {
+  if (richView.value) return null
+  if (imagePreviewUrl.value) return null
+  return tryParseTable(props.toolCall.result || '')
+})
+
+const resultView = ref<ToolResultViewMode>(getToolResultView(props.toolCall.name))
+// 卡片复用换工具（同实例不同调用）：偏好按工具名重读
+watch(() => props.toolCall.name, (name) => {
+  resultView.value = getToolResultView(name)
+})
+
+function setResultView(view: ToolResultViewMode) {
+  resultView.value = view
+  setToolResultView(props.toolCall.name, view)
+}
+
+function copyResultCsv() {
+  if (!tableView.value) return
+  void copyText(toCsv(tableView.value))
+}
 
 /** 图片视图底栏摘要：N 张图 · model · size（缺项跳过）。 */
 const imageGenSummary = computed(() => {
@@ -974,6 +1048,34 @@ function toggleExpand() {
   word-break: break-all;
 }
 
+/* 三个文件工具富视图的路径行：链接态走 --aw-primary，单行省略（超长路径 title 兜底全文），
+   键盘聚焦 outline 沿 0.0.471 焦点可见体系 */
+.tool-path-row {
+  display: block;
+  max-width: 100%;
+  margin-bottom: 6px;
+  padding: 0;
+  border: none;
+  background: none;
+  font-family: var(--aw-font-mono);
+  font-size: var(--aw-text-fine);
+  color: var(--aw-primary);
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.tool-path-row:hover {
+  text-decoration: underline;
+}
+
+.tool-path-row:focus-visible {
+  outline: 2px solid var(--aw-primary);
+  outline-offset: 1px;
+}
+
 .expand-result-btn {
   border: none;
   background: none;
@@ -1020,5 +1122,73 @@ function toggleExpand() {
   max-width: 120px;
   max-height: 90px;
   object-fit: contain;
+}
+
+/* —— 结果表格化视图（表格/原文切换 + TableGrid 容器） —— */
+
+.result-view-switch {
+  display: inline-flex;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.view-switch-btn {
+  border: 1px solid var(--aw-hairline);
+  background: var(--aw-canvas-parchment);
+  color: var(--aw-ink-muted-48);
+  font-size: var(--aw-text-fine);
+  padding: 2px 10px;
+  border-radius: var(--aw-radius-sm);
+  cursor: pointer;
+}
+
+.view-switch-btn:hover {
+  color: var(--aw-ink);
+}
+
+.view-switch-btn.active {
+  border-color: var(--aw-primary);
+  color: var(--aw-primary);
+}
+
+.tool-result-table {
+  /* 上限约束而非固定高度：小表自适应收缩不留大块空白，大表封顶后由 TableGrid 内部虚拟滚动接管 */
+  max-height: 280px;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--aw-divider-soft);
+  border-radius: var(--aw-radius-sm);
+  background: var(--aw-surface-code);
+  overflow: hidden;
+  margin-bottom: 8px;
+}
+
+.tool-result-table-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--aw-divider-soft);
+  background: var(--aw-canvas-parchment);
+  flex: none;
+}
+
+.tool-result-table-hint {
+  font-size: var(--aw-text-fine);
+  color: var(--aw-ink-muted-48);
+}
+
+/* 复用 .copy-btn 图标样式；该类默认绝对定位于 code-block-wrapper 内，表格工具条里回归常规流内常显 */
+.tool-result-table-toolbar .copy-btn {
+  position: static;
+  opacity: 1;
+}
+
+/* TableGrid 根即滚动容器（flex:1 依赖有界高度）：body 给 flex 上下文，滚动由其内部接管，不叠外层 */
+.tool-result-table-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
 }
 </style>

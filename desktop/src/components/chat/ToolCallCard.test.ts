@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
-import { nextTick, h, ref } from 'vue'
+import { computed, nextTick, h, ref } from 'vue'
 import { createApp } from 'vue'
 import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -17,7 +17,10 @@ vi.mock('../../utils/monaco-colorize', () => ({
 }))
 
 import ToolCallCard from './ToolCallCard.vue'
+import { useSessionStore, type Session } from '../../stores/session'
+import { useCenterTabs } from '../../composables/useCenterTabs'
 import type { ToolCall } from '../../composables/useChat'
+import { setToolResultView } from '../../utils/tool-result-table'
 
 function mountCard(toolCall: ToolCall) {
   const pinia = createPinia()
@@ -773,5 +776,211 @@ describe('ToolCallCard 执行中耗时', () => {
       mounted = null
       vi.useRealTimers()
     }
+  })
+})
+
+describe('ToolCallCard 文件工具路径行', () => {
+  let mounted: ReturnType<typeof mountCard> | null = null
+  afterEach(() => { mounted?.destroy() })
+
+  /** 播种一个 CLOUD 可打开会话（workspace + activeSessionId），供 canOpenToolFile 放行 */
+  function seedOpenableSession(id: string, overrides: Partial<Session> = {}) {
+    const sessionStore = useSessionStore()
+    sessionStore.upsertSessionEntity({
+      id,
+      title: 't',
+      workspace: '/ws',
+      executionMode: 'CLOUD',
+      status: 'ACTIVE',
+      phase: 'COMPLETED',
+      ...overrides,
+    } as unknown as Session)
+    sessionStore.setActiveSession(id)
+  }
+
+  it('read/write/edit 三卡渲染 .tool-path-row 且文本 = 输入 path', async () => {
+    for (const call of [makeReadCall(), makeWriteCall(), makeEditCall()]) {
+      mounted = mountCard(call)
+      await nextTick()
+      // 未播种会话：守卫先行，不渲染
+      expect(document.querySelector('.tool-path-row')).toBeNull()
+
+      seedOpenableSession(`path-row-${call.id}`)
+      await nextTick()
+      const row = document.querySelector('.tool-path-row')
+      expect(row?.textContent?.trim()).toBe('/ws/src/a.ts')
+
+      mounted.destroy()
+      mounted = null
+    }
+  })
+
+  it('点击路径行 → 中心 Tab 打开文件（filePath / title / workspaceRoot 三元组）', async () => {
+    mounted = mountCard(makeReadCall())
+    await nextTick()
+    seedOpenableSession('path-row-click')
+    await nextTick()
+
+    const row = document.querySelector('.tool-path-row') as HTMLButtonElement
+    expect(row).toBeTruthy()
+    row.click()
+    await nextTick()
+
+    const sessionStore = useSessionStore()
+    const tabs = useCenterTabs(computed(() => sessionStore.activeSessionId))
+    const fileTab = tabs.tabs.value.find(t => t.type === 'file')
+    expect(fileTab?.filePath).toBe('/ws/src/a.ts')
+    expect(fileTab?.title).toBe('a.ts')
+    expect(fileTab?.workspaceRoot).toBe('/ws')
+  })
+
+  it('LOCAL 无 workspace：路径行不渲染', async () => {
+    mounted = mountCard(makeReadCall())
+    await nextTick()
+    seedOpenableSession('path-row-local', { executionMode: 'LOCAL', workspace: '' })
+    await nextTick()
+    expect(document.querySelector('.tool-path-row')).toBeNull()
+  })
+
+  it('read_file 失败态（error 结果）：路径行照常渲染', async () => {
+    mounted = mountCard(makeReadCall({ result: JSON.stringify({ error: '文件不存在' }) }))
+    await nextTick()
+    seedOpenableSession('path-row-error')
+    await nextTick()
+    expect(document.querySelector('.tool-path-row')?.textContent?.trim()).toBe('/ws/src/a.ts')
+  })
+
+  it('输入无 path：路径行不渲染', async () => {
+    mounted = mountCard(makeReadCall({ input: {} }))
+    await nextTick()
+    seedOpenableSession('path-row-nopath')
+    await nextTick()
+    expect(document.querySelector('.tool-path-row')).toBeNull()
+  })
+
+  it('shell 卡不渲染路径行（路径行仅限文件工具）', async () => {
+    mounted = mountCard(makeShellCall())
+    await nextTick()
+    seedOpenableSession('path-row-shell')
+    await nextTick()
+    expect(document.querySelector('.tool-path-row')).toBeNull()
+  })
+})
+
+describe('ToolCallCard 结果表格化视图', () => {
+  let mounted: ReturnType<typeof mountCard> | null = null
+  afterEach(() => {
+    mounted?.destroy()
+    window.localStorage.clear()
+  })
+
+  function makeTaskListCall(overrides: Partial<ToolCall> = {}): ToolCall {
+    return {
+      id: 'tc-tasks',
+      name: 'task_list',
+      input: {},
+      result: JSON.stringify({
+        todos: [
+          { id: '1', content: '设计', status: 'completed' },
+          { id: '2', content: '开发', status: 'in_progress' },
+          { id: '3', content: '测试', status: 'pending' },
+        ],
+        progress: '已完成 1/3，进行中 1',
+      }),
+      status: 'success',
+      isExpanded: true,
+      argsStreaming: false,
+      ...overrides,
+    }
+  }
+
+  function outputWrapper(): HTMLElement {
+    // 卡片内 .tool-result 有输入区与输出区两个，输出区恒为最后一个
+    const areas = document.querySelectorAll('.tool-result')
+    return areas[areas.length - 1].querySelector('.code-block-wrapper') as HTMLElement
+  }
+
+  it('列表形 JSON：切换按钮出现、默认原文；切表格后行列对应，切回原文与初始逐字节一致', async () => {
+    mounted = mountCard(makeTaskListCall())
+    await nextTick()
+
+    const switchRow = document.querySelector('.result-view-switch')
+    expect(switchRow).toBeTruthy()
+    expect(switchRow?.getAttribute('aria-label')).toBe('结果视图切换')
+    expect(document.querySelector('.tool-result-table')).toBeNull()
+    const wrapper = outputWrapper()
+    expect(wrapper.style.display).not.toBe('none')
+    const initialText = wrapper.querySelector('pre')?.textContent ?? ''
+
+    findButton('表格')!.click()
+    await nextTick()
+
+    const tableBox = document.querySelector('.tool-result-table')
+    expect(tableBox).toBeTruthy()
+    const hint = document.querySelector('.tool-result-table-hint')?.textContent ?? ''
+    expect(hint).toContain('3 行 × 3 列')
+    const headers = Array.from(document.querySelectorAll('.tool-result-table thead th'))
+      .map((el) => el.textContent?.trim())
+    expect(headers).toEqual(['id', 'content', 'status'])
+    const bodyRows = document.querySelectorAll('.tool-result-table tbody tr')
+    expect(bodyRows.length).toBe(3)
+    expect(bodyRows[0].querySelectorAll('td')[1].textContent?.trim()).toBe('设计')
+    expect(outputWrapper().style.display).toBe('none')
+
+    findButton('原文')!.click()
+    await nextTick()
+    expect(document.querySelector('.tool-result-table')).toBeNull()
+    const restored = outputWrapper()
+    expect(restored.style.display).not.toBe('none')
+    expect(restored.querySelector('pre')?.textContent ?? '').toBe(initialText)
+  })
+
+  it('偏好持久化：设 table 后重挂载默认表格；偏好按工具名隔离', async () => {
+    setToolResultView('task_list', 'table')
+    mounted = mountCard(makeTaskListCall())
+    await nextTick()
+    expect(document.querySelector('.tool-result-table')).toBeTruthy()
+
+    mounted.destroy()
+    mounted = mountCard(makeTaskListCall({ id: 'tc-tasks2', name: 'list_scheduled_tasks' }))
+    await nextTick()
+    expect(document.querySelector('.tool-result-table')).toBeNull()
+  })
+
+  it('richView 命中的卡片（shell）不出现切换按钮，保持富视图现状', async () => {
+    mounted = mountCard(makeShellCall())
+    await nextTick()
+    expect(document.querySelector('.result-view-switch')).toBeNull()
+    expect(document.querySelector('.tool-result-table')).toBeNull()
+  })
+
+  it('图片卡：图片预览与原始输出并存，切换行不出现（tableView 因图片分支守卫恒 null）', async () => {
+    mounted = mountCard(makeReadCall({
+      result: JSON.stringify({
+        content: '图片读取成功：/ws/a.png',
+        total_lines: 0,
+        media_type: 'image',
+        data_uri: 'data:image/png;base,AAAA',
+      }),
+    }))
+    await nextTick()
+    expect(document.querySelector('.result-view-switch')).toBeNull()
+    expect(document.querySelector('.image-preview')).toBeTruthy()
+    const wrapper = outputWrapper()
+    expect(wrapper.style.display).not.toBe('none')
+    expect(wrapper.querySelector('pre')?.textContent ?? '').toContain('图片读取成功')
+  })
+
+  it('嵌套/非 JSON 结果不出现切换按钮，保持原文', async () => {
+    mounted = mountCard(makeTaskListCall({ result: 'plain shell output\nno json' }))
+    await nextTick()
+    expect(document.querySelector('.result-view-switch')).toBeNull()
+
+    mounted.destroy()
+    mounted = mountCard(makeTaskListCall({
+      result: JSON.stringify({ todos: [{ id: 1, nested: { a: 1 } }] }),
+    }))
+    await nextTick()
+    expect(document.querySelector('.result-view-switch')).toBeNull()
   })
 })

@@ -169,6 +169,60 @@ describe('glob search', () => {
     expect(viaNode.files).toEqual([path.join('src', 'a.ts')]);
     expect(viaNode.search_root).toBe(workspace);
   });
+
+  // rx 的 `**/` 是「零个或多个目录」：带目录前缀的 pattern 必须命中该目录直下文件，
+  // 且不能因为 basename 相同而越界命中其他目录。
+  it('treats "src/**/*.ts" as src/ 直下与子目录，且不越界到 docs/', async () => {
+    fs.mkdirSync(path.join(workspace, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(workspace, 'docs'), { recursive: true });
+    fs.writeFileSync(path.join(workspace, 'src/a.ts'), 'export const a = 1;\n');
+    fs.writeFileSync(path.join(workspace, 'docs/b.ts'), 'export const b = 1;\n');
+
+    const search = await loadSearchWithoutRg();
+    const out = await search.handleGlobSearch({ pattern: 'src/**/*.ts' }, workspace, SESSION_ID);
+    expect(out.error).toBeUndefined();
+    const files = out.files as string[];
+    expect(files).toEqual(expect.arrayContaining([path.join('src', 'a.ts')]));
+    expect(files.some((file) => file.includes('docs'))).toBe(false);
+  });
+
+  it('matches root and nested files for "**/*.ts" in the node fallback', async () => {
+    fs.mkdirSync(path.join(workspace, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(workspace, 'c.ts'), 'export const c = 1;\n');
+    fs.writeFileSync(path.join(workspace, 'src/a.ts'), 'export const a = 1;\n');
+
+    const search = await loadSearchWithoutRg();
+    const out = await search.handleGlobSearch({ pattern: '**/*.ts' }, workspace, SESSION_ID);
+    expect(out.error).toBeUndefined();
+    expect(out.files).toEqual(expect.arrayContaining(['c.ts', path.join('src', 'a.ts')]));
+  });
+
+  it('applies the same globstar semantics to grep when rg is unavailable', async () => {
+    fs.mkdirSync(path.join(workspace, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(workspace, 'c.ts'), 'NEEDLE root\n');
+    fs.writeFileSync(path.join(workspace, 'src/a.ts'), 'NEEDLE nested\n');
+
+    const search = await loadSearchWithoutRg();
+    const prefixed = await search.handleGrepSearch(
+      { pattern: 'NEEDLE', glob: 'src/**/*.ts' },
+      workspace,
+      SESSION_ID,
+    );
+    expect(prefixed.error).toBeUndefined();
+    expect((prefixed.matches as Array<{ file: string }>).map((m) => m.file)).toEqual([
+      path.join('src', 'a.ts'),
+    ]);
+
+    const anyDepth = await search.handleGrepSearch(
+      { pattern: 'NEEDLE', glob: '**/*.ts' },
+      workspace,
+      SESSION_ID,
+    );
+    expect(anyDepth.error).toBeUndefined();
+    expect((anyDepth.matches as Array<{ file: string }>).map((m) => m.file).sort()).toEqual(
+      ['c.ts', path.join('src', 'a.ts')].sort(),
+    );
+  });
 });
 
 // round 1 BUG-5：数值参数的非法值处理必须与云端（backend asInt 语义 + 各 tool 校验）一致。

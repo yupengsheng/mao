@@ -8,7 +8,7 @@
 //   - filterCommands 大小写不敏感、keywords 命中、空关键词全量
 //   - TopNav 快捷键分支 / isTypingTarget 守卫 / aria-label
 //   - registry 设置路径与 router/index.ts 一致（防手写漂移）
-//   - 浮层 a11y 语义与速查表 7 条
+//   - 浮层 a11y 语义、动态分组与快捷键速查表单一数据源
 import { readFileSync } from 'node:fs'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
@@ -18,6 +18,7 @@ import {
   COMMAND_GROUP_ORDER,
   type CommandHostActions
 } from '../../composables/useCommandRegistry'
+import { SHORTCUT_ROWS } from '../../utils/shortcutRows'
 
 const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
@@ -55,6 +56,9 @@ function makeHost(overrides: Partial<CommandHostActions> = {}): CommandHostActio
     openCommands: vi.fn(),
     logout: vi.fn(),
     openShortcutHelp: vi.fn(),
+    openWorkspaceFiles: vi.fn(),
+    openRunTrace: vi.fn(),
+    openUsage: vi.fn(),
     ...overrides
   }
 }
@@ -96,7 +100,7 @@ describe('buildCommands 命令清单（§2.3 定案 29 条）', () => {
   })
 
   it('分组标签与渲染顺序齐备', () => {
-    expect(COMMAND_GROUP_ORDER).toEqual(['search', 'actions', 'appearance', 'nav', 'help'])
+    expect(COMMAND_GROUP_ORDER).toEqual(['search', 'agents', 'actions', 'context', 'appearance', 'nav', 'shortcuts', 'help'])
     for (const groupId of COMMAND_GROUP_ORDER) {
       expect(COMMAND_GROUP_LABELS[groupId]).toBeTruthy()
     }
@@ -247,12 +251,88 @@ describe('filterCommands', () => {
   })
 })
 
+describe('buildCommands 动态组', () => {
+  const agents = [
+    { id: '1', name: '运维', description: '', executionMode: 'CLOUD' },
+    { id: '2', name: 'Coder', avatarUrl: 'https://x/a.png', description: '', executionMode: 'LOCAL' },
+    { id: '3', name: '写作', description: '', executionMode: 'CLOUD' }
+  ]
+
+  it('缺省 dynamic 时保持 29 条静态命令且三个动态组不出现', () => {
+    const commands = buildCommands(makeHost())
+    expect(commands).toHaveLength(29)
+    expect(commands.filter((c) => c.group === 'agents')).toHaveLength(0)
+    expect(commands.filter((c) => c.group === 'context')).toHaveLength(0)
+    expect(commands.filter((c) => c.group === 'shortcuts')).toHaveLength(0)
+  })
+
+  it('Agent 组逐条映射 title / id / keywords / avatarUrl', () => {
+    const commands = buildCommands(makeHost(), { agents, inSessionRoute: false, showShortcuts: false })
+    const group = commands.filter((c) => c.group === 'agents')
+    expect(group).toHaveLength(3)
+    expect(group[0].id).toBe('agent:run:1')
+    expect(group[0].title).toBe('新建会话 · 运维')
+    expect(group[0].keywords).toContain('运维')
+    expect(group[0].avatarUrl).toBeUndefined()
+    expect(group[1].avatarUrl).toBe('https://x/a.png')
+  })
+
+  it('Agent 条目沿用 newTask=1&agentId= 路由契约', () => {
+    buildCommands(makeHost(), { agents, inSessionRoute: false, showShortcuts: false })
+      .find((c) => c.id === 'agent:run:2')!
+      .run()
+    expect(mocks.routerPush).toHaveBeenCalledWith({ name: 'Home', query: { newTask: '1', agentId: '2' } })
+  })
+
+  it('agents 为空时整组不渲染', () => {
+    const commands = buildCommands(makeHost(), { agents: [], inSessionRoute: false, showShortcuts: false })
+    expect(commands.filter((c) => c.group === 'agents')).toHaveLength(0)
+  })
+
+  it('当前会话动作仅在 Task 路由渲染，并转发到宿主三个入口', () => {
+    const off = buildCommands(makeHost(), { agents: [], inSessionRoute: false, showShortcuts: false })
+    expect(off.filter((c) => c.group === 'context')).toHaveLength(0)
+
+    const host = makeHost()
+    const on = buildCommands(host, { agents: [], inSessionRoute: true, showShortcuts: false })
+    const context = on.filter((c) => c.group === 'context')
+    expect(context.map((c) => c.id)).toEqual(['ctx:workspace-files', 'ctx:run-trace', 'ctx:usage'])
+    byId(on, 'ctx:workspace-files').run()
+    byId(on, 'ctx:run-trace').run()
+    byId(on, 'ctx:usage').run()
+    expect(host.openWorkspaceFiles).toHaveBeenCalledOnce()
+    expect(host.openRunTrace).toHaveBeenCalledOnce()
+    expect(host.openUsage).toHaveBeenCalledOnce()
+  })
+
+  it('快捷键组按需渲染，并与 SHORTCUT_ROWS 逐条一致', () => {
+    const on = buildCommands(makeHost(), { agents: [], inSessionRoute: false, showShortcuts: true })
+    const shortcuts = on.filter((c) => c.group === 'shortcuts')
+    expect(shortcuts).toHaveLength(SHORTCUT_ROWS.length)
+    shortcuts.forEach((item, index) => {
+      expect(item.id).toBe(`shortcut:${index}`)
+      expect(item.title).toBe(SHORTCUT_ROWS[index].action)
+      expect(item.keywords).toBe(SHORTCUT_ROWS[index].keys)
+    })
+
+    const off = buildCommands(makeHost(), { agents: [], inSessionRoute: false, showShortcuts: false })
+    expect(off.filter((c) => c.group === 'shortcuts')).toHaveLength(0)
+  })
+
+  it('动态组顺序为 Agent 前置、当前会话紧随动作、快捷键贴近帮助', () => {
+    expect(COMMAND_GROUP_ORDER.indexOf('agents')).toBeLessThan(COMMAND_GROUP_ORDER.indexOf('actions'))
+    expect(COMMAND_GROUP_ORDER.indexOf('context')).toBe(COMMAND_GROUP_ORDER.indexOf('actions') + 1)
+    expect(COMMAND_GROUP_ORDER.indexOf('shortcuts')).toBe(COMMAND_GROUP_ORDER.indexOf('help') - 1)
+  })
+})
+
 describe('源码级回归（readFileSync，仿 chat-a11y.test.ts）', () => {
   const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), 'utf8')
   const topNavSrc = read('../common/TopNav.vue')
   const registrySrc = read('../../composables/useCommandRegistry.ts')
   const paletteSrc = read('./CommandPalette.vue')
   const helpSrc = read('./ShortcutHelpDialog.vue')
+  const shortcutRowsSrc = read('../../utils/shortcutRows.ts')
   const routerSrc = read('../../router/index.ts')
 
   it('TopNav 含 Ctrl/Cmd+Shift+P 分支', () => {
@@ -283,6 +363,13 @@ describe('源码级回归（readFileSync，仿 chat-a11y.test.ts）', () => {
     expect(topNavSrc).toContain('<ShortcutHelpDialog ref="shortcutHelpRef" />')
   })
 
+  it('TopNav 为动态组接好中心 Tab 与用量入口', () => {
+    expect(topNavSrc).toContain('useCenterTabs')
+    expect(topNavSrc).toContain('paletteCenterTabs.openFileManagerTab()')
+    expect(topNavSrc).toContain('paletteCenterTabs.openTraceTab()')
+    expect(topNavSrc).toContain("new CustomEvent('open_usage_drawer')")
+  })
+
   it('registry 每条 /settings/xxx 路径都存在于 router/index.ts（防手写漂移）', () => {
     const paths = [...new Set([...registrySrc.matchAll(/\/settings\/[a-z-]+/g)].map((m) => m[0]))]
     expect(paths).toHaveLength(15)
@@ -300,10 +387,19 @@ describe('源码级回归（readFileSync，仿 chat-a11y.test.ts）', () => {
     expect(paletteSrc).toContain('aria-label="关闭命令面板"')
   })
 
-  it('ShortcutHelpDialog 含 7 条快捷键 kbd 文案', () => {
-    for (const combo of ['Ctrl/Cmd+K', 'Ctrl/Cmd+`', 'Ctrl/Cmd+Shift+P', '/', 'Enter', 'Shift+Enter', 'Esc']) {
-      expect(helpSrc, `缺快捷键 ${combo}`).toContain(`keys: '${combo}'`)
+  it('CommandPalette 接入 Agent 目录、当前会话与面板内快捷键组', () => {
+    expect(paletteSrc).toContain('useAgentStore')
+    expect(paletteSrc).toContain('route.name === \'Task\'')
+    expect(paletteSrc).toContain('showShortcuts.value = true')
+    expect(paletteSrc).toContain('AGENT_GROUP_VISIBLE_MAX')
+  })
+
+  it('8 条快捷键落在单一数据源，速查对话框改为消费该常量', () => {
+    for (const combo of ['Ctrl/Cmd+K', 'Ctrl/Cmd+`', 'Ctrl/Cmd+Shift+P', '/', 'Enter', 'Shift+Enter', 'Esc', 'Y / N']) {
+      expect(shortcutRowsSrc, `缺快捷键 ${combo}`).toContain(`keys: '${combo}'`)
     }
-    expect(helpSrc.match(/keys: '/g)).toHaveLength(7)
+    expect(shortcutRowsSrc.match(/keys: '/g)).toHaveLength(8)
+    expect(helpSrc).toContain("from '../../utils/shortcutRows'")
+    expect(helpSrc).not.toContain("keys: '")
   })
 })

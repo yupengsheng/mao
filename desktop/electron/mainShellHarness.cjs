@@ -72,6 +72,7 @@ async function loadMain(options = {}) {
     appReady: false,
     windows: [],
     menuSetCount: 0,
+    flashCalls: [],
   }
 
   // ---- 假 BrowserWindow ----
@@ -124,7 +125,8 @@ async function loadMain(options = {}) {
     hide() { this.visible = false; this.emit('hide') }
     minimize() { this.minimized = true; this.emit('minimize') }
     restore() { this.minimized = false; this.emit('restore') }
-    focus() { this.focused = true }
+    focus() { this.focused = true; this.emit('focus') }
+    flashFrame(on) { state.flashCalls.push({ windowId: this.id, on: !!on }) }
     close() {
       const event = { defaultPrevented: false, preventDefault() { this.defaultPrevented = true } }
       this.emit('close', event)

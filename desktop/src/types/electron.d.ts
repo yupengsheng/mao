@@ -272,7 +272,7 @@ interface ElectronAPI {
     probe(serverBaseUrl: string, options?: { allowHttp?: boolean }): Promise<ServerConfigProbeResult>
     openPicker(): Promise<{ ok: boolean }>
     closePicker(): Promise<{ ok: boolean }>
-    removeHistory(serverBaseUrl: string): Promise<{ ok: boolean; error?: string; history?: ServerConfigHistoryEntry[] }>
+    removeHistory(serverBaseUrl: string): Promise<{ ok: boolean; error?: string; history?: ServerConfigHistoryEntry[]; authCleared?: boolean }>
   }
 
   getAppVersion(): Promise<string>
@@ -409,6 +409,8 @@ interface ElectronAPI {
 
   // Desktop shell (P2/P3)
   desktopNotify(payload: DesktopNotifyPayload): Promise<DesktopNotifyResult>
+  /** 等待审批任务栏闪烁：true 开始，false 复位 */
+  flashFrame(on: boolean): Promise<{ ok: boolean }>
   onDesktopNotificationClick(callback: (data: DesktopNotificationClickPayload) => void): RemoveListener
   /** 桥接就绪后拉取主进程积存的点击深链（无积存返回 null）；取出即清空 */
   consumePendingDesktopNotificationClick(): Promise<DesktopNotificationClickPayload | null>
