@@ -45,6 +45,8 @@ describe('session and admin routes', () => {
     approvalCounts?: Map<number, number>;
     questionCounts?: Map<number, number>;
     executionWaitRepository?: ExecutionWaitQueryStore | null;
+    hasDeviceConnection?: (userId: number, deviceId: string) => boolean;
+    getExecutorClientType?: (userId: number, deviceId: string) => string | null;
   } = {}) {
     const fastify = Fastify();
     fastify.setErrorHandler(handleError);
@@ -145,6 +147,8 @@ describe('session and admin routes', () => {
       },
       executionWaitRepository: options.executionWaitRepository,
       existsSessionUnderWorkspace: vi.fn(async () => options.participated ?? false),
+      hasDeviceConnection: options.hasDeviceConnection,
+      getExecutorClientType: options.getExecutorClientType,
     });
     registerAdminSessionRoutes(fastify, {
       sessionService,
@@ -1089,4 +1093,67 @@ describe('session and admin routes', () => {
     expect((await jsonRejected(join(rejected.root, '7', 'my-ws'))).body.code).toBe(0);
     await rejected.fastify.close();
   });
+  it('GET /sessions/:id 回显 targetDeviceOnline：在线 true / 离线 false / 未绑定与未注入 null', async () => {
+    const online = await app({ hasDeviceConnection: (_uid, deviceId) => deviceId === 'dev-a' });
+    const get = () => online.fastify.inject({ method: 'GET', url: '/v1/sessions/1' });
+
+    vi.mocked(online.sessionService.getSession).mockResolvedValueOnce(
+      session({ executionMode: 'LOCAL', targetDeviceId: 'dev-a' }) as never,
+    );
+    expect(JSON.parse((await get()).body).data.targetDeviceOnline).toBe(true);
+
+    vi.mocked(online.sessionService.getSession).mockResolvedValueOnce(
+      session({ executionMode: 'LOCAL', targetDeviceId: 'dev-b' }) as never,
+    );
+    expect(JSON.parse((await get()).body).data.targetDeviceOnline).toBe(false);
+
+    vi.mocked(online.sessionService.getSession).mockResolvedValueOnce(session({ executionMode: 'LOCAL' }) as never);
+    expect(JSON.parse((await get()).body).data.targetDeviceOnline).toBeUndefined();
+    await online.fastify.close();
+
+    // 未注入回调（如非 WS 装配场景）保持 null（Jackson 口径省略字段），前端不展示在线态
+    const plain = await app();
+    vi.mocked(plain.sessionService.getSession).mockResolvedValueOnce(
+      session({ executionMode: 'LOCAL', targetDeviceId: 'dev-a' }) as never,
+    );
+    const res = await plain.fastify.inject({ method: 'GET', url: '/v1/sessions/1' });
+    expect(JSON.parse(res.body).data.targetDeviceOnline).toBeUndefined();
+    await plain.fastify.close();
+  });
+
+  it('GET /sessions/:id 回显 executorClientType：执行连接一致，离线/未绑定/未注入缺省', async () => {
+    const online = await app({
+      hasDeviceConnection: () => true,
+      getExecutorClientType: (_uid, deviceId) => (deviceId === 'dev-a' ? 'cli' : deviceId === 'dev-web' ? 'browser' : null),
+    });
+    const get = () => online.fastify.inject({ method: 'GET', url: '/v1/sessions/1' });
+
+    vi.mocked(online.sessionService.getSession).mockResolvedValueOnce(
+      session({ executionMode: 'LOCAL', targetDeviceId: 'dev-a' }) as never,
+    );
+    expect(JSON.parse((await get()).body).data.executorClientType).toBe('cli');
+
+    vi.mocked(online.sessionService.getSession).mockResolvedValueOnce(
+      session({ executionMode: 'LOCAL', targetDeviceId: 'dev-b' }) as never,
+    );
+    expect(JSON.parse((await get()).body).data.executorClientType).toBeUndefined();
+
+    vi.mocked(online.sessionService.getSession).mockResolvedValueOnce(
+      session({ executionMode: 'LOCAL', targetDeviceId: 'dev-web' }) as never,
+    );
+    expect(JSON.parse((await get()).body).data.executorClientType).toBeUndefined();
+
+    vi.mocked(online.sessionService.getSession).mockResolvedValueOnce(session({ executionMode: 'LOCAL' }) as never);
+    expect(JSON.parse((await get()).body).data.executorClientType).toBeUndefined();
+    await online.fastify.close();
+
+    const plain = await app();
+    vi.mocked(plain.sessionService.getSession).mockResolvedValueOnce(
+      session({ executionMode: 'LOCAL', targetDeviceId: 'dev-a' }) as never,
+    );
+    const res = await plain.fastify.inject({ method: 'GET', url: '/v1/sessions/1' });
+    expect(JSON.parse(res.body).data.executorClientType).toBeUndefined();
+    await plain.fastify.close();
+  });
+
 });

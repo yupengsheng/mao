@@ -70,6 +70,36 @@ describe('LocalTargetBanner', () => {
     expect(html).toContain('该任务在「MyMac」上执行')
   })
 
+  it('在线时按执行连接类型区分桌面客户端和 mao-agent', async () => {
+    const electron = await renderBanner({
+      targetDeviceId: 'dev-1',
+      currentDeviceId: 'dev-2',
+      targetDeviceName: 'MyMac',
+      targetDeviceOnline: true,
+      executorClientType: 'electron',
+    })
+    expect(electron).toContain('桌面客户端在执行')
+    const cli = await renderBanner({
+      targetDeviceId: 'dev-1',
+      currentDeviceId: 'dev-2',
+      targetDeviceName: 'MyMac',
+      targetDeviceOnline: true,
+      executorClientType: 'cli',
+    })
+    expect(cli).toContain('mao-agent 在执行')
+  })
+
+  it('当前设备即绑定执行端时即使带了执行类型也不渲染', async () => {
+    const html = await renderBanner({
+      targetDeviceId: 'dev-1',
+      currentDeviceId: 'dev-1',
+      targetDeviceName: 'MyMac',
+      targetDeviceOnline: true,
+      executorClientType: 'cli',
+    })
+    expect(html).not.toContain('local-target-banner')
+  })
+
   it('浏览器（无当前设备身份）时照常提示', async () => {
     const html = await renderBanner({
       targetDeviceId: 'dev-1',
