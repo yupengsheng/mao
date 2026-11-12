@@ -177,7 +177,7 @@ web_search 工具支持 Tavily / TinyFish 双实现，在管理后台「系统�
 | `DINGTALK_BOT_ENABLED` | false | 钉钉机器人通道总开关 |
 | `DINGTALK_BOT_RECONCILE_INTERVAL_MS` | 5000 | 扫表间隔 |
 | `APP_DINGTALK_BOT_SECRET` | - | 机器人 Client Secret 的 AES-GCM 密钥，不复用飞书那一项 |
-| `DINGTALK_OAUTH_CLIENT_ID` / `DINGTALK_OAUTH_SECRET` / `DINGTALK_OAUTH_REDIRECT_URI` | - | 绑定用登录应用，须与机器人同一企业 |
+| `DINGTALK_OAUTH_CLIENT_ID` / `DINGTALK_OAUTH_SECRET` / `DINGTALK_OAUTH_REDIRECT_URI` | - | 已后台化：仅首次启动导入「系统设置 → 集成配置 → 钉钉 OAuth 登录」，之后以后台值为准 |
 | `DINGTALK_PROGRESS_CARD_TEMPLATE_ID` | - | 进度卡模板，可被机器人行覆盖 |
 | `DINGTALK_QUEUE_CARD_TEMPLATE_ID` | - | 排队卡模板 |
 | `DINGTALK_BOT_REPLY_MAX_LENGTH` | 2000 | markdown 截断长度 |

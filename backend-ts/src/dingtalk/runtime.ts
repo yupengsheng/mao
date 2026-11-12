@@ -37,7 +37,7 @@ import { DingtalkMessageService } from './message.service.js';
 import { MysqlDingtalkMessageRepository } from './message.repository.js';
 import { DingtalkMonitorService, type DingtalkMonitorConfig, type DingtalkStreamClient } from './monitor.service.js';
 import { MysqlDingtalkOauthStateRepository } from './oauth.repository.js';
-import { dingtalkAuthorizeUrl, exchangeUserAccessToken, fetchUnionId, fetchUseridByUnionId, oauthConfigured, webOriginOf, type DingtalkOauthConfig } from './oauth-client.js';
+import { exchangeUserAccessToken, fetchUnionId, fetchUseridByUnionId, oauthConfigured, webOriginOf, type DingtalkOauthConfig } from './oauth-client.js';
 import { MysqlDingtalkPendingBindingRepository } from './pending-binding.repository.js';
 import { DINGTALK_DISLIKE_SOURCE } from '../feedback/feedback.repository.js';
 import { MysqlDingtalkProgressCardRepository } from './progress-card.repository.js';
@@ -49,7 +49,6 @@ import { deliverScheduledDingtalkReply } from './scheduled-result.js';
 import type { LeaseHandle } from '../task/execution-lease.service.js';
 
 export interface DingtalkRuntimeConfig extends DingtalkMonitorConfig {
-  oauth: DingtalkOauthConfig;
   cardTemplateId: string;
   replyMaxLength: number;
   groupContextMaxItems: number;
@@ -96,7 +95,10 @@ export function createDingtalkRuntime(deps: {
   agentService: AgentService;
   modelService: ModelService;
   userRepo: { findById(id: number): Promise<{ id?: number } | null> };
-  settingService: { getSiteBaseUrl(): Promise<string | null> };
+  settingService: {
+    getSiteBaseUrl(): Promise<string | null>;
+    getDingtalkOauthConfig(): Promise<DingtalkOauthConfig>;
+  };
   taskTerminal: {
     beginExecution(
       sessionId: number,
@@ -131,6 +133,8 @@ export function createDingtalkRuntime(deps: {
   const bots = new MysqlDingtalkBotRepository(deps.db);
   const binding = new MysqlDingtalkBindingRepository(deps.db);
   const oauthStates = new MysqlDingtalkOauthStateRepository(deps.db);
+  /** OAuth 配置惰性读取（V214）：每次实时查 system_setting，后台保存后即时生效。 */
+  const oauthConfig = (): Promise<DingtalkOauthConfig> => deps.settingService.getDingtalkOauthConfig();
   const pending = new MysqlDingtalkPendingBindingRepository(deps.db);
   const messages = new MysqlDingtalkMessageRepository(deps.db);
   const messageService = new DingtalkMessageService(messages, {
@@ -419,7 +423,7 @@ export function createDingtalkRuntime(deps: {
   const processor = new DingtalkInboundProcessor(handler, {
     messageService,
     mergeWindowMs: deps.config.mergeWindowMs,
-    oauthConfigured: () => oauthConfigured(deps.config.oauth),
+    oauthConfigured: async () => oauthConfigured(await oauthConfig()),
     resolveUserId: ( _accountId, event) => binding.findUserId(event.senderUserid, event.senderUnionId),
     rememberMember: async (accountId, event, userId) => {
       if (event.senderUserid == null) return;
@@ -427,8 +431,9 @@ export function createDingtalkRuntime(deps: {
     },
     sendReply: (accountId, event, text) => sendText(Number(accountId), event, text),
     sendBindingCard: async (accountId, event) => {
-      if (!oauthConfigured(deps.config.oauth)) return false;
-      const origin = webOriginOf(deps.config.oauth.redirectUri);
+      const oauth = await oauthConfig();
+      if (!oauthConfigured(oauth)) return false;
+      const origin = webOriginOf(oauth.redirectUri);
       if (origin == null) return false;
       const state = await oauthStates.create(null, 3 * 60 * 1000);
       await pending.insert({ state, botId: Number(accountId), event }, new Date(Date.now() + 3 * 60 * 1000));
@@ -562,11 +567,12 @@ export function createDingtalkRuntime(deps: {
         jwt: deps.jwt,
         repository: binding,
         oauthStates,
-        oauth: deps.config.oauth,
+        oauth: oauthConfig,
         onCallback: async (state, userId, code) => {
-          const userToken = await exchangeUserAccessToken(fetchImpl, deps.config.oauth, code);
+          const oauth = await oauthConfig();
+          const userToken = await exchangeUserAccessToken(fetchImpl, oauth, code);
           const unionId = await fetchUnionId(fetchImpl, userToken);
-          const legacy = await tokens.getLegacyToken(deps.config.oauth.clientId, deps.config.oauth.clientSecret);
+          const legacy = await tokens.getLegacyToken(oauth.clientId, oauth.clientSecret);
           const userid = await fetchUseridByUnionId(fetchImpl, legacy, unionId);
           await binding.bind(userId, unionId, userid);
           const replay = await pending.claim(state);

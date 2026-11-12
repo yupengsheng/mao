@@ -47,6 +47,12 @@ export interface FeishuOAuthSettings {
   redirectUri: string;
 }
 
+export interface DingtalkOauthSettings {
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
+}
+
 export interface UploadSettings {
   storageMode: string;
   baseUrl: string;

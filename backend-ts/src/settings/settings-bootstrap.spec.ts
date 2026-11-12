@@ -43,6 +43,23 @@ describe('runSettingsBootstrap', () => {
     expect(stored).toContain(':');
   });
 
+  it('importsLegacyDingtalkOauthEnvAndEncryptsSecret', async () => {
+    findByKey.mockImplementation(async (key: string) => row(key, null));
+    await runSettingsBootstrap(repo, 'k', {
+      DINGTALK_OAUTH_CLIENT_ID: 'ding-client',
+      DINGTALK_OAUTH_SECRET: 'ding-secret',
+      DINGTALK_OAUTH_REDIRECT_URI: 'https://mao.example.com/api/v1/dingtalk/oauth/callback',
+    });
+    const calls = updateById.mock.calls.map(([s]) => s);
+    expect(calls.find((s) => s.settingKey === 'dingtalk.oauth.clientId')?.value).toBe('ding-client');
+    expect(calls.find((s) => s.settingKey === 'dingtalk.oauth.redirectUri')?.value)
+      .toBe('https://mao.example.com/api/v1/dingtalk/oauth/callback');
+    const secret = calls.find((s) => s.settingKey === 'dingtalk.oauth.clientSecret');
+    expect(secret).toBeDefined();
+    expect(String(secret!.value)).not.toBe('ding-secret');
+    expect(String(secret!.value)).toContain(':');
+  });
+
   it('skipsSecretsWhenMasterKeyMissing', async () => {
     findByKey.mockResolvedValue(row('tools.tavilyApiKey', null));
     await runSettingsBootstrap(repo, '', { TAVILY_API_KEY: 'tvly-secret' });

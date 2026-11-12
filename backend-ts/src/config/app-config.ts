@@ -10,7 +10,7 @@ export interface DingtalkBotConfig {
   reconnectBaseMs: number;
   reconnectMaxMs: number;
   maxConsecutiveFailures: number;
-  oauth: { clientId: string; clientSecret: string; redirectUri: string };
+  /** OAuth 登录配置已后台化（system_setting dingtalk.oauth.*，V214），不再从环境变量读取。 */
   cardTemplateId: string;
   replyMaxLength: number;
   groupContext: { maxItems: number; maxMinutes: number };
@@ -221,7 +221,6 @@ const DEFAULTS: AppConfig = {
     reconnectBaseMs: 1000,
     reconnectMaxMs: 30000,
     maxConsecutiveFailures: 5,
-    oauth: { clientId: '', clientSecret: '', redirectUri: '' },
     cardTemplateId: '',
     replyMaxLength: 2000,
     groupContext: { maxItems: 10, maxMinutes: 120 },
@@ -589,9 +588,6 @@ export function loadConfig(): AppConfig {
   if (process.env.APP_DINGTALK_BOT_SECRET) {
     cfg.dingtalk.appSecretKey = process.env.APP_DINGTALK_BOT_SECRET;
   }
-  if (process.env.DINGTALK_OAUTH_CLIENT_ID) cfg.dingtalk.oauth.clientId = process.env.DINGTALK_OAUTH_CLIENT_ID;
-  if (process.env.DINGTALK_OAUTH_SECRET) cfg.dingtalk.oauth.clientSecret = process.env.DINGTALK_OAUTH_SECRET;
-  if (process.env.DINGTALK_OAUTH_REDIRECT_URI) cfg.dingtalk.oauth.redirectUri = process.env.DINGTALK_OAUTH_REDIRECT_URI;
   if (process.env.DINGTALK_CARD_TEMPLATE_ID) cfg.dingtalk.cardTemplateId = process.env.DINGTALK_CARD_TEMPLATE_ID;
   cached = cfg;
   return cfg;

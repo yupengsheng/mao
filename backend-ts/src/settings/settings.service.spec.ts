@@ -309,6 +309,54 @@ describe('SystemSettingService', () => {
     await expect(svc.update('auth.ldap.password', '******')).rejects.toThrow(/掩码/);
   });
 
+  it('getDingtalkOauthConfigDecryptsSecretAndReadsLatest', async () => {
+    const rows: Record<string, SystemSetting> = {
+      'dingtalk.oauth.clientId': { ...setting('dingtalk.oauth.clientId', '集成配置', 1), value: 'ding-client' },
+      'dingtalk.oauth.clientSecret': {
+        ...setting('dingtalk.oauth.clientSecret', '集成配置', 1),
+        isSecret: 1,
+        value: encryptAesGcmNonNull('ding-secret', 'test-secret-key'),
+      },
+      'dingtalk.oauth.redirectUri': {
+        ...setting('dingtalk.oauth.redirectUri', '集成配置', 1),
+        value: 'https://mao.example.com/api/v1/dingtalk/oauth/callback',
+      },
+    };
+    vi.mocked(mapper.findByKey).mockImplementation(async (key: string) => rows[key] ?? null);
+    const svc = new SystemSettingService(mapper, agentLookup, modelLookup, { ...runtime }, 'test-secret-key');
+
+    await expect(svc.getDingtalkOauthConfig()).resolves.toEqual({
+      clientId: 'ding-client',
+      clientSecret: 'ding-secret',
+      redirectUri: 'https://mao.example.com/api/v1/dingtalk/oauth/callback',
+    });
+
+    rows['dingtalk.oauth.clientId'].value = 'ding-client-2';
+    await expect(svc.getDingtalkOauthConfig()).resolves.toMatchObject({ clientId: 'ding-client-2' });
+  });
+
+  it('getDingtalkOauthConfigFallsBackToEmptyWhenUnset', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(null);
+    await expect(service().getDingtalkOauthConfig()).resolves.toEqual({
+      clientId: '',
+      clientSecret: '',
+      redirectUri: '',
+    });
+  });
+
+  it('updateValidatesDingtalkOauthRedirectUriScheme', async () => {
+    vi.mocked(mapper.findByKey).mockResolvedValue(setting('dingtalk.oauth.redirectUri', '集成配置', 1));
+    await expect(service().update('dingtalk.oauth.redirectUri', 'mao.example.com/callback'))
+      .rejects.toThrow(/钉钉回调地址必须以 http/);
+  });
+
+  it('updateAcceptsDingtalkOauthRedirectUri', async () => {
+    const row = setting('dingtalk.oauth.redirectUri', '集成配置', 1);
+    vi.mocked(mapper.findByKey).mockResolvedValue(row);
+    await expect(service().update('dingtalk.oauth.redirectUri', 'https://mao.example.com/api/v1/dingtalk/oauth/callback'))
+      .resolves.toMatchObject({ value: 'https://mao.example.com/api/v1/dingtalk/oauth/callback' });
+  });
+
   it('updateSecretNullMeansNoChange', async () => {
     const secretRow = setting('auth.ldap.password', '集成配置', 1);
     secretRow.isSecret = 1;
