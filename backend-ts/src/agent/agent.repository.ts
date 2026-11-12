@@ -21,6 +21,7 @@ export class MysqlAgentRepository implements AgentRepository {
     clientVisibleOnly = false,
     enabled?: boolean,
     missingGitAllowedDomains = false,
+    defaultModelId?: number,
   ): { whereSql: string; params: unknown[] } {
     const where: string[] = [notDeleted()];
     const params: unknown[] = [];
@@ -35,6 +36,10 @@ export class MysqlAgentRepository implements AgentRepository {
     }
     if (missingGitAllowedDomains) {
       where.push('git_allowed_domains IS NULL');
+    }
+    if (defaultModelId != null) {
+      where.push('default_model_id = ?');
+      params.push(defaultModelId);
     }
     if (keyword != null && keyword.length > 0) {
       where.push('name LIKE ?');
@@ -66,9 +71,10 @@ export class MysqlAgentRepository implements AgentRepository {
     clientVisibleOnly = false,
     enabled?: boolean,
     missingGitAllowedDomains = false,
+    defaultModelId?: number,
   ): Promise<{ records: Agent[]; total: number }> {
     const { whereSql, params } = this.buildListWhere(
-      keyword, includeDisabled, clientVisibleOnly, enabled, missingGitAllowedDomains,
+      keyword, includeDisabled, clientVisibleOnly, enabled, missingGitAllowedDomains, defaultModelId,
     );
     const totalRow = await this.db.queryOne<{ c: number }>(
       `SELECT COUNT(*) AS c FROM agent WHERE ${whereSql}`,

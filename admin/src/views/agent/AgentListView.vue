@@ -30,6 +30,18 @@
             <el-option label="停用" value="disabled" />
           </el-select>
         </el-form-item>
+        <el-form-item label="默认模型">
+          <el-select
+            v-model="modelFilter"
+            clearable
+            filterable
+            placeholder="全部"
+            style="width: 200px"
+            @change="handleModelFilter"
+          >
+            <el-option v-for="model in modelOptions" :key="model.id" :label="model.name" :value="model.id" />
+          </el-select>
+        </el-form-item>
         <el-form-item label="Git 凭据域">
           <el-select v-model="gitDomainFilter" clearable placeholder="全部" style="width: 120px" @change="handleGitDomainFilter">
             <el-option label="未配置" value="missing" />
@@ -65,6 +77,12 @@
           </template>
         </el-table-column>
         <el-table-column prop="description" label="描述" min-width="160" show-overflow-tooltip />
+        <el-table-column label="默认模型" width="140" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span v-if="row.defaultModelId == null" class="muted-text">跟随全局默认</span>
+            <span v-else>{{ resolveModelName(row.defaultModelId) }}</span>
+          </template>
+        </el-table-column>
         <el-table-column label="状态" width="150">
           <template #default="{ row }">
             <el-tag :type="row.enabled === false ? 'info' : 'success'" size="small">
@@ -78,8 +96,18 @@
         <el-table-column label="创建人" width="120" show-overflow-tooltip class-name="hide-on-mobile" label-class-name="hide-on-mobile">
           <template #default="{ row }">{{ row.creatorName || '-' }}</template>
         </el-table-column>
-        <el-table-column label="Skills" width="84" align="right">
-          <template #default="{ row }">{{ row.skillNames?.length || 0 }}</template>
+        <el-table-column label="能力概览" width="170">
+          <template #default="{ row }">
+            <el-tooltip placement="top">
+              <template #content>
+                <div>技能：{{ capabilityText(Array.isArray(row.skillNames) ? row.skillNames : []) }}</div>
+                <div>MCP：{{ capabilityText(resolveNames(row.mcpServerIds, mcpNameById)) }}</div>
+                <div>自定义工具：{{ capabilityText(resolveNames(row.httpToolIds, toolNameById)) }}</div>
+                <div>Git 域：{{ gitDomainText(row.gitAllowedDomains) }}</div>
+              </template>
+              <span>{{ capabilitySummary(row) }}</span>
+            </el-tooltip>
+          </template>
         </el-table-column>
         <el-table-column label="Git 凭据域" width="110">
           <template #default="{ row }">{{ gitDomainText(row.gitAllowedDomains) }}</template>
@@ -134,8 +162,13 @@
             <span>{{ row.description || '-' }}</span>
           </div>
           <div class="mobile-card-row">
-            <span class="mobile-card-label">Skills</span>
-            <span>{{ row.skillNames?.length || 0 }}</span>
+            <span class="mobile-card-label">默认模型</span>
+            <span v-if="row.defaultModelId == null" class="muted-text">跟随全局默认</span>
+            <span v-else>{{ resolveModelName(row.defaultModelId) }}</span>
+          </div>
+          <div class="mobile-card-row">
+            <span class="mobile-card-label">能力概览</span>
+            <span>{{ capabilitySummary(row) }}</span>
           </div>
           <div class="mobile-card-row">
             <span class="mobile-card-label">Git 凭据域</span>
@@ -224,7 +257,12 @@ const loadingDetail = ref(false)
 const agents = ref<any[]>([])
 const searchQuery = ref('')
 const statusFilter = ref('')
+const modelFilter = ref<number | '' | undefined>('')
 const gitDomainFilter = ref<'' | 'missing'>('')
+const modelOptions = ref<Array<{ id: number; name: string }>>([])
+/** 资源名映射（能力概览 tooltip 用）：含停用行，未命中 id 以 #id 兜底。 */
+const mcpNameById = ref<Map<number, string>>(new Map())
+const toolNameById = ref<Map<number, string>>(new Map())
 const currentPage = ref(1)
 const pageSize = ref(10)
 const total = ref(0)
@@ -259,6 +297,7 @@ async function fetchAgents() {
         pageNum: currentPage.value,
         pageSize: pageSize.value,
         enabled: statusFilter.value === 'enabled' ? true : statusFilter.value === 'disabled' ? false : undefined,
+        defaultModelId: modelFilter.value !== '' && modelFilter.value != null ? modelFilter.value : undefined,
         ...(gitDomainFilter.value === 'missing' ? { missingGitDomains: true } : {}),
       }
     })
@@ -309,6 +348,11 @@ function handleStatusFilter() {
   fetchAgents()
 }
 
+function handleModelFilter() {
+  currentPage.value = 1
+  fetchAgents()
+}
+
 function handleGitDomainFilter() {
   currentPage.value = 1
   fetchAgents()
@@ -319,6 +363,58 @@ function gitDomainText(domains: string[] | null | undefined): string {
   if (domains == null) return '未配置'
   if (domains.length === 0) return '已禁止'
   return `${domains.length} 个域`
+}
+
+/** 默认模型列：启用模型显示名称；指向已停用 / 已删除模型时以 #id 兜底。 */
+function resolveModelName(modelId: number): string {
+  const found = modelOptions.value.find((model) => model.id === modelId)
+  return found ? found.name : `#${modelId}（已停用）`
+}
+
+function resolveNames(ids: unknown, map: Map<number, string>): string[] {
+  if (!Array.isArray(ids)) return []
+  return ids
+    .filter((id): id is number => Number.isInteger(id) && (id as number) > 0)
+    .map((id) => map.get(id) ?? `#${id}`)
+}
+
+function capabilityText(names: string[]): string {
+  return names.length > 0 ? names.join('、') : '—'
+}
+
+function capabilitySummary(row: any): string {
+  const skills = Array.isArray(row.skillNames) ? row.skillNames.length : 0
+  const mcp = Array.isArray(row.mcpServerIds) ? row.mcpServerIds.length : 0
+  const tools = Array.isArray(row.httpToolIds) ? row.httpToolIds.length : 0
+  const parts: string[] = []
+  if (skills > 0) parts.push(`技能 ${skills}`)
+  if (mcp > 0) parts.push(`MCP ${mcp}`)
+  if (tools > 0) parts.push(`工具 ${tools}`)
+  return parts.length > 0 ? parts.join(' · ') : '—'
+}
+
+function toNameMap(rows: unknown): Map<number, string> {
+  const map = new Map<number, string>()
+  if (!Array.isArray(rows)) return map
+  for (const row of rows as Array<Record<string, unknown>>) {
+    if (Number.isInteger(row?.id)) map.set(Number(row.id), String(row?.displayName ?? row?.name ?? `#${row.id}`))
+  }
+  return map
+}
+
+/** 名称字典 fail-soft：任一请求失败置空，不影响主列表。 */
+async function loadNameDictionaries() {
+  const [modelsRes, mcpRes, toolsRes] = await Promise.all([
+    api.get('/models/active').catch(() => null),
+    api.get('/mcp-servers').catch(() => null),
+    api.get('/admin/http-tools', { params: { page: 1, size: 100 } }).catch(() => null),
+  ])
+  const modelRows = Array.isArray(modelsRes?.data) ? modelsRes.data : []
+  modelOptions.value = modelRows
+    .filter((row: any) => Number.isInteger(row?.id))
+    .map((row: any) => ({ id: Number(row.id), name: String(row.name ?? `#${row.id}`) }))
+  mcpNameById.value = toNameMap(mcpRes?.data)
+  toolNameById.value = toNameMap((toolsRes?.data as any)?.records)
 }
 
 function handleSizeChange() {
@@ -406,6 +502,7 @@ watch(() => route.query.keyword, (kw) => {
 
 onMounted(() => {
   refreshAgentData()
+  void loadNameDictionaries()
 })
 
 let firstActivation = true
@@ -415,6 +512,7 @@ onActivated(() => {
     return
   }
   refreshAgentData()
+  void loadNameDictionaries()
 })
 </script>
 
@@ -474,6 +572,9 @@ onActivated(() => {
   margin-left: 12px;
 }
 .op-muted {
+  color: var(--el-text-color-secondary);
+}
+.muted-text {
   color: var(--el-text-color-secondary);
 }
 

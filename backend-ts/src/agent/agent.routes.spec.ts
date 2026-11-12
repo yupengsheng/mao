@@ -268,14 +268,21 @@ describe('CRUD routes', () => {
       });
       expect(paged.json().data).toEqual([expect.objectContaining({ name: 'coder' })]);
       expect(paged.headers['x-total-count']).toBe('12');
-      expect(agentService.listAgentsPage).toHaveBeenCalledWith(7, 'co', true, false, 2, 10, false, false);
+      expect(agentService.listAgentsPage).toHaveBeenCalledWith(7, 'co', true, false, 2, 10, false, false, undefined);
 
       const disabledOnly = await app.inject({
         method: 'GET',
         url: '/v1/agents?pageNum=1&pageSize=5&enabled=false',
       });
       expect(disabledOnly.json().data).toEqual([expect.objectContaining({ name: 'coder' })]);
-      expect(agentService.listAgentsPage).toHaveBeenLastCalledWith(7, undefined, false, false, 1, 5, false, false);
+      expect(agentService.listAgentsPage).toHaveBeenLastCalledWith(7, undefined, false, false, 1, 5, false, false, undefined);
+
+      const byModel = await app.inject({
+        method: 'GET',
+        url: '/v1/agents?defaultModelId=3',
+      });
+      expect(byModel.json().data).toEqual([expect.objectContaining({ name: 'coder' })]);
+      expect(agentService.listAgentsPage).toHaveBeenLastCalledWith(7, undefined, false, false, undefined, undefined, undefined, false, 3);
     } finally {
       await app.close();
     }
@@ -561,7 +568,7 @@ describe('CRUD routes', () => {
       expect(managed.json().data[0]?.gitAllowedDomains).toEqual(['git.acg.team']);
       expect(agentService.listAgents).toHaveBeenLastCalledWith(7, undefined, false, false, true);
       await app.inject({ method: 'GET', url: '/v1/agents?pageNum=1&missingGitDomains=true' });
-      expect(agentService.listAgentsPage).toHaveBeenLastCalledWith(7, undefined, false, false, 1, undefined, undefined, true);
+      expect(agentService.listAgentsPage).toHaveBeenLastCalledWith(7, undefined, false, false, 1, undefined, undefined, true, undefined);
     } finally {
       await app.close();
     }

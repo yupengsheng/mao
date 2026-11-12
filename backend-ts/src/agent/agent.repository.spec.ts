@@ -100,6 +100,13 @@ describe('MysqlAgentRepository', () => {
     expect(db.queryOne).toHaveBeenLastCalledWith(
       expect.stringContaining('git_allowed_domains IS NULL'), [],
     );
+    await repo.selectPage(1, 20, null, true, false, undefined, false, 3);
+    expect(db.queryOne).toHaveBeenLastCalledWith(
+      expect.stringContaining('default_model_id = ?'), [3],
+    );
+    expect(db.query).toHaveBeenLastCalledWith(
+      expect.stringContaining('LIMIT ? OFFSET ?'), [3, 20, 0],
+    );
     await repo.findDefault();
     expect(db.queryOne).toHaveBeenCalledWith(expect.stringContaining('enabled = 1'));
     await repo.updateEnabled(5, 0);

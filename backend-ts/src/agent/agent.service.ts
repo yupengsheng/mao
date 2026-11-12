@@ -45,11 +45,12 @@ export class AgentService {
     pageSize?: number,
     enabled?: boolean,
     missingGitAllowedDomains = false,
+    defaultModelId?: number,
   ): Promise<{ records: Agent[]; total: number }> {
     const page = Math.max(1, pageNum ?? 1);
     const size = Math.min(200, Math.max(1, pageSize ?? 20));
     return this.agentRepo.selectPage(
-      page, size, keyword, includeDisabled, clientVisibleOnly, enabled, missingGitAllowedDomains,
+      page, size, keyword, includeDisabled, clientVisibleOnly, enabled, missingGitAllowedDomains, defaultModelId,
     );
   }
 

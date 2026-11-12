@@ -85,6 +85,7 @@ export interface AgentRepository {
     clientVisibleOnly?: boolean,
     enabled?: boolean,
     missingGitAllowedDomains?: boolean,
+    defaultModelId?: number,
   ): Promise<{ records: Agent[]; total: number }>;
   selectGitAllowedDomainsById(id: number): Promise<{ domains: string | null } | null>;
   findById(id: number): Promise<Agent | null>;

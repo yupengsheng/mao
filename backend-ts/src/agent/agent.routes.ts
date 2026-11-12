@@ -136,11 +136,12 @@ export function registerAgentRoutes(app: FastifyInstance, deps: AgentRouteDeps):
     const pageNum = queryOptInt(request, 'pageNum');
     const pageSize = queryOptInt(request, 'pageSize');
     const enabled = queryOptBool(request, 'enabled');
-    const paginated = pageNum != null || pageSize != null || enabled != null;
+    const defaultModelId = queryOptInt(request, 'defaultModelId');
+    const paginated = pageNum != null || pageSize != null || enabled != null || defaultModelId != null;
     if (paginated) {
       const page = await agentService.listAgentsPage(
         userId, keyword, includeDisabled, scope === 'client', pageNum, pageSize, enabled,
-        missingGitDomains && canManage,
+        missingGitDomains && canManage, defaultModelId,
       );
       reply.header('x-total-count', String(page.total));
       const voList = await Promise.all(
