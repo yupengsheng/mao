@@ -313,6 +313,14 @@
 3. **相邻收敛点**：切换 Agent 复用既有 PATCH 与每轮重读语义，刻意不动 `AgentLoop` / `task-terminal.service.ts`；来源标记只改传参值不改 `createSession` 位置签名（`open-run.service.ts:21-26` 的逐位一致护栏）；工作区总览不动既有 `cloud-projects` 端点（新建任务下拉零回归）。
 4. **实施顺序建议**：三件可完全并行；来源标记最小（约 2 人日）可先行，切换 Agent 次之，工作区总览最后。
 
+## 第二十批（2026-11-10）
+
+背景：延续「提升现有功能完整度与用户体验」方向，聚焦高频输入链路：富文本粘贴保留结构、Excel 表格直接落 Markdown、截图轻标注后发送，降低「复制进来还要手工重排」的损耗。
+
+| 提案 | 文档 | 一句话 | 规模 |
+|---|---|---|---|
+| 输入效率包 | [2026-11-10-rich-paste-annotate.md](2026-11-10-rich-paste-annotate.md)（**已实施** 1.0.2，技术方案见 [../plan/2026-11-10-rich-paste-annotate-technical-design.md](../plan/2026-11-10-rich-paste-annotate-technical-design.md)） | 富文本 / Excel 粘贴转 Markdown、表格单元格竖线转义、截图轻标注 | 中 |
+
 ## 已评估、明确不做
 
 以下各项已复审定案，**不再重启、不再提案**（存档文档已标否决，勿再评审）：

@@ -438,7 +438,7 @@ onMounted(() => {
   padding: 14px;
   border: 1px solid var(--aw-divider-soft);
   border-radius: var(--aw-radius-md, 10px);
-  background: var(--aw-bg, #fbfbfc);
+  background: var(--aw-canvas-parchment);
   margin-bottom: 16px;
 }
 

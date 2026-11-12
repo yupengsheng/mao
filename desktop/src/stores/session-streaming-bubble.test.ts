@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { setActivePinia, createPinia } from 'pinia'
 import { useSessionStore } from './session'
+import type { ChatMessage } from '../types/chat'
 
 vi.mock('../api', () => ({
   api: {
@@ -276,5 +277,151 @@ describe('桌面消息 store 流式气泡生命周期', () => {
     expect(msgs[1]!.interrupted).toBe(true)
     expect(msgs[1]!.toolCalls?.map((c) => c.id)).toEqual(['t1'])
     expect(msgs[3]!.toolCalls?.map((c) => c.id)).toEqual(['t2'])
+  })
+})
+
+/**
+ * 后端重启 / 蓝绿部署续跑的前端回归（2026-11-09）。
+ *
+ * 时序：旧执行在途（tracked 气泡尾部挂着 running 工具）→ 后端重启 → 前端 WS 重连、
+ * subscribe 收到 session_snapshot（phase=RUNNING，但 executionId 是恢复执行的新 id）。
+ *
+ * 旧实现只处理 CANCELLED / FAILED 终态，RESUMING→RUNNING 的换 executionId 不在其列：
+ * 旧气泡连同其中永远等不到结果的 running 调用留在尾部，新执行的 tool_call_start 又
+ * 另起一条气泡——同一次调用一式两份，旧那份转圈到任务结束或刷新页面才消失。
+ */
+describe('部署重启续跑：旧 tracked 气泡不得与恢复执行的工具调用并存', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+  })
+
+  it('换 executionId 重绑时就地终结旧气泡，恢复执行另起新气泡且不再转圈', () => {
+    vi.useFakeTimers()
+    try {
+    const store = useSessionStore()
+    store.setMessages('42', [{
+      id: '100', role: 'user', content: '重新部署前后端服务', createdAt: '2026-11-09 13:46:00',
+    }])
+    // 旧执行：尾部落了一条正在跑的工具
+    store.ensureStreamingAssistantMessage('42')
+    store.appendToolCallStart('42', {
+      tool_call_id: 'old-1', tool_name: 'shell', arguments: '{"command":"curl -s -o /dev/null -w \\"%{http_code}\\" http://localhost/"}',
+    })
+    expect(store.getMessages('42')[1]!.toolCalls?.[0]!.status).toBe('running')
+
+    // WS 重连后 subscribe 带回恢复执行的新 executionId（crash-recovery-runner.notifyClient）
+    store.discardStaleStreamingBubble('42')
+
+    // 恢复执行重新发起同一条命令：新 id，落到新气泡。
+    // 时间必须前进，否则两条占位气泡落在同一毫秒、拿到同一个 id，断言失去意义。
+    vi.advanceTimersByTime(5_000)
+    store.ensureStreamingAssistantMessage('42')
+    store.appendToolCallStart('42', {
+      tool_call_id: 'new-1', tool_name: 'shell', arguments: '{"command":"curl -s -o /dev/null -w \\"%{http_code}\\" http://localhost/"}',
+    })
+
+    const msgs = store.getMessages('42')
+    // 两条气泡：旧的（已终结、带中断标记）+ 恢复执行的新气泡
+    expect(msgs).toHaveLength(3)
+    expect(String(msgs[1]!.id)).not.toBe(String(msgs[2]!.id))
+    const oldCall = msgs[1]!.toolCalls?.[0]!
+    expect(oldCall.id).toBe('old-1')
+    expect(oldCall.status).toBe('error')
+    expect(oldCall.summary).toBeTruthy()
+    expect(msgs[1]!.interrupted).toBe(true)
+    expect(msgs[1]!.superseded).toBe(true)
+    // 恢复执行的调用是唯一仍在 running 的一条，结果事件能落到它身上
+    const newCall = msgs[2]!.toolCalls?.[0]!
+    expect(newCall.id).toBe('new-1')
+    expect(newCall.status).toBe('running')
+
+    // 恢复执行完成：就地终结，界面上不再有残留转圈
+    store.updateToolCallResult('42', { tool_call_id: 'new-1', result: '200', status: 'success' })
+    const running = store.getMessages('42').flatMap((m) => m.toolCalls ?? []).filter((c) => c.status === 'running')
+    expect(running).toHaveLength(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // 线上回归（2026-11-11 会话 2326）：续跑完成后的终态重拉，旧执行气泡此前被当作
+  // 「唯一副本」保留并排在 REST 历史之后，轮次渲染取最后一条 assistant 当 finalReply，
+  // 界面于是停在部署前那半截内容，真正的最终回复被折叠进「已执行 N 个步骤」。
+  it('续跑完成后的终态重拉丢弃被顶掉的旧气泡，最终回复保持在最后一条', () => {
+    vi.useFakeTimers()
+    try {
+      const store = useSessionStore()
+      const user: ChatMessage = {
+        id: '100', role: 'user', content: '重新部署前后端服务', createdAt: '2026-11-11 11:09:50',
+      }
+      store.setMessages('42', [user])
+
+      // 旧执行：文本与 running 工具都堆在同一条 tracked 气泡里
+      store.ensureStreamingAssistantMessage('42')
+      store.appendDelta('42', '生产目录已更新到 7d4b395e。现在按标准流程部署')
+      store.appendToolCallStart('42', { tool_call_id: 'old-1', tool_name: 'shell', arguments: '{}' })
+      expect(store.getMessages('42')[1]!.toolCalls?.[0]!.status).toBe('running')
+
+      // 蓝绿切换：WS 重连带回恢复执行的新 executionId
+      store.discardStaleStreamingBubble('42')
+
+      // 恢复执行继续产出并完成（另起一条气泡）
+      vi.advanceTimersByTime(5_000)
+      store.ensureStreamingAssistantMessage('42')
+      store.appendDelta('42', '后端与管理后台已部署；桌面端依赖补齐后重跑成功')
+      store.markMessageComplete('42', {})
+
+      // 终态 REST：00:09 的旧内容已被续跑重新产出，最终回复 11:16:22 落库
+      const fetched: ChatMessage[] = [
+        user,
+        { id: '201', role: 'assistant', content: '', createdAt: '2026-11-11 11:10:09' },
+        { id: '202', role: 'assistant', content: '后端与管理后台已部署', createdAt: '2026-11-11 11:14:48' },
+        { id: '203', role: 'assistant', content: '已完成提交、推送和部署。', createdAt: '2026-11-11 11:16:22' },
+      ]
+      store.applyFetchedMessages('42', fetched)
+
+      const msgs = store.getMessages('42')
+      // 旧气泡（superseded）不得追加在 REST 之后，否则会被当成 finalReply
+      expect(msgs.map((m) => String(m.id))).toEqual(['100', '201', '202', '203'])
+      expect(msgs[msgs.length - 1]!.content).toBe('已完成提交、推送和部署。')
+      expect(msgs.some((m) => m.superseded === true)).toBe(false)
+      expect(msgs.flatMap((m) => m.toolCalls ?? []).some((c) => c.status === 'running')).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('已终结的工具轮次与已流出文本在旧气泡中原样保留', () => {
+    const store = useSessionStore()
+    store.setMessages('42', [{
+      id: '100', role: 'user', content: '部署', createdAt: '2026-11-09 13:46:00',
+    }])
+    store.ensureStreamingAssistantMessage('42')
+    store.appendDelta('42', '三端部署完成，等待旧实例排水验证。')
+    store.appendToolCallStart('42', { tool_call_id: 'ok-1', tool_name: 'shell', arguments: '{"command":"echo done"}' })
+    store.updateToolCallResult('42', { tool_call_id: 'ok-1', result: 'done', status: 'success' })
+    store.appendToolCallStart('42', { tool_call_id: 'run-1', tool_name: 'shell', arguments: '{"command":"sleep 65"}' })
+
+    store.discardStaleStreamingBubble('42')
+
+    const msg = store.getMessages('42')[1]!
+    expect(msg.content).toContain('三端部署完成')
+    expect(msg.toolCalls?.map((c) => [c.id, c.status])).toEqual([['ok-1', 'success'], ['run-1', 'error']])
+    // 已终结的调用不被改写摘要——只有中断的那条才带中断原因
+    expect(msg.toolCalls![0]!.summary).toBeUndefined()
+    expect(msg.toolCalls![1]!.summary).toBeTruthy()
+  })
+
+  it('无 tracked 气泡时（如未打开过的会话）空转，不影响后续流式', () => {
+    const store = useSessionStore()
+    store.setMessages('42', [{
+      id: '100', role: 'user', content: '部署', createdAt: '2026-11-09 13:46:00',
+    }])
+    store.discardStaleStreamingBubble('42')
+    expect(store.getMessages('42')).toHaveLength(1)
+
+    store.ensureStreamingAssistantMessage('42')
+    store.appendToolCallStart('42', { tool_call_id: 'n-1', tool_name: 'shell', arguments: '{"command":"ls"}' })
+    expect(store.getMessages('42')[1]!.toolCalls?.[0]!.status).toBe('running')
   })
 })

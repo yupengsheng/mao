@@ -169,6 +169,7 @@ import { useStreamWS } from '../../composables/useStreamWS'
 import { api } from '../../api'
 import { cloudProjectKeyForNewTask } from '../../utils/cloud-project'
 import { mapMessagesWithFileChanges, mapCompactionEvents } from '../../utils/chatMessage'
+import { shouldPreserveLiveStreamOnFetch } from '../../utils/preserve-live-stream'
 import { generateUUID } from '../../utils/uuid'
 import { collectLocalUnsyncedSkills } from '../../utils/localSkills'
 import { collectAgentsMdContent } from '../../utils/agentsMd'
@@ -735,14 +736,14 @@ async function fetchMessages() {
 /**
  * 是否应保留本地正在流式的内容，避免被可能滞后的历史回放整表覆盖。
  * 与 SubagentChatPanel 同口径：订阅重放的「执行中」工具先于 REST 历史写入缓存时必须保留。
+ * 终态一律以 REST 为准（部署重启留下的旧执行气泡不得盖在最终回复之后）。
  */
 function shouldPreserveLiveStream(msgs: ReturnType<typeof sessionStore.getMessages>): boolean {
-  if (sessionStore.isSessionStreaming(String(realSessionId.value))) return true
-  const last = msgs[msgs.length - 1]
-  if (last && normalizeMessageRole(last.role ?? '') === 'assistant') {
-    return last.toolCalls?.some(tc => tc.status === 'pending' || tc.status === 'running') ?? false
-  }
-  return false
+  return shouldPreserveLiveStreamOnFetch({
+    phase: sessionStore.getSessionPhase(String(realSessionId.value)),
+    streaming: sessionStore.isSessionStreaming(String(realSessionId.value)),
+    lastMessage: msgs[msgs.length - 1],
+  })
 }
 
 const sideMessageHasMore = computed(() => {

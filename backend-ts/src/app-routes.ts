@@ -417,6 +417,8 @@ export async function registerAllRoutes(deps: RouteDeps): Promise<void> {
       registerAdminContainerRoutes(api, {
         containerOps,
         permissionService,
+        userLookup: { findByIds: (ids) => userRepo.findByIds(ids) },
+        agentLookup: { findByIds: (ids) => agentRepo.findByIds(ids) },
         runtimeModeOf: () => runtimeModeResolver.resolve(),
       });
     }
