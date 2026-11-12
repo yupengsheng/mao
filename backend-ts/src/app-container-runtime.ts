@@ -40,7 +40,7 @@ export interface ContainerRuntimeDeps {
   envVariableService: EnvVariableService;
   uploadDir: string;
   userSkillsDir: string;
-  /** 公共共享目录（共享目录方案 §4.3）：ro 挂载进每用户容器并注入容器 env。 */
+  /** share 根（MAO_SHARE_DIR）：按 Agent 挂载本 Agent 的经验库与私有区两条子路径，并注入容器 env。 */
   shareDir: string;
   mcpClient: McpClientManager;
   activityHeartbeat: SessionActivityHeartbeat;

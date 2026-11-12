@@ -294,13 +294,17 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
   await app.register(multipart, { limits: { fileSize: multipartLimitMb * 1024 * 1024, files: 500 } });
   const uploadDir = resolve(expandHome(cfg.app.file.uploadDir));
   mkdirSync(uploadDir, { recursive: true });
-  // 公共共享目录（共享目录方案 §3.1）：与 uploadDir 同口径启动兜底创建，
-  // 容器模式 ro 挂载前保证宿主机源目录存在（docker -v 对缺失源虽会自动建空目录，
-  // 但属主会是 root，这里以后端运行用户创建，管理员投放时属主一致）。
+  // share 根（MAO_SHARE_DIR）：与 uploadDir 同口径启动兜底创建，保证容器挂载前
+  // 宿主机源目录存在且属主与后端运行用户一致（docker -v 对缺失源会自动建空目录，
+  // 但属主可能是 root）。
   // resolveShareDir 对空值/相对路径启动即拒：静默按 cwd 解析会把后端工作树
   // （含 .env 密钥）ro 挂进所有用户容器（round-02 review Bug 1）。
   const shareDir = resolveShareDir(cfg.app.harness.shareDir);
   mkdirSync(shareDir, { recursive: true });
+  // share 按 Agent 隔离：容器内改为挂两条子路径（agent-experience/{agentId} 与
+  // agents/{agentId}），启动兜底创建 agents/ 父目录；具体 Agent 子目录由
+  // 挂载校验与运行时按需创建。
+  mkdirSync(join(shareDir, 'agents'), { recursive: true });
   await registerUploadStatic(app, uploadDir, apiPrefix);
   await app.register(swagger, {
     openapi: { info: { title: 'Mao API', version: '0.1.0' } },

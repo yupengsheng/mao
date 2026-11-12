@@ -166,7 +166,7 @@ export interface ContainerRegistryOptions {
   skillViewsDir: string;
   /** 图片产物上传根（FILE_UPLOAD_DIR）：按用户挂 {uploadDir}/{userId} 并注入容器 env。 */
   uploadDir: string;
-  /** 公共共享目录根（共享目录方案 §4.3；2026-11-07 决策 13 维持整根 rw 挂载）并注入容器 env。 */
+  /** share 根（MAO_SHARE_DIR）：容器内按 Agent 挂载经验库与私有区两条子路径，并注入容器 env。 */
   shareDir: string;
   /** 创建前确保宿主机 socket server 已监听（先 listen 再 docker run），返回 socket 路径。 */
   ensureChannelListening(userId: number, agentId: number): Promise<string>;

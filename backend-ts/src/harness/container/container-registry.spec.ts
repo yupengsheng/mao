@@ -158,9 +158,11 @@ describe('container registry', () => {
     // 图片产物上传根（按用户挂 {uploadDir}/{userId}，nginx /uploads/ 静态出口同源）
     expect(runArgs).toContain(`-e MAO_UPLOAD_DIR=${join(base, 'uploads')}`);
     expect(runArgs).toContain(`${join(base, 'uploads', '7')}:${join(base, 'uploads', '7')}:rw`);
-    // 公共共享目录（共享目录方案 §4.3 + 团队经验库 2026-10-24）：env 注入 + rw 挂载，容器内路径与宿主机一致
+    // 共享目录按 Agent 隔离：env 注入全局根，实际只 rw 挂载当前 Agent 的经验库与私有区
     expect(runArgs).toContain(`-e MAO_SHARE_DIR=${join(base, 'share')}`);
-    expect(runArgs).toContain(`${join(base, 'share')}:${join(base, 'share')}:rw`);
+    expect(runArgs).toContain(`${join(base, 'share', 'agent-experience', '5')}:${join(base, 'share', 'agent-experience', '5')}:rw`);
+    expect(runArgs).toContain(`${join(base, 'share', 'agents', '5')}:${join(base, 'share', 'agents', '5')}:rw`);
+    expect(runArgs).not.toContain(`${join(base, 'share')}:${join(base, 'share')}:rw`);
     // socket 路径由 ensureChannelListening 返回（唯一真相）
     expect(runArgs).toContain(`--socket ${join(base, 'channels', '7', 'runtime.sock')}`);
     // 不暴露端口

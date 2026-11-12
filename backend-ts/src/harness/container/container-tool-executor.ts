@@ -30,12 +30,12 @@ export interface ContainerRoots {
   skillViewsDir: string;
   /** 图片产物上传根：容器内放行 {uploadDir}/{userId}（宿主同名挂载）。 */
   uploadDir: string;
-  /**
-   * 公共共享目录根（MAO_SHARE_DIR，共享目录方案 2026-10-21；2026-11-07 决策 13 维持
-   * 整根 rw 挂载）：唯一跨用户共享的允许根——经验库（agent-experience/）与管理员投放
-   * 内容都在其下，容器内可读写；跨 Agent 的经验隔离由工作区软链 + 提示词收口（已拍板）。
-   */
+  /** share 根（MAO_SHARE_DIR）：仅用于经验索引根推导；允许根为其下两条 Agent 子路径。 */
   shareDir: string;
+  /** 本 Agent 经验库：{shareDir}/agent-experience/{agentId}，与容器 rw 挂载严格一致。 */
+  shareExperienceDir: string;
+  /** 本 Agent 私有区（含管理员投放）：{shareDir}/agents/{agentId}，与容器 rw 挂载严格一致。 */
+  shareAgentDir: string;
 }
 
 /**
@@ -91,10 +91,11 @@ export class ContainerToolExecutor {
     // 图片产物（generate_image/edit_image 落盘）在宿主机按 {uploadDir}/{uid} 隔离后
     // 同名挂入容器，容器内 read_file 等按同一允许根放行
     this.pathSandbox.addAllowedRoot(path.join(roots.uploadDir, u));
-    // 公共共享目录（共享目录方案 §4.2 + 团队经验库方案 2026-10-24；2026-11-07 决策 13
-    // 维持整根）：唯一跨用户共享的允许根（/tmp 宿主机侧按 {tmpDir}/{userId} 收窄，仍属
-    // 每用户）。经验库与管理员投放内容容器内可读写；跨 Agent 经验隔离由软链 + 提示词收口
-    this.pathSandbox.addAllowedRoot(roots.shareDir);
+    // share 按 Agent 隔离：放行与本 Agent 挂载面严格一致的两条子路径（经验库 + 私有区）；
+    // 不放行 share 根，避免「容器内不存在、却可在沙箱层放行」的双口径。其他 Agent 的
+    // 目录既无挂载、也无允许根，strict 解析直接拒绝。
+    this.pathSandbox.addAllowedRoot(roots.shareExperienceDir);
+    this.pathSandbox.addAllowedRoot(roots.shareAgentDir);
     this.pathSandbox.addAllowedRoot('/tmp');
     this.outputManager = new OutputManager();
     this.backgroundTasks = new BackgroundTaskManager();
