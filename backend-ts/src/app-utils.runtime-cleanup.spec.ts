@@ -1,8 +1,23 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runtimeSessionCleanup } from './app-utils.js';
+
+const fsFail = vi.hoisted(() => ({ dir: '' }));
+
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...actual,
+    rmSync: (p: Parameters<typeof actual.rmSync>[0], opts?: Parameters<typeof actual.rmSync>[1]) => {
+      if (fsFail.dir && String(p) === fsFail.dir) {
+        throw Object.assign(new Error('EBUSY: resource busy or locked'), { code: 'EBUSY' });
+      }
+      return actual.rmSync(p, opts);
+    },
+  };
+});
 
 function tempRoot(): string {
   return join(tmpdir(), `mao-runtime-session-cleanup-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -56,6 +71,33 @@ describe('runtimeSessionCleanup（会话删除的 runtime 回收）', () => {
       expect(existsSync(join(root, 'channels', '11', '.token'))).toBe(true);
       expect(existsSync(join(root, 'channels', '67'))).toBe(true);
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('某个发言者目录清理失败时，其余目录继续回收', () => {
+    const root = tempRoot();
+    const failedDir = join(root, '17', '1607');
+    try {
+      for (const uid of ['17', '67']) {
+        mkdirSync(join(root, uid, '1607', 'shellOutput'), { recursive: true });
+        writeFileSync(join(root, uid, '1607', 'shellOutput', 'x.out'), 'x');
+      }
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      fsFail.dir = failedDir;
+
+      runtimeSessionCleanup(root)(17, 1607);
+
+      // 失败目录保留（下次可重试），其余发言者目录不能因前一个失败而被跳过。
+      expect(existsSync(failedDir)).toBe(true);
+      expect(existsSync(join(root, '67', '1607'))).toBe(false);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining(`Failed to clean runtime dir ${failedDir}`),
+        expect.anything(),
+      );
+      errorSpy.mockRestore();
+    } finally {
+      fsFail.dir = '';
       rmSync(root, { recursive: true, force: true });
     }
   });
