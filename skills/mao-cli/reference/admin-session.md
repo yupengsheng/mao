@@ -2,7 +2,7 @@
 
 ## 用途
 
-跨用户检索会话、查看详情与消息，以及筛选项（用户/Agent 下拉数据）。列表、详情和消息需要 `session:read`；归档和删除需要 `session:write`。用户下拉同时接受 `session:read`、`scheduled-task:read`、`llm-call:read`、`audit:read`；Agent 下拉同时接受前三个。定时任务、调用流水和审计复用这两个下拉，不因此打开会话列表。
+跨用户检索会话、查看详情与消息，以及筛选项（用户/Agent 下拉数据）。列表、详情和消息需要 `session:read`；归档、删除和恢复失败会话需要 `session:write`。用户下拉同时接受 `session:read`、`scheduled-task:read`、`llm-call:read`、`audit:read`；Agent 下拉同时接受前三个。定时任务、调用流水和审计复用这两个下拉，不因此打开会话列表。
 
 ## 命令选择
 
@@ -15,6 +15,7 @@
 | Agent 筛选项 | `admin-session options-agents` |
 | 清理失败会话 | `admin-session delete`（运行中会话被拒绝） |
 | 归档会话 | `admin-session archive` |
+| 恢复失败会话 | `admin-session recover-failed preview` / `run` |
 
 ## 命令：admin-session list
 
@@ -124,12 +125,22 @@ mao admin-session delete --id 100
 mao admin-session archive --id 100
 ```
 
-## 批量恢复 402/403 失败会话（管理后台页面功能，无 CLI 子命令）
+## 命令：admin-session recover-failed
 
-管理后台「会话管理」页右上角「恢复 402/403 失败会话」按钮（需 `session:write`）：扫描最近 24 小时 / 3 天 / 7 天内活跃、`phase=FAILED`、且最后一次 `scene='agent'` LLM 调用为 402/403 失败的 NORMAL 主会话，预览后勾选发起后台异步续跑（不插入新消息）。单次最多勾选 20 个；候选超过上限时页面提示分批，默认仅勾选前 20 个，提交前再次校验。对应接口：
+恢复最近时间窗内执行失败的会话（需 `session:write`）。候选为 `phase=FAILED` 的 NORMAL 主会话，不限错误类型；恢复复用崩溃恢复内核，在后台异步续跑且不插入新消息。原飞书 / 钉钉进度卡片原地复活并持续更新，无卡片映射的会话完成后推送最终回复。LOCAL 模式、子代理 / 边路、有待重试定时任务 run 的会话会被跳过。
 
-- `GET /admin/sessions/recover-failed/preview?windowHours=24&scope=QUOTA`：候选清单（`windowHours` 1–168；`scope=QUOTA` 仅额度类 / `ALL_402_403` 全部 402/403），每项带 `willRecover`/`skipReason`/`errorSummary`/`lastUserMessage`/`scheduledTask`/`hasProgressCard`。
-- `POST /admin/sessions/recover-failed/run`：`{ sessionIds: number[], scope }`，立即返回 `{ accepted, skipped }`（单批上限 20）。恢复复用崩溃恢复内核，原飞书/钉钉进度卡片原地复活并持续更新；无卡片映射的会话完成后推送最终回复。LOCAL 模式、子代理/边路、有待重试定时任务 run 的会话会被跳过。
+| 子命令 | 参数 | 必填 | 说明 |
+|--------|------|------|------|
+| `preview` | `--window-hours` | 否 | 活跃时间窗（1–168 小时，默认 24） |
+| `run` | `--session-ids` | 是 | 逗号分隔的会话 ID，自动去重；单批最多 20 个 |
+
+- `GET /admin/sessions/recover-failed/preview?windowHours=24`：返回候选清单与 `truncated`（候选超过 200 条时截断）；每项带 `willRecover`/`skipReason`/`errorSummary`/`lastUserMessage`/`scheduledTask`/`hasProgressCard`。
+- `POST /admin/sessions/recover-failed/run`：`{ sessionIds: number[] }`，立即返回 `{ accepted, skipped }`（单批上限 20）。旧客户端仍可传 `scope`，服务端忽略。
+
+```bash
+mao admin-session recover-failed preview --window-hours 24
+mao admin-session recover-failed run --session-ids 431,473
+```
 
 ## 成功失败判断
 

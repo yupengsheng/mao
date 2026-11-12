@@ -9,6 +9,7 @@
 - **定时任务结果推回钉钉会话**：在钉钉私聊或群创建的定时任务执行成功后，最终回复回到原会话；有卡片模板时发「处理完成」卡，无模板或投放失败时回落 markdown，失败和取消不推送。
 - **新增管理后台单用户用量接口**：`GET /v1/admin/users/:id/usage/summary` 与 `/trends`（权限 `analytics:read`），复用桌面端「我的用量」同一套聚合与补零逻辑，返回周期总账、按模型 / 场景 / Agent 分布及 day/hour 趋势；自定义区间上限 365 天，用户不存在返回 404。
 - **管理后台新增在线设备实时查询接口**：`GET /v1/statistics/online-devices`（权限 `analytics:read`）返回当前 WS 在线快照——连接数 / 去重在线用户数 / 去重设备数、按客户端类型分组计数与按用户连接列表。数据源为连接注册表内存快照（`listConnections()`，register 记录 `connectedAt`），零新增表零迁移；纯读不触发过期连接的惰性关闭。去重设备口径：electron / cli 按 `(userId, deviceId)` 去重（同机桌面多窗口与 mao-agent CLI 共用 device.json 算一台），安卓壳逐条计数，browser / embed 不计入设备数。响应类型下沉 `@mao/contracts`。
+- **失败会话恢复不限错误类型**：`GET /admin/sessions/recover-failed/preview` 与 `POST /admin/sessions/recover-failed/run` 现在列出并恢复时间窗内所有 `FAILED` 的 NORMAL 主会话，不再只挑最后一次 agent 调用为 402/403 的会话。预览最多返回 200 条并带 `truncated`；错误摘要优先取执行期记录的 `executionError`，缺失时回落最后一次失败的 agent 调用。单批仍限 20 个，请求中的旧 `scope` 字段保留兼容但忽略。
 
 ### 管理后台
 - **新增钉钉 OAuth 登录配置面板**：集成配置新增 Client ID / Client Secret / 回调地址三项，回调地址校验 `http(s)://` 前缀，Secret 保存后仅显示掩码。
@@ -18,11 +19,13 @@
 - **用量分析「用户」Tab 新增「用量详情」入口**：点击直达用户详情抽屉的「用量」Tab（`/users?detail=<id>&tab=usage`），保留原有用户筛选与分页。
 - **新增「在线设备」菜单页**：与「用量分析」同级（overview 组，权限 `analytics:read`）。统计卡展示在线连接 / 在线用户 / 去重设备与五类客户端分组计数；表格按用户列出每条在线连接（客户端类型、设备名 / 平台 / 设备 ID 一键复制、连接时长、认证到期、认证来源）。15s 自动轮询 + 手动刷新 +「更新于」时间戳，页面切走自动停轮询；轮询失败静默保留旧数据。客户端类型中文名走 `Record<WsClientType, string>` 穷尽汉化表。
 - **修复在线设备页设备 ID 无法复制**：设备 ID 改为单元格内省略展示、悬停查看完整值，点击 ID 或「复制」均可写入剪贴板；复制按钮不再被溢出提示裁出单元格，并补 `execCommand` 回退兼容非安全上下文。
+- **失败会话恢复支持全部失败类型**：会话管理页入口更名为「恢复失败会话」，移除错误类型下拉；弹窗新增关键词筛选、候选条数与截断提示，默认不勾选，筛选后仍保留已选但当前不可见的会话，提交前按单批 20 个校验。
 
 ### mao-cli
 - API Token 新增 `mao open token purge --id <id>` 永久删除命令；原有 `delete` 仍为吊销，二者语义区分。
 - 信号哨兵命令新增 `--probe-type`、`--script-path`、`--timeout-seconds`：支持创建与更新脚本探针，校验类型、路径和超时范围，并可在哨兵详情与检查记录中查看退出码。
 - 新增钉钉互动卡片模板 `template/dingtalk-card.json`：排队 / 进度 / 终态合一，含立即发送、取消排队、取消任务、重试、点踩和会话详情按钮，声明 PC 自适应宽度与 `requestOk` 成功判定。同步提供 `template/check-template.js` 自检脚本和变量契约说明，发布包包含 `template/`。
+- 新增 `mao admin-session recover-failed preview [--window-hours 24]` 与 `run --session-ids 431,473`：预览时间窗内全部失败主会话，按 ID 发起后台恢复；校验窗口 1–168 小时、ID 去重与正整数、单批 20 个，需 `session:write`。
 
 ### 前端（桌面 / Web / 安卓）
 - **API Token 卡片支持删除**：Token 操作区新增删除按钮（带二次确认），未吊销的 Token 删除后立即失效；吊销图标改为圆形关闭，与删除图标区分，历史调用记录仍在调用流水中可查。
