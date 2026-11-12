@@ -16,11 +16,21 @@
         >
           查看过程
         </button>
-        <el-tooltip v-if="approvalBadge" :content="approvalBadge.reason" placement="top">
-          <span class="approval-badge" :class="approvalBadge.kind">{{ approvalBadge.label }}</span>
+        <el-tooltip v-if="approvalBadge" :content="approvalBadge.tooltip" :trigger="['hover', 'click']" placement="top">
+          <span
+            class="approval-badge"
+            :class="approvalBadge.kind"
+            role="img"
+            :aria-label="approvalBadge.label"
+            @click.stop
+          >
+            <el-icon :size="14" aria-hidden="true"><component :is="approvalBadge.icon" /></el-icon>
+          </span>
         </el-tooltip>
-        <el-tooltip v-if="toolCall.resultTruncated" content="后端已截断工具输出（超出工具自身的输出上限），此处展示的是截断后的内容" placement="top">
-          <span class="truncated-badge">输出已截断</span>
+        <el-tooltip v-if="toolCall.resultTruncated" :content="TRUNCATED_TOOLTIP" :trigger="['hover', 'click']" placement="top">
+          <span class="truncated-badge" role="img" aria-label="输出已截断" @click.stop>
+            <el-icon :size="14" aria-hidden="true"><Scissor /></el-icon>
+          </span>
         </el-tooltip>
         <ToolCallElapsed v-if="toolCall.status === 'running'" :started-at-ms="toolCall.startedAtMs" />
         <span v-if="toolCall.status === 'running'" class="status-spinner"></span>
@@ -216,9 +226,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, inject } from 'vue'
+import { ref, computed, watch, inject, type Component } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Select, CloseBold, ArrowDown, CopyDocument } from '@element-plus/icons-vue'
+import { Select, CloseBold, ArrowDown, CopyDocument, Avatar, MagicStick, Document, CircleClose, Scissor } from '@element-plus/icons-vue'
 import type { ToolCall } from '../../composables/useChat'
 import { useSessionStore } from '../../stores/session'
 import { useCenterTabs } from '../../composables/useCenterTabs'
@@ -318,15 +328,27 @@ watch(
 
 const isDelegate = computed(() => ['delegate', 'delegate_followup', 'spawn_subagent', 'subagent_followup'].includes(props.toolCall.name))
 
-/** 审批放行徽标：替我审批的 LLM 拍板 / Jev 前置决策低风险放行 / 规则静默放行（V135） */
+/** 截断图标的悬停/点按说明。卡片头不再平铺「输出已截断」五字。 */
+const TRUNCATED_TOOLTIP = '输出已截断：超出工具自身的输出上限，此处展示的是截断后的内容'
+
+function approvalTooltip(label: string, reason: string | undefined): string {
+  const text = reason?.trim()
+  return text ? `${label}：${text}` : label
+}
+
+/** 审批放行图标：替我审批的 LLM 拍板 / Jev 前置决策低风险放行 / 规则静默放行（V135）。
+ *  三种放行同为绿色，靠图标区分；原文与理由在悬停/点按。 */
 const approvalBadge = computed(() => {
   const mark = props.toolCall.approvalMark
   if (!mark) return null
-  if (mark.mode === 'jev') return { kind: 'jev', label: '低风险放行', reason: mark.reason }
-  if (mark.mode === 'rule') return { kind: 'rule', label: '规则放行', reason: mark.reason }
-  return mark.approved
-    ? { kind: 'approved', label: 'AI 已批准', reason: mark.reason }
-    : { kind: 'denied', label: 'AI 已拒绝', reason: mark.reason }
+  const spec: { kind: string; label: string; icon: Component } = mark.mode === 'jev'
+    ? { kind: 'jev', label: '低风险放行', icon: MagicStick }
+    : mark.mode === 'rule'
+      ? { kind: 'rule', label: '规则放行', icon: Document }
+      : mark.approved
+        ? { kind: 'approved', label: 'AI 已批准', icon: Avatar }
+        : { kind: 'denied', label: 'AI 已拒绝', icon: CircleClose }
+  return { ...spec, tooltip: approvalTooltip(spec.label, mark.reason) }
 })
 
 const childSessionId = computed(() => {
@@ -707,10 +729,10 @@ function copyResultCsv() {
   void copyText(toCsv(tableView.value))
 }
 
-/** 图片视图底栏摘要：N 张图 · model · size（缺项跳过）。 */
+/** 图片视图底栏摘要：N 张图 · model · size（缺项跳过）。视图为 null 返回 null，让 ?? 链能跳过。 */
 const imageGenSummary = computed(() => {
   const view = imageGenView.value
-  if (!view) return ''
+  if (!view) return null
   const parts = [`${view.items.length + view.hiddenCount} 张图`]
   if (view.model) parts.push(view.model)
   if (view.size) parts.push(view.size)
@@ -719,18 +741,19 @@ const imageGenSummary = computed(() => {
 
 const askUserSummary = computed(() => {
   const view = askUserView.value
-  return view ? `${view.length} 组问答` : ''
+  return view ? `${view.length} 组问答` : null
 })
 
 /** 子代理进度底栏摘要：check 给 N 个任务，wait 给 完成 N 个 · 全部完成/已超时。 */
 const subagentSummary = computed(() => {
   const view = subagentProgressView.value
-  if (!view) return ''
+  if (!view) return null
   if (props.toolCall.name === 'check_subagent') return `${view.length} 个任务`
   const node = parseResultNode(props.toolCall.result)
-  if (!node) return ''
-  const completed = typeof node.completed === 'number' && Number.isFinite(node.completed) ? node.completed : view.length
-  const outcome = node.timed_out === true ? '已超时' : node.all_completed === true ? '全部完成' : ''
+  const completed = node && typeof node.completed === 'number' && Number.isFinite(node.completed)
+    ? node.completed
+    : view.length
+  const outcome = node?.timed_out === true ? '已超时' : node?.all_completed === true ? '全部完成' : ''
   return outcome ? `完成 ${completed} 个 · ${outcome}` : `完成 ${completed} 个`
 })
 
@@ -906,13 +929,16 @@ function toggleExpand() {
 .status-icon.success { color: var(--aw-success); }
 .status-icon.error { color: var(--aw-danger); }
 
-.approval-badge {
-  font-size: 11px;
-  line-height: 1;
-  padding: 3px 6px;
+.approval-badge,
+.truncated-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
   border-radius: var(--aw-radius-xs);
   cursor: default;
-  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .approval-badge.approved,
@@ -928,12 +954,6 @@ function toggleExpand() {
 }
 
 .truncated-badge {
-  font-size: 11px;
-  line-height: 1;
-  padding: 3px 6px;
-  border-radius: var(--aw-radius-xs);
-  cursor: default;
-  white-space: nowrap;
   color: var(--aw-warning, #b45309);
   background: color-mix(in srgb, var(--aw-warning, #b45309) 12%, transparent);
 }
