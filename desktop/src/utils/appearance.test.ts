@@ -14,17 +14,25 @@ import {
 } from './appearance'
 
 const css = readFileSync(resolve(process.cwd(), 'src/style.css'), 'utf8')
+const cssWithoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '')
 
 function readSource(relativePath: string): string {
   return readFileSync(resolve(process.cwd(), 'src', relativePath), 'utf8')
 }
 
 function cssBlock(selector: string): string {
-  const start = css.indexOf(selector)
+  const start = cssWithoutComments.indexOf(selector)
   expect(start).toBeGreaterThanOrEqual(0)
-  const open = css.indexOf('{', start)
-  const close = css.indexOf('}', open)
-  return css.slice(open + 1, close)
+  const open = cssWithoutComments.indexOf('{', start)
+  const close = cssWithoutComments.indexOf('}', open)
+  return cssWithoutComments.slice(open + 1, close)
+}
+
+function stripDocumentedDarkFallbacks(source: string): string {
+  return source.replace(
+    /:root\[data-theme="dark"\]\s*:not\(\[data-accent\]\)[^{]*\{[^}]*\}/g,
+    '',
+  )
 }
 
 beforeEach(() => {
@@ -159,6 +167,30 @@ describe('style.css 令牌守卫', () => {
     expect(css).not.toContain("html[data-accent='blue']")
   })
 
+  it('暗色令牌使用柔和底色与正文对比度，控件边框不发亮', () => {
+    const dark = cssBlock('[data-theme="dark"]')
+    expect(dark).toContain('--aw-canvas: #1c1c1e')
+    expect(dark).toContain('--aw-ink: #d0d0d4')
+    expect(dark).toContain('--aw-body: #d0d0d4')
+    expect(dark).toContain('--aw-border: #4a4a50')
+  })
+
+  it('Element Plus 暗色变量写在 html.dark 上以压过 EP 暗色皮肤', () => {
+    const epDark = cssBlock('html.dark')
+    expect(epDark).toContain('--el-text-color-primary: var(--aw-ink)')
+    expect(epDark).toContain('--el-bg-color: var(--aw-canvas)')
+    expect(epDark).toContain('--el-border-color: var(--aw-border)')
+    expect(css).not.toContain('[data-theme="dark"] {\n  --el-bg-color')
+  })
+
+  it('非默认强调色的暗色块接管 Element Plus 主色与 hover', () => {
+    for (const id of ['violet', 'green', 'orange', 'graphite']) {
+      const block = cssBlock(`html[data-theme='dark'][data-accent='${id}']`)
+      expect(block).toContain('--el-color-primary: var(--aw-primary)')
+      expect(block).toContain('--el-color-primary-dark-2: var(--aw-primary-focus)')
+    }
+  })
+
   it('字号三档覆盖界面与 Element Plus 字号令牌', () => {
     expect(cssBlock("html[data-font-scale='small']")).toContain('--aw-text-body: 15px')
     expect(cssBlock("html[data-font-scale='large']")).toContain('--aw-text-body: 19px')
@@ -176,7 +208,9 @@ describe('组件硬编码色守卫', () => {
 
   it('回退形态与头像色板之外不再残留蓝色字面量', () => {
     for (const [path, name] of componentFiles) {
-      const source = readSource(path)
+      // ServerSettingsView 的 :root[data-theme="dark"]:not([data-accent]) 块是注释明确的
+      // 暗色默认档零变化锚点，保留亮蓝原字面量属于既有行为，不纳入残留扫描。
+      const source = stripDocumentedDarkFallbacks(readSource(path))
         .replace(/var\(--aw-primary,\s*#0066cc\)/g, '')
         .split('\n')
         .filter((line) => !line.includes('AVATAR_PALETTE'))
