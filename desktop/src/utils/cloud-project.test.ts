@@ -121,6 +121,12 @@ describe('groupIconKind', () => {
     expect(groupIconKind('LOCAL:/Users/me/code')).toBe('folder')
     expect(groupIconKind('UNKNOWN_KEY')).toBe('folder')
   })
+
+  it('maps Dingtalk group keys to the dingtalk icon kind', () => {
+    expect(groupIconKind('DINGTALK_PRIVATE:7')).toBe('dingtalk')
+    expect(groupIconKind('DINGTALK_GROUP:/opt/mao-data/workspace/dingtalk-chat/1/p2p-2')).toBe('dingtalk')
+    expect(groupIconKind('DINGTALK_GROUP:/opt/mao-data/workspace/dingtalk-chat/1/cid_abc')).toBe('dingtalk')
+  })
 })
 
 describe('isGroupRenameable', () => {
