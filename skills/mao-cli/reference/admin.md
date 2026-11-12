@@ -231,7 +231,7 @@ CLI：`mao http-tool list|enabled|stats|create|update|delete|set-enabled|test`�
 - **文件与存储**：上传（存储方式 local/OSS、访问前缀、单文件大小上限）、阿里云 OSS 对象存储与 STS 临时凭证
 - **Agent 引擎**：Agent 运行（0.0.88 迁入，线程池与 WS 超时重启生效）、LLM 超时与重试、上下文压缩（Harness 调参 0.0.89 迁入，保存后重启后端生效）
 - **模型任务**（各功能的默认模型，留空则跟随会话/系统默认）：会话（`session.titleModelId` 标题生成）、代码（`git.commitMessageModelId` Git 提交信息）、记忆（`memory.extractionModelId` 记忆自动抽取）
-- **工具与终端**：网络工具（Tavily / TinyFish 搜索实现切换与各自 API Key，0.0.83 新增双实现）、网页抓取、Shell 会话、云端终端、审批（审批模型与 Jev 前置决策；「测试连接」用当前表单探测 Jev 端点与 API Key，可未保存）、自定义 HTTP 工具（`tools.http.privateAllowlist` 内网放行 CIDR 清单，见 [http-tool.md](http-tool.md)）
+- **工具与终端**：网络工具（Tavily / TinyFish 搜索实现切换与各自 API Key，0.0.83 新增双实现）、网页抓取、Shell 会话、云端终端、审批（审批模型与 Jev 前置决策；「测试连接」用当前表单探测 Jev 端点与 API Key，可未保存）、自定义 HTTP 工具（`tools.http.privateAllowlist` 内网放行 CIDR 清单，见 [http-tool.md](http-tool.md)）、Shell 环境变量（系统级变量与总开关 `shell.envVars.enabled`，变量 CRUD 见 [env.md](env.md)）
 - **通知与消息**：任务通知（0.0.88 迁入，即时生效）、微信（`weixin.agentId` / `weixin.modelId` 微信通道 Agent 与模型）
 - **平台与运维**：菜单可见性（`admin.menu.hidden`，部署级隐藏不用的功能菜单；隐藏不影响访问权限，「系统设置」不可隐藏，详见下文）、分享（匿名分享链接开关）、审计（日志保留天数，后台每小时据此自动清理）、用量（LLM 调用流水保留天数、会话活动保留天数，均默认 180 天、最低 90 天，后台每小时据此自动清理）、运行环境（工作区与 Skill 目录只读展示；容器模式额外展示运行时镜像、依赖指纹、最近预检与在线容器连接健康状态，不主动触发预检）、容器管理（Docker 模式下列出在册容器和未在册残留容器，展示用户名称与 Agent 名称，支持按关键词、运行状态、在册状态和忙碌状态筛选及客户端分页；可单个重建 / 删除或按筛选结果批量处理，权限 `container:manage`）
 

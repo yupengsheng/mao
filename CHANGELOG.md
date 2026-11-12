@@ -1,3 +1,8 @@
+## 1.0.9 (2026-11-12)
+
+### 终端 CLI（mao-cli）
+- **新增三级 Shell 环境变量管理**：`mao env` 支持用户层（`env user`）、工作区层（`env workspace`）与系统全局层（`env system`）的清单、新建、修改、删除，并可用 `env effective --session-id` 查看某会话实际生效的键与来源。值加密存储且列表不回显明文；修改时不传 `--value` 保留原值，`--value-file` 可避免密钥写进 shell 历史。管理员可用 `env user-of` / `env workspace-of` 只读查看指定用户的变量（密文长度掩码）。注入总开关为系统设置 `shell.envVars.enabled`。
+
 ## 1.0.8 (2026-11-12)
 
 ### 后端
