@@ -366,6 +366,8 @@ export async function handleSlash(
         io.hint(`已切换到会话 #${switched.id}${switched.title ? ` · ${switched.title}` : ''}`);
         if (opts.runner.snapshotIsActive) {
           await resumeActiveRun(opts, io, '该会话仍在执行，续接当前输出。可用 /cancel 中止。');
+          // 续接等待期间入队的输入同样要在本轮结束后自动发出。
+          if (drainQueue) await drainQueue();
         }
       } catch (err) {
         io.print(err instanceof Error ? err.message : String(err), 'err');
