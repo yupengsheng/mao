@@ -128,6 +128,13 @@ jobs:
         working-directory: sdk/embed
         run: npm run size
 
+      - name: Test artifact verifier
+        working-directory: desktop
+        run: npm run test:embed-sdk
+
+      - name: Verify committed SDK artifacts match rebuilt bundle
+        run: node desktop/scripts/verify-embed-sdk.cjs --strict
+
   agent-cli:
     name: Agent CLI Test (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
