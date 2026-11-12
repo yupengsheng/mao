@@ -10,7 +10,8 @@ interface DemoConfig {
   agentId: number;
   username: string;
   password: string;
-  /** 页面操作总开关：false 时 Agent 无 page_* 工具、浮窗无授权/确认/日志 UI；缺省 true */
+  /** 页面写/操作开关：未显式开启时 Agent 仍可读页面（inspect/observe/screenshot/wait），
+   *  但不能点击/填写；浮窗无授权/确认/日志 UI。 */
   pageEnabled?: boolean;
 }
 
@@ -82,8 +83,8 @@ function boot(): void {
     context: pageContext,
     theme: { primary: '#4f6ef7' },
     position: 'right',
-    // 页面操作总开关演示：勾选框切换后写回配置并刷新，验证两态行为。
-    page: { enabled: config.pageEnabled !== false },
+    // 页面写/操作开关演示：读能力始终可用，勾选后才允许写操作。
+    page: { enabled: config.pageEnabled === true },
     onEvent: (e: unknown) => console.info('[mao-embed event]', e),
   });
 }
@@ -92,7 +93,7 @@ function boot(): void {
 function bindPageToggle(): void {
   const toggle = document.getElementById('page-enabled') as HTMLInputElement | null;
   if (!toggle) return;
-  toggle.checked = config.pageEnabled !== false;
+  toggle.checked = config.pageEnabled === true;
   toggle.addEventListener('change', () => {
     saveConfig({ ...config, pageEnabled: toggle.checked });
     window.location.reload();

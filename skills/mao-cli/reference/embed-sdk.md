@@ -22,7 +22,7 @@
 </script>
 ```
 
-实例方法：`open()` / `close()` / `toggle()` / `newSession()` / `setContext(ctx)` / `destroy()`；页面操作相关：`inspectPage()` / `executePageAction(action, snapshotId?)` / `getPageAuthorization()` / `setPageAuthorization(level)` / `capturePageScreenshot({ maskSensitive?, reason? })`。重复 `init()` 会先销毁旧实例（单实例约束）。
+实例方法：`open()` / `close()` / `toggle()` / `newSession()` / `setContext(ctx)` / `destroy()`；页面读取相关：`inspectPage()` / `capturePageScreenshot({ maskSensitive?, reason? })`（始终可用）；页面写操作相关：`executePageAction(action, snapshotId?)` / `getPageAuthorization()` / `setPageAuthorization(level)`（仅在 `page.enabled: true` 时可用）。重复 `init()` 会先销毁旧实例（单实例约束）。
 
 ## 管理后台浮窗助手（内置宿主）
 
@@ -49,16 +49,17 @@ const chat = MaoChat.init({
   agentId: 1,
   getToken: () => fetch('/your-backend/embed-token').then(r => r.json()).then(d => d.accessToken),
   page: {
-    enabled: true,                  // 可选：缺省 true；false 时整条页面操作链路关闭（见下）
+    enabled: true,                  // 可选：缺省 false；只控制写操作，读能力始终可用（见下）
     initialLevel: 'per_action',     // 可选：默认每次确认；宿主不得借此静默授予高权限
     screenshotRenderer: myRenderer, // 可选：自定义截图渲染器，缺省用内置视口渲染器
   },
 });
 ```
 
-- **页面操作总开关**：`page.enabled` 缺省 `true`（不传 `page` 或只传其他字段均视为开启，存量接入零改动）。传 `false` 时端到端关闭：Agent 拿不到任何 `page_*` 工具（后端按连接级声明过滤，模型侧表现为「没有页面操作能力」）；SDK 不创建页面引擎（不 patch `history`、不挂窗口监听、不扫描 DOM）；浮窗不展示授权下拉、确认卡片、动作日志与目标高亮；实例方法 `inspectPage()` / `capturePageScreenshot()` 抛错，`executePageAction()` 返回 `page_operation_disabled`，`getPageAuthorization()` 固定 `per_action`，`setPageAuthorization()` 为空操作。与 `initialLevel` 并传时后者被忽略（禁用态无授权语义）。声明随 WS 连接发送，重连自动重发；后端版本低于 0.0.319 时该字段被忽略（按开启处理）。
+- **页面写操作开关**：`page.enabled` 缺省 `false`，只控制点击、填写、选择、勾选、滚动、键盘与批量动作等写能力，读能力不受影响。开启时 Agent 获得全部 `page_*` 工具并保留授权、确认、动作日志与目标高亮；关闭时后端按连接级声明过滤写类工具，模型侧只看到 `page_inspect` / `page_observe` / `page_screenshot` / `page_wait`，提示词切换为只读约束；`executePageAction()` 返回 `page_operation_disabled` 且不产生页面副作用，`getPageAuthorization()` 固定 `per_action`，`setPageAuthorization()` 为空操作，浮窗不展示授权下拉、确认卡片与动作日志。关闭写能力时 `inspectPage()` / `capturePageScreenshot()` 仍可调用，截图强制遮罩敏感区域且不走确认流。存量宿主如需 Agent 操作页面，须显式传 `page: { enabled: true }`；管理后台内置浮窗已默认开启。声明随 WS 连接发送，重连自动重发。
 
-- **能力**：`page_inspect`（可见交互元素快照，含已打开的下拉建议）、`page_screenshot`（当前视口截图）、`page_observe`、`page_scroll`、`page_focus`、`page_fill`、`page_select`、`page_check` / `page_uncheck`、`page_click`、`page_keyboard`、`page_wait`、`page_actions`（有序批量）。
+- **读取能力**（`page.enabled` 关闭时仍可用）：`page_inspect`（可见交互元素快照，含已打开的下拉建议）、`page_observe`、`page_screenshot`（当前视口截图）、`page_wait`。
+- **写操作能力**（仅 `page.enabled: true`）：`page_scroll`、`page_focus`、`page_fill`、`page_select`、`page_check` / `page_uncheck`、`page_click`、`page_keyboard`、`page_actions`（有序批量）。`page_scroll` 属于写操作但不逐动作确认。
 - **元素引用**：只使用快照作用域内的 opaque `elementId`；不向 Agent 暴露 selector、XPath、outerHTML 或任意脚本。页面导航、SPA 路由或 DOM 重建后旧引用立即失效，Agent 必须重新 `page_inspect`。
 - **自定义下拉**：Vue Element / Ant Design 等远程搜索框不是原生 `<select>`。`page_fill` 对 combobox 默认保持焦点并短暂等待建议（可用 `blur: true` 强制失焦）；出现选项后重新 `page_inspect`，再 `page_click` 对应 option。`page_select` 只操作原生 `select`。点中 option 后以 `observation.selected === true`（或重新 inspect 出现选中标签）为准；`multiple`/`allow-create` 下 fill 成功只代表过滤文本已写入，不代表 v-model 已绑定。
 - **授权**：默认 `per_action`（每个写操作前在浮窗确认）；用户可在输入框底部工具栏的授权下拉中切换 `task`（本次任务内有效，任务结束/切换会话/刷新后失效）或 `full`（按 Mao 用户身份、站点 Origin、Agent 持久化到 localStorage，可随时撤销）。授权键按 `serverUrl`、Origin、身份、agentId 和授权版本隔离，不保存 Token。宿主 `page.initialLevel` 与实例方法 `setPageAuthorization()` 只接受 `per_action`/`task`，传 `full` 会被降级；**完全授权只能由用户在浮窗内显式点击授予**，避免宿主一行代码替用户提权。
