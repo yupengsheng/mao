@@ -79,6 +79,8 @@ export function createMessageRuntimeModule(ctx: {
   const sessionThinking = ref<Map<string, boolean>>(new Map())
   const sessionStreaming = ref<Map<string, boolean>>(new Map())
   const streamingAssistantMessageIds = new Map<string, string>()
+  /** 当前流式气泡按 Agent round 收集的文本，用于折叠模型重复播报的进度句。 */
+  const streamingRoundTexts = new Map<string, { lastToolRoundText: string | null; currentText: string; currentHasTool: boolean }>()
   const sessionLlmRetry = ref<Map<string, LlmRetryInfo>>(new Map())
   const sessionPendingApprovals = ref<Map<string, number>>(new Map())
   const sessionQueueMessages = ref<Map<string, QueueMessage[]>>(new Map())
@@ -451,12 +453,67 @@ export function createMessageRuntimeModule(ctx: {
     }, 150))
   }
 
+  /**
+   * Agent 每个工具轮开始时调用。连续工具轮若重复输出同一整段进度播报，
+   * 只折叠上一轮的重复文本；不同轮次、不同内容和最终纯文本回复均不受影响。
+   */
+  function startAssistantRound(sessionId: string) {
+    const sid = String(sessionId)
+    const state = streamingRoundTexts.get(sid) ?? {
+      lastToolRoundText: null,
+      currentText: '',
+      currentHasTool: false,
+    }
+    const currentText = state.currentText.trim()
+    if (state.currentHasTool && currentText !== '' && state.lastToolRoundText === currentText) {
+      removeLatestRoundText(sid, state.currentText)
+    }
+    state.lastToolRoundText = state.currentHasTool && currentText !== '' ? currentText : null
+    state.currentText = ''
+    state.currentHasTool = false
+    streamingRoundTexts.set(sid, state)
+  }
+
+  /** 从流式气泡末尾移除当前轮的文本段，保留前面已完成的工具段与文本。 */
+  function removeLatestRoundText(sessionId: string, text: string) {
+    if (!text) return
+    const sid = String(sessionId)
+    const list = sessionMessages.value.get(sid) ?? []
+    const message = list.find(m => String(m.id) === streamingAssistantMessageIds.get(sid))
+    if (!message) return
+    let remaining = text.length
+    let removedText = false
+    const segments = message.segments ?? []
+    for (let i = segments.length - 1; i >= 0 && remaining > 0; i--) {
+      const segment = segments[i]
+      if (segment.type === 'tool') {
+        // 工具段通常紧跟在本轮播报后，先跳过它再回收播报文本。
+        if (removedText) break
+        continue
+      }
+      if (segment.type !== 'text') continue
+      removedText = true
+      if (segment.content.length <= remaining) {
+        remaining -= segment.content.length
+        segments.splice(i, 1)
+      } else {
+        segment.content = segment.content.slice(0, segment.content.length - remaining)
+        remaining = 0
+      }
+    }
+    if (remaining !== 0) return
+    message.content = message.content.slice(0, Math.max(0, message.content.length - text.length))
+    sessionMessages.value.set(sid, [...list])
+  }
+
   function appendDelta(sessionId: string, delta: string) {
     const sid = String(sessionId)
     if (isHistoryAnchored(sid)) return
     sessionStreaming.value.set(sid, true)
     const lastMsg = ensureStreamingAssistantMessage(sid)
     appendTextDelta(lastMsg, delta)
+    const state = streamingRoundTexts.get(sid)
+    if (state) state.currentText += delta
     notifyMessagesUpdate(sid)
   }
 
@@ -485,6 +542,8 @@ export function createMessageRuntimeModule(ctx: {
 
   function appendToolCallStart(sessionId: string, data: { tool_call_id: string; tool_name: string; arguments?: string; elapsed_ms?: number }) {
     if (isHistoryAnchored(sessionId)) return
+    const roundState = streamingRoundTexts.get(String(sessionId))
+    if (roundState) roundState.currentHasTool = true
     if (TASK_TOOL_NAMES.has(data.tool_name)) {
       filteredToolCallIds.add(data.tool_call_id)
       // 跳过 task 工具，但在末尾 text 段追加换行，保证后续文本不与前文粘连
@@ -614,6 +673,7 @@ export function createMessageRuntimeModule(ctx: {
       sessionMessages.value.set(sid, [...list])
     }
     streamingAssistantMessageIds.delete(sid)
+    streamingRoundTexts.delete(sid)
   }
 
   function finishInterruptedStreamingMessage(sessionId: string, reason = '已被新的纠偏中断') {
@@ -639,6 +699,7 @@ export function createMessageRuntimeModule(ctx: {
       sessionMessages.value.set(sid, [...list])
     }
     streamingAssistantMessageIds.delete(sid)
+    streamingRoundTexts.delete(sid)
     sessionStreaming.value.set(sid, false)
     sessionThinking.value.set(sid, false)
   }
@@ -646,6 +707,7 @@ export function createMessageRuntimeModule(ctx: {
   function markMessageComplete(sessionId: string, _data: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }) {
     const sid = String(sessionId)
     streamingAssistantMessageIds.delete(sid)
+    streamingRoundTexts.delete(sid)
     sessionStreaming.value.set(sid, false)
     sessionThinking.value.set(sid, false)
     // Message end — the full assistant message is now persisted server-side
@@ -655,6 +717,7 @@ export function createMessageRuntimeModule(ctx: {
   function clearMessages(sessionId: string) {
     const sid = String(sessionId)
     streamingAssistantMessageIds.delete(sid)
+    streamingRoundTexts.delete(sid)
     sessionMessages.value.delete(sid)
   }
 
@@ -1103,6 +1166,7 @@ export function createMessageRuntimeModule(ctx: {
     getMessages,
     removeTrailingEmptyAssistant,
     removeLastUserMessage,
+    startAssistantRound,
     appendDelta,
     appendThinkingDelta,
     resetStreamingAssistantMessage,

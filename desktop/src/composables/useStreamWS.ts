@@ -795,6 +795,7 @@ export function useStreamWS() {
       case 'round_start':
         // 只驱动轨迹 tab 的「本次执行第几轮」临时行；持久序号以 REST 的 seq 为准
         if (sessionId && typeof data?.executionId === 'string') {
+          sessionStore.startAssistantRound(sessionId)
           sessionStore.applyLiveRoundStart(sessionId, data.executionId, Number(data.round))
         }
         break

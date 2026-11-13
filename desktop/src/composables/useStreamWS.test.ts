@@ -105,6 +105,35 @@ afterEach(() => {
   vi.useRealTimers()
 })
 
+describe('useStreamWS round progress text', () => {
+  it('连续工具轮重复播报同一句进度时只保留一段', async () => {
+    const { connect, subscribe } = useStreamWS()
+    const pending = connect()
+    sockets[0].open()
+    await pending
+    await subscribe('9')
+
+    const emit = (payload: Record<string, unknown>) => {
+      sockets[0].message(payload)
+    }
+    const text = '推送成功了。验证远端分支并恢复配置。'
+    emit({ type: 'round_start', sessionId: 9, data: { executionId: 'exec-1', round: 1 } })
+    emit({ type: 'content_delta', sessionId: 9, data: { executionId: 'exec-1', delta: text } })
+    emit({ type: 'tool_call_start', sessionId: 9, data: { executionId: 'exec-1', tool_call_id: 'call-1', tool_name: 'shell', arguments: '{}' } })
+    emit({ type: 'round_end', sessionId: 9, data: { executionId: 'exec-1', round: 1 } })
+    emit({ type: 'round_start', sessionId: 9, data: { executionId: 'exec-1', round: 2 } })
+    emit({ type: 'content_delta', sessionId: 9, data: { executionId: 'exec-1', delta: text } })
+    emit({ type: 'tool_call_start', sessionId: 9, data: { executionId: 'exec-1', tool_call_id: 'call-2', tool_name: 'shell', arguments: '{}' } })
+    emit({ type: 'round_end', sessionId: 9, data: { executionId: 'exec-1', round: 2 } })
+    // 第三轮开始时才知道第二轮与第一轮完全相同，此时回收第二段文本。
+    emit({ type: 'round_start', sessionId: 9, data: { executionId: 'exec-1', round: 3 } })
+
+    const assistant = useSessionStore().getMessages('9')?.find(message => message.role === 'assistant')
+    expect(assistant?.content).toBe(text)
+    expect(assistant?.segments?.filter(segment => segment.type === 'text')).toHaveLength(1)
+  })
+})
+
 describe('useStreamWS reconnect', () => {
   it('重连握手失败会结束在途 connect Promise，后续连通可重新发送', async () => {
     const { connect } = useStreamWS()
