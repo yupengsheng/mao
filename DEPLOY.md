@@ -30,6 +30,8 @@
 
 **维护者注意**：服务器上真实部署目录为 `/opt/mao`（与云端 Agent 会话工作区路径不同）。`git pull`、构建、`restart.sh` 应在 `/opt/mao` 执行。开机自启安装 `scripts/systemd/mao-backend.service`（见部署文档「开机自启」）。
 
+**自动部署**：`main` 分支推送且全部校验通过后，CI 会自动登录服务器完成一次完整部署，无需人工执行 `git pull` 与部署脚本。配置见 [skills/mao-cli/reference/deploy.md 的「自动部署（GitHub Actions）」](skills/mao-cli/reference/deploy.md#六五-自动部署github-actions)。
+
 本地开发安装见 [skills/mao-cli/reference/install.md](skills/mao-cli/reference/install.md)。
 
 Agent 执行部署任务时应阅读 `skills/mao-cli` 内上述文档，而非依赖本短入口。

@@ -25,7 +25,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, nextTick, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, nextTick } from 'vue'
 import { ChatDotRound, ArrowDown } from '@element-plus/icons-vue'
 
 const props = defineProps<{
@@ -37,45 +37,26 @@ const isExpanded = ref(false)
 const bodyRef = ref<HTMLElement>()
 const previewRef = ref<HTMLElement>()
 
-// 思考中未展开时，头部空白区滚动展示最新思考片段：
-// 文本始终取末尾片段，scrollLeft 缓动跟随尾部，形成连续滑动效果。
+// 思考中未展开时，头部空白区展示最新思考片段：
+// 文本始终取末尾片段，内容更新后定位到尾部，不做持续动画。
 const PREVIEW_MAX_CHARS = 2000
 const previewText = computed(() => {
   const t = props.thinking || ''
   return t.length > PREVIEW_MAX_CHARS ? t.slice(-PREVIEW_MAX_CHARS) : t
 })
 
-let previewRaf = 0
-
-function stopPreviewEase() {
-  if (previewRaf) {
-    cancelAnimationFrame(previewRaf)
-    previewRaf = 0
-  }
-}
-
-function startPreviewEase() {
-  if (previewRaf) return
-  const step = () => {
+// 流式思考内容更新后只定位一次到末尾，不启动永久 requestAnimationFrame 循环。
+// 永久动画会在思考内容不再变化时仍持续改写 scrollLeft，造成页面不断滚动。
+watch(
+  [() => props.thinking, () => props.streaming, isExpanded],
+  async ([thinking, streaming, expanded]) => {
+    if (!thinking || !streaming || expanded) return
+    await nextTick()
     const el = previewRef.value
-    if (el) {
-      const target = el.scrollWidth - el.clientWidth
-      if (target > 0) {
-        const diff = target - el.scrollLeft
-        el.scrollLeft = Math.abs(diff) < 1 ? target : el.scrollLeft + diff * 0.1
-      }
-    }
-    previewRaf = requestAnimationFrame(step)
-  }
-  previewRaf = requestAnimationFrame(step)
-}
-
-watch([() => props.streaming, isExpanded], ([streaming, expanded]) => {
-  if (streaming && !expanded) startPreviewEase()
-  else stopPreviewEase()
-}, { immediate: true })
-
-onBeforeUnmount(stopPreviewEase)
+    if (el) el.scrollLeft = el.scrollWidth
+  },
+  { immediate: true },
+)
 
 function toggleExpand() {
   isExpanded.value = !isExpanded.value

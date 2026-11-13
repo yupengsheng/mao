@@ -40,6 +40,9 @@ android/android/gradle/wrapper/gradle-wrapper.jar
 # Runtime PID files
 *.pid
 
+# 自动部署标记：scripts/remote-deploy.sh 记录上次部署到的提交，用于判断依赖是否变化
+.last-deployed-sha
+
 .bash_profile
 .mao
 .zcode
