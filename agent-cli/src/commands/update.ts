@@ -6,8 +6,8 @@ import { CliError } from '../util/exit-codes';
 import { getCliVersion } from '../util/version';
 
 export const INSTALL_SCRIPT_URL =
-  'https://raw.githubusercontent.com/DC-ET/mao/main/scripts/install-mao-agent.sh';
-export const DEFAULT_UPDATE_REPO = 'https://github.com/DC-ET/mao.git';
+  'https://raw.githubusercontent.com/yupengsheng/mao/main/scripts/install-mao-agent.sh';
+export const DEFAULT_UPDATE_REPO = 'https://github.com/yupengsheng/mao.git';
 export const DEFAULT_UPDATE_REF = 'main';
 export const DEFAULT_SRC_DIR = join(homedir(), '.mao', 'agent-cli', 'src');
 

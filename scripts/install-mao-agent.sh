@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # 一键安装 mao-agent（Node.js ≥ 20、git、npm）。
-#   curl -fsSL https://raw.githubusercontent.com/DC-ET/mao/main/scripts/install-mao-agent.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/yupengsheng/mao/main/scripts/install-mao-agent.sh | bash
 # 指定版本 / 源码：
 #   curl -fsSL ... | MAO_AGENT_REF=v0.0.38 bash
 #   MAO_AGENT_SRC=/path/to/mao bash scripts/install-mao-agent.sh
 set -euo pipefail
 
-REPO="${MAO_AGENT_REPO:-https://github.com/DC-ET/mao.git}"
+REPO="${MAO_AGENT_REPO:-https://github.com/yupengsheng/mao.git}"
 REF="${MAO_AGENT_REF:-main}"
 WORKDIR="${MAO_AGENT_WORKDIR:-${HOME}/.mao/agent-cli/src}"
 SRC="${MAO_AGENT_SRC:-}"

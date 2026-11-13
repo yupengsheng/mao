@@ -128,7 +128,7 @@ async function runLiveRound() {
 
   send('tool_call_start', { tool_call_id: 'lt-2', tool_name: 'shell', arguments: '{"command":"git push origin main"}' });
   await sleep(900);
-  send('tool_call_result', { tool_call_id: 'lt-2', status: 'success', result: JSON.stringify({ output: 'To gitee.com:DC-ET/mao.git\n   d8f2f818..c6589591  main -> main', exit_code: 0 }), summary: 'git push · 已推送 origin/main' });
+  send('tool_call_result', { tool_call_id: 'lt-2', status: 'success', result: JSON.stringify({ output: 'To gitee.com:yupengsheng/mao.git\n   d8f2f818..c6589591  main -> main', exit_code: 0 }), summary: 'git push · 已推送 origin/main' });
   await sleep(500);
 
   send('thinking_start', {});

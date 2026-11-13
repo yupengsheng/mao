@@ -1,4 +1,4 @@
-[![CI](https://github.com/DC-ET/mao/actions/workflows/ci.yml/badge.svg)](https://github.com/DC-ET/mao/actions/workflows/ci.yml)
+[![CI](https://github.com/yupengsheng/mao/actions/workflows/ci.yml/badge.svg)](https://github.com/yupengsheng/mao/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 <p align="center">
@@ -115,7 +115,7 @@ Mao 不是又一个 ChatGPT 套壳，也不是 Dify / n8n 那样的低代码工�
 需要 Node.js 22+、MySQL 8.x，以及编译 `node-pty` 的 C/C++ 工具链。逐步说明见 [install.md](skills/mao-cli/reference/install.md)。
 
 ```bash
-git clone https://github.com/DC-ET/mao.git
+git clone https://github.com/yupengsheng/mao.git
 cd mao
 mysql -e "CREATE DATABASE mao CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 
@@ -214,7 +214,7 @@ cd sdk/embed && npm test && npm run build
 
 欢迎 Issue 与 PR。开始前请读 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-- Bug / 功能 — [GitHub Issues](https://github.com/DC-ET/mao/issues)
+- Bug / 功能 — [GitHub Issues](https://github.com/yupengsheng/mao/issues)
 - 安全漏洞 — [SECURITY.md](SECURITY.md)，请勿公开披露
 
 暂不接受：官方托管 / SaaS 化、界面国际化、官方签名 Electron 包分发。

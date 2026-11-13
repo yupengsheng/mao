@@ -70,7 +70,7 @@ git --version
 ### 1. 克隆
 
 ```bash
-git clone https://github.com/DC-ET/mao.git /opt/mao
+git clone https://github.com/yupengsheng/mao.git /opt/mao
 cd /opt/mao && git checkout main
 ```
 

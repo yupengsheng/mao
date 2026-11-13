@@ -9,7 +9,7 @@
 需 Node.js ≥ 20：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DC-ET/mao/main/scripts/install-mao-agent.sh | bash
+curl -fsSL https://raw.githubusercontent.com/yupengsheng/mao/main/scripts/install-mao-agent.sh | bash
 ```
 
 升级（等价于重跑安装脚本；`--check` 仅检查远端是否有新版本）：

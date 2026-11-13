@@ -24,12 +24,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/DC-ET/mao.git",
+    "url": "git+https://github.com/yupengsheng/mao.git",
     "directory": "agent-cli"
   },
-  "homepage": "https://github.com/DC-ET/mao/tree/main/agent-cli",
+  "homepage": "https://github.com/yupengsheng/mao/tree/main/agent-cli",
   "bugs": {
-    "url": "https://github.com/DC-ET/mao/issues"
+    "url": "https://github.com/yupengsheng/mao/issues"
   },
   "keywords": [
     "mao",

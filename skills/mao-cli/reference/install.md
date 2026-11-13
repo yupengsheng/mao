@@ -12,7 +12,7 @@
 ## 仅对话、不部署整套平台
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DC-ET/mao/main/scripts/install-mao-agent.sh | bash
+curl -fsSL https://raw.githubusercontent.com/yupengsheng/mao/main/scripts/install-mao-agent.sh | bash
 mao-agent login
 mao-agent
 ```
@@ -22,7 +22,7 @@ mao-agent
 ## 1. 获取源码
 
 ```bash
-git clone https://github.com/DC-ET/mao.git
+git clone https://github.com/yupengsheng/mao.git
 cd mao
 ```
 

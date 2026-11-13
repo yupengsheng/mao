@@ -905,7 +905,7 @@ agent-cli/
 
 ### 12.5 分发与发版
 
-1. 用户一条命令安装：`curl -fsSL https://raw.githubusercontent.com/DC-ET/mao/main/scripts/install-mao-agent.sh | bash`（sparse clone `agent-cli/` 后 `npm install -g .`）。包内 `vendor/localShell.cjs` 与 desktop 保持同步，独立安装即可跑 LOCAL。
+1. 用户一条命令安装：`curl -fsSL https://raw.githubusercontent.com/yupengsheng/mao/main/scripts/install-mao-agent.sh | bash`（sparse clone `agent-cli/` 后 `npm install -g .`）。包内 `vendor/localShell.cjs` 与 desktop 保持同步，独立安装即可跑 LOCAL。
 2. 仓库内开发：`cd agent-cli && npm ci && npm run build && npm link`。
 3. 需要时发布到 npm（`npm i -g mao-agent`）。
 4. CHANGELOG：在根 `CHANGELOG.md` 新增小节 **`### 终端 CLI（mao-agent）`**。

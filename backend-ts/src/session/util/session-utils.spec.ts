@@ -163,7 +163,7 @@ describe('GitUrlParser', () => {
 
 describe('GitCloneErrorFormatter', () => {
   it('repositoryNotFound', () => {
-    const raw = "Git clone failed: Cloning into '/opt/mao/data/workspace/2/projects/sms-unify'... remote: Repository not found. fatal: repository 'https://github.com/DC-ET/sms-unify.git/' not found";
+    const raw = "Git clone failed: Cloning into '/opt/mao/data/workspace/2/projects/sms-unify'... remote: Repository not found. fatal: repository 'https://github.com/yupengsheng/sms-unify.git/' not found";
     const message = GitCloneErrorFormatter.toUserMessage(raw);
     expect(message).toContain('仓库不存在或无权访问');
     expect(message).toContain('Git 凭证');
