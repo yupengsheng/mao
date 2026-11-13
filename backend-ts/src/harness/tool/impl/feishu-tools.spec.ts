@@ -3,7 +3,7 @@ import { useTmpDir } from '../../../testing/tmp-dir.js';
 import { join } from 'node:path';
 import { writeFile as writeFileAsync } from 'node:fs/promises';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { FeishuDownloadFileTool, SendFeishuFileTool, SendFeishuImageTool } from './feishu-tools.js';
+import { FeishuDownloadFileTool, ReadFeishuDocTool, SendFeishuFileTool, SendFeishuImageTool } from './feishu-tools.js';
 import { chatFilesDirOf } from '../../../feishu/chat-files.js';
 import type { FeishuMediaSendSupport } from './feishu-tools.js';
 import { isFeishuChannelSession } from '../feishu-channel-tool.js';
@@ -359,5 +359,39 @@ describe('SendFeishuFileTool', () => {
     const tool = new SendFeishuFileTool(sandbox, makeSupport({ resolveSendTarget: vi.fn(async () => null) }));
     const result = await tool.execute(JSON.stringify({ file: 'a.txt' }), 9, 1, workspace);
     expect(JSON.parse(result).error).toContain('不是飞书通道会话');
+  });
+});
+
+describe('ReadFeishuDocTool', () => {
+  const makeTool = (appId: string | null, readMarkdown: ReturnType<typeof vi.fn>) =>
+    new ReadFeishuDocTool(
+      { resolveBotAppId: vi.fn(async () => appId) },
+      { readMarkdown },
+    );
+
+  it('returns markdown content for a feishu channel session', async () => {
+    const readMarkdown = vi.fn(async () => '# 标题\n正文');
+    const tool = makeTool('cli_bot', readMarkdown);
+    const result = await tool.execute(JSON.stringify({ link: 'https://access.feishu.cn/wiki/abc' }), 9, 1, '/ws');
+    expect(JSON.parse(result).content).toContain('# 标题');
+    expect(readMarkdown).toHaveBeenCalledWith('cli_bot', 'https://access.feishu.cn/wiki/abc');
+  });
+
+  it('rejects when the session is not a feishu channel session', async () => {
+    const tool = makeTool(null, vi.fn());
+    const result = await tool.execute(JSON.stringify({ link: 'https://access.feishu.cn/wiki/abc' }), 9, 1, '/ws');
+    expect(JSON.parse(result).error).toContain('不是飞书通道会话');
+  });
+
+  it('surfaces doc reader errors as tool errors', async () => {
+    const tool = makeTool('cli_bot', vi.fn(async () => { throw new Error('当前文档类型【sheets】暂不支持读取'); }));
+    const result = await tool.execute(JSON.stringify({ link: 'https://access.feishu.cn/sheets/abc' }), 9, 1, '/ws');
+    expect(JSON.parse(result).error).toContain('暂不支持读取');
+  });
+
+  it('reports a missing link as a parameter error', async () => {
+    const tool = makeTool('cli_bot', vi.fn());
+    const result = await tool.execute(JSON.stringify({}), 9, 1, '/ws');
+    expect(JSON.parse(result).error).toContain('缺少必填参数');
   });
 });

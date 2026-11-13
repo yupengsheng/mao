@@ -10,6 +10,7 @@ export * from './message.repository.js';
 export * from './message.service.js';
 export * from './media-sender.js';
 export * from './message-detail.js';
+export * from './doc-reader.js';
 export * from './binding.repository.js';
 export * from './binding.routes.js';
 export * from './ecp-inbound-gate.js';

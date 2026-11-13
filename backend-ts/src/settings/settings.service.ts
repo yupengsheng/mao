@@ -12,7 +12,7 @@ import {
 } from '../common/container-auto-upgrade.js';
 import { decryptAesGcm, encryptAesGcmNonNull } from '../crypto/aes-gcm.js';
 import type {
-  AgentLookup, AgentRuntimeSettings, DingtalkOauthSettings, EmailSmtpSettings, FeishuOAuthSettings, HarnessTuningSettings, LdapSettings, ModelLookup,
+  AgentLookup, AgentRuntimeSettings, BundleRegistrySettings, DingtalkOauthSettings, EmailSmtpSettings, FeishuOAuthSettings, HarnessTuningSettings, LdapSettings, ModelLookup,
   NotificationTuningSettings, OssSettings, SettingsRuntimeConfig, SystemSetting, SystemSettingRepository,
   TavilySettings, TerminalSettings, TinyFishSettings, UploadSettings, WebSearchConfig, WebSearchProvider,
 } from './types.js';
@@ -69,6 +69,8 @@ export const UPLOAD_BASE_URL_KEY = 'upload.baseUrl';
 /** 站点根 URL（V170）：IM 卡片「会话详情」等网页深链的 origin 来源。留空回落 upload.baseUrl。 */
 export const SITE_BASE_URL_KEY = 'site.baseUrl';
 export const FILE_MAX_SIZE_MB_KEY = 'file.maxSizeMb';
+export const BUNDLE_REGISTRY_ENABLED_KEY = 'bundle.registry.enabled';
+export const BUNDLE_REGISTRY_ACCESS_TOKEN_KEY = 'bundle.registry.accessToken';
 export const TAVILY_API_KEY_KEY = 'tools.tavilyApiKey';
 export const TINYFISH_API_KEY_KEY = 'tools.tinyfishApiKey';
 export const WEB_SEARCH_PROVIDER_KEY = 'tools.webSearchProvider';
@@ -441,6 +443,26 @@ export class SystemSettingService {
     return this.getBool(SHARE_TOKEN_LINKS_ENABLED_KEY);
   }
 
+  /** Bundle registry 只读端点配置（资产分发闭环）：默认关闭，管理员显式开启。 */
+  async getBundleRegistryConfig(): Promise<BundleRegistrySettings> {
+    const [enabled, row] = await Promise.all([
+      this.getBool(BUNDLE_REGISTRY_ENABLED_KEY),
+      this.settingRepo.findByKey(BUNDLE_REGISTRY_ACCESS_TOKEN_KEY),
+    ]);
+    const stored = row?.value ?? '';
+    if (!hasText(stored)) {
+      // 未配置 token：管理员显式开启即公开只读（无 token 门槛）
+      return { enabled, accessToken: null };
+    }
+    const plain = this.tryDecryptSecret(stored);
+    if (plain == null || !hasText(plain)) {
+      // 密文解不开（SETTINGS_SECRET 轮换 / 跨实例拷贝 DB）：安全门必须失败闭合——
+      // 绝不能回落成"未配置 token"而整体跳过校验，否则资产（含完整 systemPrompt 与技能文件）对任何可访问域名的人全量可读
+      return { enabled: false, accessToken: null };
+    }
+    return { enabled, accessToken: plain };
+  }
+
   /** 全网搜索统一配置：provider 由后台「网络工具 → 搜索实现」切换，默认 tavily（向后兼容）。 */
   async getWebSearchConfig(): Promise<WebSearchConfig> {
     const [providerRaw, tavily, tinyfish] = await Promise.all([
@@ -801,6 +823,21 @@ export class SystemSettingService {
     } catch {
       console.error('SystemSetting decrypt failed, treat as unset (SETTINGS_SECRET changed?)');
       return '';
+    }
+  }
+
+  /**
+   * 解密失败或未配置密钥时返回 null（区别于 decryptSecret 的空串）：
+   * 供需要区分「未配置」与「密钥轮换导致解不开」的安全门做失败闭合。
+   */
+  private tryDecryptSecret(stored: string): string | null {
+    if (!hasText(this.secretKey)) {
+      return null;
+    }
+    try {
+      return decryptAesGcm(stored, this.secretKey, '配置解密失败');
+    } catch {
+      return null;
     }
   }
 

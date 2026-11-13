@@ -15,6 +15,40 @@
 
     <!-- Agent grid -->
     <div v-if="!collapsed" class="agent-scroll">
+      <!-- 团队共享分区：管理员上架的推荐 Agent，含推荐语与缺依赖角标 -->
+      <template v-if="sharedAgents.length > 0">
+        <div class="group-label">团队共享</div>
+        <div class="agent-grid shared-grid">
+          <div
+            v-for="shared in sharedAgents"
+            :key="`shared-${shared.agentId}`"
+            class="agent-card shared-card"
+            :class="{ selected: String(shared.agentId) === String(selectedAgentId) }"
+            @click="selectSharedAgent(shared)"
+          >
+            <el-avatar :size="32" :src="resolveAvatarUrl(shared.avatarUrl)" class="agent-avatar shared-avatar">{{ shared.name?.charAt(0) }}</el-avatar>
+            <div class="agent-info">
+              <span class="agent-name">
+                {{ shared.name }}
+                <el-tooltip :content="sharedIssueText(shared)" :disabled="!hasSharedIssues(shared)" placement="top">
+                  <el-icon v-if="hasSharedIssues(shared)" class="issue-badge"><WarningFilled /></el-icon>
+                </el-tooltip>
+              </span>
+              <el-tooltip :content="shared.note || shared.description || 'AI Agent'" :disabled="!(shared.note && shared.note.length > 30)" placement="top">
+                <span class="agent-desc shared-desc">{{ shared.note || shared.description || 'AI Agent' }}</span>
+              </el-tooltip>
+              <button
+                v-if="hasSharedIssues(shared)"
+                class="fix-deps-btn"
+                type="button"
+                :disabled="fixingAgentId === shared.agentId"
+                @click.stop="fixDeps(shared)"
+              >{{ fixingAgentId === shared.agentId ? '修复中…' : '修复依赖' }}</button>
+            </div>
+          </div>
+        </div>
+      </template>
+
       <div class="agent-grid">
         <div
           v-for="agent in filteredAgents"
@@ -35,7 +69,7 @@
           <span>加载失败</span>
           <button class="retry-btn" type="button" @click.stop="agentStore.fetchAgents()">重试</button>
         </div>
-        <div v-else-if="filteredAgents.length === 0" class="empty-agents">{{ emptyAgentsHint }}</div>
+        <div v-else-if="filteredAgents.length === 0 && sharedAgents.length === 0" class="empty-agents">{{ emptyAgentsHint }}</div>
       </div>
     </div>
   </div>
@@ -43,10 +77,18 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { ArrowDown } from '@element-plus/icons-vue'
-import { useAgentStore, type Agent } from '../../stores/agent'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { ArrowDown, WarningFilled } from '@element-plus/icons-vue'
+import { api } from '../../api'
+import { useAgentStore, type Agent, type SharedAgent } from '../../stores/agent'
 import { useReadinessStore } from '../../stores/readiness'
 import { resolveAvatarUrl } from '../../utils/avatar'
+
+interface FixDepsReport {
+  skills: Array<{ name: string; action: 'installed' | 'ambiguous' | 'failed'; detail?: string }>
+  mcpServers: Array<{ serverId: number; name: string | null; action: 'enabled' | 'needs-admin' | 'dangling' | 'failed'; detail?: string }>
+  selfCheck: SharedAgent
+}
 
 const props = defineProps<{
   selectedAgentId: string | null
@@ -59,6 +101,7 @@ const emit = defineEmits<{
 const agentStore = useAgentStore()
 const readinessStore = useReadinessStore()
 const collapsed = ref(false)
+const fixingAgentId = ref<number | null>(null)
 
 /** 空态按根因分流（首次成功体验）：模型未配时给出明确指引而非笼统的「暂无」。 */
 const emptyAgentsHint = computed(() => {
@@ -68,6 +111,7 @@ const emptyAgentsHint = computed(() => {
 })
 
 const filteredAgents = computed(() => agentStore.agents)
+const sharedAgents = computed(() => agentStore.sharedAgents)
 
 const selectedAgent = computed(() => {
   if (!props.selectedAgentId) return null
@@ -83,6 +127,54 @@ onMounted(async () => {
 function selectAgent(agent: Agent) {
   emit('update:selectedAgentId', String(agent.id))
   collapsed.value = true
+}
+
+// 缺依赖的共享 Agent 仍可选中（技能/MCP 缺失只降级能力，不阻断建会话）
+function selectSharedAgent(shared: SharedAgent) {
+  emit('update:selectedAgentId', String(shared.agentId))
+  collapsed.value = true
+}
+
+function hasSharedIssues(shared: SharedAgent): boolean {
+  return shared.missingSkills.length > 0 || shared.mcpIssues.length > 0
+}
+
+function sharedIssueText(shared: SharedAgent): string {
+  const parts: string[] = []
+  if (shared.missingSkills.length > 0) parts.push(`缺少技能：${shared.missingSkills.join('、')}`)
+  if (shared.mcpIssues.length > 0) parts.push(`MCP 异常：${shared.mcpIssues.join('、')}`)
+  return parts.join('；')
+}
+
+/** 依赖一键补装：缺的用户技能装到本人名下；MCP 停用需管理员（无权限时给出提示）。 */
+async function fixDeps(shared: SharedAgent) {
+  if (fixingAgentId.value != null) return
+  fixingAgentId.value = shared.agentId
+  try {
+    const { data } = await api.post<FixDepsReport>(`/shared-agents/${shared.agentId}/fix-deps`)
+    agentStore.replaceSharedAgent(data.selfCheck)
+    const installed = data.skills.filter(s => s.action === 'installed').length
+    const enabled = data.mcpServers.filter(m => m.action === 'enabled').length
+    const done: string[] = []
+    if (installed > 0) done.push(`已安装 ${installed} 个技能`)
+    if (enabled > 0) done.push(`已启用 ${enabled} 个 MCP`)
+    if (done.length > 0) {
+      ElMessage.success(done.join('，'))
+    } else {
+      ElMessage.info('没有可自动修复的依赖')
+    }
+    const pending = [
+      ...data.skills.filter(s => s.action !== 'installed').map(s => s.detail || s.name),
+      ...data.mcpServers.filter(m => m.action !== 'enabled').map(m => m.detail || `MCP#${m.serverId}`),
+    ]
+    if (pending.length > 0) {
+      ElMessageBox.alert(pending.join('\n'), '以下依赖需要人工处理', { confirmButtonText: '知道了', customStyle: { whiteSpace: 'pre-line' } as never }).catch(() => undefined)
+    }
+  } catch {
+    // 拦截器已提示
+  } finally {
+    fixingAgentId.value = null
+  }
 }
 
 function toggleCollapse() {
@@ -174,11 +266,65 @@ function expand() {
   display: none;
 }
 
+.group-label {
+  font-size: var(--aw-text-micro);
+  color: var(--aw-ink-muted-80);
+  font-weight: 500;
+  padding: 4px 2px 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.group-label::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--aw-hairline);
+}
+
 .agent-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
   gap: 6px;
   padding: 4px 0;
+}
+
+.shared-card {
+  border-color: var(--aw-primary-lighter, var(--aw-hairline));
+}
+.shared-avatar {
+  outline: 1.5px solid var(--aw-primary);
+  outline-offset: -1.5px;
+}
+.shared-desc {
+  color: var(--aw-primary);
+}
+.issue-badge {
+  font-size: 12px;
+  color: var(--el-color-warning);
+  vertical-align: -2px;
+  margin-left: 2px;
+}
+
+.fix-deps-btn {
+  align-self: flex-start;
+  margin-top: 2px;
+  padding: 1px 8px;
+  font-size: var(--aw-text-micro);
+  color: var(--aw-primary);
+  background: var(--aw-primary-soft);
+  border: 1px solid var(--aw-primary-lighter, var(--aw-hairline));
+  border-radius: var(--aw-radius-xs);
+  cursor: pointer;
+}
+
+.fix-deps-btn:hover:not(:disabled) {
+  background: var(--aw-primary-hover);
+}
+
+.fix-deps-btn:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 
 .agent-card {

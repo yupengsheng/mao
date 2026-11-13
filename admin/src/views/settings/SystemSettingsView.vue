@@ -361,6 +361,8 @@ const TOC_GROUPS: Array<{ label: string; sections: Array<{ kind: 'company-sso' |
       { kind: 'category', name: '会话' },
       { kind: 'category', name: '代码' },
       { kind: 'category', name: 'Agent 与模型' },
+      // Agent bundle 导入/导出/共享：registry 开关与访问令牌（V216）
+      { kind: 'category', name: 'Agent 资产' },
       { kind: 'category', name: '记忆' },
     ],
   },

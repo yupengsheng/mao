@@ -33,6 +33,7 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   feishu_download_file: '下载飞书文件',
   feishu_send_image: '发送飞书图片',
   feishu_send_file: '发送飞书文件',
+  feishu_read_doc: '读取飞书文档',
   dingtalk_send_image: '发送钉钉图片',
   dingtalk_send_file: '发送钉钉文件',
   send_wechat_image: '发送微信图片',
@@ -151,6 +152,8 @@ export function getToolInputPreview(name: string, input?: Record<string, unknown
     }
     case 'feishu_download_file':
       return typeof input.message_id === 'string' ? input.message_id : ''
+    case 'feishu_read_doc':
+      return typeof input.link === 'string' ? input.link : ''
     case 'feishu_send_image':
       return typeof input.image === 'string' ? input.image : ''
     case 'feishu_send_file':

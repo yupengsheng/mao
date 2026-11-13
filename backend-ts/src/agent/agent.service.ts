@@ -23,6 +23,8 @@ export class AgentService {
     private readonly experienceService: AgentExperienceService,
     private readonly suggestedQuestionService: AgentSuggestedQuestionService,
     private readonly modelLookup?: AgentModelLookup,
+    /** 团队共享目录条目级联删除（Agent 逻辑删除时同步清条目；表无外键，服务层级联）。 */
+    private readonly sharedEntryCleanup?: { deleteByAgentId(agentId: number): Promise<void> },
   ) {}
 
   listAgents(
@@ -256,6 +258,7 @@ export class AgentService {
     }
     await this.experienceService.deleteByAgentId(id);
     await this.suggestedQuestionService.deleteByAgentId(id);
+    await this.sharedEntryCleanup?.deleteByAgentId(id);
     await this.agentRepo.deleteById(id);
   }
 

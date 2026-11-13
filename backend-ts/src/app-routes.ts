@@ -15,6 +15,8 @@ import type { HttpToolService } from './http-tool/http-tool.service.js';
 import type { HttpApiExecutor } from './harness/tool/impl/http-api-executor.js';
 import type { FileService } from './file/file.service.js';
 import type { AgentService } from './agent/agent.service.js';
+import type { AgentBundleService } from './agent/agent-bundle.service.js';
+import type { SharedAgentService } from './agent/shared-agent.service.js';
 import type { AgentExperienceService } from './agent/agent-experience.service.js';
 import type { AgentSuggestedQuestionService } from './agent/agent-suggested-question.service.js';
 import type { McpServerValidatorImpl } from './agent/mcp-validator.js';
@@ -115,6 +117,8 @@ import { registerAdminHttpToolRoutes } from './http-tool/http-tool-admin.routes.
 import { registerAgentAvatarRoutes } from './agent/agent-avatar.js';
 import { registerAgentRoutes } from './agent/agent.routes.js';
 import { registerAgentExperienceLibraryRoutes } from './agent/agent-experience-library.routes.js';
+import { registerAgentBundleRoutes } from './agent/agent-bundle.routes.js';
+import { registerSharedAgentRoutes } from './agent/shared-agent.routes.js';
 import type { ExperienceIndexService } from './harness/experience/experience-index.service.js';
 import { registerModelRoutes } from './model/model.routes.js';
 import { registerSystemSettingRoutes } from './settings/settings.routes.js';
@@ -201,6 +205,9 @@ export interface RouteDeps {
   experienceIndexService: ExperienceIndexService;
   suggestedQuestionService: AgentSuggestedQuestionService;
   mcpValidator: McpServerValidatorImpl;
+  /** Agent 资产化：bundle 导出/导入 + 团队共享目录（agent-bundle.routes / shared-agent.routes）。 */
+  agentBundleService: AgentBundleService;
+  sharedAgentService: SharedAgentService;
   httpToolValidator: HttpToolValidatorImpl;
 
   // model
@@ -353,6 +360,7 @@ export async function registerAllRoutes(deps: RouteDeps): Promise<void> {
     httpToolService, httpApiExecutor, httpToolStatsStore,
     httpToolValidator,
     fileService, agentService, experienceService, experienceIndexService, suggestedQuestionService,
+    agentBundleService, sharedAgentService,
     mcpValidator,
     modelService,
     settingService, activateContainerRuntime, runtimeModeResolver, containerHostsResolver, containerAutoUpgradeResolver, containerOps,
@@ -448,6 +456,10 @@ export async function registerAllRoutes(deps: RouteDeps): Promise<void> {
     registerAgentExperienceLibraryRoutes(api, {
       agentService, experienceIndexService, permissionService,
     });
+    registerAgentBundleRoutes(api, {
+      agentBundleService, permissionService, registryConfig: settingService,
+    });
+    registerSharedAgentRoutes(api, { sharedAgentService, permissionService });
     registerModelRoutes(api, { modelService, permissionService });
     registerSystemSettingRoutes(api, {
       systemSettingService: settingService,

@@ -159,6 +159,7 @@ export function summarize(toolName: string | null | undefined, argumentsJson: st
     case 'feishu_download_file':
     case 'feishu_send_image':
     case 'feishu_send_file':
+    case 'feishu_read_doc':
       return summarizeFeishuTool(toolName.toLowerCase(), argumentsJson, result);
     case 'dingtalk_send_image':
     case 'dingtalk_send_file':
@@ -635,6 +636,7 @@ function summarizeFeishuTool(toolName: string, argumentsJson: string | null | un
     feishu_download_file: '下载飞书文件',
     feishu_send_image: '发送飞书图片',
     feishu_send_file: '发送飞书文件',
+    feishu_read_doc: '读取飞书文档',
   };
   const label = labels[toolName];
   if (has(node, 'error') || node?.success === false) {
@@ -660,6 +662,9 @@ function summarizeFeishuTool(toolName: string, argumentsJson: string | null | un
         || (file?.startsWith('http') ? formatUrl(file) : truncateFilename(file));
       break;
     }
+    case 'feishu_read_doc':
+      detail = formatUrl(extractJsonString(argumentsJson, 'link') ?? '');
+      break;
   }
   const summary = detail ? `${label}: ${truncate(detail, 60)}` : label;
   if (node?.success === true) return `${summary} (成功)`;

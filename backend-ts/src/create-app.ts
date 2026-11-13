@@ -42,6 +42,12 @@ import { MysqlAgentExperienceRepository, MysqlAgentRepository, MysqlAgentSuggest
 import { AgentExperienceService } from './agent/agent-experience.service.js';
 import { AgentSuggestedQuestionService } from './agent/agent-suggested-question.service.js';
 import { AgentService } from './agent/agent.service.js';
+import { AgentBundleService } from './agent/agent-bundle.service.js';
+import { SharedAgentService } from './agent/shared-agent.service.js';
+import { SharedAgentEntryRepository } from './agent/shared-agent.repository.js';
+import { AgentImportOriginRepository } from './agent/agent-import-origin.repository.js';
+import { registerAgentBundleRoutes } from './agent/agent-bundle.routes.js';
+import { registerSharedAgentRoutes } from './agent/shared-agent.routes.js';
 import { McpServerValidatorImpl, MysqlMcpServerLookup } from './agent/mcp-validator.js';
 import { MysqlLlmModelRepository, MysqlSessionModelRepository } from './model/model.repository.js';
 import { OpenAiChatClient } from './model/llm-chat.client.js';
@@ -406,7 +412,11 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
   const experienceService = new AgentExperienceService(new MysqlAgentExperienceRepository(db));
   const suggestedQuestionService = new AgentSuggestedQuestionService(new MysqlAgentSuggestedQuestionRepository(db));
   const modelRepo = new MysqlLlmModelRepository(db);
-  const agentService = new AgentService(agentRepo, experienceService, suggestedQuestionService, modelRepo);
+  // 团队共享目录条目（无外键，Agent 逻辑删除时由服务层级联清理）
+  const sharedAgentEntryRepo = new SharedAgentEntryRepository(db);
+  const agentService = new AgentService(agentRepo, experienceService, suggestedQuestionService, modelRepo, {
+    deleteByAgentId: (agentId) => sharedAgentEntryRepo.deleteByAgentId(agentId),
+  });
   const llmCallService = new LlmCallService(
     new LlmCallRepository(db),
     {
@@ -671,6 +681,26 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
   const { feishuMessageRepository, feishuMessageService, getFeishuClient, getFeishuChatTitle, sendFeishuText } = feishuMessaging;
 
   const mcpServerLookup = new MysqlMcpServerLookup(db);
+
+  // Agent 资产化：bundle 导出/导入（P1）+ 团队共享目录（P2）+ registry/URL 导入/检查更新（P2 分发闭环）
+  const agentImportOriginRepo = new AgentImportOriginRepository(db);
+  const agentBundleService = new AgentBundleService(
+    agentRepo, experienceService, suggestedQuestionService, skillLoader, userSkillService,
+    mcpServerService, mcpMapper, mcpCipher,
+    agentImportOriginRepo, sharedAgentEntryRepo,
+  );
+  const sharedAgentService = new SharedAgentService(
+    sharedAgentEntryRepo,
+    { findById: (id) => agentRepo.findById(id) },
+    skillLoader,
+    userSkillService,
+    {
+      findById: (id) => mcpServerLookup.findById(id),
+      // 与 PUT /v1/mcp-servers/:id/status 同一 service 方法（fix-deps 的 will-enable 动作）
+      updateStatus: (id, status) => mcpServerService.updateStatus(id, status),
+    },
+    permissionService,
+  );
   const llmEngine = assembleLlmEngine({
     harnessTuning, llmCallService, skillLoader, pathSandbox, runtimeResolver,
     commandService, skillSync, workspaceRulesSnapshotService, sessionSvc,
@@ -1038,6 +1068,7 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     gitCredentials, envVariableService, sessionRepo,
     httpToolService, httpApiExecutor, httpToolStatsStore,
     fileService, agentService, experienceService, experienceIndexService, suggestedQuestionService,
+    agentBundleService, sharedAgentService,
     mcpValidator, httpToolValidator,
     modelService,
     settingService, activateContainerRuntime, runtimeModeResolver, containerHostsResolver, containerAutoUpgradeResolver, containerOps: containerRegistry,
