@@ -6,6 +6,23 @@ import { PathSandbox } from '../safety/path-sandbox.js';
 import { RuntimeDataResolver } from '../runtime/runtime-data-resolver.js';
 import { OutputManager, ShellSessionManager } from './shell-session-manager.js';
 
+function isProcessRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    if (process.platform === 'linux') {
+      // 容器中的 PID 1 可能未及时回收孤儿进程；僵尸仍能通过 kill(pid, 0)，但已终止。
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      // comm 字段可包含空格和括号，进程状态位于最后一个右括号之后。
+      return stat[stat.lastIndexOf(')') + 2] !== 'Z';
+    }
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ESRCH' || (process.platform === 'linux' && code === 'ENOENT')) return false;
+    throw error;
+  }
+}
+
 describe('ShellSessionManager', () => {
   it('shellSessionManagerCreatesListsAndClosesRealShellSessions', async () => {
     const dir = useTmpDir('mao-shell-');
@@ -188,11 +205,10 @@ describe('ShellSessionManager', () => {
     const started = await output.readUntilMarker(session, '__M__', 5000);
     const childPid = Number(started.output.trim().split('\n').pop());
     expect(childPid).toBeGreaterThan(0);
-    expect(() => process.kill(childPid, 0)).not.toThrow();
+    expect(isProcessRunning(childPid)).toBe(true);
 
     manager.close('sh-tree');
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    expect(() => process.kill(childPid, 0)).toThrow();
+    await expect.poll(() => isProcessRunning(childPid), { timeout: 2000 }).toBe(false);
   });
 
   it('returns early on wait_for and keeps the rest of the output for the next read', async () => {

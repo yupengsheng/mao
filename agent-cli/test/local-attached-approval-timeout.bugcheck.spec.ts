@@ -63,7 +63,9 @@ describe('attached local remote approval timeout', () => {
       logger: createLogger(false),
     })).rejects.toThrow('STOP_AFTER_POLICY');
 
-    expect(captured.policy?.onApproval).toBe('remote');
-    expect(captured.policy?.remoteApprovalTimeoutMs).toBe(1500);
+    const policy = captured.policy as ApprovalPolicy | undefined;
+    if (!policy) throw new Error('executor policy was not captured');
+    expect(policy.onApproval).toBe('remote');
+    expect(policy.remoteApprovalTimeoutMs).toBe(1500);
   });
 });

@@ -67,6 +67,19 @@ describe('RuntimeChannelServer ensureListening', () => {
     await connectOk(socketPath);
   });
 
+  it('临时监听路径保持足够短，长 socket 根目录仍可原子替换', async () => {
+    const root = useTmpDir('mao-channel-');
+    // 保证最终路径仍在 Linux Unix socket 上限内，但旧的
+    // runtime.sock.tmp-{pid}-{random} 临时名会超出上限。
+    const channelDir = join(root, 'd'.repeat(Math.max(1, 90 - root.length - 1)));
+    const server = makeServer(channelDir);
+    const socketPath = await server.ensureListening(7, 5);
+
+    expect(socketPath.length).toBeLessThanOrEqual(108);
+    expect(lstatSync(socketPath).isSocket()).toBe(true);
+    await connectOk(socketPath);
+  });
+
   it('非 socket 残留文件被原子替换为可用监听', async () => {
     const root = useTmpDir('mao-channel-');
     mkdirSync(join(root, '7', '5'), { recursive: true });

@@ -95,7 +95,7 @@ export class RuntimeChannelServer {
     // 原子替换：先 listen 同目录临时路径、成功后再 rename 覆盖目标（同一文件系统内 rename 原子）。
     // 任何时刻 socketPath 要么指向旧的、要么指向新的监听者，不存在「已删除而新未建立」的空窗；
     // 蓝绿双实例并发替换时最后 rename 者胜，容器侧连接始终可寻址。
-    const tmpPath = path.join(dir, `runtime.sock.tmp-${process.pid}-${randomBytes(4).toString('hex')}`);
+    const tmpPath = path.join(dir, `.t-${randomBytes(4).toString('hex')}`);
     const server = createServer((socket) => this.acceptConnection(userId, agentId, socket));
     try {
       await new Promise<void>((resolve, reject) => {
