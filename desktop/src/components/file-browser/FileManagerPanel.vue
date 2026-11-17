@@ -608,26 +608,36 @@ async function handleDownload() {
     ElMessage.warning('当前模式不支持下载')
     return
   }
-  const files = targets.filter((e) => !e.isDirectory)
-  const dirs = targets.filter((e) => e.isDirectory)
-  if (files.length > 3) ElMessage.info(`将逐个下载 ${files.length} 个文件`)
-  let failures = 0
-  for (const f of files) {
-    const res = await props.provider.downloadFile?.(f.path, f.name)
-    if (res && !res.ok) failures++
+  const provider = props.provider
+  if (targets.length === 1) {
+    const target = targets[0]!
+    const download = target.isDirectory ? provider.downloadDirectory : provider.downloadFile
+    if (!download) {
+      ElMessage.warning('当前模式不支持下载')
+      return
+    }
+    const res = await download.call(provider, target.path, target.name)
+    if (!res.ok) ElMessage.error(res.error || '下载失败')
+    return
   }
-  for (const d of dirs) {
-    const res = await props.provider.downloadDirectory?.(d.path, d.name)
-    if (res && !res.ok) failures++
+  // 多选只发一个请求、触发一次保存，避免浏览器多下载限流丢弃后续文件。
+  if (!provider.downloadEntriesZip) {
+    ElMessage.warning('当前模式不支持下载')
+    return
   }
-  if (failures > 0) ElMessage.error(`${failures} 个条目下载失败`)
+  const res = await provider.downloadEntriesZip(targets.map((t) => t.path), 'selected.zip')
+  if (!res.ok) ElMessage.error(res.error || '下载失败')
 }
 
 async function handleDownloadZip() {
   const entry = ctxMenu.entry
-  if (!entry || !props.provider) return
-  const res = await props.provider.downloadDirectory?.(entry.path, entry.name)
-  if (res && !res.ok) ElMessage.error(res.error || '下载失败')
+  if (!entry) return
+  if (!props.provider?.downloadDirectory) {
+    ElMessage.warning('当前模式不支持下载')
+    return
+  }
+  const res = await props.provider.downloadDirectory(entry.path, entry.name)
+  if (!res.ok) ElMessage.error(res.error || '下载失败')
 }
 
 function handleCopyAbsolutePath() {

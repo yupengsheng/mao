@@ -1,10 +1,10 @@
 import Fastify from 'fastify';
 import multipart from '@fastify/multipart';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import { handleError } from '../common/http-error.js';
 import { registerFileRoutes } from './file.routes.js';
 import type { FileService } from './file.service.js';
-import type { WorkspaceBrowseService } from './workspace-browse.service.js';
+import { WorkspaceBrowseService } from './workspace-browse.service.js';
 import type { WorkspaceGitService } from './workspace-git.service.js';
 import type { GitCommitMessageService } from './git-commit-message.service.js';
 import type { GitWriteOperationService } from './git-write-operation.service.js';
@@ -15,6 +15,158 @@ import { RuntimeDataResolver } from '../harness/runtime/runtime-data-resolver.js
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { useTmpDir } from '../testing/tmp-dir.js';
+import { WorkspaceOverviewService } from './workspace-overview.service.js';
+import { PathSandbox as TestPathSandbox } from '../harness/safety/path-sandbox.js';
+import { BusinessException } from '../common/business-exception.js';
+import { ErrorCode } from '../common/error-code.js';
+
+describe('multi ZIP file routes', () => {
+  function setup() {
+    const root = useTmpDir('mao-route-multi-zip-');
+    const workspace = join(root, '7', 'projects', 'demo');
+    mkdirSync(join(workspace, 'docs'), { recursive: true });
+    writeFileSync(join(workspace, 'a.txt'), 'a');
+    writeFileSync(join(workspace, 'docs', '说明.md'), 'hello');
+    const pathSandbox = new TestPathSandbox(root);
+    const service = new WorkspaceBrowseService(pathSandbox);
+    const zip = vi.spyOn(service, 'zipEntries');
+    const participated = vi.fn(async () => false);
+    const overview = new WorkspaceOverviewService(pathSandbox, { existsSessionUnderWorkspace: participated } as never);
+    const session = { id: 1, userId: 7, workspace, executionMode: 'CLOUD', agentId: 9 };
+    const getSession = vi.fn(async (id: number) => {
+      if (id !== 1) throw new BusinessException(ErrorCode.PARAM_INVALID, '会话不存在');
+      return session;
+    });
+    const app = Fastify();
+    app.setErrorHandler(handleError);
+    app.addHook('preHandler', async (request) => {
+      if (request.headers['x-test-user'] !== 'anonymous') {
+        request.userId = Number(request.headers['x-test-user'] ?? '7');
+      }
+    });
+    registerFileRoutes(app, {
+      fileService: {} as FileService,
+      sessionService: { getSession } as unknown as SessionService,
+      workspaceBrowseService: service,
+      workspaceOverviewService: overview,
+      workspaceGitService: {} as WorkspaceGitService,
+      gitCommitMessageService: {} as GitCommitMessageService,
+      gitWriteOperationService: {} as GitWriteOperationService,
+      workspaceWriteService: {} as WorkspaceWriteService,
+      pathSandbox,
+      experienceDirForAgent: (agentId) => join(root, 'experience', String(agentId)),
+    });
+    onTestFinished(() => app.close());
+    return { app, root, workspace, session, zip, getSession, participated };
+  }
+
+  it.each(['workspace', 'owned'])('%s：混选 POST 返回一个 ZIP / Content-Disposition，流结束删除临时文件', async (mode) => {
+    const { app, workspace, zip, root } = setup();
+    const payload = { ...(mode === 'workspace' ? { sessionId: 1 } : { root: workspace }), paths: ['a.txt', 'docs'] };
+    const response = await app.inject({ method: 'POST', url: `/v1/files/${mode}-download-multi-zip`, payload });
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['content-type']).toBe('application/zip');
+    expect(response.headers['content-disposition']).toMatch(/attachment; filename="demo-\d{8}-\d{4}\.zip"; filename\*=UTF-8''demo-/);
+    expect(Number(response.headers['content-length'])).toBe(response.rawPayload.length);
+    expect(response.rawPayload.readUInt32LE(0)).toBe(0x04034b50);
+    expect(zip).toHaveBeenCalledTimes(1);
+    expect(zip.mock.calls[0]).toEqual(mode === 'workspace'
+      ? [workspace, ['a.txt', 'docs'], join(root, 'experience', '9')]
+      : [workspace, ['a.txt', 'docs']]);
+    const result = await zip.mock.results[0]!.value;
+    await vi.waitFor(() => expect(existsSync(result.zipPath)).toBe(false));
+  });
+
+  it('workspace：中文工作区名通过 RFC 5987 Content-Disposition 传递，错误不留下下载头', async () => {
+    const { app, root, session, zip } = setup();
+    session.workspace = join(root, '7', 'projects', '中文项目');
+    mkdirSync(session.workspace, { recursive: true });
+    writeFileSync(join(session.workspace, 'note.txt'), 'note');
+    const response = await app.inject({ method: 'POST', url: '/v1/files/workspace-download-multi-zip', payload: { sessionId: 1, paths: ['note.txt'] } });
+    const disposition = String(response.headers['content-disposition']);
+    expect(disposition).toContain(`filename*=UTF-8''${encodeURIComponent('中文项目')}-`);
+    expect(disposition).not.toContain('\r');
+    expect(disposition).not.toContain('\n');
+    zip.mockRejectedValueOnce(new BusinessException(ErrorCode.INTERNAL_ERROR, '打包失败'));
+    const error = await app.inject({ method: 'POST', url: '/v1/files/workspace-download-multi-zip', payload: { sessionId: 1, paths: ['note.txt'] } });
+    expect(error.json().message).toBe('打包失败');
+    expect(error.headers['content-disposition']).toBeUndefined();
+  });
+
+  it.each(['workspace', 'owned'])('%s：未认证 / 跨用户请求拒绝且不调用打包服务', async (mode) => {
+    const { app, workspace, zip } = setup();
+    const payload = { ...(mode === 'workspace' ? { sessionId: 1 } : { root: workspace }), paths: ['a.txt'] };
+    const anonymous = await app.inject({ method: 'POST', url: `/v1/files/${mode}-download-multi-zip`, payload, headers: { 'x-test-user': 'anonymous' } });
+    expect(anonymous.statusCode).toBe(401);
+    const foreign = await app.inject({ method: 'POST', url: `/v1/files/${mode}-download-multi-zip`, payload, headers: { 'x-test-user': '8' } });
+    expect(foreign.json().code).not.toBe(0);
+    expect(foreign.headers['content-type']).toContain('application/json');
+    expect(zip).not.toHaveBeenCalled();
+  });
+
+  it('LOCAL 会话服务端下载拒绝，不能用有效 sessionId 绕过能力边界', async () => {
+    const { app, session, zip } = setup();
+    session.executionMode = 'LOCAL';
+    const response = await app.inject({ method: 'POST', url: '/v1/files/workspace-download-multi-zip', payload: { sessionId: 1, paths: ['a.txt'] } });
+    expect(response.json().message).toContain('本地模式不支持');
+    expect(zip).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, null, 0, -1, 1.5, '1', {}, Number.MAX_SAFE_INTEGER + 1])('无效 sessionId %# 返回 JSON 错误，不查询会话', async (sessionId) => {
+    const { app, getSession, zip } = setup();
+    const response = await app.inject({ method: 'POST', url: '/v1/files/workspace-download-multi-zip', payload: { sessionId, paths: ['a.txt'] } });
+    expect(response.json().code).not.toBe(0);
+    expect(getSession).not.toHaveBeenCalled();
+    expect(zip).not.toHaveBeenCalled();
+  });
+
+  it.each(['workspace', 'owned'])('%s：非法选区 / 逃逸 / 不存在 / 超限均返回 JSON，不发送 ZIP 响应头', async (mode) => {
+    const { app, workspace } = setup();
+    for (const paths of [undefined, null, 'a.txt', [], [false], [''], ['missing'], ['../secret'], Array(1001).fill('a.txt')]) {
+      const response = await app.inject({
+        method: 'POST', url: `/v1/files/${mode}-download-multi-zip`,
+        payload: { ...(mode === 'workspace' ? { sessionId: 1 } : { root: workspace }), paths },
+      });
+      expect(response.json().code).not.toBe(0);
+      expect(response.headers['content-type']).toContain('application/json');
+      expect(response.headers['content-disposition']).toBeUndefined();
+    }
+  });
+
+  it('owned：非法 root / 本人根和 projects 容器均拒绝，不能任意指定目录', async () => {
+    const { app, root, zip } = setup();
+    for (const invalidRoot of [undefined, null, 7, {}, '', root, join(root, '7'), join(root, '7', 'projects'), '/etc', 'a'.repeat(4097)]) {
+      const response = await app.inject({ method: 'POST', url: '/v1/files/owned-download-multi-zip', payload: { root: invalidRoot, paths: ['a.txt'] } });
+      expect(response.json().code).not.toBe(0);
+    }
+    expect(zip).not.toHaveBeenCalled();
+  });
+
+  it('owned：受管群工作区沿用参与权限校验，不回落当前会话', async () => {
+    const { app, root, participated, getSession } = setup();
+    const channel = join(root, 'feishu-chat', 'cli_test', 'oc_group');
+    mkdirSync(channel, { recursive: true });
+    writeFileSync(join(channel, 'group.txt'), 'group');
+    const options = { method: 'POST' as const, url: '/v1/files/owned-download-multi-zip', payload: { root: channel, paths: ['group.txt'] } };
+    const denied = await app.inject(options);
+    expect(denied.json().code).not.toBe(0);
+    expect(participated).toHaveBeenCalled();
+    participated.mockResolvedValue(true);
+    const allowed = await app.inject(options);
+    expect(allowed.headers['content-type']).toBe('application/zip');
+    expect(getSession).not.toHaveBeenCalled();
+  });
+
+  it.each(['workspace', 'owned'])('%s：body 超过 512KiB 和非法 JSON 以合理状态码返回 JSON', async (mode) => {
+    const { app } = setup();
+    const tooLarge = await app.inject({ method: 'POST', url: `/v1/files/${mode}-download-multi-zip`, payload: { paths: ['x'.repeat(512 * 1024)] } });
+    expect(tooLarge.statusCode).toBe(413);
+    expect(tooLarge.json().code).not.toBe(0);
+    const malformed = await app.inject({ method: 'POST', url: `/v1/files/${mode}-download-multi-zip`, payload: '{', headers: { 'content-type': 'application/json' } });
+    expect(malformed.statusCode).toBe(400);
+    expect(malformed.json().code).not.toBe(0);
+  });
+});
 
 describe('file routes', () => {
   it('listsWorkspaceAndGitJsonEndpoints', async () => {

@@ -1,7 +1,7 @@
 import { createReadStream, existsSync, statSync, unlinkSync } from 'node:fs';
 import { resolve, sep } from 'node:path';
 import { lookup as mimeLookup } from 'mime-types';
-import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest, RouteShorthandOptions } from 'fastify';
 import '@fastify/multipart';
 import { BusinessException } from '../common/business-exception.js';
 import { ErrorCode } from '../common/error-code.js';
@@ -16,7 +16,7 @@ import type { RuntimeDataResolver } from '../harness/runtime/runtime-data-resolv
 import type { Session } from '../session/types.js';
 import type { SessionService } from '../session/session.service.js';
 import type { FileEntity, FileService } from './file.service.js';
-import type { WorkspaceBrowseService } from './workspace-browse.service.js';
+import type { WorkspaceBrowseService, ZipResult } from './workspace-browse.service.js';
 import type { WorkspaceGitService } from './workspace-git.service.js';
 import type { GitCommitMessageService } from './git-commit-message.service.js';
 import type { GitWriteOperationService, LocalGitActivity } from './git-write-operation.service.js';
@@ -44,6 +44,20 @@ export function registerFileRoutes(app: FastifyInstance, deps: FileRouteDeps): v
     fileService, sessionService, workspaceBrowseService, workspaceGitService,
     gitCommitMessageService, gitWriteOperationService, workspaceWriteService, workspaceOverviewService, pathSandbox,
   } = deps;
+
+  const multiZipOptions: RouteShorthandOptions = {
+    bodyLimit: 512 * 1024,
+    errorHandler(error, _request, reply) {
+      // 全局 handleError 不区分 body parser 错误；新端点保持合理 HTTP 状态及 JSON 错误体。
+      if (error.code === 'FST_ERR_CTP_BODY_TOO_LARGE') {
+        return sendJson(reply, 413, fail(ErrorCode.PARAM_INVALID.code, '下载请求过大'));
+      }
+      if (error.code === 'FST_ERR_CTP_INVALID_JSON_BODY' || error.code === 'FST_ERR_CTP_EMPTY_JSON_BODY') {
+        return sendJson(reply, 400, fail(ErrorCode.PARAM_INVALID.code, '下载请求 JSON 不合法'));
+      }
+      throw error;
+    },
+  };
 
   function requireCloudWorkspace(session: Session): string {
     if (session.executionMode === 'LOCAL') {
@@ -253,6 +267,19 @@ export function registerFileRoutes(app: FastifyInstance, deps: FileRouteDeps): v
       .type('application/zip')
       .header('Content-Length', String(result.size));
     return reply.send(stream);
+  });
+
+  // 多路径使用 JSON body；覆盖全局上传用的大 bodyLimit，避免已认证请求占用过多内存。
+  app.post('/v1/files/workspace-download-multi-zip', multiZipOptions, async (request, reply) => {
+    const userId = requireUserId(request);
+    const body = bodyOf<{ sessionId?: number; paths?: string[] }>(request);
+    if (!Number.isSafeInteger(body.sessionId) || body.sessionId! <= 0) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '无效的 sessionId');
+    }
+    const session = await requireOwnedSession(userId, body.sessionId!);
+    const workspace = requireCloudWorkspace(session);
+    const result = await workspaceBrowseService.zipEntries(workspace, body.paths, experienceDirOf(session));
+    return sendTemporaryZip(reply, result);
   });
 
   app.get('/v1/files/workspace-git-repos', async (request, reply) => {
@@ -694,6 +721,18 @@ export function registerFileRoutes(app: FastifyInstance, deps: FileRouteDeps): v
     return reply.send(stream);
   });
 
+  app.post('/v1/files/owned-download-multi-zip', multiZipOptions, async (request, reply) => {
+    const userId = requireUserId(request);
+    const body = bodyOf<{ root?: string; paths?: string[] }>(request);
+    if (typeof body.root !== 'string' || body.root.length > 4096) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '无效的工作区路径');
+    }
+    // 沿用受管目录解析，包含机器人工作区的参与权限；不能仅做路径前缀判断。
+    const root = await resolveOwnedWorkspace(userId, body.root);
+    const result = await workspaceBrowseService.zipEntries(root, body.paths);
+    return sendTemporaryZip(reply, result);
+  });
+
   app.get('/v1/files', async (request, reply) => {
     const userId = requireUserId(request);
     const sessionId = queryOptInt(request, 'sessionId') ?? null;
@@ -753,6 +792,24 @@ export function contentDisposition(kind: 'attachment' | 'inline', fileName: stri
   const fallback = fileName.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
   const encoded = encodeURIComponent(fileName);
   return `${kind}; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+}
+
+function sendTemporaryZip(reply: FastifyReply, result: ZipResult): FastifyReply {
+  const stream = createReadStream(result.zipPath);
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    try { unlinkSync(result.zipPath); } catch { /* 临时 zip 已不在 */ }
+  };
+  // close 包括正常结束及错误销毁；客户端中止时主动销毁流，随后清理临时文件。
+  stream.once('close', cleanup);
+  reply.raw.once('close', () => stream.destroy());
+  reply
+    .header('Content-Disposition', contentDisposition('attachment', result.fileName))
+    .type('application/zip')
+    .header('Content-Length', String(result.size));
+  return reply.send(stream);
 }
 
 function sendFile(
