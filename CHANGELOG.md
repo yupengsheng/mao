@@ -9,6 +9,7 @@
 - **显示系统默认 Git 域**：个人 Git 凭证页只读展示尚未被本人凭据覆盖的系统默认域名与备注，不回显系统 Token。
 - **移动端默认站点统一为生产域名**：安卓与 iOS 壳的远程加载地址、APK OTA 清单下载地址统一为 `https://mao.yupengsheng.cn`，与桌面安装包和 Web 部署域名保持一致。
 - **移动端包标识统一为 `cn.yupengsheng.mao.app`**：安卓 `applicationId` / Java 包名、iOS Bundle ID 与两端的 Capacitor `appId` 全部改为该标识，与个人开发者账号及生产域名归属对齐。
+- **iOS 最低系统版本提升到 15.0**：Xcode 26 及以上不再支持 14.0 作为部署目标，Podfile 与 Xcode 工程同步调整，避免归档与模拟器构建直接失败。
 
 ### 管理后台
 - **跨用户记忆管理**：用户记忆页支持用户搜索、筛选、代建、编辑、忽略 / 恢复与删除，用户详情增加「记忆」Tab；读写分别受 `memory:read` / `memory:write` 权限约束，写操作纳入审计。

@@ -16,6 +16,7 @@
 
 ## 前置条件
 
+- iOS 部署目标为 **15.0**（Xcode 26 起不再支持 14.0，Podfile 与工程已统一）
 - 完整 **Xcode**（不是 Command Line Tools），并执行：
   ```bash
   sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
