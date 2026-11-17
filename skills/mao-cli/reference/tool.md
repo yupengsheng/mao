@@ -67,7 +67,7 @@ mao tool get --name bash
 
 - 统一异步按需遍历目录，不再依赖 `rg`；使用 minimatch 匹配，支持 `**`、花括号（如 `*.{ts,js}`）、字符组（如 `[ab].ts`），`.` 按字面点匹配。
 - 包含隐藏文件，不读取 `.gitignore` / `.ignore`；固定排除目录：`node_modules`、`__pycache__`、`.git`、`target`、`dist`、`build`、`.next`、`.nuxt`、`.venv`、`venv`、`.idea`、`.vscode`（源码：`backend-ts/src/harness/tool/impl/glob-search-tool.ts` 的 `IGNORED_DIRS`）。遍历不跟随符号链接。
-- 访问失败明确返回 `error`，不能视为“没有匹配”。
+- 不可访问（EACCES / EPERM）或遍历期间已消失（ENOENT）的子目录跳过，继续搜索其余目录；根目录访问失败与其它未预期错误仍明确返回 `error`，不能视为“没有匹配”。
 - `head_limit` 须为正整数，默认 100；仅发现超出上限的额外匹配时才返回 `truncated: true`，恰好达到上限不算截断。`total_matched` 等于返回的 `files` 数量，不是全量匹配数。
 - 与搜索文件内容的 `grep_search` 不同：`grep_search` 仍区分 `rg` / 无 `rg` 分支，不应将上述遍历、忽略规则与计数语义套用于它。
 

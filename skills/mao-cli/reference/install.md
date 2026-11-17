@@ -50,7 +50,8 @@ npm run start:dev
 
 - 服务：`http://localhost:9080`
 - Swagger：`http://localhost:9080/api/swagger-ui.html`
-- Flyway 迁移在启动时自动执行（`FLYWAY_ENABLED` 默认 true）
+- Flyway 迁移在启动时自动执行（`FLYWAY_ENABLED` 默认 true），支持历史 SQL 脚本中的 `DELIMITER` 存储过程分隔符，无需手工改写或执行初始化脚本
+- `npm run start:dev` 自动读取当前 `backend-ts/.env`（不存在时跳过），已有进程环境变量优先；生产 `npm start` 仍由启动脚本注入环境变量
 
 ## 4. 配置 LLM 模型
 

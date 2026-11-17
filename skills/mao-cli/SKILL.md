@@ -20,7 +20,9 @@ Mao 的**产品文档唯一正文**（可独立分发）+ **REST 操作 CLI**。
 | 三级 Shell 环境变量（系统 / 用户 / 工作区） | [reference/env.md](reference/env.md) |
 | 管理后台怎么用 / Agent 头像与分组编辑 / 提示词版本与回滚 | [reference/admin.md](reference/admin.md) |
 | 桌面 Web 端（任务、工作区、终端、通知、渠道绑定、我的用量抽屉等） | [reference/desktop.md](reference/desktop.md) |
-| 长期记忆（跨会话记忆的查看与维护） | [reference/memory.md](reference/memory.md) |
+| 长期记忆（个人维护、后台跨用户管理、系统淘汰与主动忽略） | [reference/memory.md](reference/memory.md) |
+| 团队经验库独立页面、筛选与 Markdown 阅读 | [reference/agent.md](reference/agent.md)、[reference/admin.md](reference/admin.md) |
+| 个人与系统默认 Git 凭据、Agent 凭据域限制 | [reference/git.md](reference/git.md) |
 | 任务收件箱（站内通知中心：未读数、七类事件、偏好开关） | [reference/inbox.md](reference/inbox.md) |
 | 执行记录页面 / 通道、子代理、边路与恢复执行的记录 / 等待处理、阶段、来源与历史（只读） | [reference/task.md](reference/task.md) |
 | 任务 / 会话详情 `pendingWait`：等待类型、脱敏摘要、到期时间与恢复只读标记 | [reference/task.md](reference/task.md) |

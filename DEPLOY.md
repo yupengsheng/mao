@@ -28,6 +28,12 @@
 | Agent 级 Git 凭据域（0.0.484 起） | [Git 凭据](skills/mao-cli/reference/git.md#agent-级凭据域)、[Agent 参考](skills/mao-cli/reference/agent.md)；管理后台 Agent 编辑页配置白名单，列表可按「未配置」筛选；V207 迁移新增 `agent.git_allowed_domains` 并随 TS 启动自动执行，无新环境变量。系统设置 `gitToken.scopePolicy` 默认 `lenient`，未配置白名单的 Agent 保持原行为；改 `strict` 后未配置即不注入。显式 `[]` 永远禁止注入 |
 | 会话活跃时间筛选（0.0.485 起） | [会话管理](skills/mao-cli/reference/admin-session.md)；管理端会话列表默认最近 7 天活跃，可选 30 / 90 天、自定义区间或全部时间；`--range` / `--date-from` / `--date-to` 可用于脚本。V208 迁移新增 `idx_session_last_activity`，随 TS 启动自动执行，无新环境变量 |
 
+## 本次功能升级注意
+
+- 新增记忆忽略来源 / 管理权限、系统默认 Git 凭据表、出站投递更新时间迁移；由后端启动时执行，不能只更新前端。具体版本与检查见 [部署正文](skills/mao-cli/reference/deploy.md)。
+- 新容器增加 Docker `--init`；仅对重新创建的容器生效，`docker restart` 不会修改旧容器配置。不要为验证此改动直接删除在线运行中的容器。
+- 文件多选 ZIP 与独立经验库页面依赖对应新后端接口，前后端应配套发布。
+
 **维护者注意**：服务器上真实部署目录为 `/opt/mao`（与云端 Agent 会话工作区路径不同）。`git pull`、构建、`restart.sh` 应在 `/opt/mao` 执行。开机自启安装 `scripts/systemd/mao-backend.service`（见部署文档「开机自启」）。
 
 **自动部署**：`main` 分支推送且全部校验通过后，CI 会自动登录服务器完成一次完整部署，无需人工执行 `git pull` 与部署脚本。配置见 [skills/mao-cli/reference/deploy.md 的「自动部署（GitHub Actions）」](skills/mao-cli/reference/deploy.md#六五-自动部署github-actions)。

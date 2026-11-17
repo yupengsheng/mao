@@ -51,7 +51,7 @@
 - 运行轨迹工具明细来自 `session_activity`，单独按 `usage.sessionActivityRetentionDays` 保留（默认 180 天、最低 90 天，后台每小时清理）。工具失败率与自定义工具调用统计只聚合仍在保留期内的活动行；超期窗口不报错，但工具明细为空。
 - 环比窗口是紧邻的上一个等长窗口（如 days=7 时为前 7 天；昨日的环比为前日）
 - 环比窗口（已结束区间）的聚合结果在**后端进程内缓存 5 分钟**（0.0.338 起）：过去窗口不再增长，同一份结果供各 Tab 复用，因此`previousTotals` 最多滞后 5 分钟；本期窗口每次实时计算
-- Token 分两类：`chatTokens` 来自 `message.token_count`（对话消耗），`backgroundTokens` 来自 `llm_usage`（后台调用，如会话标题、Git 提交信息生成），`totalTokens` 为两者之和；管理后台 UI 紧凑展示用 K/M/B（千/百万/十亿）
+- Token 统计按接口区分：总览、旧 summary、模型、用户与 Agent 的 `totalTokens` 合计统一来自 `llm_call.total_tokens`，与调用次数和成本同源；趋势桶的 `chatTokens` 来自 `message.token_count`、`backgroundTokens` 来自 `llm_usage`，桶内 `totalTokens` 及趋势接口合计仍为两者之和用于堆叠图，实际调用 Token 单列 `callTokens`。旧 summary 的合计是调用口径，但其 `trends[]` 仍为堆叠口径。两种口径不能混作分母；模型页用户环图总量取全窗口汇总，不对截断的 Top 排行求和。默认排除连通性自检，系统后台调用仍计入总量。管理后台 UI 紧凑展示用 K/M/B（千/百万/十亿）
 - 管理后台总览的计数类 KPI（新增会话 / 消息数 / 活跃用户 / 会话总数）≥1 万时紧凑展示为「万 / 亿」并固定保留两位小数（如 1.70 万）；图表坐标轴与条形排行标签仍为一位小数
 - 管理后台总览的 Token KPI（0.0.301 起）同样固定保留两位小数：`totalTokens` ≥1B 显示 1.40B、`chatTokens` / `backgroundTokens` / 命中与入 Token 同口径；趋势图纵轴、模型 / 用户 / Agent 各 Tab 的条形排行与 tooltip 仍为一位小数
 - Token 紧凑展示（0.0.302 起）全站统一保留两位小数：管理后台 K/M/B 与桌面端 K/M/B/T 折算后固定两位（1.4B → 1.40B、667.6M → 667.58M），趋势纵轴、排行标签、tooltip、桌面「我的用量」抽屉与运行轨迹面板同口径；小于 1000 仍按千分位原样展示
@@ -104,14 +104,14 @@
 |------|------|
 | `granularity` | `day` 或 `hour`。`date` 在 day 下为 `YYYY-MM-DD`，在 hour 下为 `YYYY-MM-DD HH:00` |
 | `trends[]` | 按粒度补零：`date` / `sessions` / `messages` / `chatTokens` / `backgroundTokens` / `totalTokens` / `backgroundCalls`，以及 llm_call 列 `callCount` / `callFailCount` / `callCancelledCount` / `callTokens` / `promptTokens` / `cachedTokens` / `cost` / `callSuccessRate` / `cacheHitRate` / `avgDurationMs` / `avgFirstTokenMs` / `costPerMTokens`（后三项为平均总耗时 ms / 平均首字耗时 ms / 每百万 Token 平均成本，口径见下） |
-| `periodTotals` / `previousTotals` | 同 overview 口径 |
+| `periodTotals` / `previousTotals` | 与 overview 字段相同，但趋势 `totalTokens` 为 `chatTokens + backgroundTokens`；实际调用量见 `callTokens` |
 
 ### models
 
 | 字段 | 说明 |
 |------|------|
 | `modelStats[]` | `modelId` / `modelName` / `provider` / `status` / `isDefault` / `sessionCount` / `messageCount` / `chatTokens` / `backgroundTokens` / `totalTokens`（含 llm_call 调用 Token）/ `backgroundCalls` / `contextWindowTokens`，以及质量列：`callCount` / `callFailCount` / `callCancelledCount` / `callSuccessRate` / `callTokens` / `promptTokens` / `cachedTokens` / `cacheHitRate` / `avgFirstTokenMs` / `avgDurationMs` / `avgThroughput`（0.0.364 起，输出速度加权平均，口径见下）/ `retryCallCount`，以及成本列 `cost`（成本单位）。按 Token 合计降序；窗口内完全未被调用的模型不返回 |
-| `periodTotals` | `{ totalTokens, totalCost }`（模型明细合计） |
+| `periodTotals` | `{ totalTokens, totalCost }`（全窗口模型明细合计，不是截断的用户 Token 排行之和） |
 | `sceneStats[]` | `{ key, callCount, failCount, cancelledCount, callTokens }`，默认全部模型；可传 `modelId` 按模型过滤（`0` = 未关联模型，按 `model_id IS NULL` 命中） |
 | `protocolStats[]` | 同上，按 `llm_call.protocol` 分组；空串归一到 `openai-compatible`（与 `llm_model.api_protocol` 同语义，见迁移 V091），NULL 归 `unknown` |
 | `userTokenTop[]` | 「用户 Token 占比」环图数据，与 users 的 `tokenTop` 同源（`llm_call` 口径，0.0.479 起） |

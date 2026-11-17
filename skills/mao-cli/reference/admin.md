@@ -83,6 +83,10 @@ CLI：`mao agent list|get|create|update|set-enabled` 等（见 [agent.md](agent.
 - 版本历史只能恢复启用此功能后保存的内容，无法找回此前已经被覆盖的提示词。
 
 
+## 团队经验库
+
+侧边栏「能力 → 团队经验库」（`agent:read`）集中管理各 Agent 的共享长经验。可切换 Agent、按关键词 / 分组 / 日期筛选与分页；打开文档后进入整页 Markdown 阅读，返回列表保留筛选，URL 可直接定位当前 Agent 和文档。拥有 `agent:write` 才可新建、编辑、删除、切换经验库开关或重建索引；原 Agent 管理的经验库弹窗和「最佳实践」编辑仍保留。正文与 INDEX 的区别及共享目录边界见 [agent.md](agent.md#团队经验库experience-library00342-起)。
+
 ## Skills 管理
 
 维护平台 Skill 文档目录。为内部规范、排障流程编写独立 Skill；按 Agent 场景关联子集。系统 Skill 列表的「关联 Agent」列可反查引用数量，悬停查看 Agent 名称并点击直达过滤后的 Agent 列表。页面分两个 Tab：
@@ -128,6 +132,12 @@ ECP、公司 SSO、飞书首次登录自动建号时，用户名取邮箱前缀�
 公司 SSO 首次建号还会写入公司 checkToken 返回的可选 `claims.avatar`（合法头像地址才写）；已有账号后续换票不覆盖头像，头像仍可由用户本人在桌面端维护。
 
 CLI：`mao user ...`（见 [user.md](user.md)）。
+
+## 用户记忆管理
+
+侧边栏「运行 → 用户记忆」提供跨用户记忆管理；用户详情抽屉的「记忆」Tab 固定到该用户。读需 `memory:read`，可按用户、关键词、scope、status、source、项目和日期筛选并分页；写需 `memory:write`，可代建、编辑、忽略 / 恢复、物理删除，操作纳入后台审计。只有读权限时不提供写操作。
+
+主动忽略会标记为用户忽略，不会被后续自动抽取复活；系统容量淘汰项可再次命中恢复。编辑与代建仍遵守重复检测、内容长度和每用户生效容量限制，详见 [memory.md](memory.md)。
 
 ## 角色权限
 
@@ -226,6 +236,8 @@ CLI：`mao llm-call list`（见 [llm-call.md](llm-call.md)）。
 CLI：`mao http-tool list|enabled|stats|create|update|delete|set-enabled|test`。
 
 ## 系统设置
+
+「系统默认 Git 凭据」可按域名配置全站兜底 Token；个人同域凭据优先，Agent 凭据域限制仍生效，列表不回显 Token。入口与权限见 [git.md](git.md#系统默认凭据)。
 
 平台级配置，例如：
 
