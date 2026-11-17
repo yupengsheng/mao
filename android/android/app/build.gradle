@@ -11,10 +11,10 @@ def maoKeyAlias = System.getenv('MAO_KEY_ALIAS')
 def maoKeyPassword = System.getenv('MAO_KEY_PASSWORD')
 
 android {
-    namespace "cn.etarch.mao.app"
+    namespace "cn.yupengsheng.mao.app"
     compileSdk rootProject.ext.compileSdkVersion
     defaultConfig {
-        applicationId "cn.etarch.mao.app"
+        applicationId "cn.yupengsheng.mao.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode maoVersionCode

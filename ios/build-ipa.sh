@@ -16,7 +16,7 @@
 #   - CocoaPods（pod）
 #   - Node.js / npm
 #   - Apple Developer Team ID：MAO_IOS_TEAM_ID
-#   - 可选：MAO_IOS_BUNDLE_ID（默认 cn.etarch.mao.app）
+#   - 可选：MAO_IOS_BUNDLE_ID（默认 cn.yupengsheng.mao.app）
 #   - 可选：MAO_IOS_PROVISIONING_PROFILE（手动描述文件名称；默认自动签名）
 #
 # 产出：
@@ -37,7 +37,7 @@ CHANGELOG_FILE="$PROJECT_ROOT/CHANGELOG.md"
 DRY_RUN=false
 CUSTOM_VERSION=""
 EXPORT_METHOD="${MAO_IOS_EXPORT_METHOD:-development}"
-BUNDLE_ID="${MAO_IOS_BUNDLE_ID:-cn.etarch.mao.app}"
+BUNDLE_ID="${MAO_IOS_BUNDLE_ID:-cn.yupengsheng.mao.app}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

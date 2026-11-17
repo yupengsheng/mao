@@ -1,6 +1,6 @@
 # iOS APP
 
-基于 **Capacitor 7** 的 WKWebView 壳，Bundle ID `cn.etarch.mao.app`，显示名 `Mao`。**仅 CLOUD 模式**（无 `electronAPI`，自动禁用 LOCAL）。
+基于 **Capacitor 7** 的 WKWebView 壳，Bundle ID `cn.yupengsheng.mao.app`，显示名 `Mao`。**仅 CLOUD 模式**（无 `electronAPI`，自动禁用 LOCAL）。
 
 与安卓一致，App **远程加载**生产 Web（默认 `https://mao.yupengsheng.cn`）。前端 UI 改动只需部署 Web，不需要重新出 IPA；只有原生壳（Swift 插件、Info.plist、图标、`ios/capacitor.config.json`）变化时才重新构建。
 
@@ -23,7 +23,7 @@
 - **CocoaPods**：`sudo gem install cocoapods`
 - **Node.js / npm**
 - Apple Developer 账号与 **Team ID**
-- 在 Xcode 登录开发者账号，并为 `cn.etarch.mao.app` 创建 App ID
+- 在 Xcode 登录开发者账号，并为 `cn.yupengsheng.mao.app` 创建 App ID
 
 ## 构建 IPA
 
@@ -49,7 +49,7 @@ bash build-ipa.sh --version 1.0.18 --export-method development
 | 变量 | 说明 |
 |------|------|
 | `MAO_IOS_TEAM_ID` | Apple Developer Team ID，正式构建必填 |
-| `MAO_IOS_BUNDLE_ID` | 覆盖 Bundle ID，默认 `cn.etarch.mao.app` |
+| `MAO_IOS_BUNDLE_ID` | 覆盖 Bundle ID，默认 `cn.yupengsheng.mao.app` |
 | `MAO_IOS_EXPORT_METHOD` | 等价于 `--export-method` |
 | `MAO_IOS_PROVISIONING_PROFILE` | 手动描述文件名；不填则自动签名 |
 

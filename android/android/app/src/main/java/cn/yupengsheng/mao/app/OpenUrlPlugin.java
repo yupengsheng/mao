@@ -1,4 +1,4 @@
-package cn.etarch.mao.app;
+package cn.yupengsheng.mao.app;
 
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
