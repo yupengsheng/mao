@@ -1,3 +1,4 @@
+import type { Db } from '../db/db.js';
 import type { ChatResponse, LlmAdapter } from '../harness/llm/chat-request.js';
 import type { LlmModel } from '../domain/types.js';
 import { llmModelToConfig } from '../harness/deps.js';
@@ -85,6 +86,12 @@ export interface ExtractionModelLookup {
 }
 
 type SettingLookup = { getValue(key: string): Promise<string | null> };
+
+/** insert 与 EVICTED 复活共享一轮 ACTIVE 名额及淘汰次数上限。 */
+interface SlotPool {
+  activeCount: number;
+  evicted: number;
+}
 
 export class MemoryExtractionService {
   /** 同会话并发互斥链：同一会话的任务串行抽取，避免并发重复调 LLM（技术方案 5.6 第 6 点）。 */
@@ -221,7 +228,7 @@ export class MemoryExtractionService {
   /**
    * 落库（技术方案 5.6 第 5 点 + D13 动作协议 + D14 溢出自动降级）：
    * 逐候选按模型判定的 insert/touch/update 执行；满 200 时淘汰受影响组最旧 AUTO 行腾名额，
-   * 组内无 AUTO 可淘汰则放弃该候选；DISMISSED 行永不复活不变。
+   * 组内无 AUTO 可淘汰则放弃该候选。用户显式忽略不复活；容量淘汰在事实复现时按 LRU 复活。
    */
   private async persistCandidates(
     input: ExtractionSessionInput,
@@ -229,11 +236,7 @@ export class MemoryExtractionService {
     known: KnownMemoryIndex,
   ): Promise<void> {
     const userId = input.userId!;
-    let activeCount = await this.memoryRepo.countActive(userId);
-    if (activeCount >= MEMORY_ACTIVE_LIMIT) {
-      console.warn(`[memory-extraction] active memory limit (${MEMORY_ACTIVE_LIMIT}) reached, evicting stale AUTO rows for userId=${userId}`);
-    }
-    let evicted = 0;
+    let committedEvictions = 0;
     for (const candidate of candidates) {
       let scope = candidate.scope;
       let projectKey = '';
@@ -241,54 +244,61 @@ export class MemoryExtractionService {
         if (hasText(input.projectKey) && !isRobotChannelProjectKey(input.projectKey, input.workspace)) {
           projectKey = input.projectKey!.trim();
         } else {
-          // 会话无有效 projectKey（为空或机器人渠道特殊值）时降级为 USER 级
           scope = 'USER';
         }
       }
 
-      if (candidate.action !== 'insert') {
-        await this.applySemanticAction(userId, candidate, scope, projectKey, known);
-        continue;
-      }
-
-      const dedupHash = computeDedupHash(scope, projectKey, candidate.content);
-      const existing = await this.memoryRepo.findByHash(userId, dedupHash);
-      if (existing == null) {
-        if (activeCount >= MEMORY_ACTIVE_LIMIT) {
-          // D14：满了不再整体放弃——按组淘汰最旧 AUTO 行（软降级可恢复）腾名额，一轮最多淘汰 3 条
-          if (evicted >= MEMORY_EXTRACT_MAX_ITEMS) {
-            console.warn(`[memory-extraction] eviction cap reached, skip insert sessionId=${input.sessionId}`);
-            continue;
-          }
-          const slotFreed = await this.evictStale(userId, scope, projectKey);
-          if (!slotFreed) {
-            console.warn(`[memory-extraction] no evictable AUTO row in group scope=${scope} projectKey=${projectKey}, skip insert userId=${userId}`);
-            continue;
-          }
-          evicted += 1;
-          activeCount -= 1;
+      const persist = () => this.memoryRepo.withUserLock(userId, async (tx) => {
+        if (candidate.action !== 'insert') {
+          await this.applySemanticAction(userId, candidate, scope, projectKey, known, tx);
+          return committedEvictions;
         }
-        try {
+        // 先取稳定用户锁，再用当前读计算容量；不使用前一候选/其他事务留下的估算值。
+        const pool: SlotPool = { activeCount: await this.memoryRepo.countActive(userId, tx), evicted: committedEvictions };
+        const dedupHash = computeDedupHash(scope, projectKey, candidate.content);
+        const existing = await this.memoryRepo.findByHash(userId, dedupHash, tx);
+        if (existing == null) {
+          if (!(await this.freeSlotFor(userId, scope, projectKey, pool, input.sessionId, tx))) return pool.evicted;
           await this.memoryRepo.insert({
-            userId,
-            scope,
-            projectKey,
-            content: candidate.content,
-            source: 'AUTO',
-            status: 'ACTIVE',
-            dedupHash,
-            originSessionId: input.sessionId,
-          });
-          activeCount += 1;
+            userId, scope, projectKey, content: candidate.content, source: 'AUTO', status: 'ACTIVE',
+            dedupHash, originSessionId: input.sessionId,
+          }, tx);
+        } else {
+          await this.applyDedupHit(userId, dedupHash, pool, input.sessionId, tx);
+        }
+        return pool.evicted;
+      });
+      try {
+        let evictions: number;
+        try {
+          evictions = await persist();
         } catch (e) {
           if (!isDuplicateKeyError(e)) throw e;
-          // 并发插入撞唯一键：转为命中分支处理
-          await this.applyDedupHit(userId, dedupHash);
+          // 撞唯一键时先回滚（包括淘汰），再在新事务/同一用户锁下重新读取命中行。
+          evictions = await persist();
         }
-        continue;
+        // 包括 commit 失败在内，失败的候选都不消耗本轮淘汰预算。
+        committedEvictions = evictions;
+      } catch (e) {
+        console.warn(`[memory-extraction] candidate rolled back sessionId=${input.sessionId}: ${(e as Error).message}`);
       }
-      await this.applyDedupHit(userId, dedupHash);
     }
+  }
+
+  /** D14：insert 与复活同口径，只淘汰同组最旧 AUTO，一轮最多三条。 */
+  private async freeSlotFor(userId: number, scope: MemoryScope, projectKey: string, pool: SlotPool, sessionId: number, tx: Db): Promise<boolean> {
+    if (pool.activeCount < MEMORY_ACTIVE_LIMIT) return true;
+    if (pool.evicted >= MEMORY_EXTRACT_MAX_ITEMS) {
+      console.warn(`[memory-extraction] eviction cap reached, skip candidate sessionId=${sessionId}`);
+      return false;
+    }
+    if (!(await this.evictStale(userId, scope, projectKey, tx))) {
+      console.warn(`[memory-extraction] no evictable AUTO row in group scope=${scope} projectKey=${projectKey}, skip candidate userId=${userId}`);
+      return false;
+    }
+    pool.evicted += 1;
+    pool.activeCount -= 1;
+    return true;
   }
 
   /** D13 touch/update 执行：非法引用整条丢弃；update 哈希冲突回退 touch。 */
@@ -298,6 +308,7 @@ export class MemoryExtractionService {
     scope: MemoryScope,
     projectKey: string,
     known: KnownMemoryIndex,
+    tx: Db,
   ): Promise<void> {
     const row = this.resolveKnownReference(known, candidate.existingId!, scope, projectKey);
     if (row == null) {
@@ -305,40 +316,50 @@ export class MemoryExtractionService {
       return;
     }
     if (candidate.action === 'touch') {
-      await this.memoryRepo.touch(row.id!);
+      await this.memoryRepo.touch(row.id!, tx);
       return;
     }
     const dedupHash = computeDedupHash(scope, projectKey, candidate.content);
-    const conflicting = await this.memoryRepo.findByHash(userId, dedupHash);
+    const conflicting = await this.memoryRepo.findByHash(userId, dedupHash, tx);
     if (conflicting != null && conflicting.id !== row.id) {
       // 新表述与另一行逐字节相同：保留冲突行不动，仅再确认本行
-      await this.memoryRepo.touch(row.id!);
+      await this.memoryRepo.touch(row.id!, tx);
       return;
     }
     try {
-      await this.memoryRepo.updateContent(row.id!, candidate.content, dedupHash);
+      await this.memoryRepo.updateContent(row.id!, candidate.content, dedupHash, tx);
     } catch (e) {
       if (!isDuplicateKeyError(e)) throw e;
-      await this.memoryRepo.touch(row.id!);
+      await this.memoryRepo.touch(row.id!, tx);
     }
   }
 
   /** D14 溢出淘汰：受影响组内 updated_at 最旧的一条 AUTO 行置 DISMISSED（软降级，可恢复）。 */
-  private async evictStale(userId: number, scope: MemoryScope, projectKey: string): Promise<boolean> {
-    const rows = await this.memoryRepo.listStaleAuto(userId, scope, projectKey, 1);
+  private async evictStale(userId: number, scope: MemoryScope, projectKey: string, tx: Db): Promise<boolean> {
+    const rows = await this.memoryRepo.listStaleAuto(userId, scope, projectKey, 1, tx);
     const row = rows[0];
     if (row?.id == null) return false;
-    await this.memoryRepo.updateStatus(row.id, 'DISMISSED');
+    await this.memoryRepo.dismiss(row.id, 'EVICTED', tx);
     console.warn(`[memory-extraction] overflow evict: dismissed AUTO memory id=${row.id} scope=${scope} projectKey=${projectKey} userId=${userId}`);
     return true;
   }
 
-  /** 命中已有行：ACTIVE 仅刷新 updated_at 视为再次确认；DISMISSED 跳过不复活（D3）。 */
-  private async applyDedupHit(userId: number, dedupHash: string): Promise<void> {
-    const row = await this.memoryRepo.findByHash(userId, dedupHash);
+  /** ACTIVE 再确认；只有 EVICTED 可在同组有名额时复活，USER 显式忽略绝不复活。 */
+  private async applyDedupHit(userId: number, dedupHash: string, pool: SlotPool, sessionId: number, tx: Db): Promise<void> {
+    // 在同一事务内当前读并锁住目标行，管理员显式忽略与自动复活不能交错覆盖。
+    const row = await this.memoryRepo.findByHash(userId, dedupHash, tx);
     if (row == null) return;
-    if (row.status === 'DISMISSED') return;
-    await this.memoryRepo.touch(row.id!);
+    if (row.status === 'DISMISSED') {
+      if (row.dismissReason !== 'EVICTED') return;
+      const scope: MemoryScope = row.scope === 'PROJECT' ? 'PROJECT' : 'USER';
+      if (!(await this.freeSlotFor(userId, scope, row.projectKey ?? '', pool, sessionId, tx))) return;
+      if (!(await this.memoryRepo.reviveEvicted(row.id!, tx))) {
+        // 条件复核失败也必须回滚已腾出的名额，而不是提交一次无效淘汰。
+        throw new Error(`memory ${row.id} is no longer DISMISSED/EVICTED`);
+      }
+      return;
+    }
+    await this.memoryRepo.touch(row.id!, tx);
   }
 
   private async resolveExtractionModel(): Promise<LlmModel | null> {

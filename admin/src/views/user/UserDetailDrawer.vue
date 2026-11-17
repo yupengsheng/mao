@@ -70,6 +70,11 @@
           <UserUsageTab :user-id="user.id" />
         </el-tab-pane>
 
+        <!-- 记忆：复用跨用户管理面板，固定用户且按 memory 权限独立授权。 -->
+        <el-tab-pane v-if="canViewMemory" label="记忆" name="memory" lazy>
+          <MemoryManagePanel :key="user.id" :fixed-user-id="user.id" :fixed-user-label="user.displayName || user.username" />
+        </el-tab-pane>
+
         <!-- 定时任务 -->
         <el-tab-pane label="定时任务" name="tasks">
           <el-table :data="tasks" v-loading="loadingTabs['tasks']" size="small" stripe>
@@ -257,6 +262,7 @@ import { formatDateTime, formatDateTimeColumn } from '../../utils/datetime'
 import { phaseLabel } from '../../utils/labels'
 import { useAuthStore } from '../../stores/auth'
 import UserUsageTab from './components/UserUsageTab.vue'
+import MemoryManagePanel from '../memory/components/MemoryManagePanel.vue'
 
 interface UserRow {
   id: number
@@ -295,6 +301,7 @@ const canWrite = computed(() => authStore.hasPermission('user:write'))
 const canManageContainer = computed(() => authStore.hasPermission('container:manage'))
 /** 用量 Tab 与用量分析同权限码：无 analytics:read 不渲染，避免点进去 403。 */
 const canViewUsage = computed(() => authStore.hasPermission('analytics:read'))
+const canViewMemory = computed(() => authStore.hasPermission('memory:read'))
 const recycling = ref(false)
 
 async function recycleContainer() {

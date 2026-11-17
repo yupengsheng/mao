@@ -10,7 +10,7 @@
               {{ deltaText(tokenDelta) }}
             </span>
           </div>
-          <div class="sub">环比 {{ previousLabel }}</div>
+          <div class="sub">llm_call 全部调用 · 环比 {{ previousLabel }}</div>
           <BaseChart
             v-if="sparkValues.length > 1"
             class="spark"
@@ -116,7 +116,7 @@
             <li v-if="insights.length === 0" class="muted">窗口内暂无异常洞察</li>
           </ul>
           <div class="compose-grid">
-            <div class="compose-title">窗口构成（非重复环比）</div>
+            <div class="compose-title">来源参考（对话 / 后台不覆盖全部调用，不等于 Token 消耗合计）</div>
             <div v-for="row in composeRows" :key="row.label" class="compose-row">
               <span class="label">{{ row.label }}</span>
               <span class="current" :class="{ fail: row.fail }">{{ row.valueText }}</span>

@@ -1,7 +1,7 @@
 // 统计周期的日历数学、粒度默认值与 URL/查询映射。
 // 覆盖：新增的日历周期（本周/上周/本月/上月）与自定义区间、边界（周一/周日/月初/跨年）、
 // 以及缓存键只认周期语义（自定义必须带起止日）。
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   MAX_CUSTOM_DAYS,
   PERIOD_GROUPS,
@@ -23,6 +23,15 @@ import type { CustomPeriodRange } from '../types'
 
 // 固定“今天”：2026-10-29 周四（周一 10-26、上周一 10-19、上月 = 9 月 30 天）
 const THU = '2026-10-29'
+
+beforeEach(() => {
+  vi.useFakeTimers({ toFake: ['Date'] })
+  vi.setSystemTime(new Date(`${THU}T04:00:00Z`))
+})
+
+afterEach(() => {
+  vi.useRealTimers()
+})
 
 const custom = (start: string, end: string): CustomPeriodRange => ({ start, end })
 
@@ -171,18 +180,18 @@ describe('buildAnalyticsQuery / periodKey', () => {
   })
 
   it('缓存键区分周期与自定义区间，其他周期不因区间变化 miss', () => {
-    // 键 = scope|range|days|start|end|limit|modelId|excludeConnectivity|granularity|scene|scope
-    expect(periodKey('overview', buildAnalyticsQuery('week'))).toBe('overview|week' + '|'.repeat(9))
+    // 键 = scope|range|days|start|end|limit|page|pageSize|modelId|excludeConnectivity|granularity|scene|scope
+    expect(periodKey('overview', buildAnalyticsQuery('week'))).toBe('overview|week' + '|'.repeat(11))
     const customA = periodKey('overview', buildAnalyticsQuery('custom', custom('2026-10-01', '2026-10-15')))
     const customB = periodKey('overview', buildAnalyticsQuery('custom', custom('2026-10-02', '2026-10-15')))
-    expect(customA).toBe('overview|custom||2026-10-01|2026-10-15' + '|'.repeat(6))
+    expect(customA).toBe('overview|custom||2026-10-01|2026-10-15' + '|'.repeat(8))
     expect(customA).not.toBe(customB)
     // 非自定义周期即使内存里留着自定义区间，键也不带区间
     expect(periodKey('overview', buildAnalyticsQuery('today', custom('2026-10-01', '2026-10-15')))).toBe(
-      'overview|today' + '|'.repeat(9)
+      'overview|today' + '|'.repeat(11)
     )
     // 滚动窗口天数必须进键，否则切 3/7/30 天会命中同一份缓存
-    expect(periodKey('overview', buildAnalyticsQuery(7))).toBe('overview||7' + '|'.repeat(8))
+    expect(periodKey('overview', buildAnalyticsQuery(7))).toBe('overview||7' + '|'.repeat(10))
     expect(periodKey('overview', buildAnalyticsQuery(3))).not.toBe(periodKey('overview', buildAnalyticsQuery(7)))
   })
 })

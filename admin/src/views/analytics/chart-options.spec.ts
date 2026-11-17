@@ -7,6 +7,7 @@ import {
   qualityTrendOption,
   tokenCallTrendOption,
   trafficTrendOption,
+  topWithOthers,
   type TrendPoint
 } from './chart-options'
 
@@ -14,6 +15,22 @@ import {
  * Token 紧凑展示全站统一保留两位小数（0.0.302：从一位改为两位，覆盖图表与各 Tab）。
  * 单测锁住默认两位、显式传 1 的一位口径，避免再出现「改了一处漏了其余」。
  */
+describe('Token 占比全量分母', () => {
+  it('API 仅返回少数 tokenTop 时，服务端全量合计中的长尾仍进入其他', () => {
+    const items = topWithOthers([{ name: 'Ada', value: 600 }, { name: '未关联用户', value: 200 }], 10, 1000)
+    expect(items).toEqual([
+      { name: 'Ada', value: 600 }, { name: '未关联用户', value: 200 }, { name: '其他', value: 200, color: '#c7c7cc' },
+    ])
+    expect(items.reduce((sum, item) => sum + item.value, 0)).toBe(1000)
+  })
+  it('API 和图表两次截断的长尾合并为一项，不重计或丢失', () => {
+    const items = topWithOthers([{ name: 'A', value: 600 }, { name: 'B', value: 200 }], 1, 1000)
+    expect(items.map(item => item.value)).toEqual([600, 400])
+    expect(topWithOthers([], 10, 1000)).toEqual([{ name: '其他', value: 1000, color: '#c7c7cc' }])
+    expect(topWithOthers([], 10, 0)).toEqual([])
+  })
+})
+
 describe('formatCompact', () => {
   it('默认一位小数并去掉整数部分多余的 .0', () => {
     expect(formatCompact(17_000)).toBe('1.7 万')

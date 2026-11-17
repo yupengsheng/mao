@@ -745,14 +745,10 @@ async function loadOptions() {
     failed.push('模型')
   }
   try {
-    // 候选来源：当前管理员自己配置的 Git 凭据域；加载失败不阻塞手工输入
-    const { data: credentialData } = await api.get('/user/git-credentials')
-    gitDomainOptions.value = Array.isArray(credentialData)
-      ? [...new Set(
-          credentialData
-            .map((item: any) => String(item?.domain ?? '').trim())
-            .filter((domain: string) => domain !== '')
-        )]
+    // 候选来源：全站用户凭据域 ∪ 系统默认域，仅回域名；加载失败不阻塞手工输入
+    const { data: domainData } = await api.get('/admin/git-domains')
+    gitDomainOptions.value = Array.isArray(domainData?.domains)
+      ? domainData.domains.map((domain: unknown) => String(domain ?? '').trim()).filter((domain: string) => domain !== '')
       : []
   } catch {
     gitDomainOptions.value = []

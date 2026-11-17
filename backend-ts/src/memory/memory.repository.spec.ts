@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { MemoryRepository } from './memory.repository.js';
+import { ErrorCode } from '../common/error-code.js';
 
 function mockDb(queryOne: unknown = null, query: unknown[] = [], executeResult: { affectedRows: number; insertId: number } = { affectedRows: 1, insertId: 1 }) {
   return {
@@ -9,6 +10,79 @@ function mockDb(queryOne: unknown = null, query: unknown[] = [], executeResult: 
     insert: vi.fn(async () => 42),
   };
 }
+
+describe('MemoryRepository governance and admin filters', () => {
+  it('locks the stable user row before the callback on the transaction connection', async () => {
+    const tx = mockDb({ id: 7 });
+    const transaction = vi.fn(async (fn: (db: unknown) => Promise<unknown>) => fn(tx));
+    const repo = new MemoryRepository({ transaction } as never);
+    const callback = vi.fn(async (db: unknown) => {
+      expect(db).toBe(tx);
+      expect(tx.queryOne).toHaveBeenCalledWith('SELECT id FROM `user` WHERE id = ? FOR UPDATE', [7]);
+      return 42;
+    });
+    expect(await repo.withUserLock(7, callback)).toBe(42);
+    expect(transaction).toHaveBeenCalledTimes(1);
+    (tx.queryOne as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
+    await expect(repo.withUserLock(7, callback)).rejects.toMatchObject({ code: ErrorCode.USER_NOT_FOUND.code });
+    expect(callback).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads capacity and target rows with FOR UPDATE only on the supplied connection', async () => {
+    const root = mockDb({ total: 999 });
+    const tx = mockDb(null, [{ id: 1 }, { id: 2 }]);
+    const repo = new MemoryRepository(root as never);
+    expect(await repo.countActive(7, tx as never)).toBe(2);
+    await repo.findById(5, tx as never);
+    await repo.findByHash(7, 'hash', tx as never);
+    await repo.listStaleAuto(7, 'USER', '', 1, tx as never);
+    expect(root.query).not.toHaveBeenCalled();
+    expect(root.queryOne).not.toHaveBeenCalled();
+    for (const [sql] of (tx.query as ReturnType<typeof vi.fn>).mock.calls) expect(sql).toMatch(/FOR UPDATE$/);
+    for (const [sql] of (tx.queryOne as ReturnType<typeof vi.fn>).mock.calls) expect(sql).toMatch(/FOR UPDATE$/);
+  });
+
+  it('conditionally revives only DISMISSED/EVICTED on the transaction connection', async () => {
+    const root = mockDb();
+    const tx = mockDb();
+    const repo = new MemoryRepository(root as never);
+    expect(await repo.reviveEvicted(5, tx as never)).toBe(true);
+    const [sql, params] = (tx.execute as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(sql).toContain("WHERE id = ? AND status = 'DISMISSED' AND dismiss_reason = 'EVICTED'");
+    expect(params[1]).toBe(5);
+    expect(root.execute).not.toHaveBeenCalled();
+    (tx.execute as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ affectedRows: 0 });
+    expect(await repo.reviveEvicted(5, tx as never)).toBe(false);
+  });
+
+  it('filtersAcrossUsersAndBindsSourceDatesAndEscapedKeyword', async () => {
+    const db = mockDb({ total: 1 });
+    const repo = new MemoryRepository(db as never);
+    const query = { source: 'AUTO' as const, updatedFrom: '2026-11-01 00:00:00', updatedTo: '2026-11-11 23:59:59', keyword: '100%', page: 2, pageSize: 10 };
+    await repo.page(query);
+    await repo.count(query);
+    const [sql, params] = (db.query as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(sql).not.toContain('user_id = ?');
+    expect(sql).toContain('source = ?');
+    expect(sql).toContain('updated_at >= ?');
+    expect(sql).toContain('updated_at <= ?');
+    expect(params).toEqual(['AUTO', query.updatedFrom, query.updatedTo, '100\\%', '100\\%', 10, 10]);
+    expect((db.queryOne as ReturnType<typeof vi.fn>).mock.calls[0][1]).toEqual(params.slice(0, -2));
+  });
+
+  it('dismissAtomicallyWritesReasonAndNegativeHintsExcludeEvicted', async () => {
+    const db = mockDb();
+    const repo = new MemoryRepository(db as never);
+    await repo.dismiss(9, 'EVICTED');
+    await repo.dismiss(10, 'USER');
+    expect((db.execute as ReturnType<typeof vi.fn>).mock.calls[0]).toEqual([
+      "UPDATE `memory_item` SET status = 'DISMISSED', dismiss_reason = ? WHERE id = ?", ['EVICTED', 9],
+    ]);
+    expect((db.execute as ReturnType<typeof vi.fn>).mock.calls[1][1]).toEqual(['USER', 10]);
+    await repo.listDismissedContents(7, 50);
+    expect((db.query as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain("dismiss_reason = 'USER'");
+  });
+});
 
 describe('MemoryRepository', () => {
   it('pageFiltersByUserIdAndOptionalFieldsWithDescOrder', async () => {

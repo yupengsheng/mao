@@ -46,6 +46,15 @@ export class GitCredentialService {
     );
   }
 
+  /** 全站用户凭据域去重清单，仅返回域名供 Agent 白名单候选。 */
+  async listAllDomains(): Promise<string[]> {
+    const rows = await this.db.query<{ domain: string }>(
+      'SELECT DISTINCT domain FROM user_git_credential ORDER BY domain ASC',
+      [],
+    );
+    return rows.map((row) => row.domain);
+  }
+
   async listByUserIdPaged(userId: number, pageNum: number, pageSize: number): Promise<GitCredentialPage> {
     const totalRow = await this.db.queryOne<{ c: number }>(
       'SELECT COUNT(*) AS c FROM user_git_credential WHERE user_id = ?',

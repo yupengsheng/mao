@@ -506,15 +506,15 @@ export class AdminAnalyticsDbStore implements AdminAnalyticsStore {
   selectLlmCallStatsByUser(range: AnalyticsRange, opts?: LlmCallFilterOpts): Promise<LlmCallDimRow[]> {
     const { sql, params } = this.llmCallWhere(range, opts);
     return this.db.query(
-      `SELECT user_id AS id,
+      `SELECT COALESCE(user_id, 0) AS id,
               COUNT(*) AS callCount,
               COALESCE(SUM(CASE WHEN success = 0 AND ${NOT_CANCELLED_SQL} THEN 1 ELSE 0 END), 0) AS failCount,
               COALESCE(SUM(CASE WHEN ${CANCELLED_SQL} THEN 1 ELSE 0 END), 0) AS cancelledCount,
               COALESCE(SUM(total_tokens), 0) AS callTokens,
               COALESCE(SUM(cost_micros), 0) / 1000000 AS cost
        FROM llm_call
-       WHERE ${sql} AND user_id IS NOT NULL
-       GROUP BY user_id`,
+       WHERE ${sql}
+       GROUP BY COALESCE(user_id, 0)`,
       params,
     );
   }
@@ -864,6 +864,7 @@ export class AdminAnalyticsService {
       },
       periodTotals: {
         ...sumTrends(trends),
+        totalTokens: trends.reduce((sum, row) => sum + toNumber(row.callTokens), 0),
         activeUsers,
         completedSessions: periodPhases.get('COMPLETED') ?? 0,
         failedSessions: periodPhases.get('FAILED') ?? 0,
@@ -879,23 +880,29 @@ export class AdminAnalyticsService {
   }
 
   /** 总览：运行态 + 窗口合计 + 环比 + Token spark + 规则洞察；不拉维度排行。 */
-  async overview(days: number, endOffset = 0): Promise<Record<string, unknown>> {
+  async overview(
+    days: number,
+    endOffset = 0,
+    opts?: { excludeConnectivity?: boolean },
+  ): Promise<Record<string, unknown>> {
     const { range, previous } = this.resolveWindows(days, endOffset);
+    const callOpts = { excludeConnectivity: opts?.excludeConnectivity !== false };
     const [baseOverview, livePhaseRows, periodPhaseRows, trends, activeUsers, previousTotals, quality] = await Promise.all([
       this.statisticsService.getOverview(),
       this.store.selectLivePhaseCounts(),
       this.store.selectPhaseCounts(range),
-      this.trends(range),
+      this.trends(range, callOpts),
       this.store.countActiveUsers(range),
-      this.previousTotals(previous),
-      // 缓存命中率口径 llm_call，默认排除连通性自检（与趋势 Tab 一致）
-      this.store.selectLlmCallQualitySummary(range),
+      this.previousTotals(previous, callOpts),
+      this.store.selectLlmCallQualitySummary(range, callOpts),
     ]);
 
     const livePhases = phaseMap(livePhaseRows);
     const periodPhases = phaseMap(periodPhaseRows);
     const periodTotals = {
       ...sumTrends(trends),
+      // 统一消耗口径为 llm_call：覆盖 delegate / 压缩等不落消息的调用；不可叠加消息/后台 Token。
+      totalTokens: quality.callTokens,
       activeUsers,
       completedSessions: periodPhases.get('COMPLETED') ?? 0,
       failedSessions: periodPhases.get('FAILED') ?? 0,
@@ -917,7 +924,7 @@ export class AdminAnalyticsService {
       previousTotals,
       spark: trends.map((row) => ({
         date: String(row.date),
-        totalTokens: toNumber(row.totalTokens),
+        totalTokens: toNumber(row.callTokens),
       })),
       phaseDistribution: phaseDistributionOf(periodPhases),
       insights: buildOverviewInsights(periodTotals, previousTotals),
@@ -942,6 +949,7 @@ export class AdminAnalyticsService {
     ]);
     const periodPhases = phaseMap(await this.store.selectPhaseCounts(range));
     const periodTotals = {
+      // 趋势堆叠与合计仍为 chat + background；独立 callTokens 才是完整调用消耗。
       ...sumTrends(trends),
       activeUsers,
       completedSessions: periodPhases.get('COMPLETED') ?? 0,
@@ -960,6 +968,7 @@ export class AdminAnalyticsService {
       periodTotals,
       previousTotals: {
         ...previousTotals,
+        totalTokens: toNumber(previousTotals.chatTokens) + toNumber(previousTotals.backgroundTokens),
         callCount: prevQuality.callCount,
         callFailCount: prevQuality.failCount,
         callCancelledCount: prevQuality.cancelledCount,
@@ -1025,7 +1034,7 @@ export class AdminAnalyticsService {
       userActivity,
       tokenTop,
       // 明细分页后，消息排行仍需独立的全局 Top N，避免翻页时图表跟着当前页变化
-      messageTop: allRows.slice(0, RANK_LIMIT).map((row) => ({
+      messageTop: [...allRows].sort(byNumberDesc('messageCount', 'totalTokens')).slice(0, RANK_LIMIT).map((row) => ({
         userId: row.userId,
         username: row.username,
         displayName: row.displayName,
@@ -1037,7 +1046,10 @@ export class AdminAnalyticsService {
         pageSize: pagination.pageSize,
         total: allRows.length,
       },
-      periodTotals: { activeUsers },
+      periodTotals: {
+        activeUsers,
+        totalTokens: allRows.reduce((sum, row) => sum + toNumber(row.totalTokens), 0),
+      },
       previousTotals,
     };
   }
@@ -1054,7 +1066,7 @@ export class AdminAnalyticsService {
     const pagination = resolvePagination(opts, limit);
     const [allRows, tokenTop, previousTotals] = await Promise.all([
       this.agentRows(range, callOpts),
-      this.agentTokenTop(range, pagination.pageSize),
+      this.agentTokenTop(range, pagination.pageSize, callOpts),
       this.previousTotals(previous, callOpts),
     ]);
     const agentStats = sliceScopeRows(allRows, pagination);
@@ -1377,7 +1389,7 @@ export class AdminAnalyticsService {
       messages: messages.count,
       chatTokens: messages.tokens,
       backgroundTokens,
-      totalTokens: messages.tokens + backgroundTokens,
+      totalTokens: quality.callTokens,
       activeUsers,
       callCount: quality.callCount,
       callFailCount: quality.failCount,
@@ -1431,7 +1443,6 @@ export class AdminAnalyticsService {
     const names = new Map(agents.filter((a) => a.id != null).map((a) => [a.id!, a.name ?? '未知']));
     const sessionCounts = idMap(sessionRows, (r) => r.sessionCount);
     const messageCounts = idMap(messageRows, (r) => r.messageCount);
-    const tokens = idMap(messageRows, (r) => r.totalTokens);
     const callCounts = idMap(callRows, (r) => r.callCount);
     const failCounts = idMap(callRows, (r) => r.failCount);
     const cancelledCounts = idMap(callRows, (r) => r.cancelledCount);
@@ -1447,7 +1458,7 @@ export class AdminAnalyticsService {
         agentName: names.get(agentId) ?? '未知',
         sessionCount: sessionCounts.get(agentId) ?? 0,
         messageCount: messageCounts.get(agentId) ?? 0,
-        totalTokens: tokens.get(agentId) ?? 0,
+        totalTokens: callTokens.get(agentId) ?? 0,
         callCount: calls,
         callFailCount: fails,
         callCancelledCount: cancels,
@@ -1489,8 +1500,10 @@ export class AdminAnalyticsService {
     const callTokens = idMap(callRows, (r) => r.callTokens);
     const callCosts = idMap(callRows, (r) => r.cost);
     const rows: Array<Record<string, unknown>> = [];
-    for (const user of users) {
-      const uid = user.id!;
+    const meta = new Map(users.filter(user => user.id != null).map(user => [Number(user.id), user]));
+    // 系统调用(id=0)与已删除用户仍有真实消耗，不因缺少用户元数据而丢失。
+    for (const uid of unionKeys(sessionCounts, messageCounts, callCounts, callTokens)) {
+      const user = meta.get(uid);
       const sessionCount = sessionCounts.get(uid) ?? 0;
       const messageCount = messageCounts.get(uid) ?? 0;
       const calls = callCounts.get(uid) ?? 0;
@@ -1499,13 +1512,13 @@ export class AdminAnalyticsService {
         continue;
       }
       rows.push({
-        userId: user.id,
-        username: user.username,
-        displayName: user.displayName,
+        userId: uid,
+        username: user?.username ?? (uid === 0 ? '未关联用户' : `用户 ${uid}`),
+        displayName: user?.displayName,
         sessionCount,
         messageCount,
         totalTokens: callTokens.get(uid) ?? 0,
-        lastLoginAt: user.lastLoginAt != null ? String(user.lastLoginAt) : null,
+        lastLoginAt: user?.lastLoginAt != null ? String(user.lastLoginAt) : null,
         callCount: calls,
         callFailCount: fails,
         callCancelledCount: cancelledCounts.get(uid) ?? 0,
@@ -1513,7 +1526,7 @@ export class AdminAnalyticsService {
         cost: callCosts.get(uid) ?? 0,
       });
     }
-    rows.sort(byNumberDesc('messageCount', 'totalTokens'));
+    rows.sort(byNumberDesc('totalTokens', 'messageCount'));
     return rows;
   }
 
@@ -1539,7 +1552,7 @@ export class AdminAnalyticsService {
       const user = meta.get(userId);
       rows.push({
         userId,
-        username: user?.username,
+        username: user?.username ?? (userId === 0 ? '未关联用户' : `用户 ${userId}`),
         displayName: user?.displayName,
         totalTokens,
       });
@@ -1548,16 +1561,18 @@ export class AdminAnalyticsService {
     return rows.slice(0, clampLimit(limit));
   }
 
-  /** Token 排行独立按 totalTokens 排序截断，避免依赖会话/消息数截断的明细集而遗漏重消耗 Agent。 */
+  /** Token 排行按完整调用消耗排序截断，不依赖消息/会话数截断的明细。 */
   private async agentTokenTop(
     range: AnalyticsRange,
     limit: number,
+    callOpts?: { excludeConnectivity?: boolean },
   ): Promise<Array<Record<string, unknown>>> {
-    const [agents, messageRows] = await Promise.all([
+    const opts = { excludeConnectivity: callOpts?.excludeConnectivity !== false };
+    const [agents, callRows] = await Promise.all([
       this.store.listAgents(),
-      this.store.selectMessageStatsByAgent(range),
+      this.store.selectLlmCallStatsByAgent(range, opts),
     ]);
-    const tokens = idMap(messageRows, (r) => r.totalTokens);
+    const tokens = idMap(callRows, (r) => r.callTokens);
     const names = new Map(agents.filter((a) => a.id != null).map((a) => [a.id!, a.name ?? '未知']));
     const rows: Array<Record<string, unknown>> = [];
     for (const [agentId, totalTokens] of tokens) {
@@ -1643,8 +1658,8 @@ export class AdminAnalyticsService {
         messageCount,
         chatTokens: chat,
         backgroundTokens: background,
-        // 口径与总览页一致：chat + background（llm_call 与二者为包含关系，不能叠加，否则重复计一倍）
-        totalTokens: chat + background,
+        // llm_call 与 message/llm_usage 为包含关系，后两者仅作来源明细，不能与调用 Token 相加。
+        totalTokens: callTokens,
         backgroundCalls: usageCalls,
         contextWindowTokens: model?.contextWindowTokens,
         callCount,

@@ -12,6 +12,8 @@ export interface MemoryItemRow {
   content?: string | null;
   source?: string | null;
   status?: string | null;
+  /** DISMISSED 来源：USER=用户/管理员显式忽略；EVICTED=容量淘汰，ACTIVE 期间不读。 */
+  dismissReason?: string | null;
   dedupHash?: string | null;
   originSessionId?: number | null;
   createdAt?: string | null;
@@ -56,6 +58,12 @@ export interface MemoryPageVO {
 }
 
 export interface MemoryListQuery {
+  /** 缺省为跨用户；仅管理员入口允许，用户入口强制覆盖为当前用户。 */
+  userId?: number | null;
+  source?: MemorySource | null;
+  /** 路由规范化后的 SQL 日期时间闭区间。 */
+  updatedFrom?: string | null;
+  updatedTo?: string | null;
   scope?: MemoryScope | null;
   projectKey?: string | null;
   status?: MemoryStatus | null;
@@ -87,7 +95,7 @@ export const MEMORY_EXTRACT_MIN_USER_MESSAGE_LENGTH = 20;
 /** 抽取输入截断护栏：USER 消息与 ASSISTANT 答复各截取的最大字符数。 */
 export const MEMORY_EXTRACT_INPUT_MAX_CHARS = 6000;
 
-/** 负面约束集上限：DISMISSED 行 content 进入抽取 prompt 的条数上限（D13，D14 淘汰会持续产生 DISMISSED 行）。 */
+/** 负面约束集上限：仅 USER 显式忽略的 content 进入抽取 prompt，EVICTED 容量淘汰不进入。 */
 export const MEMORY_EXTRACT_DISMISSED_HINT_LIMIT = 50;
 
 export const MEMORY_SCOPES = ['USER', 'PROJECT'] as const satisfies readonly MemoryScope[];

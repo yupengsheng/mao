@@ -1,3 +1,4 @@
+import type { Db } from '../db/db.js';
 import { createHash } from 'node:crypto';
 import { BusinessException } from '../common/business-exception.js';
 import { ErrorCode } from '../common/error-code.js';
@@ -75,8 +76,20 @@ export class MemoryService {
   ) {}
 
   async list(userId: number, query: MemoryListQuery): Promise<MemoryPageVO> {
+    return this.pageInternal({ ...query, userId });
+  }
+
+  /** 后台单用户/跨用户查询，权限和跨用户强制过滤由 admin.routes 校验。 */
+  async listForAdmin(query: MemoryListQuery): Promise<MemoryPageVO> {
+    return this.pageInternal(query);
+  }
+
+  private async pageInternal(query: MemoryListQuery): Promise<MemoryPageVO> {
     const filter = {
-      userId,
+      userId: query.userId ?? null,
+      source: query.source ?? null,
+      updatedFrom: query.updatedFrom ?? null,
+      updatedTo: query.updatedTo ?? null,
       scope: query.scope ?? null,
       projectKey: query.projectKey ?? null,
       status: query.status ?? null,
@@ -94,9 +107,19 @@ export class MemoryService {
     };
   }
 
-  /** 管理后台只读审计：跨用户按 userId 查询（admin.routes 侧已做 memory:read 权限校验）。 */
-  async listForAdmin(userId: number, query: MemoryListQuery): Promise<MemoryPageVO> {
-    return this.list(userId, query);
+  /** 后台代建与用户手写完全一致，source 固定 MANUAL。 */
+  async createForAdmin(userId: number, input: { scope: string; content: string; projectKey?: string | null }): Promise<MemoryItemVO> {
+    return this.create(userId, input);
+  }
+
+  /** 目标用户由记忆 id 反查，调用方不能指定或篡改归属。 */
+  async updateForAdmin(id: number, input: { content?: string | null; status?: string | null }): Promise<MemoryItemVO> {
+    return this.applyUpdate(await this.requireRow(id), input);
+  }
+
+  async removeForAdmin(id: number): Promise<void> {
+    const row = await this.requireRow(id);
+    await this.removeRow(row);
   }
 
   async create(userId: number, input: { scope: string; content: string; projectKey?: string | null }): Promise<MemoryItemVO> {
@@ -104,31 +127,22 @@ export class MemoryService {
     const projectKey = scope === 'PROJECT' ? this.parseProjectKey(input.projectKey) : '';
     const content = normalizeMemoryContent(input.content);
     this.assertContent(content);
-    await this.assertActiveLimit(userId);
     const dedupHash = computeDedupHash(scope, projectKey, content);
-    const existing = await this.memoryRepo.findByHash(userId, dedupHash);
-    if (existing) {
-      throw new BusinessException(ErrorCode.MEMORY_CONTENT_DUPLICATE);
-    }
-    let id: number;
-    try {
-      id = await this.memoryRepo.insert({
-        userId,
-        scope,
-        projectKey,
-        content,
-        source: 'MANUAL',
-        status: 'ACTIVE',
-        dedupHash,
-        originSessionId: null,
-      });
-    } catch (e) {
-      // 并发窗口内撞 uk_memory_dedup：回业务错误码而非 500
-      if (isDuplicateKeyError(e)) throw new BusinessException(ErrorCode.MEMORY_CONTENT_DUPLICATE);
-      throw e;
-    }
-    const row = await this.memoryRepo.findById(id);
-    return toMemoryVO(row!);
+    return this.memoryRepo.withUserLock(userId, async (tx) => {
+      await this.assertActiveLimit(userId, tx);
+      const existing = await this.memoryRepo.findByHash(userId, dedupHash, tx);
+      if (existing) throw new BusinessException(ErrorCode.MEMORY_CONTENT_DUPLICATE);
+      let id: number;
+      try {
+        id = await this.memoryRepo.insert({
+          userId, scope, projectKey, content, source: 'MANUAL', status: 'ACTIVE', dedupHash, originSessionId: null,
+        }, tx);
+      } catch (e) {
+        if (isDuplicateKeyError(e)) throw new BusinessException(ErrorCode.MEMORY_CONTENT_DUPLICATE);
+        throw e;
+      }
+      return toMemoryVO((await this.memoryRepo.findById(id, tx))!);
+    });
   }
 
   /**
@@ -137,50 +151,50 @@ export class MemoryService {
    */
   async update(userId: number, id: number, input: { content?: string | null; status?: string | null }): Promise<MemoryItemVO> {
     const row = await this.requireOwnedRow(userId, id);
-    let content = row.content ?? '';
-    let dedupHash = row.dedupHash ?? '';
-    if (input.content != null) {
-      content = normalizeMemoryContent(input.content);
-      this.assertContent(content);
-      dedupHash = computeDedupHash(scopeOf(row), row.projectKey, content);
-      const existing = await this.memoryRepo.findByHash(userId, dedupHash);
-      if (existing && existing.id !== row.id) {
-        throw new BusinessException(ErrorCode.MEMORY_CONTENT_DUPLICATE);
+    return this.applyUpdate(row, input);
+  }
+
+  /** 用户与管理员共用规范化、去重、限额及事务，只有归属鉴权入口不同。 */
+  private async applyUpdate(initial: MemoryItemRow, input: { content?: string | null; status?: string | null }): Promise<MemoryItemVO> {
+    const userId = initial.userId!;
+    return this.memoryRepo.withUserLock(userId, async (tx) => {
+      // 事务外行仅定位锁；等待用户锁后重新当前读，不能依据陈旧状态决定恢复/忽略。
+      const row = await this.requireOwnedRow(userId, initial.id!, tx);
+      let content = row.content ?? '';
+      let dedupHash = row.dedupHash ?? '';
+      if (input.content != null) {
+        content = normalizeMemoryContent(input.content);
+        this.assertContent(content);
+        dedupHash = computeDedupHash(scopeOf(row), row.projectKey, content);
+        const existing = await this.memoryRepo.findByHash(userId, dedupHash, tx);
+        if (existing && existing.id !== row.id) throw new BusinessException(ErrorCode.MEMORY_CONTENT_DUPLICATE);
       }
-    }
-    let statusChanged: MemoryStatus | null = null;
-    if (input.status != null) {
-      const status = this.parseStatus(input.status);
-      if (status !== row.status) statusChanged = status;
-    }
-    // DISMISSED → ACTIVE 恢复同样受 200 条 ACTIVE 总量上限约束（D7），否则极端操作序列可突破限额
-    if (statusChanged === 'ACTIVE' && row.status === 'DISMISSED') {
-      await this.assertActiveLimit(userId);
-    }
-    if (input.content != null || statusChanged != null) {
-      // 内容与状态两步写在同一事务，避免部分成功（如状态已切、内容写入失败）
-      await this.memoryRepo.transaction(async (tx) => {
-        try {
-          if (input.content != null && (content !== row.content || dedupHash !== row.dedupHash)) {
-            await this.memoryRepo.updateContent(row.id!, content, dedupHash, tx);
-          }
-          if (statusChanged != null) {
-            await this.memoryRepo.updateStatus(row.id!, statusChanged, tx);
-          }
-        } catch (e) {
-          // 并发窗口内内容重算哈希撞 uk_memory_dedup：回业务错误码并整体回滚
-          if (isDuplicateKeyError(e)) throw new BusinessException(ErrorCode.MEMORY_CONTENT_DUPLICATE);
-          throw e;
+      let statusChanged: MemoryStatus | null = null;
+      if (input.status != null) {
+        const status = this.parseStatus(input.status);
+        if (status !== row.status || (status === 'DISMISSED' && row.dismissReason !== 'USER')) statusChanged = status;
+      }
+      if (statusChanged === 'ACTIVE') await this.assertActiveLimit(userId, tx);
+      try {
+        if (input.content != null && (content !== row.content || dedupHash !== row.dedupHash)) {
+          await this.memoryRepo.updateContent(row.id!, content, dedupHash, tx);
         }
-      });
-    }
-    const updated = await this.memoryRepo.findById(row.id!);
-    return toMemoryVO(updated!);
+        if (statusChanged === 'DISMISSED') {
+          await this.memoryRepo.dismiss(row.id!, 'USER', tx);
+        } else if (statusChanged != null) {
+          await this.memoryRepo.updateStatus(row.id!, statusChanged, tx);
+        }
+      } catch (e) {
+        if (isDuplicateKeyError(e)) throw new BusinessException(ErrorCode.MEMORY_CONTENT_DUPLICATE);
+        throw e;
+      }
+      return toMemoryVO((await this.memoryRepo.findById(row.id!, tx))!);
+    });
   }
 
   async remove(userId: number, id: number): Promise<void> {
     const row = await this.requireOwnedRow(userId, id);
-    await this.memoryRepo.deleteById(row.id!);
+    await this.removeRow(row);
   }
 
   /** 自动收集开关：默认关闭（无偏好行视为关闭），关闭时只停自动抽取，注入与手工管理不受影响。 */
@@ -243,13 +257,26 @@ export class MemoryService {
     return hints;
   }
 
-  private async requireOwnedRow(userId: number, id: number): Promise<MemoryItemRow> {
+  private async removeRow(initial: MemoryItemRow): Promise<void> {
+    await this.memoryRepo.withUserLock(initial.userId!, async (tx) => {
+      const row = await this.requireOwnedRow(initial.userId!, initial.id!, tx);
+      await this.memoryRepo.deleteById(row.id!, tx);
+    });
+  }
+
+  private async requireRow(id: number, db?: Db): Promise<MemoryItemRow> {
     if (!Number.isSafeInteger(id) || id <= 0) {
       throw new BusinessException(ErrorCode.MEMORY_ITEM_NOT_FOUND);
     }
-    const row = await this.memoryRepo.findById(id);
+    const row = await this.memoryRepo.findById(id, db);
+    if (row == null) throw new BusinessException(ErrorCode.MEMORY_ITEM_NOT_FOUND);
+    return row;
+  }
+
+  private async requireOwnedRow(userId: number, id: number, db?: Db): Promise<MemoryItemRow> {
+    const row = await this.requireRow(id, db);
     // 归属校验 user_id = 当前登录用户，越权与不存在一律按不存在处理
-    if (row == null || row.userId !== userId) {
+    if (row.userId !== userId) {
       throw new BusinessException(ErrorCode.MEMORY_ITEM_NOT_FOUND);
     }
     return row;
@@ -292,8 +319,8 @@ export class MemoryService {
     }
   }
 
-  private async assertActiveLimit(userId: number): Promise<void> {
-    const activeCount = await this.memoryRepo.countActive(userId);
+  private async assertActiveLimit(userId: number, db: Db): Promise<void> {
+    const activeCount = await this.memoryRepo.countActive(userId, db);
     if (activeCount >= MEMORY_ACTIVE_LIMIT) {
       throw new BusinessException(ErrorCode.MEMORY_LIMIT_EXCEEDED);
     }

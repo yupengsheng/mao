@@ -16,6 +16,8 @@ describe('menuGroups 配置', () => {
 
   it('menuGroupIdByPath 返回路由首段所属分组', () => {
     expect(menuGroupIdByPath(menuGroups, '/models')).toBe('capability')
+    expect(menuGroupIdByPath(menuGroups, '/experience')).toBe('capability')
+    expect(flattenMenuItems(menuGroups).find(item => item.index === '/experience')?.permission).toBe('agent:read')
     expect(menuGroupIdByPath(menuGroups, '/audit-logs')).toBe('security')
     expect(menuGroupIdByPath(menuGroups, '/unknown')).toBeUndefined()
   })

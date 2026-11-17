@@ -106,6 +106,44 @@ export class ExperienceIndexStore {
       .map(({ mtimeMs: _mtimeMs, ...meta }) => meta);
   }
 
+  /** 读索引文档（admin 展示）：返回索引文件名、正文和索引头记录的文档数。 */
+  readIndex(agentDir: string): { fileName: string; content: string; docCount: number } {
+    this.ensureFresh(agentDir);
+    const content = this.readDoc(agentDir, EXPERIENCE_INDEX_FILE) ?? '';
+    return {
+      fileName: EXPERIENCE_INDEX_FILE,
+      content,
+      docCount: readIndexCount(content) ?? 0,
+    };
+  }
+
+  /**
+   * 跨 Agent 经验库统计。只扫描数字目录下的 Markdown 子文档，不刷新索引，
+   * 避免总览请求产生磁盘写入；软链接目录和非数字目录均不属于 Agent 库。
+   */
+  overviewLibraries(): Array<{ agentId: number; docCount: number; totalBytes: number; lastUpdatedAt: string }> {
+    if (!existsSync(this.root)) return [];
+    const out: Array<{ agentId: number; docCount: number; totalBytes: number; lastUpdatedAt: string }> = [];
+    for (const entry of readdirSync(this.root, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+      const agentDir = path.join(this.root, entry.name);
+      try {
+        const docs = this.scanDocs(agentDir);
+        const lastUpdatedAt = docs.map((doc) => doc.updatedAt).sort().at(-1) ?? '';
+        out.push({
+          agentId: Number(entry.name),
+          docCount: docs.length,
+          totalBytes: docs.reduce((sum, doc) => sum + doc.sizeBytes, 0),
+          lastUpdatedAt,
+        });
+      } catch (e) {
+        // 单个库的并发删除或权限异常不应阻断其余库的总览。
+        harnessLog('warn', `experience overview scan failed: ${agentDir}: ${(e as Error).message}`);
+      }
+    }
+    return out;
+  }
+
   /** 读单篇子文档；不存在返回 null。符号链接（含指向存在的目标）一律视为不存在。 */
   readDoc(agentDir: string, fileName: string): string | null {
     if (!isValidExperienceFileName(fileName)) return null;

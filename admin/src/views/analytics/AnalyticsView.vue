@@ -22,6 +22,8 @@
           @select="handlePeriodSelect"
           @custom="handleCustomRange"
         />
+        <el-checkbox v-if="activeTab !== 'models' && activeTab !== 'run-trace'" :model-value="includeConnectivity"
+          @update:model-value="(value: string | number | boolean) => handleModelsRefresh(!!value)">含自检调用</el-checkbox>
         <template v-if="activeTab === 'run-trace'">
           <span class="toolbar-label">排行维度</span>
           <el-segmented v-model="runTraceDimension" :options="runTraceDimensionOptions" @change="handleRunTraceDimensionChange" />
@@ -187,8 +189,8 @@ const activeTab = ref<TabId>(normalizeTab(route.query.tab))
 const sceneModelId = ref<number | undefined>(
   route.query.modelId != null && route.query.modelId !== '' ? Number(route.query.modelId) : undefined
 )
-// 「含自检调用」开关仅属于模型 Tab：默认含（URL 无 conn 时），conn=0 表示排除
-const includeConnectivity = ref(route.query.conn !== '0')
+// 全部统计 Tab 共用调用口径：默认排除自检，conn=1 显式纳入；运行轨迹仍保留 scene=agent。
+const includeConnectivity = ref(route.query.conn === '1')
 /** 运行轨迹榜的排行维度：Agent / 用户，走 URL（rtScope）供分享与刷新还原 */
 const runTraceDimension = ref<RunTraceDimension>(route.query.rtScope === 'user' ? 'user' : 'agent')
 /** 用户 / Agent 明细分页：各自独立保存，切 Tab 再回来仍停在原页；分页状态进 URL 便于分享与刷新还原 */
@@ -271,7 +273,7 @@ const isEmpty = computed(() => {
   if (!data) return false
   if (activeTab.value === 'trends') {
     return ((data.trends as TrendsPayload['trends']) || []).every(
-      (row) => row.sessions === 0 && row.messages === 0 && row.totalTokens === 0
+      (row) => row.sessions === 0 && row.messages === 0 && row.totalTokens === 0 && (row.callCount ?? 0) === 0 && (row.callTokens ?? 0) === 0
     )
   }
   if (activeTab.value === 'models') return ((data.modelStats as ModelsPayload['modelStats']) || []).length === 0
@@ -332,10 +334,9 @@ function currentQuery() {
     query.page = agentPage.value
     query.pageSize = agentPageSize.value
   }
-  // 连通性开关仅属于模型 Tab；其余 Tab 不传该参数，走后端默认口径（排除连通性测试），
-  // 避免模型页的勾选状态静默改变其他 Tab 的质量指标
+  // 总览/模型/用户/Agent 的 Token 与质量指标使用同一调用过滤，缓存键也包含此参数。
+  if (activeTab.value !== 'run-trace') query.excludeConnectivity = !includeConnectivity.value
   if (activeTab.value === 'models') {
-    query.excludeConnectivity = !includeConnectivity.value
     if (sceneModelId.value != null && Number.isFinite(sceneModelId.value)) {
       query.modelId = sceneModelId.value
     }
@@ -360,7 +361,7 @@ function syncUrl() {
   const nextTab = activeTab.value
   const nextPeriod = periodToQueryValue(period.value)
   const nextGrain = grain.value
-  const nextConn = includeConnectivity.value ? null : '0'
+  const nextConn = includeConnectivity.value ? '1' : null
   // 自定义区间只在自定义周期进 URL，其余周期带上会污染分享链接
   const nextStart = period.value === 'custom' ? customRange.value.start : null
   const nextEnd = period.value === 'custom' ? customRange.value.end : null
@@ -511,7 +512,7 @@ function handleSceneModelChange(modelId: number | undefined) {
 
 function handleModelsRefresh(include: boolean) {
   includeConnectivity.value = include
-  invalidateAnalytics('models')
+  invalidateAnalytics()
   syncUrl()
   void loadActive(true)
 }
@@ -583,7 +584,7 @@ watch(
     const nextCustom =
       nextPeriod === 'custom' ? customRangeFromQuery(startValue, endValue) : customRange.value
     const nextGrain = normalizeTrendGrain(grainValue, nextPeriod, nextCustom)
-    const nextIncludeConn = connValue !== '0'
+    const nextIncludeConn = connValue === '1'
     const nextModelId =
       modelIdValue != null && modelIdValue !== '' && Number.isFinite(Number(modelIdValue))
         ? Number(modelIdValue)
@@ -617,7 +618,7 @@ watch(
     if (grainChanged) grain.value = nextGrain
     if (connChanged) {
       includeConnectivity.value = nextIncludeConn
-      if (nextTab === 'models') invalidateAnalytics('models')
+      invalidateAnalytics()
     }
     if (modelChanged && nextTab === 'models') {
       sceneModelId.value = nextModelId
@@ -636,7 +637,7 @@ watch(
       customChanged ||
       (grainChanged && nextTab === 'trends') ||
       (modelChanged && nextTab === 'models') ||
-      (connChanged && nextTab === 'models') ||
+      (connChanged && nextTab !== 'run-trace') ||
       (rtScopeChanged && nextTab === 'run-trace')
     ) {
       void loadActive(true)

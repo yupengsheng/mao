@@ -22,6 +22,7 @@ function repo(): MemoryRepository {
     insert: vi.fn(async () => 1),
     updateContent: vi.fn(async () => undefined),
     updateStatus: vi.fn(async () => undefined),
+    dismiss: vi.fn(async () => undefined),
     touch: vi.fn(async () => undefined),
     deleteById: vi.fn(async () => undefined),
     listActiveUser: vi.fn(async () => []),
@@ -29,7 +30,7 @@ function repo(): MemoryRepository {
     findPreference: vi.fn(async () => null),
     insertPreference: vi.fn(async () => undefined),
     updatePreference: vi.fn(async () => undefined),
-    transaction: vi.fn(async (fn: (db: unknown) => Promise<unknown>) => fn({})),
+    withUserLock: vi.fn(async (_userId: number, fn: (db: unknown) => Promise<unknown>) => fn({})),
   } as never as MemoryRepository;
 }
 
@@ -88,6 +89,62 @@ describe('robot channel project keys', () => {
     expect(isRobotChannelProjectKey('oc_abc', '/opt/mao-data/workspace/feishu-chat/3/oc_abc')).toBe(true);
     expect(isRobotChannelProjectKey('mao', null)).toBe(false);
     expect(isRobotChannelProjectKey(null, null)).toBe(false);
+  });
+});
+
+describe('MemoryService governance and admin methods', () => {
+  it.each(['user', 'admin'] as const)('%s explicitly dismisses with USER reason even if already evicted', async (actor) => {
+    for (const status of ['ACTIVE', 'DISMISSED']) {
+      const r = repo();
+      vi.mocked(r.findById).mockResolvedValue(row({ status, dismissReason: 'EVICTED' }));
+      const svc = new MemoryService(r, { listProjectKeyRows: async () => [] });
+      if (actor === 'user') await svc.update(7, 1, { status: 'DISMISSED' });
+      else await svc.updateForAdmin(1, { status: 'DISMISSED' });
+      expect(r.dismiss).toHaveBeenCalledWith(1, 'USER', expect.anything());
+      expect(r.updateStatus).not.toHaveBeenCalled();
+    }
+  });
+
+  it('adminEditsOtherUserButUsesSameDedupAndLimits', async () => {
+    const r = repo();
+    vi.mocked(r.findById).mockResolvedValue(row({ userId: 8, content: '旧内容', status: 'DISMISSED' }));
+    const svc = new MemoryService(r, { listProjectKeyRows: async () => [] });
+    await svc.updateForAdmin(1, { content: ' 新  内容 ' });
+    expect(r.updateContent).toHaveBeenCalledWith(1, '新 内容', computeDedupHash('USER', '', '新 内容'), expect.anything());
+    expect(r.findByHash).toHaveBeenCalledWith(8, computeDedupHash('USER', '', '新 内容'), expect.anything());
+    expect(r.updateStatus).not.toHaveBeenCalled();
+    vi.mocked(r.countActive).mockResolvedValue(200);
+    expect(await codeOf(() => svc.updateForAdmin(1, { status: 'ACTIVE' }))).toBe(ErrorCode.MEMORY_LIMIT_EXCEEDED.code);
+    vi.mocked(r.findByHash).mockResolvedValue(row({ id: 9, userId: 8 }));
+    expect(await codeOf(() => svc.updateForAdmin(1, { content: '重复内容' }))).toBe(ErrorCode.MEMORY_CONTENT_DUPLICATE.code);
+    await svc.removeForAdmin(1);
+    expect(r.deleteById).toHaveBeenCalledWith(1, expect.anything());
+    vi.mocked(r.findById).mockResolvedValue(null);
+    expect(await codeOf(() => svc.updateForAdmin(1, { content: 'x' }))).toBe(ErrorCode.MEMORY_ITEM_NOT_FOUND.code);
+    expect(await codeOf(() => svc.removeForAdmin(0))).toBe(ErrorCode.MEMORY_ITEM_NOT_FOUND.code);
+  });
+
+  it('adminCreateMatchesUserCreateManualSourceAndValidation', async () => {
+    const r = repo();
+    vi.mocked(r.findById).mockResolvedValue(row());
+    const svc = new MemoryService(r, { listProjectKeyRows: async () => [] });
+    await svc.create(7, { scope: 'USER', content: ' 新  内容 ' });
+    await svc.createForAdmin(7, { scope: 'USER', content: ' 新  内容 ' });
+    const calls = vi.mocked(r.insert).mock.calls;
+    expect(calls[0]).toEqual(calls[1]);
+    expect(calls[1][0]).toMatchObject({ source: 'MANUAL', status: 'ACTIVE', content: '新 内容', originSessionId: null });
+    expect(await codeOf(() => svc.createForAdmin(7, { scope: 'PROJECT', projectKey: 'weixin-bot', content: 'x' }))).toBe(ErrorCode.PARAM_INVALID.code);
+    vi.mocked(r.countActive).mockResolvedValue(200);
+    expect(await codeOf(() => svc.createForAdmin(7, { scope: 'USER', content: 'x' }))).toBe(ErrorCode.MEMORY_LIMIT_EXCEEDED.code);
+  });
+
+  it('adminListSupportsCrossUserButUserListForcesOwner', async () => {
+    const r = repo();
+    const svc = new MemoryService(r, { listProjectKeyRows: async () => [] });
+    await svc.listForAdmin({ userId: null, keyword: 'k', source: 'AUTO', updatedFrom: '2026-11-01 00:00:00', page: 2, pageSize: 10 });
+    expect(r.page).toHaveBeenLastCalledWith(expect.objectContaining({ userId: null, keyword: 'k', source: 'AUTO', updatedFrom: '2026-11-01 00:00:00' }));
+    await svc.list(7, { userId: 8, page: 1, pageSize: 20 });
+    expect(r.page).toHaveBeenLastCalledWith(expect.objectContaining({ userId: 7 }));
   });
 });
 

@@ -616,11 +616,12 @@ export function phaseRankItems(rows: Array<{ phase: string; count: number }>): R
     .map((row) => ({ name: phaseLabel(row.phase), value: Number(row.count), color: PHASE_COLORS[row.phase] }))
 }
 
-/** 占比图只保留 Top N，其余合并为「其他」，避免长尾把 legend 撑爆。 */
-export function topWithOthers(items: RankItem[], top: number): RankItem[] {
+/** 占比图保留 Top N；total 为服务端全量合计，包含 API 排行截断后不可见的长尾。 */
+export function topWithOthers(items: RankItem[], top: number, total?: number): RankItem[] {
   const sorted = [...items].filter((item) => item.value > 0).sort((a, b) => b.value - a.value)
-  if (sorted.length <= top) return sorted
-  const rest = sorted.slice(top).reduce((sum, item) => sum + item.value, 0)
-  // 「其他」固定中性灰：Top N 已用完 10 色调色板，循环取色会与最大项撞色
-  return rest > 0 ? [...sorted.slice(0, top), { name: '其他', value: rest, color: '#c7c7cc' }] : sorted.slice(0, top)
+  const visible = sorted.slice(0, top)
+  const sourceTotal = sorted.reduce((sum, item) => sum + item.value, 0)
+  const rest = Math.max(sourceTotal, total ?? 0) - visible.reduce((sum, item) => sum + item.value, 0)
+  // 「其他」固定中性灰，包含 API 截断和图表截断两部分。
+  return rest > 0 ? [...visible, { name: '其他', value: rest, color: '#c7c7cc' }] : visible
 }

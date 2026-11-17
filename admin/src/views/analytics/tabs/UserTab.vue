@@ -35,7 +35,7 @@
         <div class="card-header">
           <span>用户用量明细</span>
           <div class="header-actions">
-            <span class="card-hint">按消息数降序 · 共 {{ total }} 条，当前第 {{ page }} 页</span>
+            <span class="card-hint">按 Token 降序（llm_call） · 共 {{ total }} 条，当前第 {{ page }} 页</span>
             <el-button :disabled="userRows.length === 0" @click="exportRows">导出当前页 CSV</el-button>
           </div>
         </div>
@@ -112,7 +112,7 @@ const userRows = computed(() => props.payload?.userActivity || [])
 const total = computed(() => props.payload?.pagination?.total ?? userRows.value.length)
 const page = computed(() => props.payload?.pagination?.page ?? 1)
 const pageSize = computed(() => props.payload?.pagination?.pageSize ?? 20)
-// Token 排行用后端独立截断的 tokenTop：userActivity 按消息数截断，直接重排会遗漏消息少但 Token 重的用户
+// Token 排行来自全量调用聚合后的独立 Top N，不随明细翻页变化。
 const tokenSource = computed(() =>
   (props.payload?.tokenTop || []).map((row) => ({
     name: row.displayName || row.username || '未知',

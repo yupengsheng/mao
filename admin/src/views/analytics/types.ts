@@ -270,11 +270,11 @@ export interface UsersPayload {
   userActivity: UserActivityRow[]
   /** 明细分页元信息；旧后端无此字段时前端按当前页行数兜底 */
   pagination?: AnalyticsPagination
-  /** 独立按 Token 排序截断的排行（与按消息数截断的 userActivity 互不影响） */
+  /** 独立按完整调用 Token 排序截断的排行，不随明细分页变化 */
   tokenTop?: Array<{ userId: number; username?: string; displayName?: string; totalTokens: number }>
   /** 独立按消息数排序的全局 Top N，避免明细分页后排行图跟着当前页变化 */
   messageTop?: Array<{ userId: number; username?: string; displayName?: string; messageCount: number; totalTokens: number }>
-  periodTotals: { activeUsers: number }
+  periodTotals: { activeUsers: number; totalTokens?: number }
   previousTotals: PreviousTotals
 }
 

@@ -12,6 +12,7 @@ import type { MemoryItemVO } from './types.js';
 function memoryItem(overrides: Partial<MemoryItemVO> = {}): MemoryItemVO {
   return {
     id: 1,
+    userId: 7,
     scope: 'USER',
     projectKey: null,
     content: '输出报告用中文',
@@ -162,6 +163,7 @@ describe('memory routes validate request payload types', () => {
       insert: vi.fn(async () => 1),
       updateContent: vi.fn(async () => undefined),
       updateStatus: vi.fn(async () => undefined),
+      dismiss: vi.fn(async () => undefined),
       touch: vi.fn(async () => undefined),
       deleteById: vi.fn(async () => undefined),
       listActiveUser: vi.fn(async () => []),
@@ -169,7 +171,7 @@ describe('memory routes validate request payload types', () => {
       findPreference: vi.fn(async () => null),
       insertPreference: vi.fn(async () => undefined),
       updatePreference: vi.fn(async () => undefined),
-      transaction: vi.fn(async (fn: (db: unknown) => Promise<unknown>) => fn({})),
+      withUserLock: vi.fn(async (_userId: number, fn: (db: unknown) => Promise<unknown>) => fn({})),
       ...overrides,
     } as never as MemoryRepository;
   }

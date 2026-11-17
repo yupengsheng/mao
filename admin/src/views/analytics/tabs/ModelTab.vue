@@ -90,7 +90,7 @@
         <div class="card-header">
           <span>模型用量明细</span>
           <div class="header-actions">
-            <span class="card-hint">质量列来自 llm_call，延迟为均值</span>
+            <span class="card-hint">Token/成本来自 llm_call；对话列仅作消息来源参考</span>
             <el-button v-if="selectedModelId != null" link type="danger" @click="clearSelection">清除选中</el-button>
             <el-button :disabled="modelStats.length === 0" @click="exportRows">导出 CSV</el-button>
             <el-button type="primary" link @click="go('/llm-calls')">调用流水</el-button>
@@ -187,7 +187,7 @@ const emit = defineEmits<{
 const router = useRouter()
 
 const selectedModelId = ref<number | undefined>(undefined)
-const includeConnectivity = ref(true)
+const includeConnectivity = ref(false)
 
 watch(
   () => props.payload?.sceneModelId,
@@ -200,7 +200,7 @@ watch(
 watch(
   () => props.payload?.excludeConnectivity,
   (value) => {
-    includeConnectivity.value = value !== false
+    includeConnectivity.value = value === false
   },
   { immediate: true }
 )
@@ -229,11 +229,12 @@ const userTokenItems = computed<RankItem[]>(() =>
       name: row.displayName || row.username || '未知',
       value: Number(row.totalTokens || 0)
     })),
-    10
+    10,
+    totalTokens.value
   )
 )
-// 环图中心与图例合计一致：用户 Token 与模型 totalTokens 口径不同（消息 Token vs 模型合计），不共用 totalTokens
-const userTokenTotal = computed(() => userTokenSource.value.reduce((sum, row) => sum + Number(row.totalTokens || 0), 0))
+// API 的 userTokenTop 最多 100 行，不能求其和作为全量总分母；缺失的长尾一并归「其他」。
+const userTokenTotal = computed(() => totalTokens.value)
 
 function tokenShare(value: unknown): number {
   return percent(Number(value || 0), totalTokens.value)

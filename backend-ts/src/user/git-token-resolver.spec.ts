@@ -32,6 +32,10 @@ function makeDeps(overrides: Partial<GitTokenResolverDeps> = {}): GitTokenResolv
         return result;
       }),
     },
+    systemGitCredentialService: {
+      getTokenMap: vi.fn(async () => new Map<string, string>()),
+      getTokenMapFiltered: vi.fn(async () => new Map<string, string>()),
+    },
     agentLookup: {
       selectGitAllowedDomainsById: vi.fn(async () => ({ domains: null as string | null })),
     },
@@ -234,5 +238,66 @@ describe('DefaultGitTokenResolver.resolveForSession', () => {
     });
     const result = await resolverOf(deps).resolveForSession(USER_ID, SESSION_ID);
     expect(result).toEqual({});
+  });
+});
+
+describe('DefaultGitTokenResolver system defaults', () => {
+  it('白名单下按域兜底且用户 token 优先', async () => {
+    const deps = makeDeps({
+      agentLookup: {
+        selectGitAllowedDomainsById: vi.fn(async () => ({ domains: '["git.acg.team", "other.com"]' })),
+      },
+      systemGitCredentialService: {
+        getTokenMap: vi.fn(async () => new Map([
+          ['git.acg.team', 'default-acg'],
+          ['other.com', 'default-other'],
+        ])),
+        getTokenMapFiltered: vi.fn(async () => new Map([
+          ['git.acg.team', 'default-acg'],
+          ['other.com', 'default-other'],
+        ])),
+      },
+    });
+
+    await expect(resolverOf(deps).resolveForAgent(USER_ID, AGENT_ID)).resolves.toEqual({
+      'git.acg.team': 'tok-acg',
+      'other.com': 'default-other',
+    });
+    expect(deps.systemGitCredentialService.getTokenMapFiltered).toHaveBeenCalledWith(['git.acg.team', 'other.com']);
+  });
+
+  it('strict 未配置 allowlist 时不读取系统默认，显式空列表始终禁止默认', async () => {
+    const strictDeps = makeDeps({
+      scopePolicy: { getGitScopePolicy: vi.fn(async () => 'strict' as const) },
+      systemGitCredentialService: {
+        getTokenMap: vi.fn(async () => new Map([['default.com', 'secret']])),
+        getTokenMapFiltered: vi.fn(async () => new Map([['default.com', 'secret']])),
+      },
+    });
+    await expect(resolverOf(strictDeps).resolveForAgent(USER_ID, AGENT_ID)).resolves.toEqual({});
+    expect(strictDeps.systemGitCredentialService.getTokenMap).not.toHaveBeenCalled();
+
+    const deniedDeps = makeDeps({
+      agentLookup: { selectGitAllowedDomainsById: vi.fn(async () => ({ domains: '[]' })) },
+      systemGitCredentialService: {
+        getTokenMap: vi.fn(async () => new Map([['default.com', 'secret']])),
+        getTokenMapFiltered: vi.fn(async () => new Map([['default.com', 'secret']])),
+      },
+    });
+    await expect(resolverOf(deniedDeps).resolveForAgent(USER_ID, AGENT_ID)).resolves.toEqual({});
+    expect(deniedDeps.systemGitCredentialService.getTokenMapFiltered).not.toHaveBeenCalled();
+  });
+
+  it('系统默认读取失败时保留用户 token', async () => {
+    const deps = makeDeps({
+      agentLookup: {
+        selectGitAllowedDomainsById: vi.fn(async () => ({ domains: '["git.acg.team"]' })),
+      },
+      systemGitCredentialService: {
+        getTokenMap: vi.fn(async () => { throw new Error('default db down'); }),
+        getTokenMapFiltered: vi.fn(async () => { throw new Error('default db down'); }),
+      },
+    });
+    await expect(resolverOf(deps).resolveForAgent(USER_ID, AGENT_ID)).resolves.toEqual({ 'git.acg.team': 'tok-acg' });
   });
 });

@@ -1,7 +1,200 @@
 import Fastify from 'fastify';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { handleError } from '../common/http-error.js';
-import { registerAdminAnalyticsRoutes } from './admin.routes.js';
+import { registerAdminAnalyticsRoutes, registerAdminRuntimeRoutes } from './admin.routes.js';
+import type { AdminRouteDeps } from './admin.routes.js';
+import { BusinessException } from '../common/business-exception.js';
+import { ErrorCode } from '../common/error-code.js';
+import { recordAudit, shouldAudit } from '../audit/audit.interceptor.js';
+import type { AuditLogService } from '../audit/audit.service.js';
+import type { MemoryItemVO } from '../memory/types.js';
+
+describe('admin memory management and audit', () => {
+  function memoryApp(options: { permissions?: string[]; auditor?: boolean; lookup?: boolean } = {}) {
+    const fastify = Fastify();
+    fastify.setErrorHandler(handleError);
+    fastify.addHook('preHandler', (req, _reply, done) => { req.userId = 7; done(); });
+    const record = vi.fn(async () => undefined);
+    // 与生产 onResponse 同样交给全局审计器，不在记忆路由重复写审计。
+    fastify.addHook('onResponse', async (req, reply) => {
+      await recordAudit({ record } as unknown as AuditLogService, {
+        method: req.method, path: req.url.split('?')[0], queryString: req.url.split('?')[1],
+        status: reply.statusCode, userId: req.userId,
+      });
+    });
+    const listForAdmin = vi.fn(async () => ({ records: [] as MemoryItemVO[], total: 0, current: 1, size: 20 }));
+    const memory: MemoryItemVO = {
+      id: 1, userId: 8, scope: 'USER', projectKey: null, content: 'k', source: 'MANUAL', status: 'ACTIVE',
+      originSessionId: null, createdAt: null, updatedAt: null,
+    };
+    const updateForAdmin = vi.fn(async () => memory);
+    const removeForAdmin = vi.fn(async () => undefined);
+    const createForAdmin = vi.fn(async () => ({ ...memory, id: 2 }));
+    const findByIds = vi.fn(async () => [{ id: 8, username: 'bob', displayName: 'Bob' }]);
+    const search = vi.fn(async () => [{ id: 8, username: 'bob', displayName: 'Bob', email: 'private@example.com' }]);
+    const hasPermission = vi.fn(async (_id: number, code: string) => (options.permissions ?? ['memory:read', 'memory:write']).includes(code));
+    registerAdminRuntimeRoutes(fastify, {
+      jwt: {} as never, analytics: {} as never, permissionService: { hasPermission },
+      memoryAuditor: options.auditor === false ? undefined : { listForAdmin, updateForAdmin, removeForAdmin, createForAdmin },
+      memoryUserLookup: options.lookup === false ? undefined : { findByIds, search },
+    } as AdminRouteDeps);
+    return { fastify, listForAdmin, updateForAdmin, removeForAdmin, createForAdmin, findByIds, search, hasPermission, record };
+  }
+
+  it('filters and paginates cross-user queries with batched user enrichment', async () => {
+    const a = memoryApp();
+    a.listForAdmin.mockResolvedValueOnce({ records: [8, 9, 8].map((userId, i): MemoryItemVO => ({
+      id: i + 1, userId, scope: 'USER', projectKey: null, content: 'k', source: 'AUTO', status: 'ACTIVE',
+      originSessionId: 4, createdAt: null, updatedAt: null,
+    })), total: 3, current: 2, size: 50 });
+    const res = await a.fastify.inject({ method: 'GET', url: '/v1/admin/memory?keyword=%20abc%20&source=AUTO&scope=USER&projectKey=mao&status=ACTIVE&updatedFrom=2026-11-01&updatedTo=2026-11-11&page=2&pageSize=50' });
+    expect(res.json().code).toBe(0);
+    expect(a.listForAdmin).toHaveBeenCalledWith({
+      userId: null, keyword: 'abc', source: 'AUTO', scope: 'USER', projectKey: 'mao', status: 'ACTIVE',
+      updatedFrom: '2026-11-01 00:00:00', updatedTo: '2026-11-11 23:59:59', page: 2, pageSize: 50,
+    });
+    expect(a.findByIds).toHaveBeenCalledTimes(1);
+    expect(a.findByIds).toHaveBeenCalledWith([8, 9]);
+    expect(res.json().data.records[0]).toMatchObject({ username: 'bob', displayName: 'Bob' });
+    await a.fastify.close();
+  });
+
+  it('single-user query works without other filters and repeated query params use first value', async () => {
+    const a = memoryApp();
+    await a.fastify.inject({ method: 'GET', url: '/v1/admin/memory?userId=8&page=Infinity&pageSize=999' });
+    expect(a.listForAdmin).toHaveBeenLastCalledWith(expect.objectContaining({ userId: 8, page: 1, pageSize: 100 }));
+    await a.fastify.inject({ method: 'GET', url: '/v1/admin/memory?keyword=a&keyword=b' });
+    expect(a.listForAdmin).toHaveBeenLastCalledWith(expect.objectContaining({ keyword: 'a' }));
+    await a.fastify.close();
+  });
+
+  it('rejects unfiltered cross-user scans, invalid owner/enums/dates and reversed dates', async () => {
+    const a = memoryApp();
+    for (const query of ['', '?updatedFrom=2026-11-01', '?userId=abc', '?userId=-1', '?userId=1.5',
+      '?source=invalid', '?keyword=k&scope=invalid', '?keyword=k&status=invalid',
+      '?keyword=k&updatedFrom=2026-02-30', '?keyword=k&updatedTo=11/01/2026',
+      '?keyword=k&updatedFrom=2026-11-10&updatedTo=2026-11-01']) {
+      const res = await a.fastify.inject({ method: 'GET', url: `/v1/admin/memory${query}` });
+      expect(res.json().code, query).toBe(ErrorCode.PARAM_INVALID.code);
+    }
+    expect(a.listForAdmin).not.toHaveBeenCalled();
+    await a.fastify.close();
+  });
+
+  it('user search requires memory:read only and returns no private user fields', async () => {
+    const a = memoryApp({ permissions: ['memory:read'] });
+    const res = await a.fastify.inject({ method: 'GET', url: '/v1/admin/memory/users?keyword=bob&pageSize=10' });
+    expect(a.search).toHaveBeenCalledWith('bob', 10);
+    expect(res.json().data.records).toEqual([{ id: 8, username: 'bob', displayName: 'Bob' }]);
+    expect(a.hasPermission).toHaveBeenCalledWith(7, 'memory:read');
+    await a.fastify.close();
+  });
+
+  it('read-only role cannot edit/delete/create and write-only role cannot read', async () => {
+    const a = memoryApp({ permissions: ['memory:read'] });
+    for (const [method, url, payload] of [
+      ['PATCH', '/v1/admin/memory/1', { content: 'x' }], ['DELETE', '/v1/admin/memory/1', undefined],
+      ['POST', '/v1/admin/memory', { userId: 8, scope: 'USER', content: 'x' }],
+    ] as const) {
+      expect((await a.fastify.inject({ method, url, payload })).statusCode).toBe(403);
+    }
+    expect(a.updateForAdmin).not.toHaveBeenCalled();
+    expect(a.removeForAdmin).not.toHaveBeenCalled();
+    expect(a.createForAdmin).not.toHaveBeenCalled();
+    await a.fastify.close();
+    const b = memoryApp({ permissions: ['memory:write'] });
+    for (const url of ['/v1/admin/memory?userId=8', '/v1/admin/memory/users']) {
+      expect((await b.fastify.inject({ method: 'GET', url })).statusCode).toBe(403);
+    }
+    expect(b.listForAdmin).not.toHaveBeenCalled();
+    expect(b.search).not.toHaveBeenCalled();
+    await b.fastify.close();
+  });
+
+  it('edit/status/delete derive target from id and create checks target user exists', async () => {
+    const a = memoryApp();
+    for (const status of ['DISMISSED', 'ACTIVE']) {
+      const res = await a.fastify.inject({ method: 'PATCH', url: '/v1/admin/memory/1', payload: { status } });
+      expect(res.json().code).toBe(0);
+      expect(a.updateForAdmin).toHaveBeenLastCalledWith(1, { content: null, status });
+    }
+    await a.fastify.inject({ method: 'PATCH', url: '/v1/admin/memory/1', payload: { content: 'x' } });
+    expect(a.updateForAdmin).toHaveBeenLastCalledWith(1, { content: 'x', status: null });
+    await a.fastify.inject({ method: 'DELETE', url: '/v1/admin/memory/1' });
+    expect(a.removeForAdmin).toHaveBeenCalledWith(1);
+    const created = await a.fastify.inject({ method: 'POST', url: '/v1/admin/memory', payload: { userId: 8, scope: 'USER', content: 'x' } });
+    expect(created.json().code).toBe(0);
+    expect(a.createForAdmin).toHaveBeenCalledWith(8, { scope: 'USER', content: 'x', projectKey: null });
+    a.findByIds.mockResolvedValueOnce([]);
+    const missing = await a.fastify.inject({ method: 'POST', url: '/v1/admin/memory', payload: { userId: 999, scope: 'USER', content: 'x' } });
+    expect(missing.json().code).toBe(ErrorCode.USER_NOT_FOUND.code);
+    expect(a.createForAdmin).toHaveBeenCalledTimes(1);
+    await a.fastify.close();
+  });
+
+  it('rejects malformed payloads and ownership spoofing without coercion', async () => {
+    const a = memoryApp();
+    for (const payload of [{ content: 1 }, { content: [] }, { status: false }, { content: 'x', userId: 8 }, {}]) {
+      const res = await a.fastify.inject({ method: 'PATCH', url: '/v1/admin/memory/1', payload });
+      expect(res.json().code).toBe(ErrorCode.PARAM_INVALID.code);
+    }
+    for (const payload of [{ userId: true, scope: 'USER', content: 'x' }, { userId: 8, scope: 'USER', content: {} },
+      { userId: 8, scope: 1, content: 'x' }, { userId: 8, scope: 'PROJECT', content: 'x', projectKey: [] }]) {
+      const res = await a.fastify.inject({ method: 'POST', url: '/v1/admin/memory', payload });
+      expect(res.json().code).toBe(ErrorCode.PARAM_INVALID.code);
+    }
+    for (const method of ['PATCH', 'DELETE'] as const) {
+      const res = await a.fastify.inject({ method, url: '/v1/admin/memory/abc', payload: method === 'PATCH' ? { content: 'x' } : undefined });
+      expect(res.json().code).toBe(ErrorCode.MEMORY_ITEM_NOT_FOUND.code);
+    }
+    expect(a.updateForAdmin).not.toHaveBeenCalled();
+    expect(a.createForAdmin).not.toHaveBeenCalled();
+    expect(a.removeForAdmin).not.toHaveBeenCalled();
+    await a.fastify.close();
+  });
+
+  it('business failures propagate and missing dependencies fail explicitly on reads too', async () => {
+    const a = memoryApp();
+    for (const error of [ErrorCode.MEMORY_CONTENT_DUPLICATE, ErrorCode.MEMORY_LIMIT_EXCEEDED]) {
+      a.updateForAdmin.mockRejectedValueOnce(new BusinessException(error));
+      const res = await a.fastify.inject({ method: 'PATCH', url: '/v1/admin/memory/1', payload: { content: 'x' } });
+      expect(res.json().code).toBe(error.code);
+    }
+    await a.fastify.close();
+    for (const options of [{ auditor: false }, { lookup: false }]) {
+      const b = memoryApp(options);
+      for (const [method, url, payload] of [
+        ['GET', '/v1/admin/memory?userId=8', undefined], ['GET', '/v1/admin/memory/users', undefined],
+        ['PATCH', '/v1/admin/memory/1', { content: 'x' }], ['DELETE', '/v1/admin/memory/1', undefined],
+        ['POST', '/v1/admin/memory', { userId: 8, scope: 'USER', content: 'x' }],
+      ] as const) {
+        const res = await b.fastify.inject({ method, url, payload });
+        expect(res.json().code).toBe(ErrorCode.INTERNAL_ERROR.code);
+      }
+      await b.fastify.close();
+    }
+  });
+
+  it('all memory operations stay covered by global audit including denied writes', async () => {
+    const a = memoryApp();
+    for (const [method, url, payload, action, objectId] of [
+      ['GET', '/v1/admin/memory?userId=8', undefined, 'READ', null],
+      ['GET', '/v1/admin/memory/users', undefined, 'READ', null],
+      ['POST', '/v1/admin/memory', { userId: 8, scope: 'USER', content: 'x' }, 'CREATE', null],
+      ['PATCH', '/v1/admin/memory/12', { status: 'DISMISSED' }, 'UPDATE', '12'],
+      ['DELETE', '/v1/admin/memory/12', undefined, 'DELETE', '12'],
+    ] as const) {
+      expect(shouldAudit(url, method)).toBe(true);
+      await a.fastify.inject({ method, url, payload });
+      expect(a.record).toHaveBeenLastCalledWith(expect.objectContaining({ userId: 7, action, objectType: 'admin.memory', objectId, success: 1 }));
+    }
+    await a.fastify.close();
+    const denied = memoryApp({ permissions: ['memory:read'] });
+    await denied.fastify.inject({ method: 'DELETE', url: '/v1/admin/memory/12' });
+    expect(denied.record).toHaveBeenCalledWith(expect.objectContaining({ status: 403, success: 0, userId: 7, action: 'DELETE' }));
+    await denied.fastify.close();
+  });
+});
 
 const RUN_TRACE_PAYLOAD = {
   period: {},
@@ -152,6 +345,17 @@ describe('admin analytics range param', () => {
     } as never);
     return { fastify, overview };
   }
+
+  it('总览默认排除自检并透传显式包含选项', async () => {
+    const { fastify, overview } = await overviewApp();
+    for (const [query, excludeConnectivity] of [['', true], ['?excludeConnectivity=false', false]] as const) {
+      overview.mockClear();
+      const res = await fastify.inject({ method: 'GET', url: `/v1/admin/analytics/overview${query}` });
+      expect(res.statusCode).toBe(200);
+      expect(overview).toHaveBeenCalledWith(30, 0, { excludeConnectivity });
+    }
+    await fastify.close();
+  });
 
   it('日历周期解析成 (days, endOffset) 交给服务端窗口计算', async () => {
     const { fastify, overview } = await overviewApp();

@@ -141,22 +141,22 @@ describe('AdminAnalyticsService', () => {
     expect(result.periodTotals).toMatchObject({
       sessions: 4,
       messages: 8,
-      totalTokens: 1000,
+      totalTokens: 1500,
       activeUsers: 2,
       completedSessions: 5,
       failedSessions: 2,
     });
-    expect(result.previousTotals).toMatchObject({ sessions: 3, messages: 6, totalTokens: 700 });
+    expect(result.previousTotals).toMatchObject({ sessions: 3, messages: 6, totalTokens: 1500 });
     expect(result.phaseDistribution).toEqual(expect.arrayContaining([
       expect.objectContaining({ phase: 'COMPLETED', count: 5 }),
     ]));
-    expect(result.agentStats[0]).toMatchObject({ agentName: 'Coder', totalTokens: 800, sessionCount: 4 });
+    expect(result.agentStats[0]).toMatchObject({ agentName: 'Coder', totalTokens: 1000, sessionCount: 4 });
     expect(result.modelStats[0]).toMatchObject({
       modelName: 'gpt',
       chatTokens: 400,
       backgroundTokens: 90,
       callTokens: 1000,
-      totalTokens: 490,
+      totalTokens: 1000,
       callCount: 8,
       callFailCount: 1,
       callSuccessRate: 87.5,
@@ -224,7 +224,7 @@ describe('AdminAnalyticsService', () => {
     expect(result.periodTotals).toMatchObject({
       sessions: 4,
       messages: 8,
-      totalTokens: 1000,
+      totalTokens: 1500,
       activeUsers: 2,
       completedSessions: 5,
       failedSessions: 2,
@@ -233,7 +233,7 @@ describe('AdminAnalyticsService', () => {
     expect(result.periodTotals).toMatchObject({ promptTokens: 1000, cachedTokens: 200, cacheHitRate: 20 });
     expect(result.previousTotals).toMatchObject({ cacheHitRate: 20 });
     expect(result.spark).toHaveLength(7);
-    expect(result.spark.at(-1)).toEqual({ date: today, totalTokens: 1000 });
+    expect(result.spark.at(-1)).toEqual({ date: today, totalTokens: 1500 });
     expect(result.insights.length).toBeGreaterThan(0);
     expect(result.insights.some((item: any) => item.level === 'warn' && String(item.text).includes('失败率'))).toBe(true);
     // overview 不应拉取模型/用户/Agent 排行
@@ -250,6 +250,10 @@ describe('AdminAnalyticsService', () => {
     store.selectDailyMessageStats = vi.fn(async () => []);
     store.selectDailyUsageStats = vi.fn(async () => []);
     store.countActiveUsers = vi.fn(async () => 0);
+    store.selectDailyLlmCallStats = vi.fn(async () => []);
+    store.selectLlmCallQualitySummary = vi.fn(async () => ({
+      callCount: 0, successCount: 0, failCount: 0, retryCallCount: 0, promptTokens: 0, cachedTokens: 0, callTokens: 0,
+    }));
     const service = new AdminAnalyticsService(statistics as never, store as never);
 
     const result = (await service.overview(7)) as Record<string, any>;
@@ -325,7 +329,7 @@ describe('AdminAnalyticsService', () => {
     expect(result.modelStats).toHaveLength(1);
     expect(result.modelStats[0]).toMatchObject({
       modelId: 3,
-      totalTokens: 490,
+      totalTokens: 1000,
       callCount: 8,
       cacheHitRate: 12.5,
       avgFirstTokenMs: 500,
@@ -334,7 +338,7 @@ describe('AdminAnalyticsService', () => {
       avgThroughput: 60,
     });
     // store 桩未返回 cost 行 → 成本合计 0
-    expect(result.periodTotals).toEqual({ totalTokens: 490, totalCost: 0 });
+    expect(result.periodTotals).toEqual({ totalTokens: 1000, totalCost: 0 });
     expect(result.sceneStats[0]).toMatchObject({ key: 'agent', callTokens: 800 });
     expect(result.protocolStats[0]).toMatchObject({ key: 'openai-compatible', callCount: 10 });
     expect(result.userTokenTop).toEqual([
@@ -569,7 +573,7 @@ describe('AdminAnalyticsService', () => {
   it('usersAndAgentsScopeReturnTokenTopSortedIndependently', async () => {
     const statistics = { getOverview: vi.fn(async () => ({})) };
     const store = buildStore();
-    // 用户 tokenTop 走 llm_call 口径，需覆盖未进入消息明细集的重消耗用户；Agent tokenTop 仍按消息口径
+    // 用户与 Agent tokenTop 都走 llm_call，不能用落消息的 Token 代替完整调用消耗。
     store.selectMessageStatsByUser = vi.fn(async () => [
       { id: 1, messageCount: 7, totalTokens: 700 },
       { id: 2, messageCount: 1, totalTokens: 9000 },
@@ -581,6 +585,10 @@ describe('AdminAnalyticsService', () => {
     store.selectMessageStatsByAgent = vi.fn(async () => [
       { id: 9, messageCount: 8, totalTokens: 800 },
       { id: 10, messageCount: 1, totalTokens: 12000 },
+    ]);
+    store.selectLlmCallStatsByAgent = vi.fn(async () => [
+      { id: 9, callCount: 8, failCount: 1, callTokens: 1000 },
+      { id: 10, callCount: 2, failCount: 0, callTokens: 15000 },
     ]);
     store.listAgents = vi.fn(async () => [
       { id: 9, name: 'Coder' },
@@ -596,8 +604,8 @@ describe('AdminAnalyticsService', () => {
 
     const agents = (await service.agentsScope(7)) as Record<string, any>;
     expect(agents.tokenTop).toEqual([
-      expect.objectContaining({ agentId: 10, agentName: 'Heavy', totalTokens: 12000 }),
-      expect.objectContaining({ agentId: 9, totalTokens: 800 }),
+      expect.objectContaining({ agentId: 10, agentName: 'Heavy', totalTokens: 15000 }),
+      expect.objectContaining({ agentId: 9, totalTokens: 1000 }),
     ]);
   });
 
@@ -627,6 +635,68 @@ describe('AdminAnalyticsService', () => {
       expect(String((call as unknown[])[0])).toContain('JOIN_ORDER(m, s)');
     }
     expect(String((db.queryOne.mock.calls[0] as unknown[])[0])).toContain('JOIN_ORDER(m, s)');
+  });
+});
+
+describe('AdminAnalyticsService Token 统一口径回归', () => {
+  it.each([true, false])('全部消耗与环比同源且贯穿 excludeConnectivity=%s', async (excludeConnectivity) => {
+    const store = buildStore();
+    const service = new AdminAnalyticsService({ getOverview: vi.fn(async () => ({})) } as never, store as never);
+    const opts = { excludeConnectivity };
+    const overview = await service.overview(7, 0, opts) as Record<string, any>;
+    const models = await service.modelsScope(7, 0, opts) as Record<string, any>;
+    const users = await service.usersScope(7, 0, 1, opts) as Record<string, any>;
+    const agents = await service.agentsScope(7, 0, 1, opts) as Record<string, any>;
+    const trends = await service.trendsScope(7, 0, opts) as Record<string, any>;
+    expect(overview.periodTotals.totalTokens).toBe(1500);
+    expect(overview.previousTotals.totalTokens).toBe(1500);
+    expect(overview.spark.reduce((sum: number, row: any) => sum + row.totalTokens, 0)).toBe(1500);
+    expect(models.modelStats[0]).toMatchObject({ totalTokens: 1000, chatTokens: 400, backgroundTokens: 90 });
+    expect(users.userActivity[0].totalTokens).toBe(1200);
+    expect(agents.agentStats[0].totalTokens).toBe(1000);
+    expect(agents.tokenTop[0].totalTokens).toBe(1000);
+    // 堆叠和调用 Token 互为不同视角，不相加；趋势环比也不能跨口径比较。
+    expect(trends.periodTotals).toMatchObject({ totalTokens: 1000, callTokens: 1500 });
+    expect(trends.previousTotals.totalTokens).toBe(700);
+    for (const fn of [store.selectLlmCallQualitySummary, store.selectLlmCallStatsByModel,
+      store.selectLlmCallStatsByUser, store.selectLlmCallStatsByAgent, store.selectDailyLlmCallStats]) {
+      for (const args of fn.mock.calls as unknown[][]) expect(args[1]).toEqual(opts);
+    }
+  });
+
+  it('用户详情保留系统与缺元数据调用，总分母不受 tokenTop/明细截断影响，消息榜独立排序', async () => {
+    const store = buildStore();
+    store.selectLlmCallStatsByUser = vi.fn(async () => [
+      { id: 0, callCount: 1, failCount: 0, callTokens: 6000 },
+      { id: 99, callCount: 2, failCount: 0, callTokens: 3000 },
+      { id: 1, callCount: 9, failCount: 1, callTokens: 1200 },
+    ]);
+    const service = new AdminAnalyticsService({ getOverview: vi.fn(async () => ({})) } as never, store as never);
+    const result = await service.usersScope(7, 0, 1) as Record<string, any>;
+    expect(result.userActivity).toHaveLength(1);
+    expect(result.userActivity[0]).toMatchObject({ userId: 0, username: '未关联用户', totalTokens: 6000 });
+    expect(result.tokenTop).toHaveLength(1);
+    expect(result.periodTotals.totalTokens).toBe(10200);
+    expect(result.pagination.total).toBe(3);
+    expect(result.messageTop[0].userId).toBe(1);
+    const second = await service.usersScope(7, 0, 1, { page: 2, pageSize: 1 }) as Record<string, any>;
+    expect(second.userActivity[0]).toMatchObject({ userId: 99, totalTokens: 3000 });
+    expect(second.messageTop).toEqual(result.messageTop);
+  });
+
+  it('SQL 把无用户调用归为 id=0，保留连通性开关的过滤行为', async () => {
+    const db = { query: vi.fn(async () => []) };
+    const store = new AdminAnalyticsDbStore(db as never);
+    await store.selectLlmCallStatsByUser(range, { excludeConnectivity: true });
+    await store.selectLlmCallStatsByUser(range, { excludeConnectivity: false });
+    const sqls = (db.query.mock.calls as unknown[][]).map(args => String(args[0]));
+    for (const sql of sqls) {
+      expect(sql).toContain('COALESCE(user_id, 0) AS id');
+      expect(sql).toContain('GROUP BY COALESCE(user_id, 0)');
+      expect(sql).not.toContain('user_id IS NOT NULL');
+    }
+    expect(sqls[0]).toContain("scene != 'connectivity_test'");
+    expect(sqls[1]).not.toContain("scene != 'connectivity_test'");
   });
 });
 

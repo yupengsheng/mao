@@ -19,12 +19,15 @@ interface Deps {
 
 function buildDeps(): Deps {
   const memoryRepo = {
+    withUserLock: vi.fn(async (_userId: number, fn: (db: unknown) => Promise<unknown>) => fn({})),
+    reviveEvicted: vi.fn(async () => true),
     countActive: vi.fn(async () => 0),
     findByHash: vi.fn(async () => null),
     insert: vi.fn(async () => 1),
     touch: vi.fn(async () => undefined),
     updateContent: vi.fn(async () => undefined),
     updateStatus: vi.fn(async () => undefined),
+    dismiss: vi.fn(async () => undefined),
     listActiveForDedup: vi.fn(async () => []),
     listStaleAuto: vi.fn(async () => []),
     listDismissedContents: vi.fn(async () => []),
@@ -186,7 +189,7 @@ describe('MemoryExtractionService', () => {
     (d.memoryRepo.findByHash as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 5, status: 'ACTIVE' });
     const svc = buildService(d);
     await settle(svc.extractForSession(BASE_INPUT));
-    expect(d.memoryRepo.touch).toHaveBeenCalledWith(5);
+    expect(d.memoryRepo.touch).toHaveBeenCalledWith(5, expect.anything());
     expect(d.memoryRepo.insert).not.toHaveBeenCalled();
   });
 
@@ -209,7 +212,7 @@ describe('MemoryExtractionService', () => {
     });
     const svc = buildService(d);
     await settle(svc.extractForSession(BASE_INPUT));
-    expect(d.memoryRepo.touch).toHaveBeenCalledWith(12);
+    expect(d.memoryRepo.touch).toHaveBeenCalledWith(12, expect.anything());
     expect(d.memoryRepo.insert).not.toHaveBeenCalled();
   });
 
@@ -221,7 +224,7 @@ describe('MemoryExtractionService', () => {
     });
     const svc = buildService(d);
     await settle(svc.extractForSession(BASE_INPUT));
-    expect(d.memoryRepo.touch).toHaveBeenCalledWith(15);
+    expect(d.memoryRepo.touch).toHaveBeenCalledWith(15, expect.anything());
     expect(d.memoryRepo.insert).not.toHaveBeenCalled();
   });
 
@@ -251,7 +254,7 @@ describe('MemoryExtractionService', () => {
     const svc = buildService(d);
     await settle(svc.extractForSession(BASE_INPUT));
     expect(d.memoryRepo.updateContent).not.toHaveBeenCalled();
-    expect(d.memoryRepo.touch).toHaveBeenCalledWith(12);
+    expect(d.memoryRepo.touch).toHaveBeenCalledWith(12, expect.anything());
   });
 
   it('dropsCandidateReferencingRowOutsideComparisonSet', async () => {
@@ -314,7 +317,7 @@ describe('MemoryExtractionService', () => {
     (d.memoryRepo.listStaleAuto as ReturnType<typeof vi.fn>).mockResolvedValue([{ id: 5 }]);
     const svc = buildService(d);
     await settle(svc.extractForSession(BASE_INPUT));
-    expect(d.memoryRepo.updateStatus).toHaveBeenCalledWith(5, 'DISMISSED');
+    expect(d.memoryRepo.dismiss).toHaveBeenCalledWith(5, 'EVICTED', expect.anything());
     expect(d.memoryRepo.insert).toHaveBeenCalledTimes(1);
   });
 
@@ -345,7 +348,49 @@ describe('MemoryExtractionService', () => {
     const svc = buildService(d);
     await settle(svc.extractForSession(BASE_INPUT));
     expect(d.memoryRepo.insert).toHaveBeenCalledTimes(3);
-    expect((d.memoryRepo.updateStatus as ReturnType<typeof vi.fn>).mock.calls).toEqual([[40, 'DISMISSED'], [41, 'DISMISSED'], [42, 'DISMISSED']]);
+    expect((d.memoryRepo.dismiss as ReturnType<typeof vi.fn>).mock.calls.map((call) => call.slice(0, 2))).toEqual([[40, 'EVICTED'], [41, 'EVICTED'], [42, 'EVICTED']]);
+  });
+
+  it.each([
+    ['USER', 100, false, false],
+    ['EVICTED', 100, false, true],
+    ['EVICTED', 200, true, true],
+    ['EVICTED', 200, false, false],
+  ] as const)('dismissed %s at %i with evictable=%s revives=%s', async (reason, count, evictable, revives) => {
+    d.llm.chat.mockResolvedValue({ choices: [{ message: { content: JSON.stringify([{ type: 'project', content: '复现事实' }]) } }] });
+    vi.mocked(d.memoryRepo.countActive).mockResolvedValue(count);
+    vi.mocked(d.memoryRepo.findByHash).mockResolvedValue({ id: 5, status: 'DISMISSED', dismissReason: reason, scope: 'PROJECT', projectKey: 'mao' });
+    vi.mocked(d.memoryRepo.listStaleAuto).mockResolvedValue(evictable ? [{ id: 41 }] : []);
+    await settle(buildService(d).extractForSession(BASE_INPUT));
+    expect(d.memoryRepo.insert).not.toHaveBeenCalled();
+    if (revives) {
+      expect(d.memoryRepo.reviveEvicted).toHaveBeenCalledWith(5, expect.anything());
+      expect(d.memoryRepo.touch).not.toHaveBeenCalled();
+    } else {
+      expect(d.memoryRepo.updateStatus).not.toHaveBeenCalled();
+      expect(d.memoryRepo.touch).not.toHaveBeenCalled();
+    }
+    if (revives && count === 200) {
+      expect(d.memoryRepo.listStaleAuto).toHaveBeenCalledWith(7, 'PROJECT', 'mao', 1, expect.anything());
+      expect(d.memoryRepo.dismiss).toHaveBeenCalledWith(41, 'EVICTED', expect.anything());
+    } else {
+      expect(d.memoryRepo.dismiss).not.toHaveBeenCalled();
+    }
+  });
+
+  it('revivalAndInsertShareActiveSlotBookkeeping', async () => {
+    d.llm.chat.mockResolvedValue({ choices: [{ message: { content: JSON.stringify([
+      { type: 'user', content: '复现事实' }, { type: 'user', content: '全新事实' },
+    ]) } }] });
+    vi.mocked(d.memoryRepo.countActive).mockResolvedValue(200);
+    const evicted = { id: 5, status: 'DISMISSED', dismissReason: 'EVICTED', scope: 'USER', projectKey: '' };
+    vi.mocked(d.memoryRepo.findByHash).mockResolvedValueOnce(evicted).mockResolvedValueOnce(evicted).mockResolvedValueOnce(null);
+    let id = 41;
+    vi.mocked(d.memoryRepo.listStaleAuto).mockImplementation(async () => [{ id: id++ }]);
+    await settle(buildService(d).extractForSession(BASE_INPUT));
+    expect(d.memoryRepo.reviveEvicted).toHaveBeenCalledWith(5, expect.anything());
+    expect(d.memoryRepo.insert).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(d.memoryRepo.dismiss).mock.calls.map((call) => call.slice(0, 2))).toEqual([[41, 'EVICTED'], [42, 'EVICTED']]);
   });
 
   it('touchActionStillAppliesWhenActiveFull', async () => {
@@ -357,7 +402,7 @@ describe('MemoryExtractionService', () => {
     });
     const svc = buildService(d);
     await settle(svc.extractForSession(BASE_INPUT));
-    expect(d.memoryRepo.touch).toHaveBeenCalledWith(12);
+    expect(d.memoryRepo.touch).toHaveBeenCalledWith(12, expect.anything());
     expect(d.memoryRepo.updateStatus).not.toHaveBeenCalled();
     expect(d.memoryRepo.insert).not.toHaveBeenCalled();
   });

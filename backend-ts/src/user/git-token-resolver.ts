@@ -18,6 +18,11 @@ export interface GitTokenResolverDeps {
     getTokenMapByUser(userId: number | null | undefined): Promise<Map<string, string>>;
     getTokenMapByUserFiltered(userId: number | null | undefined, domains: string[]): Promise<Map<string, string>>;
   };
+  /** 系统默认凭据：用户缺少某域时兜底，但始终复用 Agent 域约束。 */
+  systemGitCredentialService: {
+    getTokenMap(): Promise<Map<string, string>>;
+    getTokenMapFiltered(domains: string[]): Promise<Map<string, string>>;
+  };
   /** 不过滤软删的轻量查询（D1）：null=agent id 不存在（故障）；{ domains: null }=未配置。 */
   agentLookup: {
     selectGitAllowedDomainsById(id: number): Promise<{ domains: string | null } | null>;
@@ -91,8 +96,14 @@ export class DefaultGitTokenResolver implements GitTokenResolver {
         // '[]' 显式禁止：不注入任何凭据（两种策略下一致）。
         return {};
       }
-      const result = toRecord(await this.deps.gitCredentialService.getTokenMapByUserFiltered(userId, allowed));
-      harnessLog('info', `[git-scope] injected=${Object.keys(result).length} allowed=${allowed.length} agentId=${agentId} uid=${userId}`);
+      const user = toRecord(await this.deps.gitCredentialService.getTokenMapByUserFiltered(userId, allowed));
+      // 默认凭据只补用户缺失的域；白名单之外的域不会被查询或解密。
+      const defaults = await this.safeDefaultMap(allowed);
+      const result = mergeTokenMaps(defaults, user);
+      harnessLog(
+        'info',
+        `[git-scope] injected=user:${Object.keys(user).length} default:${Object.keys(defaults).length} allowed=${allowed.length} agentId=${agentId} uid=${userId}`,
+      );
       return result;
     } catch (e) {
       harnessLog('warn', `[git-scope] resolve failed agentId=${agentId} uid=${userId}: ${(e as Error).message}`);
@@ -101,13 +112,35 @@ export class DefaultGitTokenResolver implements GitTokenResolver {
   }
 
   private async fullTokenMap(userId: number): Promise<Record<string, string>> {
-    return toRecord(await this.deps.gitCredentialService.getTokenMapByUser(userId));
+    const user = toRecord(await this.deps.gitCredentialService.getTokenMapByUser(userId));
+    const defaults = await this.safeDefaultMap();
+    const merged = mergeTokenMaps(defaults, user);
+    harnessLog('info', `[git-scope] injected=user:${Object.keys(user).length} default:${Object.keys(defaults).length} uid=${userId}`);
+    return merged;
+  }
+
+  /** 默认凭据故障只降级为无默认，不影响用户自有凭据；日志只记录数量/域约束，不记录 token。 */
+  private async safeDefaultMap(domains?: string[]): Promise<Record<string, string>> {
+    try {
+      const map = domains == null
+        ? await this.deps.systemGitCredentialService.getTokenMap()
+        : await this.deps.systemGitCredentialService.getTokenMapFiltered(domains);
+      return toRecord(map);
+    } catch (e) {
+      harnessLog('warn', `[git-scope] default token resolve failed${domains != null ? ` domains=${domains.length}` : ''}: ${(e as Error).message}`);
+      return {};
+    }
   }
 }
 
 /** Map → 普通对象（注入通道消费的形态）。 */
 function toRecord(map: Map<string, string>): Record<string, string> {
   return Object.fromEntries(map);
+}
+
+/** 合并默认与用户凭据：默认在前、用户在后，同域用户 Token 覆盖默认。 */
+function mergeTokenMaps(defaults: Record<string, string>, user: Record<string, string>): Record<string, string> {
+  return { ...defaults, ...user };
 }
 
 /** 解析白名单 JSON；非数组 / 解析失败 / 空数组一律按「无允许域」（安全侧）。 */

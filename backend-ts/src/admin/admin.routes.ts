@@ -2,10 +2,13 @@ import type { FastifyInstance } from 'fastify';
 import { requireRequestPermission } from '../common/http-error.js';
 import { sendJson } from '../common/http-error.js';
 import { ok } from '../common/result.js';
+import { BusinessException } from '../common/business-exception.js';
+import { ErrorCode } from '../common/error-code.js';
+import { bodyOf } from '../common/request.js';
 import type { JwtService } from '../crypto/jwt.service.js';
 import { parseAnalyticsRange, resolveAnalyticsRange } from './analytics-range.js';
 import type { AdminAnalyticsService } from './admin-analytics.service.js';
-import type { MemoryPageVO, MemoryScope, MemoryStatus } from '../memory/types.js';
+import type { MemoryItemVO, MemoryListQuery, MemoryPageVO } from '../memory/types.js';
 import { ACTIVE_PHASES } from '../session/util/session-group-key.js';
 
 /** 运行监控默认视图：全部活跃相位 + 异常终态（CANCELLING 与 ACTIVE_PHASES 同源，避免手写清单漂移）。 */
@@ -29,16 +32,17 @@ export interface AdminSessionLister {
   ): Promise<{ records: unknown[]; total: number; current: number; size: number; matchSnippets?: Record<number, string> }>;
 }
 
-/** 管理后台记忆审计：跨用户只读查询（no ownership check，路由侧已做 memory:read 校验）。 */
+/** 后台记忆读写：读需 memory:read，写需 memory:write，目标归属按记忆 id 反查。 */
 export interface AdminMemoryAuditor {
-  listForAdmin(
-    userId: number,
-    query: { scope?: MemoryScope | null; projectKey?: string | null; status?: MemoryStatus | null; page: number; pageSize: number },
-  ): Promise<MemoryPageVO>;
+  listForAdmin(query: MemoryListQuery): Promise<MemoryPageVO>;
+  updateForAdmin(id: number, input: { content?: string | null; status?: string | null }): Promise<MemoryItemVO>;
+  removeForAdmin(id: number): Promise<void>;
+  createForAdmin(userId: number, input: { scope: string; content: string; projectKey?: string | null }): Promise<MemoryItemVO>;
 }
 
 export interface AdminUserLookup {
   findByIds(ids: number[]): Promise<Array<{ id: number; username: string; displayName?: string | null }>>;
+  search(keyword: string, pageSize: number): Promise<Array<{ id: number; username: string; displayName?: string | null }>>;
 }
 
 export interface AdminRouteDeps {
@@ -113,8 +117,8 @@ export function registerAdminAnalyticsRoutes(app: FastifyInstance, deps: AdminRo
 
   app.get('/v1/admin/analytics/overview', async (req, reply) => {
     await requireRequestPermission(deps.permissionService, req, 'analytics:read');
-    const { days, endOffset } = parseAnalyticsQuery(req.query as AnalyticsQueryRaw);
-    sendJson(reply, 200, ok(await deps.analytics.overview(days, endOffset)));
+    const { days, endOffset, excludeConnectivity } = parseAnalyticsQuery(req.query as AnalyticsQueryRaw);
+    sendJson(reply, 200, ok(await deps.analytics.overview(days, endOffset, { excludeConnectivity })));
   });
 
   app.get('/v1/admin/analytics/trends', async (req, reply) => {
@@ -207,44 +211,144 @@ export function registerAdminRuntimeRoutes(app: FastifyInstance, deps: AdminRout
     sendJson(reply, 200, ok(result));
   });
 
-  // 用户记忆只读审计（技术方案 5.4）：按 userId 查看记忆内容，仅查询、无任何写接口
+  // /v1/admin 前缀由全局审计拦截器记录，查询和全部写操作均留痕。
   app.get('/v1/admin/memory', async (req, reply) => {
     await requireRequestPermission(deps.permissionService, req, 'memory:read');
-    const q = req.query as { userId?: string; page?: string; pageSize?: string; scope?: string; status?: string };
-    const userId = Number(q.userId);
-    if (!Number.isSafeInteger(userId) || userId <= 0) {
-      sendJson(reply, 200, ok({ records: [], total: 0, current: 1, size: 20 }));
-      return;
+    const q = req.query as Record<string, string | string[] | undefined>;
+    const pick = (key: string): string => {
+      const raw = q[key];
+      return (Array.isArray(raw) ? raw[0] : raw)?.trim() ?? '';
+    };
+    const rawUserId = pick('userId');
+    const userId = rawUserId === '' ? null : requirePositiveMemoryUserId(rawUserId);
+    const scope = parseMemoryFilter(pick('scope'), ['USER', 'PROJECT'] as const, 'scope');
+    const status = parseMemoryFilter(pick('status'), ['ACTIVE', 'DISMISSED'] as const, 'status');
+    const source = parseMemoryFilter(pick('source'), ['AUTO', 'MANUAL'] as const, 'source');
+    const keyword = pick('keyword') || null;
+    const projectKey = pick('projectKey') || null;
+    // 时间范围不计入跨用户查询门槛，与上游 D5 一致。
+    if (userId == null && !keyword && !scope && !status && !source && !projectKey) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '跨用户查询必须至少指定一个过滤条件（关键词/作用域/状态/来源/项目）');
     }
-    if (!deps.memoryAuditor) {
-      sendJson(reply, 200, ok({ records: [], total: 0, current: 1, size: 20 }));
-      return;
+    const updatedFrom = parseMemoryDate(pick('updatedFrom'), '00:00:00');
+    const updatedTo = parseMemoryDate(pick('updatedTo'), '23:59:59');
+    if (updatedFrom && updatedTo && updatedFrom > updatedTo) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '更新时间开始日期不能晚于结束日期');
     }
-    const page = Math.max(1, Math.floor(Number(q.page ?? 1)) || 1);
-    const pageSize = Math.min(100, Math.max(1, Math.floor(Number(q.pageSize ?? 20)) || 20));
-    const scope = q.scope === 'USER' || q.scope === 'PROJECT' ? q.scope : null;
-    const status = q.status === 'ACTIVE' || q.status === 'DISMISSED' ? q.status : null;
-    const result = await deps.memoryAuditor.listForAdmin(userId, {
-      scope,
-      status,
-      projectKey: null,
-      page,
-      pageSize,
+    const { auditor, users } = requireMemoryDeps(deps);
+    const result = await auditor.listForAdmin({
+      userId, scope, status, source, keyword, projectKey, updatedFrom, updatedTo,
+      page: normalizeInteger(pick('page'), 1, 1_000_000),
+      pageSize: normalizeInteger(pick('pageSize'), 20, 100),
     });
-    if (deps.memoryUserLookup && result.records.length > 0) {
-      try {
-        const users = await deps.memoryUserLookup.findByIds([userId]);
-        const user = users.find((u) => u.id === userId);
-        result.records = result.records.map((item) => ({
-          ...item,
-          username: user?.username ?? null,
-          displayName: user?.displayName ?? null,
-        }));
-      } catch {
-        // 用户信息补全失败不影响审计列表返回
-      }
+    if (result.records.length > 0) {
+      const ids = [...new Set(result.records.map((item) => item.userId))];
+      const byId = new Map((await users.findByIds(ids)).map((user) => [user.id, user]));
+      result.records = result.records.map((item) => ({
+        ...item,
+        username: byId.get(item.userId)?.username ?? null,
+        displayName: byId.get(item.userId)?.displayName ?? null,
+      }));
     }
     sendJson(reply, 200, ok(result));
   });
 
+  // 只暴露记忆管理所需的用户基本信息，不额外要求 user:read。
+  app.get('/v1/admin/memory/users', async (req, reply) => {
+    await requireRequestPermission(deps.permissionService, req, 'memory:read');
+    const q = req.query as Record<string, string | string[] | undefined>;
+    const keyword = Array.isArray(q.keyword) ? q.keyword[0] : q.keyword;
+    const pageSize = Array.isArray(q.pageSize) ? q.pageSize[0] : q.pageSize;
+    const { users } = requireMemoryDeps(deps);
+    const records = (await users.search(keyword?.trim() ?? '', normalizeInteger(pageSize, 20, 100)))
+      .map(({ id, username, displayName }) => ({ id, username, displayName }));
+    sendJson(reply, 200, ok({ records }));
+  });
+
+  app.patch('/v1/admin/memory/:id', async (req, reply) => {
+    await requireRequestPermission(deps.permissionService, req, 'memory:write');
+    const { auditor } = requireMemoryDeps(deps);
+    const id = requireMemoryPathId((req.params as { id: string }).id);
+    const body = bodyOf<{ content?: unknown; status?: unknown; userId?: unknown }>(req);
+    if (body.userId !== undefined) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '记忆归属不可修改');
+    }
+    if (body.content != null && typeof body.content !== 'string') {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, 'content 必须是字符串');
+    }
+    if (body.status != null && typeof body.status !== 'string') {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, 'status 必须是字符串');
+    }
+    if (body.content == null && body.status == null) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, '至少提供 content 或 status');
+    }
+    const vo = await auditor.updateForAdmin(id, {
+      content: body.content ?? null,
+      status: body.status ?? null,
+    });
+    sendJson(reply, 200, ok(vo));
+  });
+
+  app.delete('/v1/admin/memory/:id', async (req, reply) => {
+    await requireRequestPermission(deps.permissionService, req, 'memory:write');
+    const { auditor } = requireMemoryDeps(deps);
+    await auditor.removeForAdmin(requireMemoryPathId((req.params as { id: string }).id));
+    sendJson(reply, 200, ok());
+  });
+
+  app.post('/v1/admin/memory', async (req, reply) => {
+    await requireRequestPermission(deps.permissionService, req, 'memory:write');
+    const { auditor, users } = requireMemoryDeps(deps);
+    const body = bodyOf<{ userId?: unknown; scope?: unknown; content?: unknown; projectKey?: unknown }>(req);
+    const userId = requirePositiveMemoryUserId(body.userId);
+    if (typeof body.scope !== 'string' || typeof body.content !== 'string'
+      || (body.projectKey != null && typeof body.projectKey !== 'string')) {
+      throw new BusinessException(ErrorCode.PARAM_INVALID, 'scope/content/projectKey 必须是字符串');
+    }
+    // memory_item 无外键，代建前验证用户存在，防止孤儿数据。
+    if (!(await users.findByIds([userId])).some((user) => user.id === userId)) {
+      throw new BusinessException(ErrorCode.USER_NOT_FOUND);
+    }
+    sendJson(reply, 200, ok(await auditor.createForAdmin(userId, {
+      scope: body.scope, content: body.content, projectKey: body.projectKey ?? null,
+    })));
+  });
+}
+
+function requireMemoryDeps(deps: AdminRouteDeps): { auditor: AdminMemoryAuditor; users: AdminUserLookup } {
+  if (!deps.memoryAuditor || !deps.memoryUserLookup) {
+    throw new BusinessException(ErrorCode.INTERNAL_ERROR, '记忆管理依赖未装配');
+  }
+  return { auditor: deps.memoryAuditor, users: deps.memoryUserLookup };
+}
+
+function requirePositiveMemoryUserId(raw: unknown): number {
+  const id = typeof raw === 'number' || typeof raw === 'string' ? Number(raw) : NaN;
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    throw new BusinessException(ErrorCode.PARAM_INVALID, 'userId 必须是正整数');
+  }
+  return id;
+}
+
+function requireMemoryPathId(raw: string): number {
+  const id = Number(raw);
+  if (!Number.isSafeInteger(id) || id <= 0) throw new BusinessException(ErrorCode.MEMORY_ITEM_NOT_FOUND);
+  return id;
+}
+
+function parseMemoryFilter<T extends string>(raw: string, allowed: readonly T[], name: string): T | null {
+  if (raw === '') return null;
+  if (!allowed.includes(raw as T)) throw new BusinessException(ErrorCode.PARAM_INVALID, `${name} 不合法`);
+  return raw as T;
+}
+
+/** 日期按 UTC round-trip 验证，拒绝不存在的日历日期，避免查询意外放宽。 */
+function parseMemoryDate(raw: string, suffix: string): string | null {
+  if (raw === '') return null;
+  const parsed = new Date(`${raw}T00:00:00Z`);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw) || Number.isNaN(parsed.getTime())
+    || parsed.toISOString().slice(0, 10) !== raw) {
+    throw new BusinessException(ErrorCode.PARAM_INVALID, 'updatedFrom/updatedTo 必须是 YYYY-MM-DD 格式的有效日期');
+  }
+  return `${raw} ${suffix}`;
 }
