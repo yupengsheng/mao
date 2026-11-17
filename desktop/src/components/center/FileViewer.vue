@@ -124,7 +124,7 @@ import { ref, computed, onMounted, onUnmounted, watch, toRef, inject } from 'vue
 import { useMonacoViewer } from '../../composables/useMonacoViewer'
 import { attachMonacoQuote } from '../../composables/useMonacoQuote'
 import type { FileRangeQuotePayload } from '../../utils/selection-quote'
-import { isAndroidCapacitor } from '../../utils/capacitor'
+import { isNativeCapacitor } from '../../utils/capacitor'
 import MarkdownContent from '../common/MarkdownContent.vue'
 import PdfViewer from './PdfViewer.vue'
 import CsvTableView from './CsvTableView.vue'
@@ -221,7 +221,7 @@ useMonacoViewer({
   onEditor(editor) {
     detachQuote?.()
     detachQuote = null
-    if (!editor || !quoteFileRangeToChat || isAndroidCapacitor()) return
+    if (!editor || !quoteFileRangeToChat || isNativeCapacitor()) return
     detachQuote = attachMonacoQuote({
       editor,
       getFilePath: () => props.filePath,

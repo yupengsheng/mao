@@ -174,7 +174,7 @@ import { resolveWorkspaceFilePath } from '../../utils/workspace-path'
 import { copyText } from '../../utils/clipboard'
 import DownloadLinkDialog from '../common/DownloadLinkDialog.vue'
 import { isWechatBrowser } from '../../utils/user-agent'
-import { isAndroidCapacitor } from '../../utils/capacitor'
+import { isNativeCapacitor } from '../../utils/capacitor'
 import { useFileClipboard } from '../../composables/useFileClipboard'
 import {
   copyWorkspacePath,
@@ -579,7 +579,7 @@ async function handleDownloadFile() {
       : node.name
     const result = await props.provider.downloadFile(node.path, suggestedName)
     if (result.ok) {
-      if ((isWechatBrowser() || isAndroidCapacitor()) && result.url) {
+      if ((isWechatBrowser() || isNativeCapacitor()) && result.url) {
         // 微信浏览器和安卓 WebView 可能阻止 Blob 自动下载，显示可鉴权的下载链接
         downloadDialog.url = result.url
         downloadDialog.fileName = suggestedName
@@ -617,7 +617,7 @@ async function handleDownloadDirectory() {
       : node.name
     const result = await props.provider.downloadDirectory(node.path, `${baseName}.zip`)
     if (result.ok) {
-      if ((isWechatBrowser() || isAndroidCapacitor()) && result.url) {
+      if ((isWechatBrowser() || isNativeCapacitor()) && result.url) {
         // 微信浏览器和安卓 WebView 可能阻止 Blob 自动下载，显示可鉴权的下载链接
         downloadDialog.url = result.url
         downloadDialog.fileName = `${baseName}.zip`

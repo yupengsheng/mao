@@ -1,20 +1,33 @@
 import { ref } from 'vue'
 
 export function isMobileDevice(): boolean {
-  return window.innerWidth <= 768
+  return typeof window !== 'undefined' && window.innerWidth <= 768
 }
 
-const leftCollapsed = ref(false)
-const rightCollapsed = ref(isMobileDevice())
+const MOBILE_BREAKPOINT = 768
 
-// 监听视口变化：桌面端拉窄窗口跨过移动断点时自动折叠右侧面板（拉宽不自动展开，由用户手动控制）
-const isMobileViewport = ref(isMobileDevice())
+function isMobileViewportNow(): boolean {
+  return typeof window !== 'undefined' && window.innerWidth <= MOBILE_BREAKPOINT
+}
+
+// 移动端默认收起左右面板：历史会话改成顶栏汉堡打开的抽屉，首屏直接给对话区。
+const leftCollapsed = ref(isMobileViewportNow())
+const rightCollapsed = ref(isMobileViewportNow())
+
+// 监听视口变化：跨过移动断点时左侧改为“进入移动端即收起、回到桌面端即展开”，
+// 右侧维持“进入移动端自动收起、回到桌面不自动展开”的旧口径。
+const isMobileViewport = ref(isMobileViewportNow())
 if (typeof window !== 'undefined') {
   window.addEventListener('resize', () => {
-    const mobile = isMobileDevice()
+    const mobile = isMobileViewportNow()
     if (mobile !== isMobileViewport.value) {
       isMobileViewport.value = mobile
-      if (mobile) rightCollapsed.value = true
+      if (mobile) {
+        leftCollapsed.value = true
+        rightCollapsed.value = true
+      } else {
+        leftCollapsed.value = false
+      }
     }
   }, { passive: true })
 }

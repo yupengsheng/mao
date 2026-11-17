@@ -61,7 +61,7 @@ import { computed, ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useTerminal } from '../../composables/useTerminal'
 import { useSessionStore } from '../../stores/session'
-import { isAndroidCapacitor } from '../../utils/capacitor'
+import { isNativeCapacitor } from '../../utils/capacitor'
 import TerminalTabs from './TerminalTabs.vue'
 
 const {
@@ -304,7 +304,7 @@ const KEY_BAR: KeyBarItem[] = [
   { label: '粘贴', action: 'paste' },
 ]
 
-const showKeyBar = isAndroidCapacitor()
+const showKeyBar = isNativeCapacitor()
 const ctrlSticky = ref(false)
 
 /** 统一走 xterm 的 input()：会触发 onData，local / remote 自动走各自写入通道。 */

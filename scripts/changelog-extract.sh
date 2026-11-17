@@ -17,7 +17,7 @@ DEFAULT_CHANGELOG="${MAO_CHANGELOG:-$PROJECT_ROOT/CHANGELOG.md}"
 
 # OTA 用户可见小节（前缀匹配 ### 标题）
 OTA_SECTIONS=(
-  "前端（桌面 / Web / 安卓）"
+  "前端（桌面 / Web / 安卓"
   "安卓原生"
 )
 

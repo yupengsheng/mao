@@ -1,4 +1,4 @@
-import { isAndroidCapacitor } from './capacitor'
+import { isAndroidCapacitor, isIosCapacitor } from './capacitor'
 
 /**
  * 客户端形态检测（与 utils/capacitor.ts 并列）。
@@ -9,12 +9,13 @@ export function isElectronClient(): boolean {
 }
 
 /**
- * 客户端形态三态（WS 握手 client 词表）。握手与建会话来源共用这一份判定，
+ * 客户端形态（WS 握手 client 词表）。握手与建会话来源共用这一份判定，
  * 避免两处各写一份三元表达式后漂移。
  */
-export function clientKind(): 'electron' | 'android' | 'browser' {
+export function clientKind(): 'electron' | 'android' | 'ios' | 'browser' {
   if (isElectronClient()) return 'electron'
   if (isAndroidCapacitor()) return 'android'
+  if (isIosCapacitor()) return 'ios'
   return 'browser'
 }
 
@@ -27,5 +28,7 @@ export function clientSessionSource(): 'desktop' | 'android' | 'web' {
   const kind = clientKind()
   if (kind === 'electron') return 'desktop'
   if (kind === 'android') return 'android'
+  // 后端 CLIENT_DECLARABLE_SESSION_SOURCES 尚未收录 ios；iOS 远程壳按 web 建会话，
+  // WS 握手仍用 clientKind() 的 ios 供运行时识别。
   return 'web'
 }

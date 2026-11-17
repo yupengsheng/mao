@@ -1,0 +1,13 @@
+{
+  "appId": "cn.etarch.mao.app",
+  "appName": "Mao",
+  "webDir": "web-stub",
+  "server": {
+    "url": "https://mao.etarch.cn"
+  },
+  "ios": {
+    "path": ".",
+    "allowsLinkPreview": false,
+    "contentInset": "never"
+  }
+}

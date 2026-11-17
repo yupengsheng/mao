@@ -317,7 +317,7 @@ import {
 } from '../../composables/useChat'
 import { buildSegmentsFromContentAndTools, extractCitationsFromMetadata } from '../../utils/chatMessage'
 import { buildCiteMap, stripCitationMarkers } from '../../utils/citationMarkers'
-import { isAndroidCapacitor, openExternalUrl } from '../../utils/capacitor'
+import { isNativeCapacitor, openExternalUrl } from '../../utils/capacitor'
 import { plainTextFromRange, splitUserMessageForDisplay, summarizeQuote } from '../../utils/selection-quote'
 import type { Citation } from '../../types/chat'
 import { formatDateTime } from '../../utils/datetime'
@@ -720,7 +720,7 @@ function elementFromNode(node: Node | null): Element | null {
 }
 
 function captureQuoteSelection() {
-  if (!quoteReplyToChat || isAndroidCapacitor() || role.value !== 'assistant' || isAssistantRunning.value) {
+  if (!quoteReplyToChat || isNativeCapacitor() || role.value !== 'assistant' || isAssistantRunning.value) {
     hideQuoteFloat()
     return
   }

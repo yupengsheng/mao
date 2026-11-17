@@ -25,16 +25,17 @@ import { useForegroundRecovery } from './composables/useForegroundRecovery'
 import './style.css'
 import 'monaco-editor/min/vs/editor/editor.main.css'
 
-function markAndroidCapacitor() {
+function markNativeCapacitor() {
   try {
     const capacitor = (window as any).Capacitor
-    if (capacitor?.getPlatform?.() === 'android') {
-      document.documentElement.classList.add('android-capacitor')
+    const platform = capacitor?.isNativePlatform?.() ? capacitor.getPlatform?.() : null
+    if (platform === 'android' || platform === 'ios') {
+      document.documentElement.classList.add(`${platform}-capacitor`, 'native-mobile')
       return
     }
     const host = window.location.hostname
     if (/Android/i.test(navigator.userAgent) && /^(localhost|127\.0\.0\.1)$/i.test(host)) {
-      document.documentElement.classList.add('android-capacitor')
+      document.documentElement.classList.add('android-capacitor', 'native-mobile')
     }
   } catch {
     // 非 Capacitor 环境忽略
@@ -42,7 +43,7 @@ function markAndroidCapacitor() {
 }
 
 async function bootstrap() {
-  markAndroidCapacitor()
+  markNativeCapacitor()
   await initAuthStorage()
 
   const app = createApp(App)

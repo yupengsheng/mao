@@ -131,7 +131,7 @@ vi.mock('../../utils/sessionShare', () => ({ downloadSessionJsonl: vi.fn() }))
 import { createApp } from 'vue'
 import TaskIndexPanel from './TaskIndexPanel.vue'
 
-function mountPanel(listMode: 'standard' | 'focus' = 'standard', handlers: Record<string, () => void> = {}) {
+function mountPanel(listMode: 'standard' | 'focus' = 'standard', handlers: Record<string, unknown> = {}) {
   const host = document.createElement('div')
   document.body.appendChild(host)
   const app = createApp({
@@ -546,6 +546,50 @@ describe('TaskIndexPanel 宽度阈值', () => {
     ;(globalThis as any).__resizeCallbacks.forEach((cb: () => void) => cb())
     await tick()
     expect(q(host, '.panel-title')!.textContent).toBe('任务')
+    app.unmount()
+  })
+})
+
+describe('TaskIndexPanel 移动端历史会话抽屉', () => {
+  it('关闭态保留 DOM 但 inert，展开态显示关闭按钮且可交互', async () => {
+    const closed = mountPanel('standard', { mobile: true, drawerOpen: false })
+    const closedPanel = q(closed.host, '.task-index-panel')!
+    expect(closedPanel.classList.contains('mobile-drawer')).toBe(true)
+    expect(closedPanel.classList.contains('drawer-open')).toBe(false)
+    expect(closedPanel.getAttribute('aria-hidden')).toBe('true')
+    expect(closedPanel.hasAttribute('inert')).toBe(true)
+    closed.app.unmount()
+
+    const opened = mountPanel('standard', { mobile: true, drawerOpen: true })
+    const openedPanel = q(opened.host, '.task-index-panel')!
+    expect(openedPanel.classList.contains('drawer-open')).toBe(true)
+    expect(openedPanel.hasAttribute('aria-hidden')).toBe(false)
+    expect(openedPanel.hasAttribute('inert')).toBe(false)
+    expect(q(opened.host, '.drawer-close-btn')).toBeTruthy()
+    opened.app.unmount()
+  })
+
+  it('关闭按钮只触发 close，不切换列表或新建任务', async () => {
+    const onClose = vi.fn()
+    const onNewTask = vi.fn()
+    const { host, app } = mountPanel('standard', { mobile: true, drawerOpen: true, onClose, onNewTask })
+    await tick()
+    ;(q(host, '.drawer-close-btn') as HTMLElement).click()
+    await tick()
+    expect(onClose).toHaveBeenCalledTimes(1)
+    expect(onNewTask).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('选中会话先关闭抽屉再跳转，避免详情页仍被遮罩覆盖', async () => {
+    store.sessions = [row('1')]
+    const onClose = vi.fn()
+    const { host, app } = mountPanel('standard', { mobile: true, drawerOpen: true, onClose })
+    await tick()
+    ;(host.querySelector('.session-group .session-item') as HTMLElement).click()
+    await tick()
+    expect(onClose).toHaveBeenCalledTimes(1)
+    expect(routerPush).toHaveBeenCalledWith('/tasks/1')
     app.unmount()
   })
 })

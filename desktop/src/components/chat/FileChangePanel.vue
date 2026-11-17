@@ -66,7 +66,7 @@ import DownloadLinkDialog from '../common/DownloadLinkDialog.vue'
 import { copyText } from '../../utils/clipboard'
 import { ElMessage } from 'element-plus'
 import { isWechatBrowser } from '../../utils/user-agent'
-import { isAndroidCapacitor } from '../../utils/capacitor'
+import { isNativeCapacitor } from '../../utils/capacitor'
 import type { WorkspaceFileProvider } from '../../composables/workspace-file-provider'
 
 const props = defineProps<{
@@ -196,8 +196,8 @@ async function handleDownloadFile() {
   try {
     const result = await fileProvider.downloadFile(change.path, fileName)
     if (result.ok) {
-      if ((isWechatBrowser() || isAndroidCapacitor()) && result.url) {
-        // 微信浏览器和安卓 WebView 可能阻止 Blob 自动下载，显示可鉴权的下载链接
+      if ((isWechatBrowser() || isNativeCapacitor()) && result.url) {
+        // 微信浏览器和原生壳 WebView 可能阻止 Blob 自动下载，显示可鉴权的下载链接
         downloadDialog.url = result.url
         downloadDialog.fileName = fileName
         downloadDialog.visible = true

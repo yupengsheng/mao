@@ -131,7 +131,7 @@ import { useAuthStore } from '../../stores/auth'
 import appIcon from '../../assets/app-icon-small.png'
 import { useTheme } from '../../utils/theme'
 import { readRedirectQuery, safeRedirect } from '../../utils/login-redirect'
-import { isAndroidCapacitor, openExternalUrl } from '../../utils/capacitor'
+import { isNativeCapacitor, openExternalUrl } from '../../utils/capacitor'
 import { feishuPollPhase, openFeishuAuthPopup } from '../../utils/feishu-login-poll'
 import { safeRemoveItem, safeSetItem } from '../../utils/safe-storage'
 
@@ -267,8 +267,8 @@ async function startFeishuLogin(provider: FeishuProvider) {
         feishuStatusText.value = '授权窗口已关闭'
         backToPasswordLogin()
       }
-    } else if (isAndroidCapacitor()) {
-      // 安卓壳交给系统浏览器，授权完成后由用户回到 App，原页面继续轮询
+    } else if (isNativeCapacitor()) {
+      // 原生壳（安卓 / iOS）交给系统浏览器，授权完成后由用户回到 App，原页面继续轮询
       feishuStatusText.value = '请在打开的飞书授权页面中完成登录'
       const opened = await openExternalUrl(authUrl)
       if (!opened) {

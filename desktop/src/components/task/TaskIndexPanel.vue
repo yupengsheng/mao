@@ -2,13 +2,24 @@
   <div
     ref="panelEl"
     class="task-index-panel"
-    :class="{ collapsed, 'actions-hidden': !showItemActions, 'header-condensed': !showHeaderTitle }"
+    :class="{ 'collapsed': collapsed && !mobile, 'mobile-drawer': mobile, 'drawer-open': mobile && drawerOpen, 'actions-hidden': !showItemActions, 'header-condensed': !showHeaderTitle }"
     :style="panelStyle"
+    :aria-hidden="mobile && !drawerOpen ? 'true' : undefined"
+    :inert="mobile && !drawerOpen ? true : undefined"
   >
-    <template v-if="!collapsed">
+    <template v-if="!collapsed || mobile">
       <div class="panel-header">
         <span v-if="showHeaderTitle" class="panel-title">任务</span>
         <div class="header-actions">
+          <button
+            v-if="mobile"
+            class="refresh-btn drawer-close-btn"
+            title="关闭历史会话"
+            aria-label="关闭历史会话"
+            @click="emit('close')"
+          >
+            <el-icon :size="18"><Close /></el-icon>
+          </button>
           <button
             class="refresh-btn mode-toggle-btn"
             :class="{ active: listMode === 'focus' }"
@@ -189,7 +200,7 @@
       </div>
     </template>
     <div
-      v-if="!collapsed"
+      v-if="!collapsed && !mobile"
       class="resize-handle"
       @mousedown="onResizeStart"
       @touchstart.prevent="onResizeStart"
@@ -217,7 +228,7 @@
 
 <script setup lang="ts">
 import { computed, ref, reactive, watch, nextTick, onMounted, onUnmounted } from 'vue'
-import { Refresh, Bell, BellFilled, Check, ChatLineRound } from '@element-plus/icons-vue'
+import { Refresh, Bell, BellFilled, Check, ChatLineRound, Close } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { useSessionStore, ACTIVE_PHASES, type Session, type TaskPhase } from '../../stores/session'
@@ -238,6 +249,10 @@ import { shouldDismissContextMenuForScroll } from '../../utils/contextMenuDismis
 
 const props = defineProps<{
   collapsed: boolean
+  /** 移动端抽屉形态：覆盖式面板，不参与 task-layout 的横向排布 */
+  mobile?: boolean
+  /** 移动端抽屉是否展开；桌面端忽略 */
+  drawerOpen?: boolean
   listMode?: 'standard' | 'focus'
   /** 任务索引初始加载失败（TaskView 传入）：列表区顶部渲染错误条（静默失败可见化） */
   loadError?: boolean
@@ -245,6 +260,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   toggle: []
+  close: []
   newTask: []
   retry: []
   'update:listMode': [mode: 'standard' | 'focus']
@@ -801,6 +817,8 @@ function updateEffectivePanelWidth() {
 }
 
 const panelStyle = computed(() => {
+  // 移动端宽度由抽屉 CSS（min(86vw, 340px)）接管，桌面拖拽宽度不能覆盖它。
+  if (props.mobile) return {}
   if (panelWidth.value !== null) {
     return { width: `${panelWidth.value}px` }
   }
@@ -1065,6 +1083,7 @@ function formatElapsed(session: Session) {
 
 async function selectSession(session: Session) {
   if (editingSessionId.value === session.id) return
+  if (props.mobile) emit('close')
   confirmingDeleteId.value = null
   editingSessionId.value = null
   if (session.unread) {

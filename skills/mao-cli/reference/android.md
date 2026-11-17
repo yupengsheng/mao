@@ -11,7 +11,9 @@
 | 仅 `desktop/` 前端 UI | `deploy-desktop.sh` 或构建 `desktop/dist`，用户刷新 |
 | 原生壳（MainActivity、OTA 插件、Capacitor 配置） | 更新发版说明后 `build-apk.sh` |
 
-安卓专用 UI 在 `desktop/` 中用 `android-capacitor` / `Capacitor.isNativePlatform()` 守卫。
+安卓专用 UI 在 `desktop/` 中用 `android-capacitor` / `Capacitor.isNativePlatform()` 守卫；安卓与 iOS 共享的移动样式用 `native-mobile`。
+
+移动端（安卓 / iOS）历史会话为顶栏汉堡打开的覆盖式抽屉：点击遮罩、关闭按钮或 Esc 收起，选中会话与新建任务后自动关闭。抽屉内的分组、聚焦模式与历史折叠和桌面端同源，仅原生壳样式由 `native-mobile` 统一接管。
 
 ## 外链打开
 

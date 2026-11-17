@@ -43,7 +43,7 @@ import { useCenterTabs } from '../../composables/useCenterTabs'
 import { useSessionStore } from '../../stores/session'
 import MarkdownContent from '../common/MarkdownContent.vue'
 import { isExternalMarkdownLink, resolveMarkdownLink } from '../../utils/markdown-link'
-import { isAndroidCapacitor, openExternalUrl } from '../../utils/capacitor'
+import { isNativeCapacitor, openExternalUrl } from '../../utils/capacitor'
 import { attachMonacoQuote } from '../../composables/useMonacoQuote'
 import { buildPatchDiffModels } from '../../utils/unified-patch'
 import { diffEditorLayoutOptions, nextHunkIndex, resolveInitialDiffInlineMode } from '../../utils/diff-view-mode'
@@ -132,7 +132,7 @@ function detachQuoteAction() {
 }
 
 function attachQuoteAction() {
-  if (detachQuote || !diffEditor || !props.quoteEnabled || isAndroidCapacitor() || !quoteFileRangeToChat) return
+  if (detachQuote || !diffEditor || !props.quoteEnabled || isNativeCapacitor() || !quoteFileRangeToChat) return
   detachQuote = attachMonacoQuote({
     editor: diffEditor.getModifiedEditor(),
     getFilePath: () => props.change.path,

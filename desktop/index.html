@@ -7,13 +7,21 @@
     <meta name="color-scheme" content="light dark" />
     <title>Mao</title>
     <script>
-      // 尽早标记 Capacitor 安卓（仅 localhost WebView，避免误伤手机浏览器）
-      // 配合 CSS 立即隐藏 #splash，并启用安卓紧凑顶栏样式
+      // 尽早标记 Capacitor 原生壳（安卓 / iOS）：配合 CSS 立即隐藏 #splash，
+      // 并启用移动端紧凑顶栏。iOS 远程加载 mao.etarch.cn，不能靠 localhost 判断。
       ;(function () {
+        var capacitor = window.Capacitor
+        var platform = capacitor && capacitor.isNativePlatform && capacitor.isNativePlatform()
+          ? capacitor.getPlatform && capacitor.getPlatform()
+          : ''
+        if (platform === 'android' || platform === 'ios') {
+          document.documentElement.classList.add(platform + '-capacitor', 'native-mobile')
+          return
+        }
         var ua = navigator.userAgent || ''
         var host = location.hostname || ''
         if (/Android/i.test(ua) && /^(localhost|127\.0\.0\.1)$/i.test(host)) {
-          document.documentElement.classList.add('android-capacitor')
+          document.documentElement.classList.add('android-capacitor', 'native-mobile')
         }
       })()
       ;(function () {
@@ -36,8 +44,8 @@
         background: #1d1d1f;
       }
 
-      /* 与 style.css 双保险：外部 CSS 未加载时也要藏掉安卓 HTML splash */
-      html.android-capacitor #splash {
+      /* 与 style.css 双保险：外部 CSS 未加载时也要藏掉原生壳 HTML splash */
+      html.native-mobile #splash {
         display: none !important;
       }
 

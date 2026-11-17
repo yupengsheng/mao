@@ -955,3 +955,85 @@
   color: var(--aw-ink-muted-48);
   padding: 8px 0;
 }
+
+/* --- 移动端历史会话抽屉（ChatGPT 式） ---
+   移动端不再常驻窄侧栏：面板 teleport 到 body，从左侧覆盖滑出，带半透明遮罩。
+   宽度取 min(86vw, 340px)：既保留足够长的会话标题，又始终露出右侧对话区提示
+   可点遮罩关闭。高度铺满视口，安全区交给原生 WebView/Capacitor 处理。 */
+.task-index-panel.mobile-drawer {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  /* 低于 Element Plus 弹窗（2000 起），抽屉内的分享 / 确认框才能盖在抽屉之上 */
+  z-index: 1901;
+  width: min(86vw, 340px);
+  max-width: 100vw;
+  transform: translateX(-102%);
+  transition: transform 0.24s cubic-bezier(0.2, 0.8, 0.2, 1), visibility 0.24s;
+  visibility: hidden;
+  box-shadow: 0 0 32px rgba(0, 0, 0, 0.18);
+  box-sizing: border-box;
+  /* 移动端不需要桌面拖宽手柄 */
+}
+
+/* iOS Capacitor 的 WebView 铺满屏幕（contentInset=never），抽屉需自行避让
+   灵动岛 / Home Indicator。安卓系统栏已由 MainActivity 的 WindowInsets 处理，
+   这里不加，避免双倍留白。 */
+html.ios-capacitor .task-index-panel.mobile-drawer {
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.task-index-panel.mobile-drawer.drawer-open {
+  transform: translateX(0);
+  visibility: visible;
+}
+
+.task-index-panel.mobile-drawer .resize-handle {
+  display: none;
+}
+
+/* 抽屉头部：关闭按钮靠右，任务标题与刷新/模式切换留在左侧，触控目标 ≥ 32px */
+.task-index-panel.mobile-drawer .panel-header {
+  padding: 10px 12px;
+}
+
+.task-index-panel.mobile-drawer .drawer-close-btn {
+  width: 36px;
+  height: 36px;
+  order: 2;
+}
+
+.task-index-panel.mobile-drawer .header-actions {
+  gap: 0;
+}
+
+.task-index-panel.mobile-drawer .new-session-btn {
+  margin: 0 12px 10px;
+  height: 40px;
+  font-size: var(--aw-text-caption);
+}
+
+.task-index-panel.mobile-drawer .panel-content {
+  padding: 0 10px 12px;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+
+/* 分组头与会话行提升到 44px 触控高度，避免拇指误触相邻会话 */
+.task-index-panel.mobile-drawer .group-header {
+  min-height: 36px;
+  padding: 8px 6px;
+}
+
+.task-index-panel.mobile-drawer .session-item {
+  min-height: 44px;
+  padding: 10px 12px;
+}
+
+.task-index-panel.mobile-drawer .group-toggle {
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+}

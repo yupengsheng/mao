@@ -213,17 +213,17 @@
   }
 }
 
-/* Capacitor 安卓：立即隐藏 HTML splash，避免与原生 SplashScreen 叠出残留图标。 */
-html.android-capacitor #splash {
+/* Capacitor 原生壳（安卓 / iOS）：立即隐藏 HTML splash，避免与原生 SplashScreen 叠出残留图标。 */
+html.native-mobile #splash {
   display: none !important;
 }
 
 /*
- * Capacitor 安卓顶部导航：必须显示（0.0.7 曾 display:none 导致操作栏消失）。
+ * Capacitor 原生壳顶部导航：必须显示（0.0.7 曾 display:none 导致操作栏消失）。
  * 去掉 macOS 红绿灯预留的 78px 左缩进，改为紧凑单行。
  * 系统状态栏 / 手势条由原生 WebView WindowInsets padding 避让（勿再给 body 加同值 padding，会双倍）。
  */
-html.android-capacitor .top-nav {
+html.native-mobile .top-nav {
   display: flex !important;
   box-sizing: border-box;
   height: var(--aw-nav-height) !important;
@@ -232,24 +232,24 @@ html.android-capacitor .top-nav {
   -webkit-app-region: no-drag;
 }
 
-html.android-capacitor .nav-left {
+html.native-mobile .nav-left {
   gap: 4px;
   padding-left: 0 !important;
 }
 
-html.android-capacitor .nav-right {
+html.native-mobile .nav-right {
   gap: 2px;
   min-width: 0;
 }
 
-html.android-capacitor .theme-toggle {
+html.native-mobile .theme-toggle {
   flex-shrink: 0;
   width: 32px;
   height: 32px;
   position: relative;
 }
 
-html.android-capacitor .theme-toggle::before {
+html.native-mobile .theme-toggle::before {
   content: '';
   position: absolute;
   inset: 50% auto auto 50%;
@@ -258,42 +258,60 @@ html.android-capacitor .theme-toggle::before {
   transform: translate(-50%, -50%);
 }
 
-html.android-capacitor .nav-user {
+html.native-mobile .nav-user {
   flex-shrink: 0;
   padding: 2px;
 }
 
-html.android-capacitor .nav-username,
-html.android-capacitor .nav-user > .el-icon {
+html.native-mobile .nav-username,
+html.native-mobile .nav-user > .el-icon {
   display: none;
 }
 
-/* 安卓管理弹窗宽度适配（弹窗由设置页技能/指令管理、Bot 绑定等共用）。 */
-html.android-capacitor .management-dialog {
+/* 原生壳管理弹窗宽度适配（弹窗由设置页技能/指令管理、Bot 绑定等共用）。 */
+html.native-mobile .management-dialog {
   width: calc(100vw - 24px) !important;
   max-width: calc(100vw - 24px);
   margin: 12px auto !important;
 }
 
-html.android-capacitor .management-dialog .el-dialog__body {
+html.native-mobile .management-dialog .el-dialog__body {
   max-height: calc(100dvh - 140px);
   overflow-x: hidden;
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
 }
 
-/* 安卓终端：面板随软键盘避让（margin-bottom 由 JS 设置），内容区收窄留白并放大触控目标。 */
-html.android-capacitor .terminal-panel {
+/* 原生壳终端：面板随软键盘避让（margin-bottom 由 JS 设置），内容区收窄留白并放大触控目标。 */
+html.native-mobile .terminal-panel {
   transition: margin-bottom 0.12s ease-out;
 }
 
-html.android-capacitor .terminal-container {
+html.native-mobile .terminal-container {
   padding: 4px 8px;
 }
 
-html.android-capacitor .terminal-keybar-btn {
+html.native-mobile .terminal-keybar-btn {
   min-width: 44px;
   height: 36px;
+}
+
+/*
+ * iOS 安全区：Capacitor ios.contentInset = never，WebView 铺满屏幕，
+ * 由 CSS 显式避让状态栏与 Home Indicator。Android 的系统栏已由 MainActivity
+ * 的 WindowInsets padding 处理，若这里再套 safe-area 会双倍留白。
+ */
+html.ios-capacitor .top-nav {
+  box-sizing: border-box;
+  height: calc(var(--aw-nav-height) + env(safe-area-inset-top, 0px)) !important;
+  min-height: calc(var(--aw-nav-height) + env(safe-area-inset-top, 0px)) !important;
+  padding-top: env(safe-area-inset-top, 0px) !important;
+}
+
+html.ios-capacitor .layout {
+  box-sizing: border-box;
+  height: calc(100vh - env(safe-area-inset-bottom, 0px));
+  height: calc(100dvh - env(safe-area-inset-bottom, 0px));
 }
 
 /* ============================================

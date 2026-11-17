@@ -1,6 +1,6 @@
 ---
 name: mao-cli
-description: Mao 产品知识库与代理入口：项目说明、安装部署配置、管理后台/桌面/Electron/安卓/mao-agent 全端手册与排障，以及统一 REST CLI（原 mao-user-cli + mao-admin-cli）。不覆盖消息发送与 WebSocket Agent 运行。
+description: Mao 产品知识库与代理入口：项目说明、安装部署配置、管理后台/桌面/Electron/安卓/iOS/mao-agent 全端手册与排障，以及统一 REST CLI（原 mao-user-cli + mao-admin-cli）。不覆盖消息发送与 WebSocket Agent 运行。
 ---
 
 # mao-cli
@@ -36,6 +36,7 @@ Mao 的**产品文档唯一正文**（可独立分发）+ **REST 操作 CLI**。
 | 任务通知邮件渠道（SMTP 配置 / 用户选邮件推送） | [reference/settings.md](reference/settings.md#邮件通知配置notifyemail0.0.318-起) |
 | Electron LOCAL、工具审批、LOCAL 附件、托盘/通知/快捷键、打包与自动更新 | [reference/electron.md](reference/electron.md) |
 | 安卓壳、远程前端、APK OTA | [reference/android.md](reference/android.md) |
+| iOS 壳、远程前端、Xcode 签名与 TestFlight / Ad Hoc 分发 | [reference/ios.md](reference/ios.md) |
 | 终端对话客户端 mao-agent（含常驻本地执行端 `local --serve`） | [reference/mao-agent.md](reference/mao-agent.md) |
 | Web 页面嵌入对话浮窗（Embed SDK 接入，含管理后台内置浮窗助手） | [reference/embed-sdk.md](reference/embed-sdk.md)（设计细节见仓库 [docs/plan/2026-09-04-embed-sdk-technical-design.md](../../docs/plan/2026-09-04-embed-sdk-technical-design.md)；管理后台接入见 [docs/plan/2026-10-16-admin-embed-chat-technical-design.md](../../docs/plan/2026-10-16-admin-embed-chat-technical-design.md)） |
 | 部署/登录/LOCAL/Git/通知等 FAQ | [reference/troubleshooting.md](reference/troubleshooting.md) |

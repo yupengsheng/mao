@@ -2,6 +2,25 @@
   <nav class="top-nav">
     <div class="nav-left" :class="{ 'is-mac': reserveTrafficLightInset }">
       <div class="nav-left-actions">
+        <!-- 移动端：历史会话是覆盖式抽屉，入口用汉堡菜单（ChatGPT / Claude 同款位置）。
+             桌面端仍保留原来的左右面板切换按钮。 -->
+        <button
+          v-if="mobile && isTaskWorkspaceRoute"
+          type="button"
+          class="theme-toggle mobile-history-toggle"
+          :class="{ active: drawerOpen }"
+          :aria-label="drawerOpen ? '关闭历史会话' : '打开历史会话'"
+          :title="drawerOpen ? '关闭历史会话' : '打开历史会话'"
+          :aria-expanded="drawerOpen"
+          @click="toggleLeft"
+        >
+          <svg v-if="!drawerOpen" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+            <line x1="4" y1="7" x2="20" y2="7" /><line x1="4" y1="12" x2="20" y2="12" /><line x1="4" y1="17" x2="20" y2="17" />
+          </svg>
+          <svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+            <line x1="6" y1="6" x2="18" y2="18" /><line x1="18" y1="6" x2="6" y2="18" />
+          </svg>
+        </button>
         <el-tooltip content="我的工作区" :show-after="100" placement="bottom" :disabled="isMobileDevice()">
           <div class="theme-toggle" role="button" aria-label="我的工作区" @click="openMyWorkspaces">
             <el-icon :size="16"><FolderOpened /></el-icon>
@@ -12,7 +31,7 @@
             <el-icon :size="16"><ArrowLeft /></el-icon>
           </div>
         </el-tooltip>
-        <el-tooltip content="左侧面板" :show-after="100" placement="bottom" :disabled="isMobileDevice()">
+        <el-tooltip v-if="!mobile" content="左侧面板" :show-after="100" placement="bottom">
           <div class="theme-toggle" role="button" aria-label="左侧面板" @click="toggleLeft">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
               <rect x="3" y="3" width="18" height="18" rx="2" /><line x1="9" y1="3" x2="9" y2="21" />
@@ -194,7 +213,14 @@ const authStore = useAuthStore()
 // useCenterTabs 内部会注册 watch，必须放在 setup 顶层创建并随 TopNav 生命周期存活。
 const paletteCenterTabs = useCenterTabs(computed(() => sessionStore.activeSessionId))
 const { isOpen: terminalOpen, togglePanel } = useTerminal()
-const { toggleLeft, toggleRight } = usePanelLayout()
+const { toggleLeft, toggleRight, leftCollapsed } = usePanelLayout()
+
+const mobile = ref(isMobileDevice())
+const drawerOpen = computed(() => mobile.value && !leftCollapsed.value)
+
+function syncMobileViewport() {
+  mobile.value = isMobileDevice()
+}
 
 /** 终端按钮可用性矩阵：CLOUD 走云端终端（需 terminal:use），LOCAL 仅 Electron 可用。 */
 const terminalAvailability = computed<{ enabled: boolean; tooltip: string }>(() => {
@@ -243,6 +269,7 @@ const {
 } = useVersionCheck()
 
 const isSettingsRoute = computed(() => route.path.startsWith('/settings'))
+const isTaskWorkspaceRoute = computed(() => route.name === 'Home' || route.name === 'Task')
 const showUpdateIndicator = computed(() => hasUpdate.value || appUpdateAvailable.value)
 const updateTooltip = computed(() => {
   if (appUpdateDownloaded.value) {
@@ -283,6 +310,7 @@ onMounted(() => {
   document.addEventListener('keydown', handleSearchShortcut)
   syncScreenFilling()
   window.addEventListener('resize', syncScreenFilling)
+  window.addEventListener('resize', syncMobileViewport, { passive: true })
 })
 
 onUnmounted(() => {
@@ -290,6 +318,7 @@ onUnmounted(() => {
   stopAppUpdater()
   document.removeEventListener('keydown', handleSearchShortcut)
   window.removeEventListener('resize', syncScreenFilling)
+  window.removeEventListener('resize', syncMobileViewport)
 })
 
 /** Ctrl/Cmd+K：搜索浮窗；Ctrl/Cmd+`：终端；Ctrl/Cmd+Shift+P：命令面板；`?`：快捷键速查表（常驻注册）。 */
@@ -503,6 +532,13 @@ async function handleCommand(command: string) {
   gap: 5px;
   -webkit-app-region: no-drag;
   margin-right: 5px;
+}
+
+/* 汉堡按钮只服务移动端抽屉；桌面端由 v-if 兜底，这里再防一次大屏误显 */
+@media (min-width: 769px) {
+  .mobile-history-toggle {
+    display: none;
+  }
 }
 
 .nav-links {

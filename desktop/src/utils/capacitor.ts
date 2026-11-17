@@ -1,14 +1,29 @@
 /**
- * Capacitor 平台检测（安卓壳专用，不依赖 @capacitor/core npm 包，直接读运行时注入）。
+ * Capacitor 原生壳检测（不依赖 @capacitor/core npm 包，直接读运行时注入）。
  * Web / Electron 环境返回 false。
  */
-export function isAndroidCapacitor(): boolean {
+function nativePlatform(): string | null {
   try {
     // @ts-ignore Capacitor 7 运行时注入
-    return typeof window !== 'undefined' && !!window.Capacitor?.isNativePlatform?.() && window.Capacitor.getPlatform?.() === 'android'
+    const capacitor = typeof window !== 'undefined' ? window.Capacitor : undefined
+    if (!capacitor?.isNativePlatform?.()) return null
+    return capacitor.getPlatform?.() ?? null
   } catch {
-    return false
+    return null
   }
+}
+
+export function isAndroidCapacitor(): boolean {
+  return nativePlatform() === 'android'
+}
+
+export function isIosCapacitor(): boolean {
+  return nativePlatform() === 'ios'
+}
+
+/** 任一 Capacitor 原生壳（安卓 / iOS）：需要原生插件而不是浏览器新标签的场合使用 */
+export function isNativeCapacitor(): boolean {
+  return nativePlatform() !== null
 }
 
 /**
@@ -22,7 +37,7 @@ export async function openExternalUrl(url: string): Promise<boolean> {
     await electronApi.openExternal(url)
     return true
   }
-  if (isAndroidCapacitor()) {
+  if (isNativeCapacitor()) {
     const plugins = (window as any).Capacitor?.Plugins
     try {
       // 优先自研 OpenUrl 插件（ACTION_VIEW 直开系统浏览器/对应 App）；

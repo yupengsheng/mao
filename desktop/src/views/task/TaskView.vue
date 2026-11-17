@@ -1,15 +1,28 @@
 <template>
   <div class="task-layout">
-    <TaskIndexPanel
-      :collapsed="panelCollapsed"
-      :list-mode="listMode"
-      :load-error="indexError"
-      @update:list-mode="listMode = $event"
-      @toggle="panelCollapsed = !panelCollapsed"
-      @retry="retryTaskIndex"
-      @new-task="handleNewTask"
-      @new-task-from-group="handleNewTaskFromGroup"
-    />
+    <!-- 移动端：历史会话改为覆盖式抽屉，Teleport 到 body 才能盖住顶栏与中心区，且不受
+         .layout-main 的 overflow:hidden 裁剪。桌面端仍是原来的内联侧栏。 -->
+    <Teleport to="body" :disabled="!mobile">
+      <div
+        v-if="mobile && drawerOpen"
+        class="mobile-drawer-backdrop"
+        aria-hidden="true"
+        @click="closeMobileDrawer"
+      />
+      <TaskIndexPanel
+        :collapsed="panelCollapsed"
+        :mobile="mobile"
+        :drawer-open="drawerOpen"
+        :list-mode="listMode"
+        :load-error="indexError"
+        @update:list-mode="listMode = $event"
+        @toggle="panelCollapsed = !panelCollapsed"
+        @close="closeMobileDrawer"
+        @retry="retryTaskIndex"
+        @new-task="handleNewTask"
+        @new-task-from-group="handleNewTaskFromGroup"
+      />
+    </Teleport>
 
     <div class="task-container">
       <!-- 任务索引加载失败：中央错误卡（D6）——门住「静默掉进新建态」，但保留显式出口 -->
@@ -119,7 +132,7 @@ import { useAgentStore } from '../../stores/agent'
 import { useSessionStore, type TaskPhase, type SubagentItem } from '../../stores/session'
 import { persistedContextWindow } from '../../stores/session/context-window'
 import { useDraftStore } from '../../stores/draft'
-import { usePanelLayout } from '../../composables/usePanelLayout'
+import { isMobileDevice, usePanelLayout } from '../../composables/usePanelLayout'
 import { resetNewTaskTabs, useCenterTabs } from '../../composables/useCenterTabs'
 import { getPersistedActiveTab, resolveSideTaskRestoreIds, resolveSubagentRestoreId } from '../../utils/center-active-tab'
 import { useWorkspaceFileProvider } from '../../composables/workspace-file-provider'
@@ -152,6 +165,23 @@ const sessionStore = useSessionStore()
 const draftStore = useDraftStore()
 const { loadPrefs } = useTaskPanelPrefs()
 const { leftCollapsed: panelCollapsed, rightCollapsed, toggleRight } = usePanelLayout()
+
+const mobile = ref(isMobileDevice())
+const drawerOpen = computed(() => mobile.value && !panelCollapsed.value)
+
+function closeMobileDrawer() {
+  if (mobile.value) panelCollapsed.value = true
+}
+
+function syncMobileViewport() {
+  mobile.value = isMobileDevice()
+}
+
+function handleDrawerKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape' && drawerOpen.value) {
+    closeMobileDrawer()
+  }
+}
 
 const sessionIdParam = computed(() => route.params.sessionId as string)
 const agentId = ref('')
@@ -1496,10 +1526,12 @@ async function navigateToLatestSession(): Promise<string | null> {
 }
 
 async function handleNewTask() {
+  closeMobileDrawer()
   await navigateToNewTask(getCurrentNewTaskDefaults())
 }
 
 async function handleNewTaskFromGroup(payload: { agentId: string; executionMode: string; workspace?: string; reuseWorkspace?: boolean; cloudProjectKey?: string; permissionLevel?: string; modelId?: number }) {
+  closeMobileDrawer()
   await navigateToNewTask(payload)
 }
 
@@ -1658,6 +1690,8 @@ watch(getRouteWatchState, async (state, prev) => {
 
 onMounted(async () => {
   document.addEventListener('keydown', handleTabCycleKeydown)
+  document.addEventListener('keydown', handleDrawerKeydown)
+  window.addEventListener('resize', syncMobileViewport, { passive: true })
   // 首启向导判定：就绪数据与任务索引并行拉取，先到先渲染
   void readinessStore.fetch()
   if (!await loadTaskIndex()) return
@@ -1667,6 +1701,8 @@ onMounted(async () => {
 onUnmounted(() => {
   disposed = true
   document.removeEventListener('keydown', handleTabCycleKeydown)
+  document.removeEventListener('keydown', handleDrawerKeydown)
+  window.removeEventListener('resize', syncMobileViewport)
   window.removeEventListener('side_session_created', handleSideSessionCreated)
   window.removeEventListener('subagent_session_created', handleSubagentSessionCreated)
 })
@@ -1744,5 +1780,20 @@ onUnmounted(() => {
 
 .index-error-btn.primary:hover {
   opacity: 0.9;
+}
+
+/* 移动端历史会话抽屉遮罩：Teleport 到 body，层级高于顶栏与对话区、低于 Element Plus 弹窗 */
+.mobile-drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1900;
+  background: rgba(0, 0, 0, 0.32);
+  animation: mobile-drawer-fade-in 0.2s ease-out;
+  -webkit-tap-highlight-color: transparent;
+}
+
+@keyframes mobile-drawer-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 </style>

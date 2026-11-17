@@ -122,7 +122,7 @@ import { copyText } from '../../utils/clipboard'
 import type { WorkspaceFileProvider } from '../../composables/workspace-file-provider'
 import DownloadLinkDialog from '../common/DownloadLinkDialog.vue'
 import { isWechatBrowser } from '../../utils/user-agent'
-import { isAndroidCapacitor } from '../../utils/capacitor'
+import { isNativeCapacitor } from '../../utils/capacitor'
 import { isMobileDevice } from '../../composables/usePanelLayout'
 import { buildGitTree, collectDirPaths, gitPullDisabledReason, gitPushDisabledReason } from '../../utils/git-manager'
 
@@ -250,7 +250,7 @@ async function handleDownloadFile() {
       : node.file.path
     const result = await props.provider.downloadFile(relativePath, node.name)
     if (result.ok) {
-      if ((isWechatBrowser() || isAndroidCapacitor()) && result.url) {
+      if ((isWechatBrowser() || isNativeCapacitor()) && result.url) {
         // 微信浏览器和安卓 WebView 可能阻止 Blob 自动下载，显示可鉴权的下载链接
         downloadDialog.url = result.url
         downloadDialog.fileName = node.name
