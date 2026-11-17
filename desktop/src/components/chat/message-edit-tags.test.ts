@@ -165,4 +165,10 @@ describe('MessageBubble 编辑态容器换载体', () => {
     expect(confirmBtns).toHaveLength(1)
     expect(onExp(confirmBtns[0], 'click')).toBe('handleConfirm')
   })
+
+  it('编辑器收到所属 sessionId，使编辑态面板沿用会话执行上下文', () => {
+    const editors = findElements(ast, (el) => el.tag === 'MessageEditEditor')
+    expect(editors).toHaveLength(1)
+    expect(bindPropExp(editors[0], 'session-id')).toBe('sessionId')
+  })
 })
