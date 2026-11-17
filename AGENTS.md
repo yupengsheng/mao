@@ -22,7 +22,7 @@ mao-agent：`cd agent-cli && npm ci && npm run build && npm test`；`bash script
 CI：backend-ts build+test、admin/desktop build、agent-cli build+test；不跑 Playwright。
 
 ## 架构
-六端：backend-ts（NestJS+Fastify :9080 `/api/v1/`，`Result<T>` code=0）+ admin + desktop（Electron/Web）+ android（Capacitor 远程加载 https://mao.etarch.cn，仅 CLOUD）+ ios（Capacitor 远程加载，仅 CLOUD，IPA 需 Apple 签名）+ agent-cli（mao-agent）。生产单域：桌面 `/`、管理后台 `/admin/`、API `/api/`、上传 `/uploads/`；desktop 路由勿占用这些前缀。
+六端：backend-ts（NestJS+Fastify :9080 `/api/v1/`，`Result<T>` code=0）+ admin + desktop（Electron/Web）+ android（Capacitor 远程加载 https://mao.yupengsheng.cn，仅 CLOUD）+ ios（Capacitor 远程加载，仅 CLOUD，IPA 需 Apple 签名）+ agent-cli（mao-agent）。生产单域：桌面 `/`、管理后台 `/admin/`、API `/api/`、上传 `/uploads/`；desktop 路由勿占用这些前缀。
 领域：`src/<domain>/*.{routes,service,repository,spec}.ts`。引擎 `backend-ts/src/harness/`：AgentLoop、PromptEngine、ContextManager/CompactionService、ToolDispatcher→ToolRegistry（内置 `harness/tool/impl/`）、LlmAdapter、LocalToolExecutor（WS 委托桌面）、HarnessService、delegate/、skill/。CLOUD 服务端执行 / LOCAL Electron 执行。WS `/api/ws/stream` StreamingWsHandler。拦截器 Audit+Permission，`/v1/**` 排除 auth/ws。DB：MySQL8 + Flyway `backend-ts/db/migration/`，TS 启动执行（FLYWAY_ENABLED）。
 admin：router `admin/src/router/index.ts`，视图 `views/`。desktop：useStreamWS、useChat、stores/auth|agent|session、electron/{main,preload}.cjs。Side Task：HarnessService + StreamingWsHandler + useCenterTabs/CenterTabBar。
 

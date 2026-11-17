@@ -2,7 +2,7 @@
 
 基于 **Capacitor 7** 的 WKWebView 壳，Bundle ID `cn.etarch.mao.app`，显示名 `Mao`。**仅 CLOUD 模式**（无 `electronAPI`，自动禁用 LOCAL）。
 
-与安卓一致，App **远程加载**生产 Web（默认 `https://mao.etarch.cn`）。前端 UI 改动只需部署 Web，不需要重新出 IPA；只有原生壳（Swift 插件、Info.plist、图标、`ios/capacitor.config.json`）变化时才重新构建。
+与安卓一致，App **远程加载**生产 Web（默认 `https://mao.yupengsheng.cn`）。前端 UI 改动只需部署 Web，不需要重新出 IPA；只有原生壳（Swift 插件、Info.plist、图标、`ios/capacitor.config.json`）变化时才重新构建。
 
 ## 目录
 
@@ -91,5 +91,5 @@ IPA 必须签名；未签名产物只能用于归档检查，无法安装到真�
 | `xcode-select` 指向 CommandLineTools | 切到完整 Xcode 后重试 |
 | `pod: command not found` | 安装 CocoaPods |
 | 签名失败 | 确认 Team ID、App ID、设备已登记；或在 Xcode 打开 `App.xcworkspace` 手动修复签名 |
-| 打开后白屏 | 检查 `https://mao.etarch.cn` 是否可访问、证书是否有效；远程站点需允许 WKWebView 加载 |
+| 打开后白屏 | 检查 `https://mao.yupengsheng.cn` 是否可访问、证书是否有效；远程站点需允许 WKWebView 加载 |
 | 外链点击无反应 | 检查链接协议是否在 `OpenUrlPlugin` 白名单内 |

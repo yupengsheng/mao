@@ -11,7 +11,7 @@ if [[ ! -d node_modules ]]; then npm ci; fi
 npm run build
 npm test
 
-BASE="${MAO_BASE_URL:-https://mao.etarch.cn}"
+BASE="${MAO_BASE_URL:-https://mao.yupengsheng.cn}"
 USER="${MAO_AGENT_E2E_USER:-}"
 PASS="${MAO_AGENT_E2E_PASS:-}"
 if [[ -z "$USER" || -z "$PASS" ]]; then

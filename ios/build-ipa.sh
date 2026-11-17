@@ -2,7 +2,7 @@
 # =============================================================================
 # build-ipa.sh — 构建 Mao iOS 归档并导出 IPA
 #
-# iOS 壳远程加载 https://mao.etarch.cn，前端改动部署 Web 即可；只有原生壳
+# iOS 壳远程加载 https://mao.yupengsheng.cn，前端改动部署 Web 即可；只有原生壳
 # （Info.plist / Swift 插件 / 图标 / Capacitor 配置）变化时才需要重新出包。
 #
 # 用法：
@@ -101,7 +101,7 @@ echo "  Mao iOS IPA 构建"
 echo "=========================================="
 echo "  版本: $VERSION_NAME ($BUILD_NUMBER)"
 echo "  Bundle ID: $BUNDLE_ID"
-echo "  远程: https://mao.etarch.cn"
+echo "  远程: https://mao.yupengsheng.cn"
 echo "  导出方式: $EXPORT_METHOD"
 echo "  签名 Team: ${MAO_IOS_TEAM_ID:-<dry-run 未设置>}"
 echo "=========================================="

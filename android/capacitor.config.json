@@ -3,7 +3,7 @@
   "appName": "Mao",
   "webDir": "web-stub",
   "server": {
-    "url": "https://mao.etarch.cn",
+    "url": "https://mao.yupengsheng.cn",
     "androidScheme": "https"
   },
   "android": {

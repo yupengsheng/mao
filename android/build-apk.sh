@@ -2,7 +2,7 @@
 # =============================================================================
 # build-apk.sh — 一键构建安卓 APK 并发布到 releases 目录
 #
-# 安卓壳远程加载 https://mao.etarch.cn（与 Electron 一致），不再打包 desktop 前端。
+# 安卓壳远程加载 https://mao.yupengsheng.cn（与 Electron 一致），不再打包 desktop 前端。
 # 前端改动部署 Web 即可；仅原生壳变更时需本脚本发 APK OTA。
 #
 # 用法：
@@ -84,7 +84,7 @@ echo "=========================================="
 echo "  Mao Android APK 构建"
 echo "=========================================="
 echo "  版本: $VERSION_NAME (code: $VERSION_CODE)"
-echo "  远程: https://mao.etarch.cn"
+echo "  远程: https://mao.yupengsheng.cn"
 echo "  签名: $MAO_KEY_ALIAS @ $(basename "$MAO_KEYSTORE_PATH")"
 echo "  发布: $RELEASES_DIR"
 echo "=========================================="
@@ -138,7 +138,7 @@ cat > "$RELEASES_DIR/android-latest.json" <<ENDJSON
 {
   "versionCode": $VERSION_CODE,
   "versionName": "$VERSION_NAME",
-  "downloadUrl": "https://mao.etarch.cn/uploads/releases/$APK_NAME",
+  "downloadUrl": "https://mao.yupengsheng.cn/uploads/releases/$APK_NAME",
   "minVersionCode": 0,
   "changelog": "$CHANGELOG",
   "publishedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"

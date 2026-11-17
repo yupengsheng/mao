@@ -4,7 +4,7 @@ import cssInjectedByJsPlugin from 'vite-plugin-css-injected-by-js';
 import { resolve } from 'node:path';
 
 // SDK 库构建：IIFE 单文件，样式由 css-injected-by-js 内联进 JS（运行时注入 Shadow DOM）。
-// 产物部署到 https://mao.etarch.cn/embed/mao-chat.js（见 desktop/public/embed 接线）。
+// 产物部署到 https://mao.yupengsheng.cn/embed/mao-chat.js（见 desktop/public/embed 接线）。
 const rootDir = import.meta.dirname;
 
 export default defineConfig({

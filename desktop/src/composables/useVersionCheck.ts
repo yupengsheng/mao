@@ -7,7 +7,7 @@ const CHECK_INTERVAL = 60_000
 const APP_UPDATE_CHECK_INTERVAL = 60_000
 
 /* ---- 安卓 OTA（原生壳 APK）---- */
-const _apiBase = import.meta.env.VITE_API_BASE_URL || ''  // e.g. https://mao.etarch.cn/api/v1
+const _apiBase = import.meta.env.VITE_API_BASE_URL || ''  // e.g. https://mao.yupengsheng.cn/api/v1
 const ANDROID_MANIFEST_URL = _apiBase ? _apiBase.replace(/\/api\/v1\/?$/, '/uploads/releases/android-latest.json') : '/uploads/releases/android-latest.json'
 const IGNORED_VERSION_KEY = 'mao_android_ignored_version_code'
 

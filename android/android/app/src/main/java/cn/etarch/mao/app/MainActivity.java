@@ -31,7 +31,7 @@ import com.getcapacitor.BridgeActivity;
 
 /**
  * 主 Activity（Capacitor 壳）：
- * - 远程加载 https://mao.etarch.cn，AppUpdatePlugin OTA 升级
+ * - 远程加载 https://mao.yupengsheng.cn，AppUpdatePlugin OTA 升级
  * - OpenUrlPlugin 用 ACTION_VIEW 把外链交给系统浏览器（WebView 不开多窗口，
  *   页面里 target="_blank" 的 window.open 会失败，见 utils/externalLink.ts）
  * - 首屏加载走标准 HTTP 缓存（弱网复用已缓存资源），完成判定以「Vue 真正渲染」为准，
