@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
-import { ref } from 'vue'
+import { ref, nextTick } from 'vue'
 
 vi.mock('../utils/auth-storage', () => ({
   getToken: () => 'test-token',
@@ -624,6 +624,84 @@ describe('useStreamWS 崩溃恢复 executionId 重绑（恢复帧不得被 stale
     frame('content_delta', { delta: '[恢复执行增量2]', executionId: 'exec-recovered' })
 
     expect(store.getMessages('42').map((m) => String(m.content)).join('')).toContain('[恢复执行增量2]')
+  })
+})
+
+describe('useStreamWS 订阅快照终态结算', () => {
+  it.each(['COMPLETED', 'FAILED', 'CANCELLED', 'IDLE'] as const)('%s 快照唤醒真实 Promise 并且只结算一次', async (phase) => {
+    const stream = useStreamWS()
+    const connecting = stream.connect()
+    sockets[0].open()
+    await connecting
+    const { awaitExecutionSettled } = await import('./chatSessionActions')
+    const completed = vi.fn()
+    const waiting = awaitExecutionSettled('42').then(completed)
+    const otherResolve = vi.fn()
+    stream.pendingCallbacks.set('43', { resolve: otherResolve, reject: vi.fn() })
+    const store = useSessionStore()
+    store.updateSessionPhase('42', 'RUNNING')
+    store.setStreaming('42', true)
+    store.setThinking('42', true)
+
+    sockets[0].message({ type: 'session_snapshot', sessionId: 42, data: { phase } })
+    await Promise.resolve()
+    expect(completed).toHaveBeenCalledOnce()
+    await waiting
+    expect(stream.pendingCallbacks.has('42')).toBe(false)
+    expect(store.getSessionPhase('42')).toBe(phase)
+    expect(otherResolve).not.toHaveBeenCalled()
+    expect(stream.pendingCallbacks.has('43')).toBe(true)
+
+    sockets[0].message({ type: 'session_snapshot', sessionId: 42, data: { phase } })
+    expect(completed).toHaveBeenCalledOnce()
+  })
+
+  it('活动快照不提前唤醒等待者', async () => {
+    const stream = useStreamWS()
+    const connecting = stream.connect()
+    sockets[0].open()
+    await connecting
+    const resolve = vi.fn()
+    stream.pendingCallbacks.set('42', { resolve, reject: vi.fn() })
+    sockets[0].message({ type: 'session_snapshot', sessionId: 42, data: { phase: 'RUNNING' } })
+    expect(resolve).not.toHaveBeenCalled()
+    expect(stream.pendingCallbacks.has('42')).toBe(true)
+  })
+
+  it('恢复期间唯一终态来自快照时，即使 watcher 被抑制也能解开输入锁', async () => {
+    const stream = useStreamWS()
+    const store = useSessionStore()
+    store.updateSession('42', { phase: 'RUNNING' })
+    let finishHistory!: (value: unknown) => void
+    const get = vi.mocked(api.get)
+    const previousGet = get.getMockImplementation()!
+    get.mockImplementation((url: string) => url === '/sessions/42/messages'
+      ? new Promise(resolve => { finishHistory = resolve })
+      : Promise.resolve({ data: [] }))
+    const chat = useChat(ref('1'), ref('CLOUD'))
+    try {
+      const restoring = chat.restoreSession('42', 'CLOUD')
+      expect(chat.sending.value).toBe(true)
+      expect(chat.sendingSessionId.value).toBe('42')
+      sockets[0].open()
+      await stream.connect()
+      await nextTick()
+      // 历史加载尚未结束，phase watcher 在整个终态变化期间都被 switchingSession 抑制。
+      expect(finishHistory).toBeTypeOf('function')
+      expect(chat.switchingSession.value).toBe(true)
+      sockets[0].message({ type: 'session_snapshot', sessionId: 42, data: { phase: 'COMPLETED' } })
+      await nextTick()
+      await Promise.resolve()
+      expect(chat.sending.value).toBe(false)
+      expect(chat.sendingSessionId.value).toBeNull()
+      expect(stream.pendingCallbacks.has('42')).toBe(false)
+      expect(chat.switchingSession.value).toBe(true)
+      finishHistory({ data: { messages: [], hasMore: false } })
+      await restoring
+      expect(chat.switchingSession.value).toBe(false)
+    } finally {
+      get.mockImplementation(previousGet)
+    }
   })
 })
 

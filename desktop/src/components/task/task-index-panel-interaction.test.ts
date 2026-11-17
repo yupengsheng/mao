@@ -82,7 +82,7 @@ const store = reactive({
   loadMoreInGroup: vi.fn(async () => true),
   getGroupMeta: vi.fn(() => undefined),
   isGroupLoadingMore: vi.fn(() => false),
-  getSessionEntity: vi.fn(() => undefined),
+  getSessionEntity: vi.fn((_id: string): any => undefined),
   updateSessionTreeSignals: vi.fn(),
   isArchiving: vi.fn(() => false),
   isDeleting: vi.fn(() => false),
@@ -96,7 +96,7 @@ const store = reactive({
   unarchiveSession: vi.fn(async () => {}),
   sessionPendingApprovals: new Map(),
   sessionPendingQuestions: new Map(),
-  getSideTasks: vi.fn(() => []),
+  getSideTasks: vi.fn((_id: string): any[] => []),
   activeCompactionEvents: [] as any[],
   activeExecutionError: null,
   activeStreaming: false,
@@ -173,6 +173,13 @@ beforeEach(() => {
   document.body.innerHTML = ''
   mockPanelWidth = 280
   store.sessions = []
+  store.activeSessionId = null
+  store.sessionPendingApprovals.clear()
+  store.sessionPendingQuestions.clear()
+  store.getSessionEntity.mockReset()
+  store.getSessionEntity.mockImplementation((id: string) => store.sessions.find(s => String(s.id) === id))
+  store.getSideTasks.mockReset()
+  store.getSideTasks.mockReturnValue([])
   store.fetchSessions.mockClear()
   store.fetchFocusSessions.mockClear()
   store.deleteSession.mockClear()
@@ -190,6 +197,113 @@ beforeEach(() => {
   messageBoxConfirm.mockReset()
   messageBoxConfirm.mockImplementation(() => new Promise<void>(() => {}))
   routerPush.mockClear()
+})
+
+describe('TaskIndexPanel 标准分组整树活跃排序', () => {
+  const renderedIds = (host: HTMLElement) => qa(host, '.session-group .session-item')
+    .map(el => el.dataset.sessionId)
+
+  it.each([
+    '主任务运行', '服务端整树运行', '边路运行', '边路待审批相位',
+    '整树待审批', '整树待回答', '主任务实时审批', '主任务实时问题',
+    '边路实时审批', '边路实时问题', '边路缓存审批计数', '边路缓存问题计数',
+  ])('%s 即使更新时间旧也排在新空闲任务前', async (signal) => {
+    const old: any = row('1')
+    const fresh = { ...row('9'), updatedAt: '2026-11-17T00:00:00' }
+    const side: any = { id: '101', phase: 'COMPLETED' }
+    if (signal === '主任务运行') Object.assign(old, { running: true, phase: 'RUNNING' })
+    if (signal === '服务端整树运行') old.treeRunning = true
+    if (signal === '边路运行') side.phase = 'RUNNING'
+    if (signal === '边路待审批相位') side.phase = 'WAITING_APPROVAL'
+    if (signal === '整树待审批') old.treePendingApprovalCount = 1
+    if (signal === '整树待回答') old.treePendingQuestionCount = 1
+    if (signal === '主任务实时审批') store.sessionPendingApprovals.set('1', 1)
+    if (signal === '主任务实时问题') store.sessionPendingQuestions.set('1', [{ requestId: 'q1' }])
+    if (signal === '边路实时审批') store.sessionPendingApprovals.set('101', 1)
+    if (signal === '边路实时问题') store.sessionPendingQuestions.set('101', [{ requestId: 'q2' }])
+    if (signal === '边路缓存审批计数') side.pendingApprovalCount = 1
+    if (signal === '边路缓存问题计数') side.pendingQuestionCount = 1
+    store.getSideTasks.mockImplementation((id: string) => id === '1' ? [side] : [])
+    store.sessions = [fresh, old]
+    const { host, app } = mountPanel()
+    try {
+      await tick()
+      expect(renderedIds(host)).toEqual(['1', '9'])
+    } finally {
+      app.unmount()
+    }
+  })
+
+  it('treeRunning=false 抑制边路残留运行态，但不抑制待审批/待回答实时信号', async () => {
+    store.sessions = [
+      { ...row('1'), treeRunning: false },
+      { ...row('9'), updatedAt: '2026-11-17T00:00:00' },
+    ]
+    store.getSideTasks.mockImplementation((id: string) => id === '1' ? [{ id: '101', phase: 'RUNNING' }] : [])
+    const { host, app } = mountPanel()
+    try {
+      await tick()
+      expect(renderedIds(host)).toEqual(['9', '1'])
+      store.sessionPendingApprovals.set('101', 1)
+      await tick()
+      expect(renderedIds(host)).toEqual(['1', '9'])
+      store.sessionPendingApprovals.clear()
+      await tick()
+      expect(renderedIds(host)).toEqual(['9', '1'])
+      store.sessionPendingQuestions.set('101', [{ requestId: 'q' }])
+      await tick()
+      expect(renderedIds(host)).toEqual(['1', '9'])
+      store.sessionPendingQuestions.clear()
+      await tick()
+      expect(renderedIds(host)).toEqual(['9', '1'])
+    } finally {
+      app.unmount()
+    }
+  })
+
+  it('服务端整树信号变化会立即重排，结束后恢复更新时间和 id 倒序', async () => {
+    store.sessions = [row('1'), row('2'), row('3')]
+    const { host, app } = mountPanel()
+    try {
+      await tick()
+      expect(renderedIds(host)).toEqual(['3', '2', '1'])
+      store.sessions[2].treeRunning = true
+      store.sessions[0].treeRunning = true
+      await tick()
+      expect(renderedIds(host)).toEqual(['3', '1', '2'])
+      store.sessions[2].treeRunning = false
+      store.sessions[0].treeRunning = false
+      await tick()
+      expect(renderedIds(host)).toEqual(['3', '2', '1'])
+    } finally {
+      app.unmount()
+    }
+  })
+
+  it.each([null, '1', '9', 'outside'])('分组新建按当前同组会话优先、最新会话兜底（当前 %s）', async (activeId) => {
+    store.sessions = [
+      { ...row('1'), treeRunning: true, agentId: 'old-agent', modelId: 'old-model', permissionLevel: 'READ_ONLY' },
+      { ...row('9'), updatedAt: '2026-11-17T00:00:00', agentId: 'new-agent', modelId: 'new-model', permissionLevel: 'FULL' },
+    ]
+    store.activeSessionId = activeId
+    const onNewTaskFromGroup = vi.fn()
+    const { host, app } = mountPanel('standard', { onNewTaskFromGroup })
+    try {
+      await tick()
+      expect(renderedIds(host)).toEqual(['1', '9'])
+      q(host, '.group-header button[title="在该分组新建任务"]')!.click()
+      await tick()
+      const useOld = activeId === '1'
+      expect(onNewTaskFromGroup).toHaveBeenCalledWith(expect.objectContaining({
+        agentId: useOld ? 'old-agent' : 'new-agent',
+        modelId: useOld ? 'old-model' : 'new-model',
+        permissionLevel: useOld ? 'READ_ONLY' : 'FULL',
+        executionMode: 'CLOUD',
+      }))
+    } finally {
+      app.unmount()
+    }
+  })
 })
 
 describe('TaskIndexPanel 多选批量归档交互', () => {

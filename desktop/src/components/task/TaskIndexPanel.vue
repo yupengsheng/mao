@@ -238,6 +238,7 @@ import { useTaskPanelPrefs } from '../../composables/useTaskPanelPrefs'
 import { useRelativeTime, formatRelativeTime } from '../../composables/useRelativeTime'
 import { cloudGroupKey, cloudProjectKeyForNewTask, isEmbedGroupKey, isGroupRenameable, newTaskWorkspaceFromSession, resolveGroupLabel, SIGNAL_GROUP_KEY } from '../../utils/cloud-project'
 import { planFocusReveal, planGroupReveal } from '../../utils/taskSidebarReveal'
+import { sortSessionsInGroup } from '../../utils/taskGroupSort'
 import { sessionToFocusCandidate, sortByFocusPriority, isHistoryEligible } from '../../utils/focusSort'
 import TaskSessionGroupList from './TaskSessionGroupList.vue'
 import TaskFocusList from './TaskFocusList.vue'
@@ -954,10 +955,15 @@ function scrollSessionIntoView(sessionId: string) {
 }
 
 async function onGroupNewTask(group: { sessions: Session[] }) {
-  const last = group.sessions[0] // already sorted by updatedAt desc
+  // 活跃优先后首项不一定最新，显式按更新时间选兜底来源。
+  const last = group.sessions.reduce<Session | undefined>((latest, session) => {
+    if (!latest) return session
+    return new Date(session.updatedAt || session.createdAt || 0).getTime()
+      > new Date(latest.updatedAt || latest.createdAt || 0).getTime() ? session : latest
+  }, undefined)
   if (!last) return
   // Prefer the currently open session in this group (user may have just switched model mid-chat;
-  // model switch does not bump updatedAt, so sessions[0] can be a different older session).
+  // model switch does not bump updatedAt, so the newest session can be a different one).
   const activeId = activeSessionId.value
   const activeInGroup = activeId
     ? group.sessions.find(s => String(s.id) === String(activeId))
@@ -1000,9 +1006,21 @@ function openTerminal(group: { key: string }) {
   createTerminal(workspace || undefined)
 }
 
+/** 与行内圆点 / 转圈同源：自身、服务端整树聚合、实时 Map 与边路缓存取并集。 */
+function isTreeActive(session: Session): boolean {
+  if (session.running || session.treeRunning === true) return true
+  // 服务端明确整树空闲时，不信缓存中残留的边路活跃相位。
+  if (session.treeRunning !== false && hasActiveSideTask(session.id)) return true
+  return hasPendingApproval(session.id) || hasPendingQuestion(session.id)
+}
+
 const groupedSessions = computed(() => {
   const sessions = sessionStore.sessions
   const groups = new Map<string, Session[]>()
+  const treeActiveIds = new Set<string>()
+  for (const session of sessions) {
+    if (isTreeActive(session)) treeActiveIds.add(String(session.id))
+  }
 
   for (const s of sessions) {
     const key = cloudGroupKey(s)
@@ -1028,15 +1046,7 @@ const groupedSessions = computed(() => {
   const result = entries.map(([key, sessions]) => ({
     key,
     label: resolveGroupLabel(key, groupAliases.value, sessions[0]),
-    sessions: sessions.sort((a, b) => {
-      if (a.running && !b.running) return -1
-      if (!a.running && b.running) return 1
-      const tb = new Date(b.updatedAt || b.createdAt || 0).getTime()
-      const ta = new Date(a.updatedAt || a.createdAt || 0).getTime()
-      if (tb !== ta) return tb - ta
-      // updated_at 相同时按 id 倒序，避免批量更新导致按创建正序排列
-      return Number(b.id) - Number(a.id)
-    })
+    sessions: sortSessionsInGroup(sessions, treeActiveIds)
   }))
 
   // 应用自定义排序

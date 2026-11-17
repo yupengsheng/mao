@@ -36,6 +36,10 @@ export async function ensureHtmlConverter(): Promise<void> {
         strongDelimiter: '**',
       })
       instance.use(gfmMod.gfm)
+      // 产物按纯文本插入输入框、发送模型，不经过 Markdown 渲染；默认按文本节点
+      // 转义会把富文本 run 边界上的 --flag / 1. 等污染成 \\- / 1\\.。
+      // 仅保留节点字面内容，格式规则及下方表格竖线转义仍照常生效。
+      instance.escape = (s: string) => s
       // turndown-plugin-gfm 的 tableCell 原样输出单元格文本，不转义 `|`；GFM 会把它
       // 当成列分隔符，2 列表格被撑成 3 列。这里覆盖同名规则：addRule 后注册的规则
       // 在 Rules 数组中排在最前，优先于插件规则命中。

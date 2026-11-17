@@ -87,6 +87,45 @@ describe('convertHtmlToMarkdown 结构转换', () => {
   })
 })
 
+describe('convertHtmlToMarkdown 转义治理（纯文本消费）', () => {
+  it('行首序号不注入反斜杠', async () => {
+    await ready()
+    expect(convertHtmlToMarkdown('<p>1. 支持「按结束时间」查作业</p><p>2. limit 截断</p>')).toBe(
+      '1. 支持「按结束时间」查作业\n\n2. limit 截断',
+    )
+  })
+
+  it('富文本 run 切分不改变 --flag 的字面内容', async () => {
+    await ready()
+    const expected = '场景：我要找「昨晚 13:41 失败」的作业，--since 24h/30h 全部查不到'
+    expect(convertHtmlToMarkdown(`<p>${expected}</p>`)).toBe(expected)
+    expect(convertHtmlToMarkdown(
+      '<p>场景：我要找「昨晚 13:41 失败」的作业，<span>--since 24h/30h 全部查不到</span></p>',
+    )).toBe(expected)
+  })
+
+  it('文本内的 * _ [ ] 反引号逐字保留', async () => {
+    await ready()
+    expect(convertHtmlToMarkdown('<p>普通 *星号* _下划线_ [方括号] `反引号`</p>')).toBe(
+      '普通 *星号* _下划线_ [方括号] `反引号`',
+    )
+  })
+
+  it('格式规则产物不受影响', async () => {
+    await ready()
+    expect(convertHtmlToMarkdown('<p><em>斜体</em>与<code>a * b</code></p>')).toBe('*斜体*与`a * b`')
+    expect(convertHtmlToMarkdown('<pre><code>const a = 1</code></pre>')).toContain('```')
+  })
+
+  it('合并单元格展开仍转义竖线，同时保留序号与 --flag', async () => {
+    await ready()
+    expect(convertHtmlToMarkdown(
+      '<table><tr><td colspan="2">1. a|b</td></tr>' +
+      '<tr><td rowspan="2">--flag</td><td>x|y</td></tr><tr><td>末行</td></tr></table>',
+    )).toBe('| 1. a\\|b | 1. a\\|b |\n| --- | --- |\n| --flag | x\\|y |\n| --flag | 末行 |')
+  })
+})
+
 describe('convertHtmlToMarkdown 护栏', () => {
   it('converter 未就绪 → null（同步探测，粘贴回落现状）', () => {
     // 本 describe 不预热：前提是前面用例可能已预热过——用独立判断不可靠，这里直接验证

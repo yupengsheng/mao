@@ -225,6 +225,44 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
   const agentName = ref('Agent')
   const startedAt = ref<string | null>(null)
   let restoreGeneration = 0
+  let sendingGeneration = 0
+  const sessionSendingGenerations = new Map<string | null, number>()
+  type SendingContext = { sessionId: string | null; generation: number; startedAt: string | null }
+
+  // 会话 id 不足以隔离同会话的下一次发送；恢复/新建/重发也会接管共享 UI 状态。
+  function beginSending(sid: string | null, time: string | null = new Date().toISOString()): SendingContext {
+    const context = { sessionId: sid, generation: ++sendingGeneration, startedAt: time }
+    sessionSendingGenerations.set(sid, context.generation)
+    sendingSessionId.value = sid
+    startedAt.value = time
+    return context
+  }
+
+  function isLatestSending(context: SendingContext): boolean {
+    return sessionSendingGenerations.get(context.sessionId) === context.generation
+  }
+
+  function ownsSendingState(context: SendingContext): boolean {
+    return context.generation === sendingGeneration && sessionId.value === context.sessionId
+  }
+
+  function clearSendingState(context: SendingContext) {
+    if (!ownsSendingState(context)) return
+    sending.value = false
+    sendingSessionId.value = null
+    startedAt.value = null
+    initializingWorkspace.value = false
+    initializingWorkspaceLabel.value = ''
+  }
+
+  function recordSendingDuration(context: SendingContext) {
+    if (!context.sessionId || !context.startedAt || !isLatestSending(context)) return
+    const list = sessionStore.getMessages(context.sessionId)
+    const lastMsg = list[list.length - 1]
+    if (lastMsg?.role === 'assistant') {
+      lastMsg.durationMs = Date.now() - new Date(context.startedAt).getTime()
+    }
+  }
 
   const isElectron = typeof window !== 'undefined' && (window as any).electronAPI
 
@@ -378,7 +416,7 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
    * 上传附件 → 连接 WS → 按需建会话 → 解析文本/收集本地技能 → 注册流式气泡 → WS 发送。
    * 任一步骤失败时统一清理（复位 sending、移除尾部空 assistant、提示、刷新会话）并返回 null。
    */
-  async function prepareAndSendMessage(text: string, files?: File[], pendingUploads?: PendingUploadFile[]): Promise<string | null> {
+  async function prepareAndSendMessage(text: string, files?: File[], pendingUploads?: PendingUploadFile[]): Promise<SendingContext | null> {
     if ((!text && (!files || files.length === 0) && (!pendingUploads || pendingUploads.length === 0)) || sending.value) return null
     syncMissingSessionFromStore()
     const targetSessionId = sessionStore.activeSessionId
@@ -387,14 +425,14 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
       return null
     }
 
+    const context = beginSending(targetSessionId)
     sending.value = true
-    startedAt.value = new Date().toISOString()
 
     // 浏览器只能接管已有 LOCAL 会话对话，不能新建本地任务；
     // 执行端始终是会话绑定的设备，浏览器只是消息入口。
     if (executionMode.value === 'LOCAL' && !isElectron && !sessionId.value) {
       ElMessage.error('浏览器端不能新建本地任务，请在桌面客户端创建；已有本地任务可直接继续对话')
-      sending.value = false
+      clearSendingState(context)
       return null
     }
 
@@ -408,15 +446,15 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
       // 图片全部失败且无待传文件：直接中止，不建会话不发文字-only 消息
       if ((files?.length ?? 0) > 0 && imageUrls.length === 0 && (!pendingUploads || pendingUploads.length === 0)) {
         ElMessage.error('图片全部上传失败，已取消发送')
-        sending.value = false
+        clearSendingState(context)
         return null
       }
 
       // Ensure WS connection is established
       await connect()
 
-      if (!requireCurrentSession(targetSessionId)) {
-        sending.value = false
+      if (!ownsSendingState(context) || !requireCurrentSession(targetSessionId)) {
+        clearSendingState(context)
         return null
       }
 
@@ -424,9 +462,10 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
       if (!sessionId.value) {
         if (executionMode.value === 'LOCAL' && isElectron && !workspace.value) {
           const dir = await (window as any).electronAPI.selectDirectory()
+          if (!ownsSendingState(context)) return null
           if (dir) workspace.value = dir
           else {
-            sending.value = false
+            clearSendingState(context)
             return null
           }
         }
@@ -440,11 +479,12 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
           const gitError = validateHttpsGitUrl(gitCloneUrl.value)
           if (gitError) {
             ElMessage.error(gitError)
-            sending.value = false
+            clearSendingState(context)
             return null
           }
         }
 
+        if (!ownsSendingState(context)) return null
         initializingWorkspace.value = true
         initializingWorkspaceLabel.value = resolveWorkspaceInitLabel()
         try {
@@ -462,7 +502,11 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
             executionMode.value === 'CLOUD' && workspaceMode.value === 'git' ? gitCloneUrl.value : undefined,
             executionMode.value === 'CLOUD' && workspaceMode.value === 'git' ? (gitBranch.value || undefined) : undefined
           )
+          if (!ownsSendingState(context)) return null
+          context.sessionId = sessionData.id
+          sessionSendingGenerations.set(sessionData.id, context.generation)
           sessionId.value = sessionData.id
+          sendingSessionId.value = sessionData.id
           sessionStore.setActiveSession(sessionData.id)
           if (sessionData.workspace) {
             workspace.value = sessionData.workspace
@@ -471,8 +515,10 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
             agentName.value = sessionData.agentName
           }
         } finally {
-          initializingWorkspace.value = false
-          initializingWorkspaceLabel.value = ''
+          if (ownsSendingState(context)) {
+            initializingWorkspace.value = false
+            initializingWorkspaceLabel.value = ''
+          }
         }
       }
 
@@ -507,7 +553,7 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
         failureLabel: executionMode.value === 'LOCAL' && isElectron ? '拷贝' : undefined,
       })
       if (!canSend) {
-        sending.value = false
+        clearSendingState(context)
         return null
       }
       // Resolve file reference relative paths to absolute paths — before both
@@ -515,8 +561,8 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
       resolvedText = resolveFileRefPaths(resolvedText, workspace.value)
       const localSkills = await collectLocalUnsyncedSkills(executionMode.value, isElectron)
       const agentsMdContent = await collectAgentsMdContent(workspace.value, executionMode.value, isElectron)
-      if (!requireCurrentSession(sid)) {
-        sending.value = false
+      if (!ownsSendingState(context) || !requireCurrentSession(sid)) {
+        clearSendingState(context)
         return null
       }
 
@@ -530,6 +576,7 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
       if (sessionStore.isHistoryAnchored(sid)) {
         sessionStore.setHistoryAnchored(sid, false)
         await fetchMessages({ sessionId: sid, forceLatest: true })
+        if (!ownsSendingState(context)) return null
       }
 
       // Add user message to store
@@ -556,11 +603,10 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
         throw new Error('消息发送失败，网络连接不可用，请重试')
       }
 
-      return sid
+      return context
     } catch (error: any) {
-      sending.value = false
-      initializingWorkspace.value = false
-      initializingWorkspaceLabel.value = ''
+      clearSendingState(context)
+      if (!isLatestSending(context)) return null
       if (rollbackSessionId) {
         // 回滚乐观插入的用户消息与 assistant 占位，避免失败后留下幽灵气泡
         // （内容被修改后重发时，尾部保留逻辑无法识别旧乐观消息，会双条上屏）。
@@ -583,39 +629,21 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
   }
 
   async function sendMessage(text: string, files?: File[], pendingUploads?: PendingUploadFile[]) {
-    const sid = await prepareAndSendMessage(text, files, pendingUploads)
-    if (!sid) return
+    const context = await prepareAndSendMessage(text, files, pendingUploads)
+    if (!context?.sessionId || !isLatestSending(context)) return
+    const sid = context.sessionId
 
     try {
-      // Wait for completion (session_status reaches COMPLETED/FAILED)
-      await new Promise<void>((resolve, reject) => {
-        pendingCallbacks.set(sid, { resolve, reject })
-      })
-
-      sending.value = false
-      if (startedAt.value) {
-        const lastMsg = messages.value[messages.value.length - 1]
-        if (lastMsg && lastMsg.role === 'assistant') {
-          lastMsg.durationMs = Date.now() - new Date(startedAt.value).getTime()
-        }
-        startedAt.value = null
-      }
-      // Refresh session to pick up server-generated title/summary
-      if (sessionId.value) {
-        sessionStore.fetchSession(sessionId.value)
-        // Re-fetch messages so that the API-structured messages replace the
-        // live-streamed single-message, enabling round-based collapse in UI.
-        // Skip when the queue will auto-consume next — REST 会与刚写入的用户消息竞态。
-        if (sessionStore.getQueueMessages(sessionId.value).length === 0) {
-          fetchMessages()
-        }
+      await awaitExecutionSettled(sid)
+      if (!isLatestSending(context)) return
+      recordSendingDuration(context)
+      // 结果及刷新始终归发送目标；切换后的当前会话不能被旧 continuation 重拉。
+      sessionStore.fetchSession(sid)
+      if (sessionStore.getQueueMessages(sid).length === 0) {
+        fetchMessages({ sessionId: sid })
       }
     } catch (error: any) {
-      sending.value = false
-      initializingWorkspace.value = false
-      initializingWorkspaceLabel.value = ''
-      // 回滚写回发起发送的会话：等待执行期间用户可能已切到别的会话，
-      // 不能摘掉当前会话尾部的气泡（可能就是它正在流式输出的那条）
+      if (!isLatestSending(context)) return
       sessionStore.removeTrailingEmptyAssistant(sid)
       if (!(error as Error & { toastShown?: boolean }).toastShown) {
         ElMessage.error(
@@ -625,6 +653,8 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
         )
       }
       sessionStore.fetchSession(sid)
+    } finally {
+      clearSendingState(context)
     }
   }
 
@@ -633,8 +663,9 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
    * @returns true 表示消息已发出（可清空输入框）；false 表示发送失败（保留输入以便重试）
    */
   async function sendMessageAndWaitForSave(text: string, files?: File[], pendingUploads?: PendingUploadFile[]): Promise<boolean> {
-    const sid = await prepareAndSendMessage(text, files, pendingUploads)
-    if (!sid) return false
+    const context = await prepareAndSendMessage(text, files, pendingUploads)
+    if (!context?.sessionId) return false
+    const sid = context.sessionId
 
     // 等待消息保存确认后立即返回，解锁输入框；Agent 在后台继续执行
     // 完成后的 sending / 刷新由 phase watcher 处理
@@ -645,9 +676,11 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
     // - Agent 尚未进入 RUNNING 时复位，避免误显示停止按钮
     // - 若 RUNNING 已先到达则保持 true；后续由 phase watcher 接管
     // 必须用本次发送的 sid，而非 activeSession（等待期间用户可能已切走会话）
-    if (String(sessionId.value) === String(sid)) {
+    if (ownsSendingState(context)) {
       sending.value = isActivePhase(sessionStore.getSessionPhase(sid))
     }
+    // 返回落库确认本身，维持输入框清空 / 保留草稿的既有语义；旧代次不做副作用。
+    if (!isLatestSending(context)) return saved
 
     if (!saved) {
       // 服务端未确认落库（落库前拒绝：本地执行端未连接 / 会话被占用 / 预算 BLOCK 等；
@@ -665,18 +698,10 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
       new Promise<void>((resolve, reject) => {
         pendingCallbacks.set(sid, { resolve, reject })
       }).then(() => {
-        if (startedAt.value) {
-          // 必须按本次发送的 sid 取消息：messages 绑的是活跃会话，等待期间用户可能已切走，
-          // 否则耗时会写到另一个会话最后一条 assistant 上。
-          const list = sessionStore.getMessages(sid)
-          const lastMsg = list[list.length - 1]
-          if (lastMsg && lastMsg.role === 'assistant') {
-            lastMsg.durationMs = Date.now() - new Date(startedAt.value).getTime()
-          }
-          startedAt.value = null
-        }
+        recordSendingDuration(context)
+        if (ownsSendingState(context)) startedAt.value = null
       }).catch(() => {
-        startedAt.value = null
+        if (ownsSendingState(context)) startedAt.value = null
       })
     }
     return true
@@ -685,6 +710,7 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
   async function stopExecution() {
     if (!sessionId.value) return
     const sid = sessionId.value
+    const context = { sessionId: sid, generation: sendingGeneration, startedAt: startedAt.value }
 
     const cancelled = await wsCancel(sid)
     if (!cancelled) {
@@ -692,9 +718,8 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
       return
     }
 
-    sending.value = false
-    sendingSessionId.value = null
-    startedAt.value = null
+    if (!ownsSendingState(context)) return
+    clearSendingState(context)
 
     // 与边路任务共用的取消收尾：清流式/思考/压缩状态、标记气泡已中止、唤醒等待收敛的调用方
     finalizeCancelledSession(sid)
@@ -703,29 +728,27 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
   async function retryExecution() {
     const sid = sessionId.value
     if (!sid) return
+    const context = beginSending(sid)
     sending.value = true
     // 清理前端错误状态
     sessionStore.clearExecutionError(sid)
     // 发送重试消息（宕机恢复语义）；发送失败不进入执行态
     const ok = await wsRetryExecution(sid)
     if (!ok) {
-      sending.value = false
+      clearSendingState(context)
       ElMessage.error('重试失败，网络连接不可用，请重试')
       return
     }
+    if (!ownsSendingState(context)) return
     // 确保 assistant 占位消息存在以便流式输出
     sessionStore.ensureStreamingAssistantMessage(sid)
     // 注册 pendingCallbacks：error 事件 reject 到本地 catch 复位 sending，避免幽灵运行中
     try {
       await awaitExecutionSettled(sid)
-      if (sessionId.value === sid) {
-        sending.value = false
-      }
     } catch {
-      if (sessionId.value === sid) {
-        sending.value = false
-        startedAt.value = null
-      }
+      // error 帧已负责提示；这里只结束属于本次重试的 UI 状态。
+    } finally {
+      clearSendingState(context)
     }
   }
 
@@ -766,8 +789,8 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
       images: m.images ? [...m.images] : m.images,
     }))
 
+    const context = beginSending(sid)
     sending.value = true
-    startedAt.value = new Date().toISOString()
 
     try {
       // Ensure WS connection is established
@@ -777,11 +800,7 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
       // 收集期间会话可能被切走，乐观更新先行会让截断/改写无法回滚）
       const localSkills = await collectLocalUnsyncedSkills(executionMode.value, isElectron)
       const agentsMdContent = await collectAgentsMdContent(workspace.value, executionMode.value, isElectron)
-      if (!requireCurrentSession(sid)) {
-        sending.value = false
-        startedAt.value = null
-        return
-      }
+      if (!ownsSendingState(context) || !requireCurrentSession(sid)) return
 
       // 连接成功后乐观更新：截断后续消息，更新编辑内容。
       // images 显式传入（含 []）必须原样写回——[] 表示移除全部图片，不能回落成
@@ -807,32 +826,24 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
         throw new Error('消息发送失败，网络连接不可用，请重试')
       }
 
-      // Wait for completion
-      await new Promise<void>((resolve, reject) => {
-        pendingCallbacks.set(sid, { resolve, reject })
-      })
-
-      sending.value = false
-      if (startedAt.value) {
-        const sidMsgs = sessionStore.getMessages(sid)
-        const lastMsg = sidMsgs[sidMsgs.length - 1]
-        if (lastMsg && lastMsg.role === 'assistant') {
-          lastMsg.durationMs = Date.now() - new Date(startedAt.value).getTime()
-        }
-        startedAt.value = null
-      }
+      if (!isLatestSending(context)) return
+      await awaitExecutionSettled(sid)
+      if (!isLatestSending(context)) return
+      recordSendingDuration(context)
       sessionStore.fetchSession(sid)
       if (sessionStore.getQueueMessages(sid).length === 0) {
         fetchMessages({ sessionId: sid })
       }
     } catch (error: any) {
-      sending.value = false
+      if (!isLatestSending(context)) return
       // M-10：失败时回滚乐观编辑——恢复截断/更新前的完整消息列表。
       // 必须写回入口捕获的 sid：执行期用户可能已切到别的会话，
       // 用 sessionId.value 会把当前会话的消息整表换成编辑目标会话的快照。
       sessionStore.setMessages(sid, sidMessagesBeforeEdit)
       ElMessage.error(error?.message || '编辑重新发送失败')
       sessionStore.fetchSession(sid)
+    } finally {
+      clearSendingState(context)
     }
   }
 
@@ -867,18 +878,12 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
     } else if (phase === 'RUNNING' || phase === 'WAITING_APPROVAL') {
       // Auto-sync sending state (covers queue auto-consume case)
       if (!sending.value) {
+        const sid = sessionId.value
+        const context = beginSending(sid)
         sending.value = true
-        startedAt.value = new Date().toISOString()
-        if (sessionId.value && !pendingCallbacks.has(sessionId.value)) {
-          new Promise<void>((resolve, reject) => {
-            pendingCallbacks.set(sessionId.value!, { resolve, reject })
-          }).then(() => {
-            sending.value = false
-            startedAt.value = null
-          }).catch(() => {
-            sending.value = false
-            startedAt.value = null
-          })
+        if (sid && !pendingCallbacks.has(sid)) {
+          const settle = () => clearSendingState(context)
+          awaitExecutionSettled(sid).then(settle, settle)
         }
       }
     }
@@ -943,6 +948,11 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
 
   function newSession() {
     restoreGeneration++
+    sendingGeneration++
+    sendingSessionId.value = null
+    startedAt.value = null
+    initializingWorkspace.value = false
+    initializingWorkspaceLabel.value = ''
     switchingSession.value = false
     if (sessionId.value) {
       sessionStore.clearQueueMessages(sessionId.value)
@@ -966,12 +976,24 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
     // from resetting sending/cancelling state
     switchingSession.value = true
 
+    try {
+      await runRestoreSession(sessionIdVal, mode, initialWorkspace, generation)
+    } finally {
+      // 提前返回或抛错也必须恢复 phase watcher；旧代次不能解开新会话的切换锁。
+      if (generation === restoreGeneration) {
+        switchingSession.value = false
+      }
+    }
+  }
+
+  async function runRestoreSession(sessionIdVal: string, mode: string, initialWorkspace: string | undefined, generation: number) {
     // Unsubscribe from previous session
     if (sessionId.value && sessionId.value !== sessionIdVal) {
       unsubscribe(sessionId.value)
     }
 
     sessionId.value = sessionIdVal
+    const context = beginSending(sessionIdVal, startedAt.value)
     executionMode.value = mode
     sessionStore.setActiveSession(sessionIdVal)
 
@@ -1009,23 +1031,20 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
     )
     if (active) {
       sending.value = true
+      sendingSessionId.value = sessionIdVal
       if (hasCompleteCache) {
         sessionStore.ensureStreamingAssistantMessage(sessionIdVal)
       }
-      // Register a pending callback so stopExecution() works and session_status can resolve it
-      if (!pendingCallbacks.has(sessionIdVal)) {
-        new Promise<void>((resolve, reject) => {
-          pendingCallbacks.set(sessionIdVal, { resolve, reject })
-        }).then(() => {
-          sending.value = false
-          startedAt.value = null
-        }).catch(() => {
-          sending.value = false
-          startedAt.value = null
-        })
+      // 单槽等待：显式让旧等待者以 superseded 退出，再由本次恢复占槽。
+      // 切走会话或同会话被更新代次接管后，旧回调都不能清掉新的发送锁。
+      const settleRestoredExecution = () => {
+        if (generation !== restoreGeneration) return
+        clearSendingState(context)
       }
+      awaitExecutionSettled(sessionIdVal).then(settleRestoredExecution, settleRestoredExecution)
     } else {
       sending.value = false
+      sendingSessionId.value = null
     }
 
     // Ensure WS connection is established before subscribing
@@ -1046,11 +1065,6 @@ export function useChat(agentId: Ref<string>, executionMode: Ref<string>, select
     }
     fetchTodos()
     fetchQueue()
-
-    // Resume phase watcher only after the latest session switch is complete
-    if (generation === restoreGeneration) {
-      switchingSession.value = false
-    }
   }
 
   async function submitQuestionAnswer(requestId: string, answers: QuestionAnswer[]): Promise<boolean> {

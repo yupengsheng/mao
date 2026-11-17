@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ref } from 'vue'
 import { createPinia, setActivePinia } from 'pinia'
 import { ElMessage } from 'element-plus'
@@ -8,7 +8,7 @@ import { useSessionStore } from '../stores/session'
 
 const ws = vi.hoisted(() => ({
   connect: vi.fn(), subscribe: vi.fn(), unsubscribe: vi.fn(),
-  cancel: vi.fn(),
+  cancel: vi.fn(), sendMessage: vi.fn(),
   pendingCallbacks: new Map(), onMessageSaved: vi.fn(), offMessageSaved: vi.fn(),
   sendEditMessage: vi.fn(),
   setActiveExecution: vi.fn(), clearActiveExecution: vi.fn(),
@@ -28,6 +28,7 @@ describe('restoreSession', () => {
     vi.clearAllMocks()
     ws.connect.mockReset()
     ws.connect.mockResolvedValue(undefined)
+    ws.pendingCallbacks.clear()
     vi.mocked(api.get).mockResolvedValue({ data: [] } as never)
   })
 
@@ -60,6 +61,89 @@ describe('restoreSession', () => {
     expect(api.get).not.toHaveBeenCalled()
     expect(chat.sessionId.value).toBeNull()
     expect(chat.switchingSession.value).toBe(false)
+  })
+
+  it('订阅抛错也释放切换锁，后续终态仍由 phase watcher 接管', async () => {
+    const store = useSessionStore()
+    store.updateSession('A', { phase: 'RUNNING' })
+    const chat = useChat(ref('1'), ref('CLOUD'))
+    ws.subscribe.mockImplementationOnce(() => { throw new Error('subscribe failed') })
+
+    await expect(chat.restoreSession('A', 'CLOUD')).rejects.toThrow('subscribe failed')
+    expect(chat.switchingSession.value).toBe(false)
+    expect(chat.sending.value).toBe(true)
+    expect(chat.sendingSessionId.value).toBe('A')
+    store.updateSessionPhase('A', 'COMPLETED')
+    await vi.waitFor(() => expect(chat.sending.value).toBe(false))
+    expect(chat.sendingSessionId.value).toBeNull()
+  })
+
+  it.each(['resolve', 'reject'] as const)('旧会话等待者 %s 不清掉新会话的发送锁和计时', async (outcome) => {
+    const store = useSessionStore()
+    store.updateSession('A', { phase: 'RUNNING' })
+    store.updateSession('B', { phase: 'RUNNING' })
+    const chat = useChat(ref('1'), ref('CLOUD'))
+    await chat.restoreSession('A', 'CLOUD')
+    const oldWaiter = ws.pendingCallbacks.get('A')!
+    await chat.restoreSession('B', 'CLOUD')
+    chat.startedAt.value = '2026-11-17T10:00:00Z'
+
+    oldWaiter[outcome](outcome === 'reject' ? new Error('old execution failed') : undefined)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(chat.sending.value).toBe(true)
+    expect(chat.sendingSessionId.value).toBe('B')
+    expect(chat.startedAt.value).toBe('2026-11-17T10:00:00Z')
+
+    ws.pendingCallbacks.get('B')!.resolve()
+    await vi.waitFor(() => expect(chat.sending.value).toBe(false))
+    expect(chat.sendingSessionId.value).toBeNull()
+    expect(chat.startedAt.value).toBeNull()
+  })
+
+  it('同会话再次恢复会替换等待者，旧代次的 rejection 不解开新发送锁', async () => {
+    const store = useSessionStore()
+    store.updateSession('A', { phase: 'RUNNING' })
+    const chat = useChat(ref('1'), ref('CLOUD'))
+    await chat.restoreSession('A', 'CLOUD')
+    const previous = ws.pendingCallbacks.get('A')!
+    const reject = vi.spyOn(previous, 'reject')
+
+    await chat.restoreSession('A', 'CLOUD')
+    expect(reject).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('superseded') }))
+    expect(ws.pendingCallbacks.get('A')).not.toBe(previous)
+    expect(chat.sending.value).toBe(true)
+    expect(chat.sendingSessionId.value).toBe('A')
+    ws.pendingCallbacks.get('A')!.resolve()
+    await vi.waitFor(() => expect(chat.sending.value).toBe(false))
+    expect(chat.sendingSessionId.value).toBeNull()
+  })
+
+  it('恢复活动会话时显式替换已占槽的等待者，新等待者能解开输入锁', async () => {
+    const store = useSessionStore()
+    store.updateSession('A', { phase: 'RUNNING' })
+    const reject = vi.fn()
+    ws.pendingCallbacks.set('A', { reject })
+    const chat = useChat(ref('1'), ref('CLOUD'))
+    await chat.restoreSession('A', 'CLOUD')
+
+    expect(reject).toHaveBeenCalledOnce()
+    expect(reject).toHaveBeenCalledWith(expect.objectContaining({ toastShown: true }))
+    expect(chat.sending.value).toBe(true)
+    ws.pendingCallbacks.get('A')!.resolve()
+    await vi.waitFor(() => expect(chat.sending.value).toBe(false))
+  })
+
+  it('恢复空闲会话时清掉上一会话的发送归属', async () => {
+    const store = useSessionStore()
+    store.updateSession('A', { phase: 'RUNNING' })
+    store.updateSession('B', { phase: 'COMPLETED' })
+    const chat = useChat(ref('1'), ref('CLOUD'))
+    await chat.restoreSession('A', 'CLOUD')
+    expect(chat.sendingSessionId.value).toBe('A')
+    await chat.restoreSession('B', 'CLOUD')
+    expect(chat.sending.value).toBe(false)
+    expect(chat.sendingSessionId.value).toBeNull()
   })
 
   it('历史请求失败后结束加载状态', async () => {
@@ -208,6 +292,76 @@ describe('restoreSession', () => {
     await older
     expect(store.getFileChanges('A').map(c => c.path)).toEqual(['old.ts', 'a.ts'])
     expect(store.getFileChanges('B')).toEqual([])
+  })
+})
+
+describe('发送完成回调的会话与代次隔离', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+    ws.pendingCallbacks.clear()
+    ws.connect.mockReset().mockResolvedValue(undefined)
+    ws.sendMessage.mockReset().mockResolvedValue(true)
+    vi.mocked(api.get).mockResolvedValue({ data: [] } as never)
+  })
+
+  it.each(['resolve', 'reject'] as const)('同会话旧发送 %s 不清新发送的状态、不回滚或刷新新气泡', async (outcome) => {
+    const store = useSessionStore()
+    store.updateSession('A', { phase: 'IDLE' })
+    store.setActiveSession('A')
+    const chat = useChat(ref('1'), ref('CLOUD'))
+    chat.sessionId.value = 'A'
+    const first = chat.sendMessage('first')
+    await vi.waitFor(() => expect(ws.pendingCallbacks.has('A')).toBe(true))
+    const previous = ws.pendingCallbacks.get('A')!
+    const remove = vi.spyOn(store, 'removeTrailingEmptyAssistant')
+    vi.mocked(api.get).mockClear()
+    // 终态回调已排入微任务，但 UI 已允许下一次发送；下一代必须立即接管。
+    previous[outcome](outcome === 'reject' ? new Error('old failure') : undefined)
+    chat.sending.value = false
+    const second = chat.sendMessage('second')
+    await first
+    expect(chat.sending.value).toBe(true)
+    expect(chat.sendingSessionId.value).toBe('A')
+    expect(chat.startedAt.value).not.toBeNull()
+    expect(remove).not.toHaveBeenCalled()
+    expect(api.get).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(ws.pendingCallbacks.get('A')).not.toBe(previous))
+    expect(store.getMessages('A').filter(m => m.role === 'user').map(m => m.content)).toEqual(['first', 'second'])
+    expect(ElMessage.error).not.toHaveBeenCalled()
+    ws.pendingCallbacks.get('A')!.resolve()
+    await second
+    expect(chat.sending.value).toBe(false)
+    expect(chat.sendingSessionId.value).toBeNull()
+  })
+
+  it.each(['resolve', 'reject'] as const)('旧建会话 %s 的 finally 不清新建任务的初始化提示', async (outcome) => {
+    const store = useSessionStore()
+    const deferred: Array<{ resolve: (value: any) => void; reject: (error: Error) => void }> = []
+    vi.spyOn(store, 'createSession').mockImplementation(() => new Promise((resolve, reject) => {
+      deferred.push({ resolve, reject })
+    }))
+    const chat = useChat(ref('1'), ref('CLOUD'))
+    const first = chat.sendMessage('first')
+    await vi.waitFor(() => expect(deferred).toHaveLength(1))
+    chat.newSession()
+    const second = chat.sendMessage('second')
+    await vi.waitFor(() => expect(deferred).toHaveLength(2))
+    const time = chat.startedAt.value
+    expect(chat.initializingWorkspace.value).toBe(true)
+    if (outcome === 'resolve') deferred[0]!.resolve({ id: 'old' })
+    else deferred[0]!.reject(new Error('old creation failed'))
+    await first
+    expect(chat.sessionId.value).toBeNull()
+    expect(chat.sending.value).toBe(true)
+    expect(chat.startedAt.value).toBe(time)
+    expect(chat.initializingWorkspace.value).toBe(true)
+    expect(chat.initializingWorkspaceLabel.value).toBe('正在初始化工作区...')
+    deferred[1]!.resolve({ id: 'new' })
+    await vi.waitFor(() => expect(ws.pendingCallbacks.has('new')).toBe(true))
+    ws.pendingCallbacks.get('new')!.resolve()
+    await second
+    expect(chat.initializingWorkspace.value).toBe(false)
   })
 })
 
@@ -821,5 +975,110 @@ describe('断网切换会话后新鲜失败仍可见（round2 回归）', () => 
     seed('B', '2')
     await chat.loadOlderMessages()
     expect(chat.olderLoadError.value).toEqual({ sessionId: 'B' })
+  })
+})
+
+// 此组切换到真实 useStreamWS：终态与错误走真实帧路由，而非手动 resolve mock。
+describe('普通发送 → 切会话 → 旧执行终态的 WS 联动', () => {
+  class ChatSocket {
+    static readonly CONNECTING = 0
+    static readonly OPEN = 1
+    static readonly CLOSING = 2
+    static readonly CLOSED = 3
+    static sockets: ChatSocket[] = []
+    readyState = ChatSocket.CONNECTING
+    onopen: (() => void) | null = null
+    onmessage: ((event: { target: unknown; data: string }) => void) | null = null
+    onclose: ((event: { target: unknown }) => void) | null = null
+    onerror: (() => void) | null = null
+    sent: Array<Record<string, unknown>> = []
+    constructor(_url: string) { ChatSocket.sockets.push(this) }
+    send(value: string) { this.sent.push(JSON.parse(value)) }
+    message(payload: Record<string, unknown>) {
+      this.onmessage?.({ target: this, data: JSON.stringify(payload) })
+    }
+    open() {
+      this.readyState = ChatSocket.OPEN
+      this.onopen?.()
+      this.message({ type: 'connected', data: { userId: 7 } })
+    }
+    close() {
+      this.readyState = ChatSocket.CLOSED
+      this.onclose?.({ target: this })
+    }
+  }
+
+  let stream: ReturnType<typeof import('./useStreamWS')['useStreamWS']> | undefined
+  beforeEach(() => {
+    vi.resetModules()
+    vi.doUnmock('./useStreamWS')
+    vi.doMock('../utils/auth-storage', () => ({ getToken: () => 'test-token' }))
+    vi.doMock('../api', () => ({
+      api,
+      fetchInboxUnreadCount: vi.fn(async () => ({ unreadCount: 0 })),
+    }))
+    vi.stubGlobal('WebSocket', ChatSocket)
+    vi.stubGlobal('window', new EventTarget())
+    ChatSocket.sockets = []
+    vi.clearAllMocks()
+    vi.mocked(api.get).mockResolvedValue({ data: [] } as never)
+    setActivePinia(createPinia())
+  })
+  afterEach(() => {
+    stream?.disconnect()
+    stream = undefined
+    vi.unstubAllGlobals()
+    vi.doMock('./useStreamWS', () => ({ useStreamWS: () => ws }))
+    vi.doMock('../api', () => ({ api }))
+    vi.doUnmock('../utils/auth-storage')
+    vi.resetModules()
+  })
+
+  it.each(['session_snapshot', 'error'] as const)('A 真实发送后切到运行中 B，A 的 %s 不改 B 状态或重拉 B 历史', async (type) => {
+    const { useStreamWS: realWS } = await import('./useStreamWS')
+    const { useChat: realChat } = await import('./useChat')
+    const { useSessionStore: realStore } = await import('../stores/session')
+    stream = realWS()
+    const connecting = stream.connect()
+    const socket = ChatSocket.sockets[0]!
+    socket.open()
+    await connecting
+    const store = realStore()
+    store.updateSession('42', { phase: 'IDLE', executionMode: 'CLOUD' })
+    store.updateSession('43', { phase: 'RUNNING', executionMode: 'CLOUD' })
+    store.setMessages('43', [
+      { id: 'b-user', role: 'user', content: 'B question', createdAt: '' },
+      { id: 'b-assistant', role: 'assistant', content: 'B live content', createdAt: '' },
+    ])
+    store.setActiveSession('42')
+    const chat = realChat(ref('1'), ref('CLOUD'))
+    chat.sessionId.value = '42'
+    const sending = chat.sendMessage('A question')
+    await vi.waitFor(() => expect(stream!.pendingCallbacks.has('42')).toBe(true))
+    expect(socket.sent.some(frame => frame.type === 'send_message' && frame.sessionId === 42)).toBe(true)
+    await chat.restoreSession('43', 'CLOUD')
+    chat.startedAt.value = '2026-11-17T10:00:00Z'
+    chat.initializingWorkspace.value = true
+    chat.initializingWorkspaceLabel.value = 'B owns this label'
+    const bBefore = store.getMessages('43').map(message => ({ ...message }))
+    const bWaiter = stream.pendingCallbacks.get('43')
+    const fetch = vi.spyOn(store, 'fetchSession')
+    vi.mocked(api.get).mockClear()
+
+    socket.message({ type, sessionId: 42, data: type === 'session_snapshot'
+      ? { phase: 'COMPLETED' } : { message: 'A execution failed' } })
+    await sending
+    expect(chat.sessionId.value).toBe('43')
+    expect(chat.sending.value).toBe(true)
+    expect(chat.sendingSessionId.value).toBe('43')
+    expect(chat.startedAt.value).toBe('2026-11-17T10:00:00Z')
+    expect(chat.initializingWorkspace.value).toBe(true)
+    expect(chat.initializingWorkspaceLabel.value).toBe('B owns this label')
+    expect(store.getMessages('43')).toEqual(bBefore)
+    expect(stream.pendingCallbacks.get('43')).toBe(bWaiter)
+    expect(stream.pendingCallbacks.has('42')).toBe(false)
+    expect(fetch).toHaveBeenCalledWith('42')
+    expect(fetch).not.toHaveBeenCalledWith('43')
+    expect(vi.mocked(api.get).mock.calls.some(([url]) => url === '/sessions/43/messages')).toBe(false)
   })
 })
