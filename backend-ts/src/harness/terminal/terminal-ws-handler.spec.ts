@@ -276,6 +276,31 @@ describe('TerminalWsHandler attach', () => {
     expect(socket.last()).toEqual({ type: 'output', terminalId: 't1', data: 'live' });
   });
 
+  it('filters response-triggering history but leaves live output unchanged', async () => {
+    const harness = newHarness();
+    const terminal = harness.registry.add(new FakeTerminal('t1', 3, 7));
+    const query = '\x1b]11;?\x07\x1b[6n\x1b[?1004h';
+    terminal.buffered = `\x1b[32mhistory\x1b[0m${query}`;
+    const socket = await authed(harness);
+    await harness.handler.handleTextMessage(socket, JSON.stringify({ type: 'attach', terminalId: 't1' }));
+    expect(socket.frames('output')).toEqual([{ type: 'output', terminalId: 't1', data: '\x1b[32mhistory\x1b[0m' }]);
+    expect(terminal.buffered).toContain(query);
+    terminal.emit(query);
+    expect(socket.last()).toEqual({ type: 'output', terminalId: 't1', data: query });
+    await harness.handler.handleTextMessage(socket, JSON.stringify({ type: 'input', terminalId: 't1', data: '\x1b[1;1R' }));
+    expect(terminal.written).toEqual(['\x1b[1;1R']);
+  });
+
+  it('omits an output frame if sanitizing removes the entire history', async () => {
+    const harness = newHarness();
+    const terminal = harness.registry.add(new FakeTerminal('t1', 3, 7));
+    terminal.buffered = '\x1b[c\x1bP$qm\x1b\\';
+    const socket = await authed(harness);
+    await harness.handler.handleTextMessage(socket, JSON.stringify({ type: 'attach', terminalId: 't1' }));
+    expect(socket.frames('attached')).toHaveLength(1);
+    expect(socket.frames('output')).toHaveLength(0);
+  });
+
   it('skips the replay frame when the buffer is empty', async () => {
     const harness = newHarness();
     harness.registry.add(new FakeTerminal('t1', 3, 7));

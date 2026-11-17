@@ -71,6 +71,97 @@ export function compareVersions(a: string, b: string): number {
   return 0;
 }
 
+/**
+ * DELIMITER 是 mysql 客户端指令，不能发给 mysql2；存储过程内的分号也不能拆分。
+ * 只在引号/注释外识别分隔符，指令必须独占一行且位于语句之间。
+ * 按 MySQL 默认字符串转义规则扫描（不支持脚本中切换 NO_BACKSLASH_ESCAPES）。
+ */
+export function splitSqlStatements(sql: string): string[] {
+  const text = sql.replace(/^\uFEFF/, '').replace(/\r\n?|\n/g, '\n');
+  const statements: string[] = [];
+  let delimiter = ';';
+  let buffer = '';
+  let hasSql = false;
+  let quote: string | null = null;
+  let comment: 'line' | 'block' | null = null;
+  let lineStart = true;
+  for (let i = 0; i < text.length;) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (comment === 'line') {
+      buffer += ch;
+      i += 1;
+      if (ch === '\n') { comment = null; lineStart = true; }
+      continue;
+    }
+    if (comment === 'block') {
+      if (ch === '*' && next === '/') {
+        buffer += '*/';
+        i += 2;
+        comment = null;
+        lineStart = false;
+      } else {
+        buffer += ch;
+        i += 1;
+      }
+      continue;
+    }
+    if (quote !== null) {
+      buffer += ch;
+      i += 1;
+      if (ch === '\\' && quote !== '`' && i < text.length) {
+        buffer += text[i++];
+      } else if (ch === quote) {
+        if (text[i] === quote) buffer += text[i++];
+        else quote = null;
+      }
+      continue;
+    }
+    if (lineStart) {
+      const end = text.indexOf('\n', i);
+      const lineEnd = end < 0 ? text.length : end;
+      const directive = /^[\t ]*DELIMITER[\t ]+(\S+)[\t ]*$/i.exec(text.slice(i, lineEnd));
+      if (directive) {
+        if (hasSql) throw new Error('DELIMITER must appear between SQL statements');
+        delimiter = directive[1];
+        buffer = '';
+        i = lineEnd + 1;
+        continue;
+      }
+    }
+    if (text.startsWith(delimiter, i)) {
+      if (hasSql) statements.push(buffer.trim());
+      buffer = '';
+      hasSql = false;
+      i += delimiter.length;
+      lineStart = false;
+      continue;
+    }
+    if (ch === '#' || (ch === '-' && next === '-' && (i + 2 === text.length || /\s/.test(text[i + 2])))) {
+      comment = 'line';
+    } else if (ch === '/' && next === '*') {
+      // MySQL executable comments / optimizer hints must survive even as standalone statements.
+      if (text[i + 2] === '!' || text[i + 2] === '+') hasSql = true;
+      comment = 'block';
+      buffer += '/*';
+      i += 2;
+      lineStart = false;
+      continue;
+    } else if (ch === "'" || ch === '"' || ch === '`') {
+      quote = ch;
+      hasSql = true;
+    } else if (!/\s/.test(ch)) {
+      hasSql = true;
+    }
+    buffer += ch;
+    i += 1;
+    lineStart = ch === '\n';
+  }
+  if (quote !== null || comment === 'block') throw new Error('Unterminated SQL quote or block comment');
+  if (hasSql) statements.push(buffer.trim());
+  return statements;
+}
+
 function hasSqlFiles(dir: string): boolean {
   return existsSync(dir) && readdirSync(dir).some((f) => f.endsWith('.sql'));
 }
@@ -264,7 +355,9 @@ export async function migrateWithDb(
       }
       const started = Date.now();
       try {
-        await db.query(migration.sql);
+        for (const statement of splitSqlStatements(migration.sql)) {
+          await db.query(statement);
+        }
         await insertHistory(db, {
           installedRank: nextRank,
           version: migration.version,

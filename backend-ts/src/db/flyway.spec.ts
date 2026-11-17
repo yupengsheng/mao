@@ -10,6 +10,7 @@ import {
   parseMigrationName,
   resolveMigrationDir,
   runFlywayIfEnabled,
+  splitSqlStatements,
   type FlywayDb,
 } from './flyway.js';
 import { notDeleted } from './db.js';
@@ -85,6 +86,65 @@ describe('Flyway checksum and filenames', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('splitSqlStatements', () => {
+  it('splits same-line statements and ignores empty or comment-only fragments', () => {
+    expect(splitSqlStatements('SELECT 1; SELECT 2; ; # trailing ;\n-- comment\n/* comment */')).toEqual(['SELECT 1', 'SELECT 2']);
+    expect(splitSqlStatements('SELECT 3')).toEqual(['SELECT 3']);
+  });
+
+  it('keeps a stored procedure intact and removes client directives with BOM/CRLF', () => {
+    const sql = '\uFEFFSELECT 1;\r\n  delimiter //\r\nCREATE PROCEDURE p()\r\nBEGIN\r\n SELECT \'a; //\';\r\n SELECT 2;\r\nEND //\r\nDELIMITER ;\r\nCALL p(); DROP PROCEDURE p;';
+    expect(splitSqlStatements(sql)).toEqual([
+      'SELECT 1', "CREATE PROCEDURE p()\nBEGIN\n SELECT 'a; //';\n SELECT 2;\nEND", 'CALL p()', 'DROP PROCEDURE p',
+    ]);
+  });
+
+  it('does not split quoted semicolons, doubled quotes or backslash-escaped quotes', () => {
+    const first = ["SELECT 'a;it''s'", '"b;""c"', '`semi;``colon`', String.raw`'it\'s;ok'`, String.raw`"a\";b"`].join(', ');
+    expect(splitSqlStatements(`${first}; SELECT 2;`)).toEqual([first, 'SELECT 2']);
+  });
+
+  it('does not treat multiline literal or comment content as a DELIMITER directive', () => {
+    const first = "SELECT 'first;\nDELIMITER //\nlast;'";
+    expect(splitSqlStatements(`${first}; SELECT 2;`)).toEqual([first, 'SELECT 2']);
+    const commented = '/*\nDELIMITER $$\n; */\nSELECT 1 /* ; */';
+    expect(splitSqlStatements(`${commented}; -- DELIMITER //\nSELECT 2;`)).toEqual([commented, '-- DELIMITER //\nSELECT 2']);
+  });
+
+  it('ignores delimiters in line/block comments, including a comment after a statement', () => {
+    const sql = 'DELIMITER $$\nCREATE PROCEDURE p()\nBEGIN\n -- $$\n # $$\n SELECT "$$"; /* $$ */\nEND$$ -- done $$\nDELIMITER ;\nSELECT 1;';
+    const statements = splitSqlStatements(sql);
+    expect(statements).toHaveLength(2);
+    expect(statements[0]).toContain('SELECT "$$"; /* $$ */');
+    expect(statements[0]).toMatch(/END$/);
+    expect(statements[1]).toBe('SELECT 1');
+    expect(splitSqlStatements('SELECT 1--2; SELECT 3;')).toEqual(['SELECT 1--2', 'SELECT 3']);
+  });
+
+  it('keeps executable comments, but never sends comment-only queries', () => {
+    expect(splitSqlStatements('/* ordinary ; */; /*!40101 SET @x = 1 */;')).toEqual(['/*!40101 SET @x = 1 */']);
+  });
+
+  it('rejects incomplete literals/comments and a directive inside unfinished SQL', () => {
+    for (const sql of ["SELECT 'abc", 'SELECT `abc', 'SELECT 1 /* abc']) {
+      expect(() => splitSqlStatements(sql)).toThrow(/Unterminated SQL/);
+    }
+    expect(() => splitSqlStatements('SELECT 1\nDELIMITER //')).toThrow(/between SQL statements/);
+  });
+
+  it('splits the real V001 stored procedure without changing the migration checksum', () => {
+    const sql = readFileSync(resolve(process.cwd(), 'db/migration/V001__init_schema.sql'), 'utf8');
+    const checksum = flywayChecksum(sql);
+    const statements = splitSqlStatements(sql);
+    const procedure = statements.find((statement) => /CREATE PROCEDURE create_agent_skill_table/.test(statement));
+    expect(procedure).toContain('END IF;');
+    expect(procedure).toMatch(/END$/);
+    expect(statements.some((statement) => /^DELIMITER/m.test(statement))).toBe(false);
+    expect(statements).toContain('CALL create_agent_skill_table()');
+    expect(flywayChecksum(sql)).toBe(checksum);
   });
 });
 
@@ -178,6 +238,30 @@ describe('migrateWithDb', () => {
     expect(db.history).toHaveLength(2);
     expect(db.history[0]?.success).toBe(1);
     expect(db.history[0]?.script).toBe('V001__init.sql');
+  });
+
+  it('executes a DELIMITER migration statement by statement and records its original checksum once', async () => {
+    const db = new FakeFlywayDb();
+    const sql = 'DELIMITER //\nCREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END//\nDELIMITER ;\nCALL p(); DROP PROCEDURE p;';
+    const migration = { ...sample[0], sql, checksum: flywayChecksum(sql) };
+    const result = await migrateWithDb(db, [migration], {
+      baselineOnMigrate: false, baselineVersion: '001', validateOnMigrate: true, installedBy: 'mao',
+    });
+    expect(result.applied).toEqual([migration.script]);
+    expect(db.executed).toEqual(['CREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END', 'CALL p()', 'DROP PROCEDURE p']);
+    expect(db.history).toHaveLength(1);
+    expect(db.history[0]).toMatchObject({ checksum: migration.checksum, success: 1 });
+  });
+
+  it('stops a split migration at the first failed statement and records failure once', async () => {
+    const db = new FakeFlywayDb();
+    db.failScript = 'SELECT 2';
+    await expect(migrateWithDb(db, [{ ...sample[0], sql: 'SELECT 1; SELECT 2; SELECT 3;' }], {
+      baselineOnMigrate: false, baselineVersion: '001', validateOnMigrate: false, installedBy: 'mao',
+    })).rejects.toThrow(/V001__init.sql.*syntax error/);
+    expect(db.executed).toEqual(['SELECT 1', 'SELECT 2']);
+    expect(db.history).toHaveLength(1);
+    expect(db.history[0]?.success).toBe(0);
   });
 
   it('baselines a non-empty schema and skips versions up to baseline', async () => {

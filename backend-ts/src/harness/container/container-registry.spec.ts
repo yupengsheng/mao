@@ -135,6 +135,7 @@ describe('container registry', () => {
     expect(tokenIdx).toBeLessThan(runIdx);
     const runArgs = log.find((line) => line.startsWith('run -d'));
     expect(runArgs).toBeDefined();
+    expect(runArgs).toContain('--init');
     expect(runArgs).toContain('--memory 512m');
     expect(runArgs).toContain('--cpus 1');
     expect(runArgs).toContain('--pids-limit 100');

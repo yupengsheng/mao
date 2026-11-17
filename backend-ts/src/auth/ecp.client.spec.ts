@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { EcpClient, resolveEcpOAuthState } from './ecp.client.js';
+import { EcpClient, resolveEcpOAuthState, type EcpHttpClient } from './ecp.client.js';
 import { defaultEcpConfig } from './ecp.config.js';
 
 describe('EcpClient', () => {
@@ -45,6 +45,68 @@ describe('EcpClient', () => {
     const session = await client.createSessionFromFeishuCallback(config, 'code', 'state');
     expect(session.sessionToken).toBe('tok-1');
     expect(session.user.email).toBe('a@example.com');
+  });
+
+  it.each([
+    ['https://ecp.example.com/a.png', 'https://ecp.example.com/a.png'],
+    ['http://ecp.example.com/a.png', 'http://ecp.example.com/a.png'],
+    ['/uploads/a.png', '/uploads/a.png'],
+    ['  https://ecp.example.com/a.png\n', 'https://ecp.example.com/a.png'],
+    [`https://a/${'x'.repeat(502)}`, `https://a/${'x'.repeat(502)}`],
+  ])('normalizes user.avatar %j in callback exchange and session verification', async (avatar, avatarUrl) => {
+    const request = vi.fn<EcpHttpClient['request']>().mockResolvedValue({
+      status: 200,
+      json: { code: 0, data: {
+        sessionToken: 'tok-1', expiresAt: '2099-01-01T00:00:00Z',
+        user: { email: 'a@example.com', realName: 'Alice', avatar },
+      } },
+    });
+    const client = new EcpClient({ request });
+    const session = await client.createSessionFromFeishuCallback(config, 'code', 'state');
+    expect(session.user).toEqual({ email: 'a@example.com', displayName: 'Alice', avatarUrl });
+    expect(await client.verifySession(config, 'tok-1')).toEqual(session.user);
+  });
+
+  it.each([undefined, null, '', '   ', 'javascript:alert(1)', 'data:text/html,x', 'https://a/b c', `https://a/${'x'.repeat(503)}`, 42, {}, []])('omits unusable user.avatar %j without failing either identity endpoint', async (avatar) => {
+    const request = vi.fn<EcpHttpClient['request']>().mockResolvedValue({
+      status: 200,
+      json: { code: 0, data: {
+        sessionToken: 'tok-1', expiresAt: '2099-01-01T00:00:00Z',
+        user: { email: 'a@example.com', realName: 'Alice', ...(avatar === undefined ? {} : { avatar }) },
+      } },
+    });
+    const client = new EcpClient({ request });
+    const session = await client.createSessionFromFeishuCallback(config, 'code', 'state');
+    expect(session.user).toEqual({ email: 'a@example.com', displayName: 'Alice' });
+    expect(session.user).not.toHaveProperty('avatarUrl');
+    expect(await client.verifySession(config, 'tok-1')).toEqual(session.user);
+  });
+
+  it('reads the flat identity avatar while retaining the existing flat-response fallback', async () => {
+    const request = vi.fn<EcpHttpClient['request']>().mockResolvedValue({
+      status: 200,
+      json: { code: 0, data: {
+        sessionToken: 'tok-flat', expiresAt: '2099-01-01T00:00:00Z',
+        email: 'a@example.com', displayName: 'Alice', avatar: '/uploads/flat.png',
+      } },
+    });
+    const client = new EcpClient({ request });
+    expect((await client.createSessionFromFeishuCallback(config, 'code', 'state')).user)
+      .toEqual({ email: 'a@example.com', displayName: 'Alice', avatarUrl: '/uploads/flat.png' });
+    expect(await client.verifySession(config, 'tok-flat')).toMatchObject({ avatarUrl: '/uploads/flat.png' });
+  });
+
+  it('uses avatar on the selected identity object, not top-level metadata or invented field aliases', async () => {
+    const request = vi.fn<EcpHttpClient['request']>().mockResolvedValue({
+      status: 200,
+      json: { code: 0, data: {
+        sessionToken: 'tok-1', expiresAt: '2099-01-01T00:00:00Z', avatar: '/uploads/metadata.png',
+        user: { email: 'a@example.com', avatarUrl: '/uploads/alias.png', avatar_url: '/uploads/alias-2.png' },
+      } },
+    });
+    const client = new EcpClient({ request });
+    expect((await client.createSessionFromFeishuCallback(config, 'code', 'state')).user).not.toHaveProperty('avatarUrl');
+    expect(await client.verifySession(config, 'tok-1')).not.toHaveProperty('avatarUrl');
   });
 
   it('renews a session when the response has no user info', async () => {

@@ -8,6 +8,9 @@ import { buildUniqueUsername, usernameTaken } from './username.js';
 
 export type EcpAssociationAction = 'created' | 'bound' | 'existing';
 
+// 保持与 user.service / company-sso.client 的头像规则一致；无效可选头像不阻止登录。
+const AVATAR_URL_PATTERN = /^(?=.{1,512}$)(?:https?:\/\/|\/)[^\s]+$/;
+
 export class EcpIdentityRepository {
   constructor(private readonly db: Db) {}
 
@@ -63,6 +66,9 @@ export class EcpIdentityRepository {
           status: 1,
           deleted: 0,
         };
+        // 只在首次建号时写入，bound / existing 不覆盖用户自行维护的头像。
+        const avatarUrl = typeof identity.avatarUrl === 'string' ? identity.avatarUrl.trim() : undefined;
+        if (avatarUrl !== undefined && AVATAR_URL_PATTERN.test(avatarUrl)) user.avatarUrl = avatarUrl;
         user.id = await tx.insert('user', user);
         await tx.insert('user_role', { userId: user.id, roleId: role.id });
       }

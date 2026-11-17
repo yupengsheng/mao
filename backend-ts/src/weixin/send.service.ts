@@ -19,6 +19,7 @@ const LOG_BODY_MAX_CHARS = 300;
 /**
  * 按微信单条字节上限切分回复：优先段落（`\n\n`）、行（`\n`）、空格边界，都没有则硬切。
  * 每条分片由调用方以独立 `client_id` 发送，用户侧表现为连续多条气泡。
+ * 自定义预算小于单个 codePoint 的 UTF-8 长度时，该字符独立成片（保完整性，允许这一片超限）。
  */
 export function splitTextForWeixin(text: string, maxBytes: number = WEIXIN_MAX_TEXT_BYTES): string[] {
   if (text === '') return [];
@@ -39,11 +40,11 @@ export function splitTextForWeixin(text: string, maxBytes: number = WEIXIN_MAX_T
 function prefixLenWithinBytes(text: string, maxBytes: number): number {
   let bytes = 0;
   let i = 0;
-  while (i < text.length) {
-    const next = bytes + Buffer.byteLength(text[i]);
+  for (const char of text) {
+    const next = bytes + Buffer.byteLength(char);
     if (next > maxBytes) break;
     bytes = next;
-    i += 1;
+    i += char.length;
   }
   return i;
 }
@@ -61,7 +62,8 @@ function findCut(text: string, maxBytes: number, minBytes: number): number {
     // 分隔符位置按字节衡量：中文场景下字符数远小于字节数，必须换算后才知是否落在前半段预算内。
     if (Buffer.byteLength(window.slice(0, at)) >= minBytes) return at + keep;
   }
-  return Math.max(1, limit);
+  // 单个 codePoint 超过预算时也保持完整并向前推进，不能切出半个代理对。
+  return limit || (text.codePointAt(0)! > 0xffff ? 2 : 1);
 }
 
 /** ilink 原始响应体脱敏后落日志：截断长度并遮罩 token/secret，便于定位 ret=-2 这类未公开错误码。 */

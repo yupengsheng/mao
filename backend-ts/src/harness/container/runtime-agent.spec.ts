@@ -151,7 +151,7 @@ describe('runtime agent channel behavior', () => {
 
   it('reportsNullBuildWhenAgentHasNoManifest', async () => {
     // 旧 agent / manifest 缺失：hello 不带 build → 宿主收到 null（unknown 按漂移处理，one-shot 自愈）
-    const base = useTmpDir('mao-agent-build-none-');
+    const base = useTmpDir('mao-build-none-');
     mkdirSync(join(base, 'workspace', '7'), { recursive: true });
     const statuses: RuntimeStatus[] = [];
     const hellos: Array<{ build: string | null }> = [];
@@ -185,7 +185,7 @@ describe('runtime agent channel behavior', () => {
 
   it('acksPtyOpenFailureFastAndReportsExit', async () => {
     // BUG-6 回归：spawn 失败快速回 ok:false + error，同时按退出码 -1 收尾
-    const base = useTmpDir('mao-agent-pty-bad-');
+    const base = useTmpDir('mao-pty-bad-');
     const failing: ContainerPtyFactory = () => { throw new Error('posix_spawnp failed'); };
     const statuses: RuntimeStatus[] = [];
     const conn = await startAgent(base, statuses, failing);

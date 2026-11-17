@@ -8,6 +8,22 @@ const os = require('os')
 const path = require('path')
 const { createLocalShellRuntime, MAX_COMMAND_LENGTH, shellSingleQuote } = require('./localShell.cjs')
 
+function isProcessRunning(pid) {
+  try {
+    process.kill(pid, 0)
+    if (process.platform === 'linux') {
+      // 容器中的 PID 1 可能未及时回收孤儿进程；僵尸仍能通过 kill(pid, 0)，但已终止。
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
+      // comm 字段可包含空格和括号，进程状态位于最后一个右括号之后。
+      return stat[stat.lastIndexOf(')') + 2] !== 'Z'
+    }
+    return true
+  } catch (error) {
+    if (error.code === 'ESRCH' || (process.platform === 'linux' && error.code === 'ENOENT')) return false
+    throw error
+  }
+}
+
 function createRuntime(t, extra = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mao-local-shell-'))
   // node:test 的 after 按注册顺序执行。删目录必须发生在所有 shell 关闭之后，
@@ -142,10 +158,13 @@ test('kills the whole process group when a session closes', async (t) => {
   )
   const childPid = Number(started.output.trim().split('\n').pop())
   assert.ok(childPid > 0)
-  assert.doesNotThrow(() => process.kill(childPid, 0))
+  assert.equal(isProcessRunning(childPid), true)
   await runtime.handle({ action: 'close', session_id: 'sh-tree' }, { conversationId: 15 })
-  await new Promise((resolve) => setTimeout(resolve, 500))
-  assert.throws(() => process.kill(childPid, 0))
+  const deadline = Date.now() + 2000
+  while (isProcessRunning(childPid) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  assert.equal(isProcessRunning(childPid), false, `child process ${childPid} should terminate when the session closes`)
 })
 
 test('enforces per-conversation session limits and command length', async (t) => {

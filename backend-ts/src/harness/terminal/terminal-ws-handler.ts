@@ -1,5 +1,6 @@
 import { harnessLog } from '../log.js';
 import type { RemoteTerminalInfo } from './remote-terminal.js';
+import { sanitizeReplayData } from './replay-sanitizer.js';
 import {
   MAX_TERMINAL_COLS,
   MAX_TERMINAL_ROWS,
@@ -274,7 +275,8 @@ export class TerminalWsHandler {
 
     const info = terminal.toInfo();
     this.send(conn.socket, { type: 'attached', terminalId, cols: info.cols, rows: info.rows });
-    const buffered = terminal.readBuffered();
+    // 仅过滤历史回放，实时输出保留查询供运行中的程序接收终端应答。
+    const buffered = sanitizeReplayData(terminal.readBuffered());
     if (buffered !== '') {
       this.send(conn.socket, { type: 'output', terminalId, data: buffered });
     }

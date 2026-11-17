@@ -56,6 +56,26 @@ describe('splitTextForWeixin', () => {
     for (const c of chunks) expect(c).not.toContain('\uFFFD');
   });
 
+  it('按 codePoint 分片，a😀b 在 4 字节预算不产生坏代理对', () => {
+    expect(splitTextForWeixin('a😀b', 4)).toEqual(['a', '😀', 'b']);
+    expect(splitTextForWeixin('😀😀', 4)).toEqual(['😀', '😀']);
+  });
+
+  it('单个 codePoint 超出小预算时保持完整并继续推进', () => {
+    expect(splitTextForWeixin('😀a😀', 1)).toEqual(['😀', 'a', '😀']);
+    expect(splitTextForWeixin('中😀a', 2)).toEqual(['中', '😀', 'a']);
+  });
+
+  it('混合 emoji 与分隔符的分片可独立 UTF-8 编码且不超预算', () => {
+    const text = '中文 😀 hello\n\n👨‍👩‍👧‍👦 end\n'.repeat(500);
+    const chunks = splitTextForWeixin(text, 32);
+    expect(chunks.join('')).toBe(text);
+    for (const chunk of chunks) {
+      expect(Buffer.byteLength(chunk)).toBeLessThanOrEqual(32);
+      expect(Buffer.from(chunk).toString('utf8')).toBe(chunk);
+    }
+  });
+
   it('分隔符落在前半段预算内才采用，避免切出过短碎片', () => {
     const text = `${'中'.repeat(1900)}\n${'b'.repeat(WEIXIN_MAX_TEXT_BYTES)}`;
     const chunks = splitTextForWeixin(text);

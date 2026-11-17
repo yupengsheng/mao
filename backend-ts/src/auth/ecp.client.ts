@@ -5,6 +5,8 @@ import { EcpError } from './ecp.error.js';
 export interface EcpSessionUser {
   email: string;
   displayName: string;
+  /** ECP `data.user.avatar`（扁平身份响应为 `avatar`），仅首次建号使用。 */
+  avatarUrl?: string;
 }
 
 export interface EcpSessionResult {
@@ -103,13 +105,24 @@ function parseExpiresAt(value: unknown): Date {
   throw new EcpError('ECP 响应缺少有效 expiresAt');
 }
 
+/** 与 user.service / company-sso.client 保持相同规则：限定长度、协议/相对路径且不含空白。 */
+const AVATAR_URL_PATTERN = /^(?=.{1,512}$)(?:https?:\/\/|\/)[^\s]+$/;
+
+/** 可选头像无效时忽略，不得让正常身份换票失败。 */
+function normalizeAvatar(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const url = value.trim();
+  return AVATAR_URL_PATTERN.test(url) ? url : undefined;
+}
+
 function parseUser(data: Record<string, unknown>): EcpSessionUser {
   const user = data.user;
   const userObj = user && typeof user === 'object' && !Array.isArray(user) ? user as Record<string, unknown> : data;
   const email = String(userObj.email ?? '').trim();
   if (!email) throw new EcpError('ECP 响应缺少用户邮箱');
   const displayName = String(userObj.realName ?? userObj.displayName ?? userObj.name ?? email).trim();
-  return { email, displayName };
+  const avatarUrl = normalizeAvatar(userObj.avatar);
+  return { email, displayName, ...(avatarUrl === undefined ? {} : { avatarUrl }) };
 }
 
 /**

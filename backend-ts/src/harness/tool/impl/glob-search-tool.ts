@@ -84,15 +84,28 @@ export class GlobSearchTool extends BaseTool {
   }
 
   private async *walk(dir: string, root: string): AsyncGenerator<string> {
-    const entries = await opendir(dir);
-    for await (const entry of entries) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        if (!IGNORED_DIRS.has(entry.name)) yield* this.walk(full, root);
-      } else if (entry.isFile()) {
-        yield path.relative(root, full).split(path.sep).join('/');
+    try {
+      const entries = await opendir(dir);
+      for await (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (!IGNORED_DIRS.has(entry.name)) yield* this.walk(full, root);
+        } else if (entry.isFile()) {
+          yield path.relative(root, full).split(path.sep).join('/');
+        }
+        // 不跟随符号链接，避免递归环路及遍历到搜索目录之外。
       }
-      // 不跟随符号链接，避免递归环路及遍历到搜索目录之外。
+    } catch (e) {
+      if (dir === root || !isRecoverableDirectoryError(e)) throw e;
+      harnessLog('warn', `GlobSearchTool 跳过不可读目录: ${dir}`, e);
     }
   }
+}
+
+/** 只忽略子目录的已知局部故障；未知错误必须继续上抛，避免静默返回不完整结果。 */
+function isRecoverableDirectoryError(error: unknown): boolean {
+  const code = typeof error === 'object' && error != null && 'code' in error
+    ? (error as { code?: unknown }).code
+    : undefined;
+  return code === 'EACCES' || code === 'EPERM' || code === 'ENOENT';
 }

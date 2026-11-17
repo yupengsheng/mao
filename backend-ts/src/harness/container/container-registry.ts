@@ -1076,6 +1076,8 @@ export class ContainerRegistry {
     const userHomeMount = mounts.find((m) => m.purpose === 'userHome');
     const args = [
       'run', '-d',
+      // docker-init 回收被 reparent 的孤儿/孙进程，避免僵尸耗尽 pids-limit；并转发 SIGTERM。
+      '--init',
       '--name', name,
       '--label', 'mao.runtime=user',
       '--label', `mao.user=${userId}`,
