@@ -243,3 +243,68 @@ describe('MysqlOutboundDeliveryRepository.deleteHistory', () => {
     expect((execute.mock.calls[0] as [string])[0]).toContain('LIMIT 5000');
   });
 });
+
+describe('MysqlOutboundDeliveryRepository 认领恢复与终态 CAS', () => {
+  it('恢复依据 updated_at，而不是不随投递推进的 created_at', async () => {
+    const execute = vi.fn(async () => ({ affectedRows: 1 }));
+    const repo = new MysqlOutboundDeliveryRepository({ execute } as unknown as Db);
+
+    await repo.recoverInterrupted('2026-11-17 11:55:00', '2026-11-17 12:00:00');
+
+    const [sql, params] = execute.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain("status = 'SENDING'");
+    expect(sql).toContain('updated_at < ?');
+    expect(sql).not.toContain('created_at < ?');
+    expect(params).toEqual(['2026-11-17 12:00:00', '2026-11-17 11:55:00']);
+  });
+
+  it('终态和重试回写都带 SENDING CAS，并暴露是否抢到当前归属', async () => {
+    const execute = vi.fn()
+      .mockResolvedValueOnce({ affectedRows: 1 })
+      .mockResolvedValueOnce({ affectedRows: 0 })
+      .mockResolvedValueOnce({ affectedRows: 1 });
+    const repo = new MysqlOutboundDeliveryRepository({ execute } as unknown as Db);
+
+    await expect(repo.markSucceeded(7, 'token-a', 2, 204, '2026-11-17 12:00:00')).resolves.toBe(true);
+    await expect(repo.markFailed(7, 'token-a', 3, 500, 'stale')).resolves.toBe(false);
+    await expect(repo.scheduleRetry(7, 'token-a', 2, 500, 'retry', '2026-11-17 12:01:00')).resolves.toBe(true);
+
+    for (const [sql] of execute.mock.calls) {
+      expect(sql).toContain("WHERE id = ? AND status = 'SENDING'");
+    }
+  });
+
+  it('每次成功认领生成不同 token，并将 token 写入认领 CAS', async () => {
+    const execute = vi.fn(async () => ({ affectedRows: 1 }));
+    const repo = new MysqlOutboundDeliveryRepository({ execute } as unknown as Db);
+
+    const first = await repo.claim(7);
+    const second = await repo.claim(7);
+
+    expect(first).toEqual(expect.any(String));
+    expect(second).toEqual(expect.any(String));
+    expect(second).not.toBe(first);
+    expect((execute.mock.calls[0] as [string, unknown[]])[0]).toContain('claim_token = ?');
+    expect((execute.mock.calls[0] as [string, unknown[]])[1]).toContain(first);
+    expect((execute.mock.calls[1] as [string, unknown[]])[1]).toContain(second);
+  });
+
+  it('恢复与其他 worker 认领交错时，旧 worker 的终态回写被真实 repository CAS 拒绝', async () => {
+    const execute = vi.fn()
+      .mockResolvedValueOnce({ affectedRows: 1 }) // stale SENDING 被恢复
+      .mockResolvedValueOnce({ affectedRows: 1 }) // 另一 worker 重新认领
+      .mockResolvedValueOnce({ affectedRows: 0 }); // 旧 worker 不能覆盖新归属
+    const repo = new MysqlOutboundDeliveryRepository({ execute } as unknown as Db);
+
+    await repo.recoverInterrupted('2026-11-17 11:55:00', '2026-11-17 12:00:00');
+    const claimToken = await repo.claim(7);
+    expect(claimToken).toEqual(expect.any(String));
+    await expect(repo.markSucceeded(7, claimToken!, 2, 204, '2026-11-17 12:00:01')).resolves.toBe(false);
+
+    expect((execute.mock.calls[0] as [string])[0]).toContain('updated_at < ?');
+    expect((execute.mock.calls[0] as [string])[0]).toContain('claim_token = NULL');
+    expect((execute.mock.calls[1] as [string])[0]).toContain("SET status = 'SENDING', claim_token = ?");
+    expect((execute.mock.calls[1] as [string])[0]).toContain("WHERE id = ? AND status = 'PENDING'");
+    expect((execute.mock.calls[2] as [string])[0]).toContain("WHERE id = ? AND status = 'SENDING' AND claim_token = ?");
+  });
+});

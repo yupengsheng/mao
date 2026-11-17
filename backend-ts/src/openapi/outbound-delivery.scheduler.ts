@@ -83,9 +83,9 @@ export class OutboundDeliveryScheduler {
       const due = await this.deps.deliveryRepo.listDue(now, BATCH_SIZE);
       for (const delivery of due) {
         if (delivery.id == null) continue;
-        const claimed = await this.deps.deliveryRepo.claim(delivery.id);
-        if (claimed) {
-          this.execute(() => this.deliver(delivery.id!));
+        const claimToken = await this.deps.deliveryRepo.claim(delivery.id);
+        if (claimToken != null) {
+          this.execute(() => this.deliver(delivery.id!, claimToken));
         }
       }
     } finally {
@@ -93,19 +93,24 @@ export class OutboundDeliveryScheduler {
     }
   }
 
-  private async deliver(deliveryId: number): Promise<void> {
+  private async deliver(deliveryId: number, claimToken: string): Promise<void> {
     try {
       // 发送前重查投递行与订阅（行可能在排队期间被删/订阅停用）
       const row = await this.deps.deliveryRepo.findById(deliveryId);
       if (row == null || row.subscriptionId == null) return;
+      // 排队期间行可能已被恢复并被其他 worker 重新认领；status 单独判断不足以防 ABA，必须同时匹配原 token
+      if (row.status !== 'SENDING' || row.claimToken !== claimToken) {
+        console.warn(`出站投递执行前发现行已被恢复或接管（status=${row.status}, claimToken=${row.claimToken ?? 'null'}）, id=${deliveryId}`);
+        return;
+      }
       const subscription = await this.deps.subscriptionRepo.findById(row.subscriptionId);
       if (subscription == null || Number(subscription.enabled) !== 1 || subscription.secretCipher == null) {
-        await this.deps.deliveryRepo.markFailed(deliveryId, Number(row.attemptCount ?? 0) + 1, null, '订阅不存在或已停用');
+        await this.settleAttempt(deliveryId, '终态回写', () => this.deps.deliveryRepo.markFailed(deliveryId, claimToken, Number(row.attemptCount ?? 0) + 1, null, '订阅不存在或已停用'));
         return;
       }
       const event = row.event;
       if (!isOutboundEvent(event)) {
-        await this.deps.deliveryRepo.markFailed(deliveryId, Number(row.attemptCount ?? 0) + 1, null, '未知事件类型');
+        await this.settleAttempt(deliveryId, '终态回写', () => this.deps.deliveryRepo.markFailed(deliveryId, claimToken, Number(row.attemptCount ?? 0) + 1, null, '未知事件类型'));
         return;
       }
       const attempt = Number(row.attemptCount ?? 0) + 1;
@@ -113,17 +118,17 @@ export class OutboundDeliveryScheduler {
       const payload = this.safeParse(row.payload);
       const result = await this.deps.sender.send(subscription.targetUrl ?? '', secret, event, payload, hmacSignature);
       if (result.success) {
-        await this.deps.deliveryRepo.markSucceeded(deliveryId, attempt, result.httpStatus, formatDateTime(new Date()));
+        await this.settleAttempt(deliveryId, '终态回写', () => this.deps.deliveryRepo.markSucceeded(deliveryId, claimToken, attempt, result.httpStatus, formatDateTime(new Date())));
         return;
       }
       const retryIndex = attempt - 1;
       if (result.retryable && retryIndex < RETRY_DELAY_MINUTES.length) {
         const nextRetryAt = formatDateTime(new Date(Date.now() + RETRY_DELAY_MINUTES[retryIndex] * 60_000));
-        await this.deps.deliveryRepo.scheduleRetry(deliveryId, attempt, result.httpStatus, result.error, nextRetryAt);
+        await this.settleAttempt(deliveryId, '重试回写', () => this.deps.deliveryRepo.scheduleRetry(deliveryId, claimToken, attempt, result.httpStatus, result.error, nextRetryAt));
         return;
       }
-      await this.deps.deliveryRepo.markFailed(deliveryId, attempt, result.httpStatus, result.error);
-      await this.recordFailedAudit(subscription.userId ?? null, subscription.id ?? null, event, subscription.targetUrl ?? null, result.error);
+      const settled = await this.settleAttempt(deliveryId, '终态回写', () => this.deps.deliveryRepo.markFailed(deliveryId, claimToken, attempt, result.httpStatus, result.error));
+      if (settled) await this.recordFailedAudit(subscription.userId ?? null, subscription.id ?? null, event, subscription.targetUrl ?? null, result.error);
     } catch (e) {
       console.error(`出站投递发送异常, id=${deliveryId}`, e);
       // 抛出型失败（secret 解密抛出、发送器前置异常、回写瞬断）与 result 失败同口径收口：
@@ -137,11 +142,11 @@ export class OutboundDeliveryScheduler {
         const retryIndex = attempt - 1;
         if (retryIndex < RETRY_DELAY_MINUTES.length) {
           const nextRetryAt = formatDateTime(new Date(Date.now() + RETRY_DELAY_MINUTES[retryIndex] * 60_000));
-          await this.deps.deliveryRepo.scheduleRetry(deliveryId, attempt, null, error.slice(0, 200), nextRetryAt);
+          await this.settleAttempt(deliveryId, '重试回写', () => this.deps.deliveryRepo.scheduleRetry(deliveryId, claimToken, attempt, null, error.slice(0, 200), nextRetryAt));
           return;
         }
-        await this.deps.deliveryRepo.markFailed(deliveryId, attempt, null, error.slice(0, 200));
-        if (isOutboundEvent(row.event)) {
+        const settled = await this.settleAttempt(deliveryId, '终态回写', () => this.deps.deliveryRepo.markFailed(deliveryId, claimToken, attempt, null, error.slice(0, 200)));
+        if (settled && isOutboundEvent(row.event)) {
           const subscription = await this.deps.subscriptionRepo.findById(row.subscriptionId);
           await this.recordFailedAudit(
             subscription?.userId ?? null,
@@ -155,6 +160,13 @@ export class OutboundDeliveryScheduler {
         console.error(`出站投递异常收口失败, id=${deliveryId}`, fallbackError);
       }
     }
+  }
+
+  /** 终态/重试回写统一收口：repo 层带认领 token CAS，被拒（行已被他方接管）时仅告警，不用过期结果覆盖新归属。 */
+  private async settleAttempt(deliveryId: number, what: string, write: () => Promise<boolean>): Promise<boolean> {
+    const settled = await write();
+    if (!settled) console.warn(`出站投递${what}被 CAS 跳过（行已被他方接管）, id=${deliveryId}`);
+    return settled;
   }
 
   private async recordFailedAudit(userId: number | null, subscriptionId: number | null, event: OutboundEvent, targetUrl: string | null, error: string | null): Promise<void> {

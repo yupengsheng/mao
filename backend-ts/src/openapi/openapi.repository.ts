@@ -1,4 +1,5 @@
 export type { ApiToken, OutboundDelivery, OutboundSubscription, WebhookTrigger } from './types.js';
+import { randomUUID } from 'node:crypto';
 import type { Db } from '../db/db.js';
 import { formatDateTime } from '../common/json.js';
 import type { ApiToken, OutboundDelivery, OutboundSubscription, WebhookTrigger } from './types.js';
@@ -314,42 +315,51 @@ export class MysqlOutboundDeliveryRepository {
     );
   }
 
-  /** 认领：PENDING → SENDING（CAS，防多 worker/重复 tick 重复投递）。 */
-  async claim(id: number): Promise<boolean> {
+  /** 认领：PENDING → SENDING（CAS，防多 worker/重复 tick 重复投递），返回本次唯一认领 token。 */
+  async claim(id: number): Promise<string | null> {
+    const claimToken = randomUUID();
     const result = await this.db.execute(
-      "UPDATE outbound_delivery SET status = 'SENDING' WHERE id = ? AND status = 'PENDING'",
-      [id],
+      "UPDATE outbound_delivery SET status = 'SENDING', claim_token = ? WHERE id = ? AND status = 'PENDING'",
+      [claimToken, id],
     );
-    return result.affectedRows === 1;
+    return result.affectedRows === 1 ? claimToken : null;
   }
 
-  /** SENDING 卡死行恢复（进程重启/发送中断）：超时 cutoff 前的 SENDING 复位回 PENDING。 */
+  /**
+   * SENDING 卡死行恢复（进程重启/发送中断）：最后推进时间早于 cutoff 的 SENDING 复位回 PENDING。
+   * 判据必须是 updated_at（claim/回写时由 ON UPDATE CURRENT_TIMESTAMP 刷新）：若用 created_at（行创建时间，
+   * 不随投递推进），行龄超过 cutoff 的在途重试行会被运行期恢复 tick 误判卡死并复位重发 → 同一事件重复投递。
+   */
   async recoverInterrupted(cutoff: string, now: string): Promise<void> {
     await this.db.execute(
-      "UPDATE outbound_delivery SET status = 'PENDING', next_retry_at = ? WHERE status = 'SENDING' AND created_at < ?",
+      "UPDATE outbound_delivery SET status = 'PENDING', claim_token = NULL, next_retry_at = ? WHERE status = 'SENDING' AND updated_at < ?",
       [now, cutoff],
     );
   }
 
-  async markSucceeded(id: number, attemptCount: number, httpStatus: number | null, now: string): Promise<void> {
-    await this.db.execute(
-      "UPDATE outbound_delivery SET status = 'SUCCEEDED', attempt_count = ?, last_http_status = ?, last_error = NULL, sent_at = ?, next_retry_at = NULL WHERE id = ?",
-      [attemptCount, httpStatus, now, id],
+  /** 终态/重试回写均带认领 token CAS：过期投递不得覆盖恢复后新 worker 的归属。 */
+  async markSucceeded(id: number, claimToken: string, attemptCount: number, httpStatus: number | null, now: string): Promise<boolean> {
+    const result = await this.db.execute(
+      "UPDATE outbound_delivery SET status = 'SUCCEEDED', claim_token = NULL, attempt_count = ?, last_http_status = ?, last_error = NULL, sent_at = ?, next_retry_at = NULL WHERE id = ? AND status = 'SENDING' AND claim_token = ?",
+      [attemptCount, httpStatus, now, id, claimToken],
     );
+    return result.affectedRows === 1;
   }
 
-  async markFailed(id: number, attemptCount: number, httpStatus: number | null, error: string | null): Promise<void> {
-    await this.db.execute(
-      "UPDATE outbound_delivery SET status = 'FAILED', attempt_count = ?, last_http_status = ?, last_error = ?, next_retry_at = NULL WHERE id = ?",
-      [attemptCount, httpStatus, error, id],
+  async markFailed(id: number, claimToken: string, attemptCount: number, httpStatus: number | null, error: string | null): Promise<boolean> {
+    const result = await this.db.execute(
+      "UPDATE outbound_delivery SET status = 'FAILED', claim_token = NULL, attempt_count = ?, last_http_status = ?, last_error = ?, next_retry_at = NULL WHERE id = ? AND status = 'SENDING' AND claim_token = ?",
+      [attemptCount, httpStatus, error, id, claimToken],
     );
+    return result.affectedRows === 1;
   }
 
-  async scheduleRetry(id: number, attemptCount: number, httpStatus: number | null, error: string | null, nextRetryAt: string): Promise<void> {
-    await this.db.execute(
-      "UPDATE outbound_delivery SET status = 'PENDING', attempt_count = ?, last_http_status = ?, last_error = ?, next_retry_at = ? WHERE id = ?",
-      [attemptCount, httpStatus, error, nextRetryAt, id],
+  async scheduleRetry(id: number, claimToken: string, attemptCount: number, httpStatus: number | null, error: string | null, nextRetryAt: string): Promise<boolean> {
+    const result = await this.db.execute(
+      "UPDATE outbound_delivery SET status = 'PENDING', claim_token = NULL, attempt_count = ?, last_http_status = ?, last_error = ?, next_retry_at = ? WHERE id = ? AND status = 'SENDING' AND claim_token = ?",
+      [attemptCount, httpStatus, error, nextRetryAt, id, claimToken],
     );
+    return result.affectedRows === 1;
   }
 
   listBySubscription(subscriptionId: number, limit: number): Promise<OutboundDelivery[]> {

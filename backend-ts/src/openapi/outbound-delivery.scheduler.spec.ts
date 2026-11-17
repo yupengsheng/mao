@@ -18,40 +18,47 @@ function fakeDeliveryRepo(row: DeliveryRow) {
     async listDue(): Promise<OutboundDelivery[]> {
       return row.status === 'PENDING' ? [{ ...row }] : [];
     },
-    async claim(id: number): Promise<boolean> {
-      if (row.id !== id || row.status !== 'PENDING') return false;
+    async claim(id: number): Promise<string | null> {
+      if (row.id !== id || row.status !== 'PENDING') return null;
       row.status = 'SENDING';
-      return true;
+      row.claimToken = 'claim-1';
+      return row.claimToken;
     },
     async findById(id: number): Promise<OutboundDelivery | null> {
       return row.id === id ? { ...row } : null;
     },
     async recoverInterrupted(): Promise<void> {},
-    async scheduleRetry(id: number, attemptCount: number, httpStatus: number | null, error: string | null, nextRetryAt: string): Promise<void> {
+    async scheduleRetry(id: number, claimToken: string, attemptCount: number, httpStatus: number | null, error: string | null, nextRetryAt: string): Promise<boolean> {
       void id;
+      void claimToken;
       calls.scheduleRetry++;
       row.status = 'PENDING';
       row.attemptCount = attemptCount;
       row.lastHttpStatus = httpStatus;
       row.lastError = error;
       row.nextRetryAt = nextRetryAt;
+      return true;
     },
-    async markFailed(id: number, attemptCount: number, httpStatus: number | null, error: string | null): Promise<void> {
+    async markFailed(id: number, claimToken: string, attemptCount: number, httpStatus: number | null, error: string | null): Promise<boolean> {
       void id;
+      void claimToken;
       calls.markFailed++;
       row.status = 'FAILED';
       row.attemptCount = attemptCount;
       row.lastHttpStatus = httpStatus;
       row.lastError = error;
       row.nextRetryAt = null;
+      return true;
     },
-    async markSucceeded(id: number, attemptCount: number, httpStatus: number | null, now: string): Promise<void> {
+    async markSucceeded(id: number, claimToken: string, attemptCount: number, httpStatus: number | null, now: string): Promise<boolean> {
       void id;
+      void claimToken;
       calls.markSucceeded++;
       row.status = 'SUCCEEDED';
       row.attemptCount = attemptCount;
       row.lastHttpStatus = httpStatus;
       row.sentAt = now;
+      return true;
     },
   };
   return { repo, calls };
@@ -77,6 +84,7 @@ function baseRow(): DeliveryRow {
     nextRetryAt: null,
     lastHttpStatus: null,
     lastError: null,
+    claimToken: null,
     createdAt: null,
     sentAt: null,
   };
@@ -156,6 +164,56 @@ describe('OutboundDeliveryScheduler 抛出型失败收口', () => {
     expect(calls.markSucceeded).toBe(1);
     expect(row.status).toBe('SUCCEEDED');
     expect(row.attemptCount).toBe(1);
+    expect(audit.recordDeliveryFailed).not.toHaveBeenCalled();
+  });
+
+  it('发送前再次确认 SENDING，已被恢复或接管的旧执行不发送也不回写', async () => {
+    const row = baseRow();
+    const send = vi.fn(async () => ({ success: true, httpStatus: 200 }));
+    const { scheduler, calls } = makeScheduler(row, { send });
+
+    await (scheduler as unknown as { deliver(id: number, claimToken: string): Promise<void> }).deliver(row.id, 'claim-1');
+
+    expect(send).not.toHaveBeenCalled();
+    expect(calls.markSucceeded).toBe(0);
+    expect(calls.markFailed).toBe(0);
+    expect(row.status).toBe('PENDING');
+  });
+
+  it('发送中的旧 worker 经恢复后不能借新 token 结算，也不能为过期失败写审计', async () => {
+    const state: DeliveryRow = { ...baseRow(), status: 'SENDING', claimToken: 'claim-a' };
+    const audit = { recordDeliveryFailed: vi.fn(async () => undefined) };
+    const deliveryRepo = {
+      findById: vi.fn(async () => ({ ...state })),
+      markFailed: vi.fn(async (_id: number, claimToken: string) => {
+        if (state.status !== 'SENDING' || state.claimToken !== claimToken) return false;
+        state.status = 'FAILED';
+        return true;
+      }),
+      markSucceeded: vi.fn(async () => false),
+      scheduleRetry: vi.fn(async () => false),
+    };
+    const scheduler = new OutboundDeliveryScheduler({
+      deliveryRepo: deliveryRepo as never,
+      subscriptionRepo: { findById: vi.fn(async () => ({ ...SUBSCRIPTION })) } as never,
+      cipher: { decrypt: () => 'secret' } as never,
+      sender: {
+        send: vi.fn(async () => {
+          // A 被恢复为 PENDING 后由 B 重新认领；A 的回调仍只能使用 claim-a。
+          state.status = 'PENDING';
+          state.claimToken = null;
+          state.status = 'SENDING';
+          state.claimToken = 'claim-b';
+          return { success: false, retryable: false, httpStatus: 500, error: '过期 worker 失败' };
+        }),
+      } as never,
+      auditRecorder: audit,
+    });
+
+    await (scheduler as unknown as { deliver(id: number, claimToken: string): Promise<void> }).deliver(1, 'claim-a');
+
+    expect(deliveryRepo.markFailed).toHaveBeenCalledWith(1, 'claim-a', 1, 500, '过期 worker 失败');
+    expect(state).toMatchObject({ status: 'SENDING', claimToken: 'claim-b' });
     expect(audit.recordDeliveryFailed).not.toHaveBeenCalled();
   });
 });

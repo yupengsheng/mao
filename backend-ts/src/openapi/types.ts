@@ -89,7 +89,9 @@ export interface OutboundDelivery {
   nextRetryAt?: string | null;
   lastHttpStatus?: number | null;
   lastError?: string | null;
+  claimToken?: string | null;
   createdAt?: string | null;
+  updatedAt?: string | null;
   sentAt?: string | null;
 }
 
