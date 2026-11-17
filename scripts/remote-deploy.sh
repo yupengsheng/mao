@@ -82,7 +82,7 @@ cd "$ROOT_DIR"
 
 # ---- 前置检查：线上目录脏时拒绝拉取，避免 git pull 中途失败留下半成品 ----
 if [ "$NO_PULL" -eq 0 ]; then
-  dirty="$(git status --porcelain)"
+  dirty="$(git status --porcelain | awk 'substr($0, 4) != "desktop/.env.production"')"
   if [ -n "$dirty" ]; then
     echo "错误：$ROOT_DIR 存在未提交改动，拒绝自动拉取。请先人工处理后重试：" >&2
     printf '%s\n' "$dirty" >&2
@@ -106,7 +106,7 @@ if [ -n "$EXPECT_COMMIT" ] && [ "$HEAD_SHA" != "$EXPECT_COMMIT" ]; then
   exit 1
 fi
 
-if ! git diff --quiet HEAD -- . 2>/dev/null; then
+if ! git diff --quiet HEAD -- . ':(exclude)desktop/.env.production' 2>/dev/null; then
   echo "错误：检出后工作区仍不干净，终止部署。" >&2
   exit 1
 fi

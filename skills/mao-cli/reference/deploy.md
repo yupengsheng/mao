@@ -344,7 +344,7 @@ Flyway 在启动时自动迁移；升级期间勿多实例并发启动后端。�
 
 `.github/workflows/ci.yml` 在 `main` 分支**推送**且全部校验任务（backend / admin / desktop / embed-sdk / agent-cli）通过后，自动登录服务器执行 `scripts/remote-deploy.sh` 完成一次完整部署。校验不通过不会触发部署。
 
-线上动作与人工口径完全一致（`git pull` → 构建三端 → 蓝绿重启），只是由 workflow 代为执行，因此服务器上无需改动现有部署流程。
+线上动作与人工口径完全一致（`git pull` → 构建三端 → 蓝绿重启），只是由 workflow 代为执行，因此服务器上无需改动现有部署流程。workflow 使用 `/tmp/mao-remote-deploy.sh` 传递部署脚本，不会把临时脚本写进 `/opt/mao` 工作区；线上保留的 `desktop/.env.production` 本地配置不会被脏工作区检查阻断或提交覆盖。
 
 ### 配置仓库 Secret
 

@@ -238,13 +238,15 @@ jobs:
           set -euo pipefail
           if ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
              ubuntu@43.142.86.132 'test -d /opt/mao/.git'; then
-            echo "线上已有 /opt/mao git 检出，上传本次部署脚本"
+            echo "线上已有 /opt/mao git 检出，准备临时部署脚本"
+            # 旧版本流程曾把脚本写进仓库，失败重试时会留下未跟踪文件；
+            # 只清理这个已知 CI 临时文件，不触碰生产配置或其它工作区文件。
+            ssh -q -o BatchMode=yes -o StrictHostKeyChecking=yes \
+              ubuntu@43.142.86.132 \
+              'cd /opt/mao && if ! git ls-files --error-unmatch scripts/remote-deploy.sh >/dev/null 2>&1; then rm -f scripts/remote-deploy.sh; fi && rm -f /tmp/mao-remote-deploy.sh'
             scp -q -o BatchMode=yes -o StrictHostKeyChecking=yes \
               scripts/remote-deploy.sh \
               ubuntu@43.142.86.132:/tmp/mao-remote-deploy.sh
-            ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
-              ubuntu@43.142.86.132 \
-              'install -m 755 /tmp/mao-remote-deploy.sh /opt/mao/scripts/remote-deploy.sh && rm -f /tmp/mao-remote-deploy.sh'
             exit 0
           fi
 
@@ -280,7 +282,7 @@ jobs:
           # 拿到的是远端 shell 自身而不是提交号）。
           ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
             ubuntu@43.142.86.132 \
-            "bash /opt/mao/scripts/remote-deploy.sh --ref main --expect-commit '${GITHUB_SHA}'"
+            "bash /tmp/mao-remote-deploy.sh --ref main --expect-commit '${GITHUB_SHA}'"
 
       - name: 部署后健康检查
         run: |
