@@ -97,7 +97,7 @@ private struct NativeChatView: View {
                 NativeTopBar(drawerPresented: $drawerPresented, composerFocused: $composerFocused, configurationPresented: $configurationPresented)
                 Divider()
                 NativeMessageList()
-                NativeComposer(focused: $composerFocused)
+                NativeComposer(focused: $composerFocused, configurationPresented: $configurationPresented)
             }
             .background(Color(uiColor: .systemBackground))
             if drawerPresented {
@@ -502,27 +502,263 @@ private struct NativeMessageBubble: View {
 private struct NativeComposer: View {
     @EnvironmentObject private var store: NativeStore
     @FocusState.Binding var focused: Bool
+    @Binding var configurationPresented: Bool
+
+    private var workspaceTitle: String {
+        switch store.workspaceMode {
+        case "existing":
+            return store.cloudProjectKey.isEmpty ? "已有项目" : store.cloudProjectKey
+        case "git":
+            return "Git 仓库"
+        default:
+            return "新工作区"
+        }
+    }
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            TextEditor(text: $store.composerText)
-                .frame(minHeight: 38, maxHeight: 110)
-                .focused($focused)
-                .font(.body)
-                .padding(.horizontal, 9)
-                .padding(.vertical, 5)
-                .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-            Button { store.sendComposer() } label: {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.system(size: 32))
-                    .foregroundStyle(store.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Color.secondary : Color.accentColor)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .bottom, spacing: 8) {
+                Button { configurationPresented = true } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 32, height: 32)
+                        .background(Color(uiColor: .tertiarySystemBackground), in: Circle())
+                }
+                .frame(width: 44, height: 44)
+                .accessibilityLabel("添加或配置任务")
+                .accessibilityHint("打开任务配置")
+
+                ZStack(alignment: .topLeading) {
+                    if store.composerText.isEmpty {
+                        Text("输入任务…")
+                            .font(.body)
+                            .foregroundStyle(.tertiary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 9)
+                            .allowsHitTesting(false)
+                    }
+                    NativeTextEditor(
+                        text: $store.composerText,
+                        isFocused: Binding(get: { focused }, set: { focused = $0 })
+                    )
+                        .frame(height: store.composerText.isEmpty ? 44 : 112)
+                        .padding(.horizontal, 2)
+                        .padding(.vertical, 2)
+                }
+
+                Button { store.sendComposer() } label: {
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 32, height: 32)
+                        .background(
+                            store.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                ? Color(uiColor: .tertiaryLabel)
+                                : Color.accentColor,
+                            in: Circle()
+                        )
+                }
+                .frame(width: 44, height: 44)
+                .disabled(store.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || store.isSending)
+                .accessibilityLabel("发送消息")
+                .accessibilityHint(store.isSending ? "正在发送" : "发送当前任务")
             }
-            .disabled(store.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || store.isSending)
-            .accessibilityLabel("发送消息")
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+            }
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    NativeComposerMenuChip(
+                        title: store.selectedAgent?.name ?? "Agent",
+                        systemImage: "person.crop.circle",
+                        isLoading: store.agents.isEmpty && store.isLoadingConfiguration
+                    ) {
+                        if store.agents.isEmpty {
+                            Text("暂无可用 Agent")
+                        } else {
+                            ForEach(store.agents) { agent in
+                                Button {
+                                    store.selectAgent(agent)
+                                } label: {
+                                    HStack {
+                                        Text(agent.name)
+                                        if agent.id == store.selectedAgent?.id { Image(systemName: "checkmark") }
+                                    }
+                                }
+                            }
+                        }
+                        Divider()
+                        Button("任务配置…") { configurationPresented = true }
+                    }
+
+                    NativeComposerMenuChip(
+                        title: store.selectedModel?.name ?? "模型",
+                        systemImage: "cpu",
+                        isLoading: store.models.isEmpty && store.isLoadingConfiguration
+                    ) {
+                        if store.models.isEmpty {
+                            Text("暂无可用模型")
+                        } else {
+                            ForEach(store.models) { model in
+                                Button {
+                                    store.selectModel(model)
+                                } label: {
+                                    HStack {
+                                        Text(model.name)
+                                        if model.id == store.selectedModel?.id { Image(systemName: "checkmark") }
+                                    }
+                                }
+                            }
+                        }
+                        Divider()
+                        Button("任务配置…") { configurationPresented = true }
+                    }
+
+                    NativeComposerMenuChip(
+                        title: workspaceTitle,
+                        systemImage: "folder",
+                        isLoading: false
+                    ) {
+                        Button {
+                            store.selectWorkspaceMode("new")
+                        } label: {
+                            HStack {
+                                Text("新工作区")
+                                if store.workspaceMode == "new" { Image(systemName: "checkmark") }
+                            }
+                        }
+                        if !store.cloudProjects.isEmpty {
+                            Divider()
+                            ForEach(store.cloudProjects) { project in
+                                Button {
+                                    store.setCloudProject(project)
+                                } label: {
+                                    HStack {
+                                        Text(project.name)
+                                        if store.cloudProjectKey == project.name { Image(systemName: "checkmark") }
+                                    }
+                                }
+                            }
+                        }
+                        Divider()
+                        Button("Git 仓库或更多设置…") { configurationPresented = true }
+                    }
+                }
+                .padding(.horizontal, 2)
+                .padding(.vertical, 1)
+            }
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(.thinMaterial)
+        .padding(.top, 6)
+        .padding(.bottom, 8)
+        .background(Color(uiColor: .systemBackground))
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Color.primary.opacity(0.05))
+                .frame(height: 1)
+        }
+    }
+}
+
+private struct NativeComposerMenuChip<Content: View>: View {
+    let title: String
+    let systemImage: String
+    let isLoading: Bool
+    @ViewBuilder let content: () -> Content
+
+    init(title: String, systemImage: String, isLoading: Bool, @ViewBuilder content: @escaping () -> Content) {
+        self.title = title
+        self.systemImage = systemImage
+        self.isLoading = isLoading
+        self.content = content
+    }
+
+    var body: some View {
+        Menu { content() } label: {
+            HStack(spacing: 5) {
+                Image(systemName: systemImage)
+                Text(isLoading ? "加载中…" : title)
+                    .lineLimit(1)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .bold))
+            }
+            .font(.caption.weight(.medium))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 10)
+            .frame(minHeight: 32)
+            .background(Color(uiColor: .tertiarySystemBackground), in: Capsule())
+            .overlay {
+                Capsule().stroke(Color.primary.opacity(0.06), lineWidth: 1)
+            }
+        }
+        .buttonStyle(.plain)
+        .padding(.vertical, 6)
+        .frame(minHeight: 44)
+        .contentShape(Capsule())
+        .accessibilityLabel(title)
+        .accessibilityHint("点按以切换配置")
+    }
+}
+
+private struct NativeTextEditor: UIViewRepresentable {
+    @Binding var text: String
+    @Binding var isFocused: Bool
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    func makeUIView(context: Context) -> UITextView {
+        let view = UITextView()
+        view.delegate = context.coordinator
+        view.backgroundColor = .clear
+        view.isOpaque = false
+        view.font = UIFont.preferredFont(forTextStyle: .body)
+        view.textColor = .label
+        view.tintColor = .systemBlue
+        view.textContainerInset = .zero
+        view.textContainer.lineFragmentPadding = 0
+        view.showsVerticalScrollIndicator = false
+        view.alwaysBounceVertical = false
+        view.returnKeyType = .default
+        return view
+    }
+
+    func updateUIView(_ uiView: UITextView, context: Context) {
+        if uiView.text != text {
+            uiView.text = text
+        }
+        if isFocused && !uiView.isFirstResponder {
+            uiView.becomeFirstResponder()
+        } else if !isFocused && uiView.isFirstResponder {
+            uiView.resignFirstResponder()
+        }
+    }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        private var parent: NativeTextEditor
+
+        init(_ parent: NativeTextEditor) {
+            self.parent = parent
+        }
+
+        func textViewDidChange(_ textView: UITextView) {
+            parent.text = textView.text
+        }
+
+        func textViewDidBeginEditing(_ textView: UITextView) {
+            parent.isFocused = true
+        }
+
+        func textViewDidEndEditing(_ textView: UITextView) {
+            parent.isFocused = false
+        }
     }
 }
 

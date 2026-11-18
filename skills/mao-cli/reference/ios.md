@@ -1,6 +1,6 @@
 # iOS APP
 
-Mao iOS 客户端使用 **SwiftUI 原生界面**，Bundle ID `cn.yupengsheng.mao.app`，显示名 `Mao`。核心聊天页面不再加载远程 WKWebView，直接通过原生 URLSession 调用生产 API 与 WebSocket。当前原生版本覆盖登录、Keychain 令牌、历史会话抽屉与折叠、会话切换、智能体与模型切换、CLOUD 工作区选择、消息历史、发送消息和流式回复，统一使用 CLOUD 会话。
+Mao iOS 客户端使用 **SwiftUI 原生界面**，Bundle ID `cn.yupengsheng.mao.app`，显示名 `Mao`。核心聊天页面不再加载远程 WKWebView，直接通过原生 URLSession 调用生产 API 与 WebSocket。当前原生版本覆盖登录、Keychain 令牌、历史会话抽屉与折叠、会话切换、智能体与模型切换、CLOUD 工作区选择、ChatGPT 式输入区快捷配置、消息历史、发送消息和流式回复，统一使用 CLOUD 会话。
 
 ## 目录
 
@@ -29,7 +29,7 @@ Mao iOS 客户端使用 **SwiftUI 原生界面**，Bundle ID `cn.yupengsheng.mao
 ```bash
 cd ios
 export MAO_IOS_TEAM_ID=你的TeamID
-bash build-ipa.sh --version 1.0.20 --export-method app-store
+bash build-ipa.sh --version 1.0.22 --export-method app-store
 ```
 
 可选参数：
