@@ -6,11 +6,13 @@ set -euo pipefail
 : "${MAO_BLUE_GREEN_PORT_A:=9080}"
 : "${MAO_BLUE_GREEN_PORT_B:=9081}"
 : "${MAO_RUNTIME_DIR:=/opt/mao-data/runtime}"
+: "${MAO_NGINX_SITES_DIR:=/etc/nginx/sites-enabled}"
 : "${MAO_NGINX_UPSTREAM_CONF:=/etc/nginx/conf.d/mao-upstream.conf}"
 : "${MAO_BLUE_GREEN_DRAIN_SEC:=60}"
 : "${MAO_BLUE_GREEN_HEALTH_RETRIES:=60}"
 : "${MAO_BLUE_GREEN_HEALTH_INTERVAL_SEC:=1}"
 : "${MAO_BLUE_GREEN_STALE_LOCK_SEC:=600}"
+: "${MAO_BACKEND_LEGACY_SERVICE:=mao.service}"
 
 bg_active_port_file() {
   echo "${MAO_RUNTIME_DIR}/active-backend-port"
@@ -35,17 +37,172 @@ bg_ensure_runtime_dir() {
   mkdir -p "${MAO_RUNTIME_DIR}"
 }
 
+bg_backend_run_user() {
+  if [ -n "${MAO_BACKEND_RUN_USER:-}" ]; then
+    echo "${MAO_BACKEND_RUN_USER}"
+  elif id mao >/dev/null 2>&1; then
+    # 生产数据目录（share/uploads/workspace）属于 mao；部署账号通常只负责构建和发布。
+    echo "mao"
+  else
+    id -un
+  fi
+}
+
+bg_as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  else
+    sudo -n "$@"
+  fi
+}
+
+# kill -0 对其他用户的进程会因 EPERM 返回失败，不能用来判断进程是否仍存在。
+bg_process_running() {
+  local pid="$1"
+  [ -n "$pid" ] || return 1
+  ps -p "$pid" -o pid= >/dev/null 2>&1 || bg_as_root ps -p "$pid" -o pid= >/dev/null 2>&1
+}
+
+bg_process_pgid() {
+  local pid="$1"
+  local pgid=""
+  [ -n "$pid" ] || return 1
+  pgid="$(ps -p "$pid" -o pgid= 2>/dev/null | tr -d '[:space:]' || true)"
+  if [ -z "$pgid" ]; then
+    pgid="$(bg_as_root ps -p "$pid" -o pgid= 2>/dev/null | tr -d '[:space:]' || true)"
+  fi
+  [ -n "$pgid" ] && printf '%s\n' "$pgid"
+}
+
 bg_port_in_use() {
   local port="$1"
   if command -v lsof >/dev/null 2>&1; then
-    lsof -ti ":${port}" >/dev/null 2>&1
-    return $?
+    if lsof -tiTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1; then
+      return 0
+    fi
   fi
   if command -v ss >/dev/null 2>&1; then
-    ss -tln | grep -q ":${port} "
+    # Ubuntu 的 hidepid / 受限 /proc 下，普通部署用户运行 lsof 可能什么都看不到，
+    # 但 ss 仍能读取监听表。不能再把 lsof 的非零退出当成“端口空闲”。
+    ss -H -ltn 2>/dev/null | grep -Eq ":${port}[[:space:]]"
+    return $?
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -ltn 2>/dev/null | grep -Eq ":${port}[[:space:]]"
     return $?
   fi
   return 1
+}
+
+bg_listener_pids() {
+  local port="$1"
+  local pids="" output=""
+  if command -v lsof >/dev/null 2>&1; then
+    pids="$(lsof -tiTCP:"${port}" -sTCP:LISTEN 2>/dev/null || true)"
+  fi
+  if [ -z "$pids" ] && command -v ss >/dev/null 2>&1; then
+    output="$(ss -H -ltnp 2>/dev/null | grep -E ":${port}[[:space:]]" || true)"
+    pids="$(printf '%s\n' "$output" | grep -o 'pid=[0-9][0-9]*' 2>/dev/null | cut -d= -f2 || true)"
+    if [ -z "$pids" ]; then
+      output="$(bg_as_root ss -H -ltnp 2>/dev/null | grep -E ":${port}[[:space:]]" || true)"
+      pids="$(printf '%s\n' "$output" | grep -o 'pid=[0-9][0-9]*' 2>/dev/null | cut -d= -f2 || true)"
+    fi
+  fi
+  printf '%s\n' "$pids" | awk 'NF && !seen[$0]++'
+}
+
+bg_pid_matches_backend() {
+  local pid="$1"
+  [ -n "$pid" ] || return 1
+  local args
+  args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+  if [ -z "$args" ]; then
+    args="$(bg_as_root ps -p "$pid" -o args= 2>/dev/null || true)"
+  fi
+  case "$args" in
+    *"dist/main.js"*|*"src/main.ts"*|*"mao-server-ts"*) return 0 ;;
+  esac
+  return 1
+}
+
+bg_terminate_process() {
+  local pid="$1"
+  [ -n "$pid" ] || return 1
+  bg_pid_matches_backend "$pid" || return 1
+  if ! bg_process_running "$pid"; then
+    return 0
+  fi
+  local pgid
+  pgid="$(bg_process_pgid "$pid" || true)"
+  # 只有 PGID == PID 时才整组停止：该组由 setsid 专为本实例创建，可同时收掉
+  # sudo/nohup 启动器和 Node 子进程。否则只杀 PID，绝不影响其他进程组。
+  if [ "$pgid" = "$pid" ]; then
+    bg_as_root kill -TERM -- "-${pid}" 2>/dev/null || true
+  else
+    bg_as_root kill -TERM "$pid" 2>/dev/null || true
+  fi
+  local i
+  for i in $(seq 1 50); do
+    if ! bg_process_running "$pid"; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  if [ "$pgid" = "$pid" ]; then
+    bg_as_root kill -KILL -- "-${pid}" 2>/dev/null || true
+  else
+    bg_as_root kill -KILL "$pid" 2>/dev/null || true
+  fi
+  return 0
+}
+
+bg_stop_legacy_service_if_matches() {
+  local pid="$1"
+  local service="${MAO_BACKEND_LEGACY_SERVICE:-}"
+  [ -n "$pid" ] && [ -n "$service" ] || return 1
+  command -v systemctl >/dev/null 2>&1 || return 1
+  local main_pid
+  main_pid="$(bg_as_root systemctl show "$service" -p MainPID --value 2>/dev/null || true)"
+  [ -n "$main_pid" ] && [ "$main_pid" != "0" ] && [ "$main_pid" = "$pid" ] || return 1
+  echo "Stopping and disabling legacy systemd service ${service} (PID: ${pid})..."
+  bg_as_root systemctl stop "$service" || return 1
+  bg_as_root systemctl disable "$service" >/dev/null 2>&1 || true
+  return 0
+}
+
+bg_validate_backend_runtime() {
+  local app_dir="$1"
+  local env_file="${app_dir}/.env"
+  local run_user current_user
+  run_user="$(bg_backend_run_user)"
+  current_user="$(id -un)"
+  if ! id "$run_user" >/dev/null 2>&1; then
+    echo "错误：后端运行用户 ${run_user} 不存在。" >&2
+    return 1
+  fi
+  if [ ! -f "$env_file" ]; then
+    echo "错误：后端环境文件不存在：${env_file}。" >&2
+    echo "     请先按 DEPLOY.md 创建 .env，再执行部署。" >&2
+    return 1
+  fi
+  if [ ! -r "$env_file" ]; then
+    echo "错误：当前部署用户 ${current_user} 无法读取 ${env_file}。" >&2
+    echo "     请执行 sudo chown ${current_user}:${run_user} ${env_file} && sudo chmod 640 ${env_file}" >&2
+    return 1
+  fi
+  if [ "$run_user" != "$current_user" ]; then
+    if ! sudo -n -u "$run_user" true >/dev/null 2>&1; then
+      echo "错误：当前用户 ${current_user} 无法免密切换到后端运行用户 ${run_user}。" >&2
+      echo "     请为部署用户配置：sudo -n -u ${run_user} <command>，或设置 MAO_BACKEND_RUN_USER。" >&2
+      return 1
+    fi
+    if ! sudo -n -u "$run_user" test -r "$env_file"; then
+      echo "错误：后端运行用户 ${run_user} 无法读取 ${env_file}。" >&2
+      echo "     请将 .env 调整为部署用户属主、${run_user} 属组并设 640：" >&2
+      echo "     sudo chown ${current_user}:${run_user} ${env_file} && sudo chmod 640 ${env_file}" >&2
+      return 1
+    fi
+  fi
 }
 
 bg_read_active_port() {
@@ -116,23 +273,31 @@ bg_stop_port() {
   local port="$2"
   local pid_file
   pid_file="$(bg_pid_file_for_port "$app_dir" "$port")"
+  local pids=""
   if [ -f "$pid_file" ]; then
     local pid
-    pid="$(cat "$pid_file")"
-    if kill -0 "$pid" 2>/dev/null; then
-      echo "Stopping mao-server-ts on port ${port} (PID: ${pid})..."
-      kill "$pid" 2>/dev/null || true
-      sleep 2
-      kill -9 "$pid" 2>/dev/null || true
-    fi
-    rm -f "$pid_file"
+    pid="$(tr -d '[:space:]' < "$pid_file")"
+    [ -n "$pid" ] && pids="${pid}"
   fi
-  if bg_port_in_use "$port"; then
-    if command -v lsof >/dev/null 2>&1; then
-      lsof -ti ":${port}" | xargs kill 2>/dev/null || true
-      sleep 1
-      lsof -ti ":${port}" | xargs kill -9 2>/dev/null || true
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    pids="${pids} ${pid}"
+  done < <(bg_listener_pids "$port")
+
+  for pid in $(printf '%s\n' "$pids" | tr ' ' '\n' | awk 'NF && !seen[$0]++'); do
+    if bg_stop_legacy_service_if_matches "$pid"; then
+      continue
     fi
+    if bg_pid_matches_backend "$pid"; then
+      echo "Stopping mao-server-ts on port ${port} (PID: ${pid})..."
+      bg_terminate_process "$pid" || true
+    fi
+  done
+  rm -f "$pid_file"
+
+  if bg_port_in_use "$port"; then
+    echo "错误：端口 ${port} 仍被占用，无法安全停止后端。" >&2
+    return 1
   fi
 }
 
@@ -154,65 +319,140 @@ bg_start_port() {
   local port="$2"
   local log_dir="$3"
   local log_file="${log_dir}/backend-ts-${port}.log"
+  local env_file="${app_dir}/.env"
   local pid_file
   pid_file="$(bg_pid_file_for_port "$app_dir" "$port")"
 
-  if [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
-    echo "Backend already running on port ${port} (PID: $(cat "$pid_file"))"
-    return 0
+  if [ -f "$pid_file" ]; then
+    local existing_pid
+    existing_pid="$(tr -d '[:space:]' < "$pid_file")"
+    if [ -n "$existing_pid" ] && bg_process_running "$existing_pid"; then
+      if bg_pid_matches_backend "$existing_pid"; then
+        echo "Backend already running on port ${port} (PID: ${existing_pid})"
+        return 0
+      fi
+      echo "错误：PID 文件 ${pid_file} 指向的进程 ${existing_pid} 不是 Mao 后端，拒绝覆盖。" >&2
+      echo "     请人工确认后删除该 PID 文件再重试。" >&2
+      return 1
+    fi
   fi
 
-  echo "Starting mao-server-ts on port ${port}..."
+  local run_user current_user
+  bg_validate_backend_runtime "$app_dir" || return 1
+  run_user="$(bg_backend_run_user)"
+  current_user="$(id -un)"
+
+  echo "Starting mao-server-ts on port ${port} as ${run_user}..."
   bg_rotate_log "$log_file"
   mkdir -p "$log_dir"
-  cd "$app_dir"
-  export MAO_TS_PORT="$port"
-  if [ -f dist/main.js ]; then
-    setsid nohup node dist/main.js >> "$log_file" 2>&1 </dev/null &
+  local entry_script='if [ -f dist/main.js ]; then exec node dist/main.js; else exec npx tsx src/main.ts; fi'
+  local launch_cmd=(bash -c "umask 0027; cd \"\$1\" || exit 1; set -a; if [ -f \"\$2\" ]; then . \"\$2\"; fi; set +a; export MAO_TS_PORT=\"\$3\"; ${entry_script}" _ "$app_dir" "$env_file" "$port")
+  local launcher_pid
+  if [ "$run_user" = "$current_user" ]; then
+    setsid nohup "${launch_cmd[@]}" >> "$log_file" 2>&1 </dev/null &
   else
-    setsid nohup npx tsx src/main.ts >> "$log_file" 2>&1 </dev/null &
+    setsid nohup sudo -n -H -u "$run_user" "${launch_cmd[@]}" >> "$log_file" 2>&1 </dev/null &
   fi
-  echo $! > "$pid_file"
+  launcher_pid=$!
+  echo "$launcher_pid" > "$pid_file"
   disown 2>/dev/null || true
-  echo "Started on port ${port} (PID: $(cat "$pid_file"))"
+  echo "Started on port ${port} (PID: ${launcher_pid})"
 }
 
 bg_wait_healthy() {
-  local port="$1"
-  local i code
+  local app_dir="$1"
+  local port="$2"
+  local log_dir="$3"
+  local pid_file log_file i code
+  pid_file="$(bg_pid_file_for_port "$app_dir" "$port")"
+  log_file="${log_dir}/backend-ts-${port}.log"
   for i in $(seq 1 "$MAO_BLUE_GREEN_HEALTH_RETRIES"); do
-    code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/api/swagger-ui.html" 2>/dev/null || echo 000)
-    if [ "$code" = "200" ] || [ "$code" = "301" ] || [ "$code" = "302" ]; then
+    if [ -f "$pid_file" ]; then
+      local pid
+      pid="$(tr -d '[:space:]' < "$pid_file")"
+      if [ -n "$pid" ] && ! bg_process_running "$pid"; then
+        echo "错误：端口 ${port} 的后端进程在健康检查前退出（PID: ${pid}）。" >&2
+        bg_log_tail "$log_file"
+        return 1
+      fi
+    fi
+    code=$(curl --max-time 3 -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/api/v1/health" 2>/dev/null || true)
+    [ -n "$code" ] || code=000
+    if [ "$code" = "200" ]; then
       echo "Health check passed on port ${port} (HTTP ${code})"
       return 0
     fi
     sleep "$MAO_BLUE_GREEN_HEALTH_INTERVAL_SEC"
   done
   echo "Health check failed on port ${port} after ${MAO_BLUE_GREEN_HEALTH_RETRIES} attempts" >&2
+  bg_log_tail "$log_file"
   return 1
+}
+
+bg_log_tail() {
+  local log_file="$1"
+  if [ -f "$log_file" ]; then
+    echo "---- ${log_file} (last 40 lines) ----" >&2
+    tail -n 40 "$log_file" >&2 || true
+    echo "---- end ${log_file} ----" >&2
+  fi
+}
+
+bg_validate_nginx_upstream() {
+  command -v nginx >/dev/null 2>&1 || return 0
+  local sites_dir="${MAO_NGINX_SITES_DIR}"
+  if [ ! -d "$sites_dir" ]; then
+    echo "错误：Nginx sites 目录不存在：${sites_dir}，无法切换蓝绿流量。" >&2
+    return 1
+  fi
+  if grep -RqsE 'proxy_pass[[:space:]]+http://(127\.0\.0\.1|localhost):[0-9]+([;[:space:]]|$)' "$sites_dir"; then
+    echo "错误：${sites_dir} 仍有硬编码回环端口的 proxy_pass。" >&2
+    echo "     蓝绿切换必须改用 http://mao_backend，否则 upstream 文件更新不会真正切流。" >&2
+    echo "     请先把站点配置的两处 proxy_pass 改为 http://mao_backend，并执行 nginx -t。" >&2
+    return 1
+  fi
+  if ! grep -RqsE 'proxy_pass[[:space:]]+http://mao_backend([;[:space:]]|$)' "$sites_dir"; then
+    echo "错误：${sites_dir} 未找到 proxy_pass http://mao_backend。" >&2
+    echo "     请按 DEPLOY.md 的 Nginx upstream 配置接入后再部署。" >&2
+    return 1
+  fi
+  return 0
 }
 
 bg_switch_nginx_upstream() {
   local port="$1"
+  bg_validate_nginx_upstream || return 1
   if [ ! -d "$(dirname "$MAO_NGINX_UPSTREAM_CONF")" ]; then
-    echo "WARN: nginx conf dir missing, skip upstream switch (port ${port})"
-    return 0
+    echo "错误：Nginx conf 目录不存在：$(dirname "$MAO_NGINX_UPSTREAM_CONF")" >&2
+    return 1
   fi
-  local tmp="${MAO_NGINX_UPSTREAM_CONF}.tmp.$$"
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/mao-upstream.XXXXXX")"
+  chmod 644 "$tmp"
   cat > "$tmp" <<EOF
 upstream mao_backend {
     server 127.0.0.1:${port};
 }
 EOF
-  if [ "$(id -u)" -eq 0 ]; then
-    mv "$tmp" "$MAO_NGINX_UPSTREAM_CONF"
-    nginx -t
-    systemctl reload nginx
-  else
-    sudo mv "$tmp" "$MAO_NGINX_UPSTREAM_CONF"
-    sudo nginx -t
-    sudo systemctl reload nginx
+  local backup=""
+  if [ -f "$MAO_NGINX_UPSTREAM_CONF" ]; then
+    backup="$(mktemp "${TMPDIR:-/tmp}/mao-upstream-backup.XXXXXX")"
+    bg_as_root cp -p "$MAO_NGINX_UPSTREAM_CONF" "$backup"
   fi
+  if ! bg_as_root mv "$tmp" "$MAO_NGINX_UPSTREAM_CONF" || ! bg_as_root nginx -t || ! bg_as_root systemctl reload nginx; then
+    if [ -n "$backup" ]; then
+      bg_as_root cp -p "$backup" "$MAO_NGINX_UPSTREAM_CONF" 2>/dev/null || true
+    else
+      bg_as_root rm -f "$MAO_NGINX_UPSTREAM_CONF" 2>/dev/null || true
+    fi
+    bg_as_root nginx -t >/dev/null 2>&1 || true
+    bg_as_root systemctl reload nginx >/dev/null 2>&1 || true
+    rm -f "$tmp" 2>/dev/null || true
+    bg_as_root rm -f "$backup" 2>/dev/null || true
+    echo "错误：Nginx upstream 写入、校验或重载失败，已回滚。" >&2
+    return 1
+  fi
+  bg_as_root rm -f "$backup" 2>/dev/null || true
   echo "Nginx upstream switched to port ${port}"
 }
 
@@ -319,6 +559,8 @@ bg_deploy() {
   BG_LIB_PATH="${BG_LIB_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/blue-green.sh}"
   bg_ensure_runtime_dir
   bg_clear_stale_deploy_lock
+  bg_validate_backend_runtime "$app_dir" || exit 1
+  bg_validate_nginx_upstream || exit 1
 
   local flock_file="${MAO_RUNTIME_DIR}/deploy.flock"
   if [ ! -e "$flock_file" ] && [ ! -w "$MAO_RUNTIME_DIR" ]; then
@@ -373,21 +615,28 @@ bg_deploy() {
     # 结果把流量切到运行旧代码的实例，CI 全绿但线上接口仍是旧版本。
     if bg_port_in_use "$new_port"; then
       echo "Stale instance detected on idle port ${new_port}; stopping before start"
-      bg_stop_port "$app_dir" "$new_port"
+      if ! bg_stop_port "$app_dir" "$new_port"; then
+        bg_write_deploy_lock "$started_at" "$current_port" "$new_port" "failed"
+        exit 1
+      fi
       if bg_port_in_use "$new_port"; then
         echo "错误：空闲端口 ${new_port} 仍被占用，终止部署以免切到旧实例。" >&2
         bg_write_deploy_lock "$started_at" "$current_port" "$new_port" "failed"
         exit 1
       fi
     fi
-    bg_start_port "$app_dir" "$new_port" "$log_dir"
-    if ! bg_wait_healthy "$new_port"; then
-      bg_stop_port "$app_dir" "$new_port"
+    if ! bg_start_port "$app_dir" "$new_port" "$log_dir"; then
+      bg_stop_port "$app_dir" "$new_port" || true
+      bg_write_deploy_lock "$started_at" "$current_port" "$new_port" "failed"
+      exit 1
+    fi
+    if ! bg_wait_healthy "$app_dir" "$new_port" "$log_dir"; then
+      bg_stop_port "$app_dir" "$new_port" || true
       bg_write_deploy_lock "$started_at" "$current_port" "$new_port" "failed"
       exit 1
     fi
     bg_switch_nginx_upstream "$new_port" || {
-      bg_stop_port "$app_dir" "$new_port"
+      bg_stop_port "$app_dir" "$new_port" || true
       bg_write_deploy_lock "$started_at" "$current_port" "$new_port" "failed"
       exit 1
     }
@@ -399,15 +648,26 @@ bg_deploy() {
     echo "No backend listening on ${current_port}; starting fresh on ${current_port}"
     if bg_port_in_use "$new_port"; then
       echo "Stopping orphan instance on alternate port ${new_port} (active port ${current_port} was down)"
-      bg_stop_port "$app_dir" "$new_port"
+      if ! bg_stop_port "$app_dir" "$new_port"; then
+        bg_write_deploy_lock "$started_at" "$current_port" "$current_port" "failed"
+        exit 1
+      fi
     fi
-    bg_start_port "$app_dir" "$current_port" "$log_dir"
-    if ! bg_wait_healthy "$current_port"; then
-      bg_stop_port "$app_dir" "$current_port"
+    if ! bg_start_port "$app_dir" "$current_port" "$log_dir"; then
+      bg_stop_port "$app_dir" "$current_port" || true
       bg_write_deploy_lock "$started_at" "$current_port" "$current_port" "failed"
       exit 1
     fi
-    bg_switch_nginx_upstream "$current_port" || true
+    if ! bg_wait_healthy "$app_dir" "$current_port" "$log_dir"; then
+      bg_stop_port "$app_dir" "$current_port" || true
+      bg_write_deploy_lock "$started_at" "$current_port" "$current_port" "failed"
+      exit 1
+    fi
+    bg_switch_nginx_upstream "$current_port" || {
+      bg_stop_port "$app_dir" "$current_port" || true
+      bg_write_deploy_lock "$started_at" "$current_port" "$current_port" "failed"
+      exit 1
+    }
     bg_write_active_port "$current_port"
     bg_write_deploy_lock "$started_at" "$current_port" "$current_port" "started"
     echo "Backend started on port ${current_port}"

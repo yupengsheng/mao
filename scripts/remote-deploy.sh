@@ -169,6 +169,19 @@ if ! git diff --quiet HEAD -- . ':(exclude)desktop/.env.production' 2>/dev/null;
   exit 1
 fi
 
+# ---- 前置检查：后端运行用户、.env 可读性与 Nginx 切流配置 ----
+# 这些条件原本到 desktop/admin 发布后、后端蓝绿阶段才暴露；失败会留下
+# 「前端新、后端旧」的混合版本。部署新代码后、构建任何前端之前统一校验。
+BG_LIB_PATH="$ROOT_DIR/scripts/lib/blue-green.sh"
+if [ ! -f "$BG_LIB_PATH" ]; then
+  echo "错误：蓝绿部署库不存在：${BG_LIB_PATH}" >&2
+  exit 1
+fi
+# shellcheck source=/dev/null
+source "$BG_LIB_PATH"
+bg_validate_backend_runtime "$ROOT_DIR/backend-ts" || exit 1
+bg_validate_nginx_upstream || exit 1
+
 # ---- 依赖安装：仅在相对上次部署有依赖变化时重装 ----
 # node_modules 常驻线上，全量 npm ci 每次部署要数分钟。用标记文件记录上次部署的提交，
 # 只在该区间内依赖清单变化时才重装，避免每次部署都跑完整安装。

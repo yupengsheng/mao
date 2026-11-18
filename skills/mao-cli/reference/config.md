@@ -74,6 +74,7 @@
 | `MAO_RUNTIME_IDENTITY` | 否 | 群聊运行身份：`execution`（默认，执行期资源跟随本次发言者）/ `owner`（应急回退，跟随会话归属）。影响技能、文件、容器、终端、CLI、依赖与记忆；列表权限、审批、计费与预算不受影响。非法值告警并回落到 `execution` |
 | `MAO_CONTAINER_*` | 否 | 容器模式参数：`MAO_CONTAINER_IDLE_MINUTES` / `MAO_CONTAINER_MAX_LIFETIME_HOURS` / `MAO_CONTAINER_MEMORY_MB` / `MAO_CONTAINER_CPUS` / `MAO_CONTAINER_PIDS_LIMIT` / `MAO_CONTAINER_IMAGE` / `MAO_CONTAINER_NETWORK` / `MAO_CONTAINER_CHANNEL_DIR` / `MAO_CONTAINER_DIST_DIR` / `MAO_CONTAINER_DEPS_DIR` / `MAO_CONTAINER_TMP_DIR`（默认 `/opt/mao-data/tmp`，按 `{tmpDir}/{userId}` 挂到容器 `/tmp`） / `MAO_CONTAINER_TMP_RETENTION_DAYS`（默认 7） / `MAO_CONTAINER_START_TIMEOUT_MS` |
 | `MAO_BLUE_GREEN_DRAIN_SEC` | 否 | 蓝绿切换后停旧实例延迟，默认 60s |
+| `MAO_BACKEND_RUN_USER` | 否 | 蓝绿部署启动后端所用用户；检测到 `mao` 用户时默认 `mao`，否则跟随当前部署用户。生产数据目录属于 `mao`，部署账号需可免密切换到该用户 |
 
 ### 群聊运行身份（0.0.482）
 

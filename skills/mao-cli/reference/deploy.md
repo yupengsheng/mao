@@ -143,10 +143,24 @@ chmod +x /opt/mao/backend-ts/restart.sh
 
 状态文件在 `MAO_RUNTIME_DIR`：`active-backend-port`、`deploy.lock`、`deploy.flock`。
 
+### 蓝绿运行身份与切流前置检查
+
+生产数据目录属于 `mao`，部署账号 `ubuntu` 只负责拉取、构建和发布。蓝绿脚本默认用 `sudo -n -H -u mao` 启动后端；需让部署账号与运行用户都能读取 `.env`，但不要让 `ubuntu` 拥有或递归改写 `/opt/mao-data/share`：
+
+```bash
+sudo chown ubuntu:mao /opt/mao/backend-ts/.env
+sudo chmod 640 /opt/mao/backend-ts/.env
+sudo -n -u mao test -r /opt/mao/backend-ts/.env
+```
+
+如运行用户不是 `mao`，可在 `backend-ts/.env` 设置 `MAO_BACKEND_RUN_USER=<用户名>`；部署账号仍需可免密切换到该用户。启动失败会输出 `backend-ts-<port>.log` 尾部并非零退出，不会把旧实例的 200 当成新实例健康。
+
+蓝绿切流要求 `/etc/nginx/sites-enabled/` 中所有 `/api/`、`/api/ws/` location 都引用 upstream，不能硬编码 `127.0.0.1:9080` 或 `localhost:9080`。`restart.sh` 只更新 `/etc/nginx/conf.d/mao-upstream.conf`，验证方式见下节。
+
 验证：
 
 ```bash
-curl -s -o /dev/null -w "%{http_code}\n" http://localhost:9080/api/swagger-ui.html
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:9080/api/v1/health
 cat /opt/mao-data/runtime/active-backend-port
 tail -50 /opt/mao/backend-ts/logs/backend-ts-*.log
 ```
@@ -175,6 +189,8 @@ upstream mao_backend {
 ```
 
 9080/9081 仅本机监听；对外经 Nginx 443/80。一份 `server` 同时托管桌面 Web 与管理后台。
+
+**切流硬性要求**：站点配置里的 `/api/` 与 `/api/ws/` 必须使用 `proxy_pass http://mao_backend;`。若仍写死 `proxy_pass http://127.0.0.1:9080;`，蓝绿脚本更新 upstream 后实际流量不会切换，现会在部署前直接拒绝并提示修正。
 
 **管理后台 location 必须原样使用下面这一段**（仓库 `scripts/nginx/mao-admin-locations.conf`）。不要 `rewrite ^/admin/(.*)$ /$1`：`/admin/` 会被写成 `/`，`try_files` 内部跳转进桌面端 `location /`，页面标题变成 `Mao`、管理后台白屏；`/admin/login` 却可能正常。也不要把 SPA fallback 写成 URI `/index.html` 或 `/admin/index.html`，改用 named location `@admin`。`^~ /admin` 必须写在桌面端后缀匹配和 `location /` **之前**。
 
@@ -355,7 +371,7 @@ Flyway 在启动时自动迁移；升级期间勿多实例并发启动后端。�
 
 **服务器侧准备**：把 `MAO_DEPLOY_SSH_KEY` 对应的**公钥**加入 `ubuntu@43.142.86.132` 的 `~/.ssh/authorized_keys`。若该用户对 `/opt/mao` 无写权限，需把它加入 `/opt/mao` 属主/属组，或配置**免密 sudo**（`remote-deploy.sh` 检测到无写权限时会自动用 `sudo -n` 重跑自身）。
 
-部署用户还必须满足两项权限，`remote-deploy.sh` 会在拉取代码前统一校验并直接报错退出：
+部署用户还必须满足三项权限，`remote-deploy.sh` 会在拉取代码前统一校验并直接报错退出：
 
 ```bash
 # 1) 能访问 Docker（运行时镜像对齐 + 蓝绿重启）
@@ -365,9 +381,14 @@ ssh ubuntu@43.142.86.132 'docker info >/dev/null && echo docker-ok'
 # 2) 能写运行时目录（蓝绿部署锁 / 端口文件 / 排水脚本）
 ls -ld /opt/mao-data/runtime
 sudo chown ubuntu:ubuntu /opt/mao-data/runtime   # 只需该目录，勿递归改动 channels/workspace
+
+# 3) 能读取 .env，并免密切换到后端运行用户 mao（share/uploads/workspace 属于 mao）
+sudo chown ubuntu:mao /opt/mao/backend-ts/.env
+sudo chmod 640 /opt/mao/backend-ts/.env
+sudo -n -u mao test -r /opt/mao/backend-ts/.env
 ```
 
-漏配时的典型报错：`permission denied ... unix:///var/run/docker.sock` 与 `/opt/mao-data/runtime/deploy.flock: Permission denied`。
+漏配时的典型报错：`permission denied ... unix:///var/run/docker.sock`、`/opt/mao-data/runtime/deploy.flock: Permission denied` 与 `EACCES: permission denied, mkdir '/opt/mao-data/share/agents'`。出现最后一项时修正运行用户和 `.env` 权限，不要把 `/opt/mao-data/share` 递归改给 `ubuntu`。
 
 ### 行为说明
 

@@ -21,6 +21,7 @@
 - **自动部署改用 CI 提交 bundle**：GitHub Actions 将已通过校验的提交打包上传到服务器后再部署，避免服务器访问 GitHub 时因出网或 TLS 中断导致线上版本停留在旧提交。
 - **服务器 desktop 依赖安装跳过 Electron 下载脚本**：线上只构建 Web 前端时使用 `npm ci --ignore-scripts`，避免 Electron 二进制下载失败阻断部署。
 - **部署前置校验 Docker 与运行时目录**：拉取代码前先检查部署用户能否访问 Docker、是否可写 `/opt/mao-data/runtime`，缺权限直接给出修复命令，避免前端已发布而后端重启失败留下混合版本。
+- **蓝绿部署修正运行用户与切流预检**：部署账号构建后以 `mao` 启动后端，避免数据目录 `EACCES` 导致新实例退出而旧进程继续服务；`lsof` 受限时回退 `ss`，健康检查改用 `/api/v1/health` 并立即输出失败日志；Nginx 仍硬编码回环端口或未接 `mao_backend` upstream 时拒绝切流。
 
 ### 前端（桌面 / Web / 安卓 / iOS）
 - **原生移动端按设备识别窄屏**：iOS / 安卓 WebView 即使报告桌面宽度，也会启用 ChatGPT 式历史会话抽屉，避免原生壳回到三栏桌面布局。

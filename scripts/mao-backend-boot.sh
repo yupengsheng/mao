@@ -11,8 +11,8 @@ source "$BG_LIB_PATH"
 
 port="$(bg_read_active_port)"
 if bg_port_in_use "$port"; then
-  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/api/swagger-ui.html" 2>/dev/null || echo 000)"
-  if [ "$code" = "200" ] || [ "$code" = "301" ] || [ "$code" = "302" ]; then
+  code="$(curl --max-time 3 -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/api/v1/health" 2>/dev/null || echo 000)"
+  if [ "$code" = "200" ]; then
     echo "Mao backend already healthy on port ${port}; skip start"
     exit 0
   fi
