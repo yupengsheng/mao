@@ -89,11 +89,32 @@ if [ "$NO_PULL" -eq 0 ]; then
     exit 1
   fi
 
+  # 生产环境允许单独维护 desktop/.env.production。它是已跟踪文件，
+  # 即使上面的脏检查排除了它，git pull 仍会因为本地改动可能被覆盖而中止。
+  # 拉取期间暂时恢复仓库版本，完成后把线上配置原样写回；失败退出也通过 trap 恢复。
+  ENV_FILE="$ROOT_DIR/desktop/.env.production"
+  ENV_BACKUP=""
+  restore_desktop_env() {
+    if [ -n "$ENV_BACKUP" ] && [ -f "$ENV_BACKUP" ]; then
+      cp -p "$ENV_BACKUP" "$ENV_FILE"
+      rm -f "$ENV_BACKUP"
+      ENV_BACKUP=""
+    fi
+  }
+  if [ -f "$ENV_FILE" ] && ! git diff --quiet HEAD -- "$ENV_FILE"; then
+    ENV_BACKUP="$(mktemp)"
+    cp -p "$ENV_FILE" "$ENV_BACKUP"
+    git restore --source=HEAD --staged --worktree -- "$ENV_FILE"
+    trap restore_desktop_env EXIT
+  fi
+
   echo "==> 拉取 $REF ..."
   git fetch --prune origin
   git checkout "$REF"
   # --ff-only：线上只做快进，禁止自动生成合并提交，便于事后用 git log 回溯部署内容
   git pull --ff-only origin "$REF"
+  restore_desktop_env
+  trap - EXIT
 fi
 
 HEAD_SHA="$(git rev-parse HEAD)"
