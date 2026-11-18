@@ -33,7 +33,7 @@
 - 新增记忆忽略来源 / 管理权限、系统默认 Git 凭据表、出站投递更新时间迁移；由后端启动时执行，不能只更新前端。具体版本与检查见 [部署正文](skills/mao-cli/reference/deploy.md)。
 - 新容器增加 Docker `--init`；仅对重新创建的容器生效，`docker restart` 不会修改旧容器配置。不要为验证此改动直接删除在线运行中的容器。
 - 文件多选 ZIP 与独立经验库页面依赖对应新后端接口，前后端应配套发布。
-- 蓝绿部署会以 `mao` 用户运行后端；`ubuntu` 部署账号用于拉取和构建。升级前确认 `backend-ts/.env` 为 `ubuntu:mao 640`，且 Nginx 的 `/api/`、`/api/ws/` 均 `proxy_pass http://mao_backend`。修复命令与检查步骤见 [部署正文的「蓝绿运行身份与切流前置检查」](skills/mao-cli/reference/deploy.md#蓝绿运行身份与切流前置检查)。
+- 蓝绿部署会以 `mao` 用户运行后端；`ubuntu` 部署账号用于拉取和构建。升级前确认 `backend-ts/.env` 为 `ubuntu:mao 640`，且 Nginx 的 `/api/`、`/api/ws/` 均 `proxy_pass http://mao_backend`。部署脚本会以 `0022` umask 构建，并在启动前校验、必要时修复运行用户对 `dist`/`node_modules` 的读取权限。修复命令与检查步骤见 [部署正文的「蓝绿运行身份与切流前置检查」](skills/mao-cli/reference/deploy.md#蓝绿运行身份与切流前置检查)。
 
 **维护者注意**：服务器上真实部署目录为 `/opt/mao`（与云端 Agent 会话工作区路径不同）。`git pull`、构建、`restart.sh` 应在 `/opt/mao` 执行。开机自启安装 `scripts/systemd/mao-backend.service`（见部署文档「开机自启」）。
 

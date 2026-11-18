@@ -205,6 +205,46 @@ bg_validate_backend_runtime() {
   fi
 }
 
+# 构建由部署用户完成，后端却以独立用户运行。若部署用户的 umask 是 077，
+# dist/node_modules 会变成 700/600，运行用户看不到构建产物，旧脚本甚至会
+# 静默回退到 npx tsx 并因缺少依赖退出。启动前必须显式校验，历史产物则一次性
+# 补上只读/目录遍历权限；这里只处理构建产物，不触碰运行数据目录。
+bg_prepare_backend_artifacts() {
+  local app_dir="$1"
+  local run_user current_user entry_script modules_dir
+  run_user="$(bg_backend_run_user)"
+  current_user="$(id -un)"
+  entry_script="${app_dir}/dist/main.js"
+  modules_dir="${app_dir}/node_modules"
+
+  if [ ! -f "$entry_script" ]; then
+    echo "错误：后端构建产物不存在：${entry_script}。" >&2
+    echo "     请先执行 backend-ts 的 npm run build，再启动蓝绿部署。" >&2
+    return 1
+  fi
+  if [ ! -d "$modules_dir" ]; then
+    echo "错误：后端依赖目录不存在：${modules_dir}。" >&2
+    echo "     请先在 backend-ts 执行 npm ci。" >&2
+    return 1
+  fi
+
+  if [ "$run_user" != "$current_user" ]; then
+    if ! sudo -n -u "$run_user" test -r "$entry_script" 2>/dev/null \
+      || ! sudo -n -u "$run_user" test -x "$modules_dir" 2>/dev/null; then
+      echo "==> 后端构建产物对运行用户 ${run_user} 不可读，修复 dist/node_modules 权限..."
+      chmod -R a+rX "$app_dir/dist" "$modules_dir"
+    fi
+    if ! sudo -n -u "$run_user" test -r "$entry_script" 2>/dev/null; then
+      echo "错误：后端运行用户 ${run_user} 仍无法读取 ${entry_script}。" >&2
+      return 1
+    fi
+    if ! sudo -n -u "$run_user" test -x "$modules_dir" 2>/dev/null; then
+      echo "错误：后端运行用户 ${run_user} 仍无法进入 ${modules_dir}。" >&2
+      return 1
+    fi
+  fi
+}
+
 bg_read_active_port() {
   local file
   file="$(bg_active_port_file)"
@@ -341,11 +381,12 @@ bg_start_port() {
   bg_validate_backend_runtime "$app_dir" || return 1
   run_user="$(bg_backend_run_user)"
   current_user="$(id -un)"
+  bg_prepare_backend_artifacts "$app_dir" || return 1
 
   echo "Starting mao-server-ts on port ${port} as ${run_user}..."
   bg_rotate_log "$log_file"
   mkdir -p "$log_dir"
-  local entry_script='if [ -f dist/main.js ]; then exec node dist/main.js; else exec npx tsx src/main.ts; fi'
+  local entry_script='exec node dist/main.js'
   local launch_cmd=(bash -c "umask 0027; cd \"\$1\" || exit 1; set -a; if [ -f \"\$2\" ]; then . \"\$2\"; fi; set +a; export MAO_TS_PORT=\"\$3\"; ${entry_script}" _ "$app_dir" "$env_file" "$port")
   local launcher_pid
   if [ "$run_user" = "$current_user" ]; then

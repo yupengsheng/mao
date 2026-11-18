@@ -25,6 +25,9 @@
 # =============================================================================
 set -euo pipefail
 
+# npm ci 产出的 node_modules 会供 mao 用户运行后端，不能继承部署账号的 077 umask。
+umask 0022
+
 REF="main"
 EXPECT_COMMIT=""
 BUNDLE_PATH=""

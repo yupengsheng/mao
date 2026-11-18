@@ -153,7 +153,7 @@ sudo chmod 640 /opt/mao/backend-ts/.env
 sudo -n -u mao test -r /opt/mao/backend-ts/.env
 ```
 
-如运行用户不是 `mao`，可在 `backend-ts/.env` 设置 `MAO_BACKEND_RUN_USER=<用户名>`；部署账号仍需可免密切换到该用户。启动失败会输出 `backend-ts-<port>.log` 尾部并非零退出，不会把旧实例的 200 当成新实例健康。
+如运行用户不是 `mao`，可在 `backend-ts/.env` 设置 `MAO_BACKEND_RUN_USER=<用户名>`；部署账号仍需可免密切换到该用户。部署脚本以 `0022` umask 构建，并在启动前检查运行用户能否读取 `dist/main.js`、进入 `node_modules`；历史产物权限过严时会自动补 `a+rX`。生产启动只执行 `node dist/main.js`，不会静默回退到 `tsx`。启动失败会输出 `backend-ts-<port>.log` 尾部并非零退出，不会把旧实例的 200 当成新实例健康。
 
 蓝绿切流要求 `/etc/nginx/sites-enabled/` 中所有 `/api/`、`/api/ws/` location 都引用 upstream，不能硬编码 `127.0.0.1:9080` 或 `localhost:9080`。`restart.sh` 只更新 `/etc/nginx/conf.d/mao-upstream.conf`，验证方式见下节。
 
