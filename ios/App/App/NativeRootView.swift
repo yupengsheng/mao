@@ -89,11 +89,12 @@ private struct NativeChatView: View {
     @EnvironmentObject private var store: NativeStore
     @Binding var drawerPresented: Bool
     @FocusState private var composerFocused: Bool
+    @State private var configurationPresented = false
 
     var body: some View {
         ZStack(alignment: .leading) {
             VStack(spacing: 0) {
-                NativeTopBar(drawerPresented: $drawerPresented, composerFocused: $composerFocused)
+                NativeTopBar(drawerPresented: $drawerPresented, composerFocused: $composerFocused, configurationPresented: $configurationPresented)
                 Divider()
                 NativeMessageList()
                 NativeComposer(focused: $composerFocused)
@@ -110,6 +111,10 @@ private struct NativeChatView: View {
             }
         }
         .animation(.easeOut(duration: 0.2), value: drawerPresented)
+        .sheet(isPresented: $configurationPresented) {
+            NativeSessionConfigurationView()
+                .environmentObject(store)
+        }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             store.retryConnection()
         }
@@ -126,6 +131,7 @@ private struct NativeTopBar: View {
     @EnvironmentObject private var store: NativeStore
     @Binding var drawerPresented: Bool
     @FocusState.Binding var composerFocused: Bool
+    @Binding var configurationPresented: Bool
 
     var body: some View {
         HStack(spacing: 12) {
@@ -144,14 +150,24 @@ private struct NativeTopBar: View {
                     .lineLimit(1)
                 HStack(spacing: 5) {
                     Circle().fill(store.isConnected ? Color.green : Color.orange).frame(width: 6, height: 6)
-                    Text(store.isConnected ? "已连接" : "连接中")
+                    Text(store.isConnected ? "已连接" : (store.socketErrorMessage == nil ? "连接中" : "连接失败，点击重试"))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
             }
             Spacer()
             Button {
+                if !store.isConnected { store.retryConnection() }
+                else { configurationPresented = true }
+            } label: {
+                Image(systemName: store.isConnected ? "slider.horizontal.3" : "arrow.clockwise")
+                    .font(.system(size: 17, weight: .semibold))
+                    .frame(width: 40, height: 40)
+            }
+            .accessibilityLabel(store.isConnected ? "任务配置" : "重试连接")
+            Button {
                 store.startNewChat()
+                configurationPresented = true
             } label: {
                 Image(systemName: "square.and.pencil")
                     .font(.system(size: 18, weight: .semibold))
@@ -162,6 +178,157 @@ private struct NativeTopBar: View {
         .padding(.horizontal, 8)
         .frame(height: 56)
         .background(.thinMaterial)
+    }
+}
+
+private struct NativeSessionConfigurationView: View {
+    @EnvironmentObject private var store: NativeStore
+    @Environment(\.dismiss) private var dismiss
+
+    private var agentSelection: Binding<Int> {
+        Binding(
+            get: { store.selectedAgent?.id ?? 0 },
+            set: { id in
+                if let agent = store.agents.first(where: { $0.id == id }) { store.selectAgent(agent) }
+            }
+        )
+    }
+
+    private var modelSelection: Binding<Int> {
+        Binding(
+            get: { store.selectedModel?.id ?? 0 },
+            set: { id in
+                if let model = store.models.first(where: { $0.id == id }) { store.selectModel(model) }
+            }
+        )
+    }
+
+    private var projectSelection: Binding<String> {
+        Binding(
+            get: { store.cloudProjectKey },
+            set: { key in
+                store.setCloudProject(store.cloudProjects.first(where: { $0.name == key }))
+            }
+        )
+    }
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section("智能体") {
+                    if store.agents.isEmpty {
+                        Text("暂无可用智能体")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Picker("智能体", selection: agentSelection) {
+                            ForEach(store.agents) { agent in
+                                Text(agent.name).tag(agent.id)
+                            }
+                        }
+                        if let description = store.selectedAgent?.description, !description.isEmpty {
+                            Text(description)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                Section("模型") {
+                    if store.models.isEmpty {
+                        Text("暂无可用模型")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Picker("模型", selection: modelSelection) {
+                            ForEach(store.models) { model in
+                                HStack {
+                                    Text(model.name)
+                                    if model.isDefault == true { Text("默认").foregroundStyle(.secondary) }
+                                }
+                                .tag(model.id)
+                            }
+                        }
+                    }
+                }
+
+                Section("工作区") {
+                    Picker("方式", selection: Binding(
+                        get: { store.workspaceMode },
+                        set: { store.selectWorkspaceMode($0) }
+                    )) {
+                        Text("新建工作区").tag("new")
+                        Text("已有项目").tag("existing")
+                        Text("Git 仓库").tag("git")
+                    }
+                    if store.workspaceMode == "existing" {
+                        if store.cloudProjects.isEmpty {
+                            Text("暂无已有云项目")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Picker("项目", selection: projectSelection) {
+                                Text("请选择项目").tag("")
+                                ForEach(store.cloudProjects) { project in
+                                    Text(project.name).tag(project.name)
+                                }
+                            }
+                        }
+                    } else if store.workspaceMode == "git" {
+                        TextField("Git 地址，如 https://github.com/org/repo.git", text: Binding(
+                            get: { store.gitCloneURL },
+                            set: { store.setGitCloneURL($0) }
+                        ))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+                    } else {
+                        Text("服务端会为新任务创建独立云工作区")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if let session = store.selectedSession {
+                    Section("当前会话") {
+                        HStack {
+                            Text("会话")
+                            Spacer()
+                            Text(session.title?.isEmpty == false ? session.title! : "未命名会话")
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        HStack {
+                            Text("工作区")
+                            Spacer()
+                            Text(session.projectKey ?? session.workspace ?? "自动分配")
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                }
+
+                Section {
+                    Button {
+                        Task { await store.loadConfiguration() }
+                    } label: {
+                        HStack {
+                            Text("刷新配置")
+                            Spacer()
+                            if store.isLoadingConfiguration { ProgressView() }
+                        }
+                    }
+                    .disabled(store.isLoadingConfiguration)
+                }
+            }
+            .navigationTitle("任务配置")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("完成") { dismiss() }
+                }
+            }
+            .task {
+                if store.agents.isEmpty || store.models.isEmpty { await store.loadConfiguration() }
+            }
+        }
     }
 }
 

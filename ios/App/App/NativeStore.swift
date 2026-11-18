@@ -1,6 +1,19 @@
 import Foundation
 import SwiftUI
 
+private final class NativeWebSocketDelegate: NSObject, URLSessionWebSocketDelegate {
+    var onOpen: (() -> Void)?
+    var onClose: ((URLSessionWebSocketTask.CloseCode, Data?) -> Void)?
+
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
+        onOpen?()
+    }
+
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        onClose?(closeCode, reason)
+    }
+}
+
 @MainActor
 final class NativeStore: ObservableObject {
     @Published var user: NativeUser?
@@ -13,9 +26,23 @@ final class NativeStore: ObservableObject {
     @Published var isConnected = false
     @Published var errorMessage: String?
     @Published var composerText = ""
+    @Published var agents: [NativeAgent] = []
+    @Published var models: [NativeModel] = []
+    @Published var cloudProjects: [NativeCloudProject] = []
+    @Published var selectedAgent: NativeAgent?
+    @Published var selectedModel: NativeModel?
+    @Published var workspaceMode = "new"
+    @Published var workspacePath = ""
+    @Published var cloudProjectKey = ""
+    @Published var gitCloneURL = ""
+    @Published var isLoadingConfiguration = false
+    @Published var socketErrorMessage: String?
 
     private let api = NativeAPI.shared
     private var socket: URLSessionWebSocketTask?
+    private var socketSession: URLSession?
+    private var socketDelegate: NativeWebSocketDelegate?
+    private var socketTimeoutTask: Task<Void, Never>?
     private var receiveTask: Task<Void, Never>?
     private var subscribedSessionId: Int?
     private var streamingAssistantId: String?
@@ -40,6 +67,7 @@ final class NativeStore: ObservableObject {
         do {
             user = try await api.loadMe()
             try await loadGroups()
+            await loadConfiguration()
             connect()
         } catch {
             if let nativeError = error as? NativeError, nativeError.requiresLogin {
@@ -58,6 +86,7 @@ final class NativeStore: ObservableObject {
             let response = try await api.login(username: username, password: password)
             user = response.user
             try await loadGroups()
+            await loadConfiguration()
             connect()
         } catch {
             errorMessage = error.localizedDescription
@@ -73,9 +102,23 @@ final class NativeStore: ObservableObject {
         terminalRefreshTask = nil
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
+        socketSession?.invalidateAndCancel()
+        socketSession = nil
+        socketDelegate = nil
+        socketTimeoutTask?.cancel()
+        socketTimeoutTask = nil
         isConnected = false
         await api.logout()
         groups = []
+        agents = []
+        models = []
+        cloudProjects = []
+        selectedAgent = nil
+        selectedModel = nil
+        workspaceMode = "new"
+        workspacePath = ""
+        cloudProjectKey = ""
+        gitCloneURL = ""
         messages = []
         selectedSession = nil
         user = nil
@@ -86,10 +129,69 @@ final class NativeStore: ObservableObject {
         groups = try await api.loadGroups().groups
     }
 
+    func loadConfiguration() async {
+        isLoadingConfiguration = true
+        defer { isLoadingConfiguration = false }
+        // 三个列表相互独立。云项目接口短暂失败时，智能体和模型仍应可用。
+        let loadedAgents = try? await api.loadAgents()
+        let loadedModels = try? await api.loadModels()
+        let loadedProjects = try? await api.loadCloudProjects()
+        if let loadedAgents {
+            agents = loadedAgents.filter { $0.enabled != false && $0.clientVisible != false }
+        }
+        if let loadedModels {
+            models = loadedModels.filter { $0.status == nil || $0.status == 1 }
+        }
+        if let loadedProjects {
+            cloudProjects = loadedProjects
+        }
+        syncSelectionFromSession()
+        if selectedAgent == nil { selectedAgent = agents.first }
+        if selectedModel == nil {
+            selectedModel = preferredModel(for: selectedAgent) ?? models.first(where: { $0.isDefault == true }) ?? models.first
+        }
+    }
+
+    func selectAgent(_ agent: NativeAgent) {
+        selectedAgent = agent
+        if let preferred = preferredModel(for: agent) { selectedModel = preferred }
+        guard let session = selectedSession, session.agentId != agent.id else { return }
+        Task { await updateCurrentSession(agentId: agent.id) }
+    }
+
+    func selectModel(_ model: NativeModel) {
+        selectedModel = model
+        guard selectedSession?.modelId != model.id, let sessionId = selectedSession?.id else { return }
+        Task { await updateCurrentSession(modelId: model.id, sessionId: sessionId) }
+    }
+
+    func selectWorkspaceMode(_ mode: String) {
+        workspaceMode = mode
+        if mode != "existing" { cloudProjectKey = "" }
+        if mode != "git" { gitCloneURL = "" }
+        if mode != "path" { workspacePath = "" }
+    }
+
+    func setGitCloneURL(_ value: String) {
+        gitCloneURL = value
+        if !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { workspaceMode = "git" }
+    }
+
+    func setWorkspacePath(_ path: String) {
+        workspacePath = path
+        if !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { workspaceMode = "path" }
+    }
+
+    func setCloudProject(_ project: NativeCloudProject?) {
+        cloudProjectKey = project?.name ?? ""
+        if project != nil { workspaceMode = "existing" }
+    }
+
     func selectSession(_ session: NativeSession) {
         let previousSessionId = subscribedSessionId
         subscribedSessionId = nil
         selectedSession = session
+        syncSelectionFromSession()
         composerText = ""
         Task { await loadMessages(for: session) }
         if let previousSessionId, previousSessionId != session.id {
@@ -104,6 +206,7 @@ final class NativeStore: ObservableObject {
         selectedSession = nil
         messages = []
         composerText = ""
+        // 保留上一次使用的 Agent / 模型 / 工作区，方便连续创建任务。
         if let previousSessionId {
             Task { try? await sendSocket(type: "unsubscribe", sessionId: previousSessionId) }
         }
@@ -118,11 +221,19 @@ final class NativeStore: ObservableObject {
     }
 
     func retryConnection() {
+        reconnectTask?.cancel()
+        reconnectTask = nil
         if !isConnected {
             socket?.cancel(with: .goingAway, reason: nil)
             socket = nil
+            socketSession?.invalidateAndCancel()
+            socketSession = nil
+            socketDelegate = nil
             subscribedSessionId = nil
         }
+        socketTimeoutTask?.cancel()
+        socketTimeoutTask = nil
+        socketErrorMessage = nil
         connect()
     }
 
@@ -142,11 +253,27 @@ final class NativeStore: ObservableObject {
         errorMessage = nil
         do {
             if selectedSession == nil {
-                let agents = try await api.loadAgents()
-                guard let agent = agents.first(where: { $0.clientVisible != false }) ?? agents.first else {
+                if agents.isEmpty || models.isEmpty { await loadConfiguration() }
+                guard let agent = selectedAgent ?? agents.first(where: { $0.clientVisible != false }) ?? agents.first else {
                     throw NativeError(message: "暂无可用 Agent")
                 }
-                let session = try await api.createSession(agentId: agent.id)
+                let model = selectedModel ?? preferredModel(for: agent) ?? models.first(where: { $0.isDefault == true }) ?? models.first
+                selectedAgent = agent
+                selectedModel = model
+                if workspaceMode == "existing" && cloudProjectKey.isEmpty {
+                    throw NativeError(message: "请选择已有云工作区")
+                }
+                if workspaceMode == "git" && gitCloneURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    throw NativeError(message: "请输入 Git 仓库地址")
+                }
+                let session = try await api.createSession(
+                    agentId: agent.id,
+                    modelId: model?.id,
+                    workspaceMode: resolvedWorkspaceMode,
+                    workspace: resolvedWorkspacePath,
+                    cloudProjectKey: resolvedCloudProjectKey,
+                    gitCloneURL: resolvedGitCloneURL
+                )
                 selectedSession = session
                 groups = try await api.loadGroups().groups
                 subscribe(to: session.id)
@@ -159,7 +286,9 @@ final class NativeStore: ObservableObject {
             pendingUserMessageIds[eventId] = localMessageId
             messages.append(userMessage)
             do {
-                try await sendSocket(type: "send_message", sessionId: sessionId, data: ["content": text, "eventId": eventId, "images": []])
+                var data: [String: Any] = ["content": text, "eventId": eventId, "images": []]
+                if let modelId = selectedModel?.id { data["modelId"] = modelId }
+                try await sendSocket(type: "send_message", sessionId: sessionId, data: data)
             } catch {
                 pendingUserMessageIds.removeValue(forKey: eventId)
                 messages.removeAll { $0.id == localMessageId }
@@ -171,36 +300,121 @@ final class NativeStore: ObservableObject {
         isSending = false
     }
 
-    private func connect() {
-        guard socket == nil, let token = NativeTokenStore.shared.accessToken,
-              let url = URL(string: "wss://mao.yupengsheng.cn/api/ws/stream?client=browser") else { return }
-        let task = URLSession.shared.webSocketTask(with: url)
-        socket = task
-        task.resume()
-        Task {
-            do {
-                // auth 是服务端约定的根级帧字段；业务 payload 才放在 data 中。
-                try await sendSocket(
-                    type: "auth",
-                    rootFields: ["token": token, "client": "browser", "pageEnabled": false]
-                )
-                await receiveLoop()
-            } catch {
-                await MainActor.run {
-                    self.isConnected = false
-                    self.socket = nil
-                    self.subscribedSessionId = nil
-                    self.scheduleReconnect()
-                }
-            }
+    private var resolvedWorkspaceMode: String {
+        if workspaceMode == "existing", !cloudProjectKey.isEmpty { return "existing" }
+        if workspaceMode == "git", !gitCloneURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "git" }
+        if workspaceMode == "path", !workspacePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "new" }
+        return "new"
+    }
+
+    private var resolvedWorkspacePath: String? {
+        workspaceMode == "path" ? workspacePath.trimmingCharacters(in: .whitespacesAndNewlines) : nil
+    }
+
+    private var resolvedCloudProjectKey: String? {
+        workspaceMode == "existing" ? cloudProjectKey : nil
+    }
+
+    private var resolvedGitCloneURL: String? {
+        workspaceMode == "git" ? gitCloneURL.trimmingCharacters(in: .whitespacesAndNewlines) : nil
+    }
+
+    private func preferredModel(for agent: NativeAgent?) -> NativeModel? {
+        guard let modelId = agent?.defaultModelId else { return nil }
+        return models.first(where: { $0.id == modelId })
+    }
+
+    private func syncSelectionFromSession() {
+        guard let session = selectedSession else { return }
+        if let agentId = session.agentId, let agent = agents.first(where: { $0.id == agentId }) {
+            selectedAgent = agent
+        }
+        if let modelId = session.modelId, let model = models.first(where: { $0.id == modelId }) {
+            selectedModel = model
+        } else {
+            selectedModel = preferredModel(for: selectedAgent) ?? selectedModel
+        }
+        if let projectKey = session.projectKey,
+           !projectKey.isEmpty,
+           session.workspace?.contains("/projects/") == true {
+            cloudProjectKey = projectKey
+            workspaceMode = "existing"
+        } else {
+            // 已有会话的自动工作区是服务端按会话分配的目录，配置面板仍显示“新建工作区”。
+            workspacePath = ""
+            workspaceMode = "new"
         }
     }
 
-    private func receiveLoop() async {
-        guard let socket else { return }
+    private func updateCurrentSession(modelId: Int? = nil, agentId: Int? = nil, sessionId: Int? = nil) async {
+        guard let id = sessionId ?? selectedSession?.id else { return }
+        do {
+            let updated = try await api.updateSession(sessionId: id, modelId: modelId, agentId: agentId)
+            guard selectedSession?.id == id else { return }
+            selectedSession = updated
+            syncSelectionFromSession()
+            groups = try await api.loadGroups().groups
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func connect() {
+        guard socket == nil, let token = NativeTokenStore.shared.accessToken,
+              let url = URL(string: "wss://mao.yupengsheng.cn/api/ws/stream?client=browser") else { return }
+        isConnected = false
+        socketErrorMessage = nil
+        let configuration = URLSessionConfiguration.default
+        configuration.waitsForConnectivity = true
+        configuration.timeoutIntervalForRequest = 30
+        let delegate = NativeWebSocketDelegate()
+        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+        let task = session.webSocketTask(with: url)
+        socket = task
+        socketSession = session
+        socketDelegate = delegate
+        socketTimeoutTask?.cancel()
+        socketTimeoutTask = Task { [weak self, weak task] in
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            guard !Task.isCancelled, let self, let task else { return }
+            await MainActor.run {
+                guard self.socket === task, !self.isConnected else { return }
+                self.handleSocketFailure(NativeError(message: "连接服务器超时，请检查网络后重试"), task: task)
+            }
+        }
+        delegate.onOpen = { [weak self, weak task] in
+            Task { @MainActor in
+                guard let self, let task, self.socket === task else { return }
+                do {
+                    // URLSessionWebSocketTask 在 didOpenWithProtocol 之前不能发送帧。
+                    // 首帧必须是 auth，发送成功后再开始接收服务端回包。
+                    try await self.sendSocket(
+                        type: "auth",
+                        rootFields: ["token": token, "client": "browser", "pageEnabled": false]
+                    )
+                    await self.receiveLoop(for: task)
+                } catch {
+                    self.handleSocketFailure(error, task: task)
+                }
+            }
+        }
+        delegate.onClose = { [weak self, weak task] closeCode, reason in
+            Task { @MainActor in
+                guard let self, let task, self.socket === task else { return }
+                let reasonText = reason.flatMap { String(data: $0, encoding: .utf8) }
+                let message = reasonText?.isEmpty == false
+                    ? reasonText!
+                    : "WebSocket 已关闭（\(closeCode.rawValue)）"
+                self.handleSocketFailure(NativeError(message: message), task: task)
+            }
+        }
+        task.resume()
+    }
+
+    private func receiveLoop(for task: URLSessionWebSocketTask) async {
         do {
             while !Task.isCancelled {
-                let message = try await socket.receive()
+                let message = try await task.receive()
                 let data: Data
                 switch message {
                 case .string(let text): data = Data(text.utf8)
@@ -210,13 +424,24 @@ final class NativeStore: ObservableObject {
                 await handleSocketData(data)
             }
         } catch {
-            await MainActor.run {
-                self.isConnected = false
-                self.socket = nil
-                self.subscribedSessionId = nil
-                self.scheduleReconnect()
-            }
+            handleSocketFailure(error, task: task)
         }
+    }
+
+    private func handleSocketFailure(_ error: Error?, task: URLSessionWebSocketTask) {
+        guard socket === task else { return }
+        isConnected = false
+        socket = nil
+        socketSession?.invalidateAndCancel()
+        socketSession = nil
+        socketDelegate = nil
+        socketTimeoutTask?.cancel()
+        socketTimeoutTask = nil
+        subscribedSessionId = nil
+        if let error, !(error is CancellationError) {
+            socketErrorMessage = error.localizedDescription
+        }
+        scheduleReconnect()
     }
 
     private func scheduleReconnect() {
@@ -243,6 +468,8 @@ final class NativeStore: ObservableObject {
             switch type {
             case "connected":
                 isConnected = true
+                socketTimeoutTask?.cancel()
+                socketTimeoutTask = nil
                 reconnectTask?.cancel()
                 reconnectTask = nil
                 reconnectDelay = 1_000_000_000
@@ -286,11 +513,11 @@ final class NativeStore: ObservableObject {
 
     private func updateSession(id: Int, phase: String) {
         guard let selected = selectedSession, selected.id == id else { return }
-        selectedSession = NativeSession(id: selected.id, agentId: selected.agentId, agentName: selected.agentName, title: selected.title, status: selected.status, executionMode: selected.executionMode, phase: phase, summary: selected.summary, updatedAt: selected.updatedAt, createdAt: selected.createdAt, running: phase == "RUNNING", unread: selected.unread)
+        selectedSession = NativeSession(id: selected.id, agentId: selected.agentId, agentName: selected.agentName, modelId: selected.modelId, modelName: selected.modelName, title: selected.title, status: selected.status, executionMode: selected.executionMode, workspace: selected.workspace, projectKey: selected.projectKey, permissionLevel: selected.permissionLevel, phase: phase, summary: selected.summary, updatedAt: selected.updatedAt, createdAt: selected.createdAt, running: phase == "RUNNING", unread: selected.unread)
         groups = groups.map { group in
             NativeSessionGroup(key: group.key, label: group.label, total: group.total, hasMore: group.hasMore, sessions: group.sessions.map { item in
                 guard item.id == id else { return item }
-                return NativeSession(id: item.id, agentId: item.agentId, agentName: item.agentName, title: item.title, status: item.status, executionMode: item.executionMode, phase: phase, summary: item.summary, updatedAt: item.updatedAt, createdAt: item.createdAt, running: phase == "RUNNING", unread: item.unread)
+                return NativeSession(id: item.id, agentId: item.agentId, agentName: item.agentName, modelId: item.modelId, modelName: item.modelName, title: item.title, status: item.status, executionMode: item.executionMode, workspace: item.workspace, projectKey: item.projectKey, permissionLevel: item.permissionLevel, phase: phase, summary: item.summary, updatedAt: item.updatedAt, createdAt: item.createdAt, running: phase == "RUNNING", unread: item.unread)
             })
         }
     }

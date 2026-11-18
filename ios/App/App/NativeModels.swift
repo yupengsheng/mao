@@ -19,9 +19,14 @@ struct NativeSession: Codable, Identifiable, Equatable {
     let id: Int
     let agentId: Int?
     let agentName: String?
+    let modelId: Int?
+    let modelName: String?
     var title: String?
     let status: String?
     let executionMode: String?
+    let workspace: String?
+    let projectKey: String?
+    let permissionLevel: String?
     let phase: String?
     let summary: String?
     let updatedAt: String?
@@ -46,8 +51,29 @@ struct NativeSessionGroupsResponse: Codable {
 struct NativeAgent: Codable, Identifiable {
     let id: Int
     let name: String
+    let description: String?
+    let avatarUrl: String?
+    let enabled: Bool?
     let clientVisible: Bool?
     let defaultModelId: Int?
+}
+
+struct NativeModel: Codable, Identifiable, Equatable {
+    let id: Int
+    let name: String
+    let provider: String?
+    let modelId: String?
+    let modelType: String?
+    let status: Int?
+    let supportsVision: Bool?
+    let isDefault: Bool?
+}
+
+struct NativeCloudProject: Codable, Identifiable, Equatable {
+    var id: String { name }
+    let name: String
+    let path: String
+    let isGit: Bool
 }
 
 struct NativeMessage: Codable, Identifiable, Equatable {

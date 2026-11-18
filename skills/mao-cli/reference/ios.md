@@ -1,6 +1,6 @@
 # iOS APP
 
-Mao iOS 客户端使用 **SwiftUI 原生界面**，Bundle ID `cn.yupengsheng.mao.app`，显示名 `Mao`。核心聊天页面不再加载远程 WKWebView，直接通过原生 URLSession 调用生产 API 与 WebSocket。当前原生版本覆盖登录、Keychain 令牌、历史会话抽屉与折叠、会话切换、消息历史、发送消息和流式回复，统一使用 CLOUD 会话。
+Mao iOS 客户端使用 **SwiftUI 原生界面**，Bundle ID `cn.yupengsheng.mao.app`，显示名 `Mao`。核心聊天页面不再加载远程 WKWebView，直接通过原生 URLSession 调用生产 API 与 WebSocket。当前原生版本覆盖登录、Keychain 令牌、历史会话抽屉与折叠、会话切换、智能体与模型切换、CLOUD 工作区选择、消息历史、发送消息和流式回复，统一使用 CLOUD 会话。
 
 ## 目录
 
@@ -72,9 +72,9 @@ IPA 必须签名；未签名产物只能用于归档检查，无法安装到真�
 ## 原生能力
 
 - **认证**：登录与刷新令牌写入 Keychain，网络请求遇到 401 会自动刷新并重试。
-- **聊天流**：原生客户端使用 URLSessionWebSocketTask 连接 `/api/ws/stream`，接收 `content_delta`、`message_end`、`session_status` 与错误事件。
+- **聊天流**：原生客户端使用 URLSessionWebSocketTask 连接 `/api/ws/stream`，等待 WebSocket 握手完成后发送根级 `auth` 首帧，接收 `content_delta`、`message_end`、`session_status` 与错误事件；连接断开时显示失败原因并自动重连。
 - **会话来源**：服务端当前没有 `ios` 来源值，原生 iOS 创建的 CLOUD 会话暂使用通用 `web` 来源，避免伪装成安卓客户端。
-- **历史会话**：原生抽屉按服务端分组展示会话，支持「历史会话」总折叠、会话切换和新建会话。
+- **历史会话**：原生抽屉按服务端分组展示会话，支持「历史会话」总折叠、会话切换和新建会话。顶栏配置按钮可切换智能体、模型；新建 CLOUD 会话可新建工作区、复用已有云项目或使用 Git 地址。
 - **更新**：原生代码变化必须重新签名并走 TestFlight / App Store / Ad Hoc；服务端 API 与聊天协议变化可在下次原生版本中同步。
 - **纯原生工程**：启动入口、聊天 UI、REST、WebSocket 和令牌存储均由 Swift/SwiftUI 实现，工程不再编译 Capacitor、Cordova、WKWebView 或旧 Web 资源。
 

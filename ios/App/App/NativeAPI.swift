@@ -52,6 +52,7 @@ final class NativeAPI {
 
     init() {
         let configuration = URLSessionConfiguration.default
+        configuration.waitsForConnectivity = true
         configuration.timeoutIntervalForRequest = 30
         configuration.timeoutIntervalForResource = 60
         session = URLSession(configuration: configuration)
@@ -91,14 +92,55 @@ final class NativeAPI {
         try await request(path: "/agents?scope=client", method: "GET", authenticated: true)
     }
 
+    func loadModels() async throws -> [NativeModel] {
+        try await request(path: "/models/active", method: "GET", authenticated: true)
+    }
+
+    func loadCloudProjects() async throws -> [NativeCloudProject] {
+        try await request(path: "/sessions/cloud-projects", method: "GET", authenticated: true)
+    }
+
     func loadMe() async throws -> NativeUser {
         try await request(path: "/users/me", method: "GET", authenticated: true)
     }
 
-    func createSession(agentId: Int) async throws -> NativeSession {
+    func createSession(
+        agentId: Int,
+        modelId: Int?,
+        workspaceMode: String,
+        workspace: String?,
+        cloudProjectKey: String?,
+        gitCloneURL: String?
+    ) async throws -> NativeSession {
         // 服务端目前的 SessionSource 没有 ios，web 是兼容的通用 CLOUD 客户端来源；
         // 不伪造 android，避免后续按来源统计时把 iOS 计入安卓。
-        try await request(path: "/sessions", method: "POST", body: ["agentId": agentId, "executionMode": "CLOUD", "source": "web", "workspaceMode": "new"], authenticated: true)
+        var body: [String: Any] = [
+            "agentId": agentId,
+            "executionMode": "CLOUD",
+            "source": "web",
+            "workspaceMode": workspaceMode
+        ]
+        if let modelId { body["modelId"] = modelId }
+        if let workspace, !workspace.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            body["workspace"] = workspace
+        }
+        if let cloudProjectKey, !cloudProjectKey.isEmpty, workspaceMode != "git" {
+            body["cloudProjectKey"] = cloudProjectKey
+        }
+        if let gitCloneURL, !gitCloneURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, workspaceMode == "git" {
+            body["gitCloneUrl"] = gitCloneURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return try await request(path: "/sessions", method: "POST", body: body, authenticated: true)
+    }
+
+    func updateSession(sessionId: Int, modelId: Int? = nil, agentId: Int? = nil) async throws -> NativeSession {
+        var body: [String: Any] = [:]
+        if let modelId { body["modelId"] = modelId }
+        if let agentId { body["agentId"] = agentId }
+        guard !body.isEmpty else {
+            throw NativeError(message: "没有可更新的会话配置")
+        }
+        return try await request(path: "/sessions/\(sessionId)", method: "PATCH", body: body, authenticated: true)
     }
 
     func loadMessages(sessionId: Int) async throws -> NativeMessagesResponse {
