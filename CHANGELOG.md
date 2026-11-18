@@ -2,6 +2,7 @@
 
 ### 运维
 - **自动部署改用 CI 提交 bundle**：GitHub Actions 将已通过校验的提交打包上传到服务器后再部署，避免服务器访问 GitHub 时因出网或 TLS 中断导致线上版本停留在旧提交。
+- **服务器 desktop 依赖安装跳过 Electron 下载脚本**：线上只构建 Web 前端时使用 `npm ci --ignore-scripts`，避免 Electron 二进制下载失败阻断部署。
 
 ### 前端（桌面 / Web / 安卓 / iOS）
 - **移动端历史会话总折叠**：iOS/安卓抽屉增加「历史会话」总开关，可一次收起或展开历史列表，保留 ChatGPT 式侧栏层级并满足 44px 触控命中区。

@@ -206,7 +206,13 @@ done
 if [ "${#need_ci_dirs[@]}" -gt 0 ]; then
   for dir in "${need_ci_dirs[@]}"; do
     echo "==> 安装依赖：${dir}（npm ci）..."
-    (cd "$ROOT_DIR/$dir" && npm ci)
+    if [ "$dir" = "desktop" ]; then
+      # 服务器只构建 desktop/dist，不打 Electron 安装包；跳过 Electron 的二进制下载脚本，
+      # 避免服务器出网/TLS 不稳定时 npm ci 因 electron/install.js 失败。
+      (cd "$ROOT_DIR/$dir" && npm ci --ignore-scripts)
+    else
+      (cd "$ROOT_DIR/$dir" && npm ci)
+    fi
   done
 else
   echo "==> 依赖清单与 node_modules 均无变化，跳过 npm ci"

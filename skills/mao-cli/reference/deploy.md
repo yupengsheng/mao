@@ -364,6 +364,7 @@ Flyway 在启动时自动迁移；升级期间勿多实例并发启动后端。�
   - `--expect-commit` 校验线上拉到的 HEAD 就是本次 CI 校验过的提交，`main` 在 CI 期间又前进时直接中止，不会把未经验证的代码带到线上；
   - SSH 启用 `BatchMode` + `StrictHostKeyChecking`，并用 `ssh-keyscan` 预置目标主机指纹。
 - **依赖安装**：用 `/opt/mao/.last-deployed-sha` 记录上次部署的提交，只在该区间内 `package.json` / `package-lock.json` 变化或 `node_modules` 缺失时才跑 `npm ci`，避免每次部署都重装（该标记文件已加入 `.gitignore`，不会影响工作区干净度判断）。
+- **desktop 依赖安装**：自动部署在服务器上只构建 `desktop/dist`，因此 desktop 依赖使用 `npm ci --ignore-scripts`，跳过 Electron 二进制下载脚本；Electron 安装包仍由本地或 CI 的 `npm run dist` 构建。
 - **部署顺序**：desktop → admin → backend-ts，与人工部署一致。**desktop 必须在 admin 之前**，管理后台浮窗助手的 Embed SDK 产物由 desktop 部署提供，反序则浮窗不出现。
 - **健康检查**：部署后轮询 `9080` / `9081` 的 `/api/v1/health`，最多等 60 秒，未返回 200 则任务失败。
 - **手动重跑**：`Actions → CI → Deploy to 43.142.86.132 → Run workflow`（环境需选 `production`）。若只想在线上重跑而不重新拉取，可手工执行 `bash /opt/mao/scripts/remote-deploy.sh --no-pull`。
