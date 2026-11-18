@@ -273,6 +273,15 @@ jobs:
             ubuntu@43.142.86.132 \
             "encoded_clean_url='${encoded_clean_url}'; clean_url=\$(printf '%s' \"\$encoded_clean_url\" | base64 -d); cd /opt/mao && git remote set-url origin \"\$clean_url\""
 
+      - name: 上传已校验提交 bundle
+        run: |
+          set -euo pipefail
+          bundle_path="$RUNNER_TEMP/mao-${GITHUB_SHA}.bundle"
+          git bundle create "$bundle_path" main
+          scp -q -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "$bundle_path" \
+            "ubuntu@43.142.86.132:/tmp/mao-${GITHUB_SHA}.bundle"
+
       - name: 部署到服务器
         run: |
           set -euo pipefail
@@ -282,7 +291,7 @@ jobs:
           # 拿到的是远端 shell 自身而不是提交号）。
           ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
             ubuntu@43.142.86.132 \
-            "bash /tmp/mao-remote-deploy.sh --ref main --expect-commit '${GITHUB_SHA}'"
+            "bash /tmp/mao-remote-deploy.sh --ref main --expect-commit '${GITHUB_SHA}' --bundle '/tmp/mao-${GITHUB_SHA}.bundle'"
 
       - name: 部署后健康检查
         run: |

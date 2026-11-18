@@ -344,21 +344,21 @@ Flyway 在启动时自动迁移；升级期间勿多实例并发启动后端。�
 
 `.github/workflows/ci.yml` 在 `main` 分支**推送**且全部校验任务（backend / admin / desktop / embed-sdk / agent-cli）通过后，自动登录服务器执行 `scripts/remote-deploy.sh` 完成一次完整部署。校验不通过不会触发部署。
 
-线上动作与人工口径完全一致（`git pull` → 构建三端 → 蓝绿重启），只是由 workflow 代为执行，因此服务器上无需改动现有部署流程。workflow 使用 `/tmp/mao-remote-deploy.sh` 传递部署脚本，不会把临时脚本写进 `/opt/mao` 工作区；线上保留的 `desktop/.env.production` 本地配置不会被脏工作区检查阻断或提交覆盖。
+线上动作与人工口径完全一致（更新代码 → 构建三端 → 蓝绿重启），只是由 workflow 代为执行，因此服务器上无需改动现有部署流程。workflow 使用 `/tmp/mao-remote-deploy.sh` 传递部署脚本，并把已通过 CI 校验的提交打成临时 Git bundle 上传到服务器；部署时优先从 bundle 更新，避免服务器直接访问 GitHub 时遇到出网或 TLS 问题。临时文件不写入 `/opt/mao` 工作区；线上保留的 `desktop/.env.production` 本地配置不会被脏工作区检查阻断或提交覆盖。
 
 ### 配置仓库 Secret
 
 | Secret | 必填 | 说明 |
 |--------|------|------|
 | `MAO_DEPLOY_SSH_KEY` | 是 | 服务器 SSH 私钥全文。workflow 写入 runner 临时 `~/.ssh/id_ed25519`，只用于 `ubuntu@43.142.86.132` |
-| `MAO_DEPLOY_GIT_URL` | 否 | 线上 `git pull` 用的 origin 地址。**私有仓库必须配置**为带凭据、服务器可拉取的地址（如 `https://ghfast.top/https://github.com/<owner>/mao.git`）；未配置时回落 `https://github.com/<owner>/mao.git`，私有仓库会拉取失败 |
+| `MAO_DEPLOY_GIT_URL` | 否 | 线上手工 `git pull` 或首次检出使用的 origin 地址。自动部署会使用 Actions 上传的提交 bundle，因此服务器无需直接访问 GitHub；私有仓库仍建议配置可拉取地址（如 `https://ghfast.top/https://github.com/<owner>/mao.git`）供人工维护 |
 
 **服务器侧准备**：把 `MAO_DEPLOY_SSH_KEY` 对应的**公钥**加入 `ubuntu@43.142.86.132` 的 `~/.ssh/authorized_keys`。若该用户对 `/opt/mao` 无写权限，需把它加入 `/opt/mao` 属主/属组，或配置**免密 sudo**（`remote-deploy.sh` 检测到无写权限时会自动用 `sudo -n` 重跑自身）。
 
 ### 行为说明
 
 - **首次部署**：`/opt/mao` 尚无检出时，workflow 用 Actions 自带的 `GITHUB_TOKEN` 克隆仓库，随后把带 token 的临时 URL 换成 `MAO_DEPLOY_GIT_URL`，避免凭据留在线上 git config。
-- **后续部署**：只做 `git fetch + checkout + pull --ff-only`（快进，不生成合并提交）。
+- **后续部署**：自动部署从 Actions 上传的 bundle 执行 `git fetch + checkout + merge --ff-only`（快进，不生成合并提交）；手工运行时仍使用线上 origin 的 `git fetch + checkout + pull --ff-only`。
 - **安全闸门**：
   - 线上工作区有未提交改动时拒绝拉取，避免 `git pull` 中途失败留下半成品；
   - `--expect-commit` 校验线上拉到的 HEAD 就是本次 CI 校验过的提交，`main` 在 CI 期间又前进时直接中止，不会把未经验证的代码带到线上；

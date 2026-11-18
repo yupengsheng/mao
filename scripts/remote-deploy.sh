@@ -13,18 +13,21 @@
 # 先 desktop 后 admin：管理后台浮窗助手的 Embed SDK 产物由 desktop 部署提供，反序则浮窗不出现。
 #
 # 用法（在服务器上执行）：
-#   bash /opt/mao/scripts/remote-deploy.sh [--ref main] [--expect-commit <sha>] [--no-pull]
+#   bash /opt/mao/scripts/remote-deploy.sh [--ref main] [--expect-commit <sha>] [--bundle <path>] [--no-pull]
 #
 # 选项：
 #   --ref <name>          拉取并检出的分支/标签（默认 main）
 #   --expect-commit <sha> CI 校验过的具体提交；线上 HEAD 与之不符时直接中止，
 #                         避免部署到未经验证的提交
+#   --bundle <path>      使用 GitHub Actions 上传到服务器的 git bundle 更新代码，
+#                         避免服务器直接访问 GitHub（适合服务器出网/TLS 不稳定时）
 #   --no-pull             跳过 git pull，只跑三个部署脚本（要求线上代码已是目标版本）
 # =============================================================================
 set -euo pipefail
 
 REF="main"
 EXPECT_COMMIT=""
+BUNDLE_PATH=""
 NO_PULL=0
 
 while [ "$#" -gt 0 ]; do
@@ -39,6 +42,11 @@ while [ "$#" -gt 0 ]; do
       EXPECT_COMMIT="$2"; shift 2 ;;
     --expect-commit=*)
       EXPECT_COMMIT="${1#*=}"; shift ;;
+    --bundle)
+      [ "$#" -ge 2 ] || { echo "错误：--bundle 需要参数" >&2; exit 2; }
+      BUNDLE_PATH="$2"; shift 2 ;;
+    --bundle=*)
+      BUNDLE_PATH="${1#*=}"; shift ;;
     --no-pull)
       NO_PULL=1; shift ;;
     -h|--help)
@@ -108,17 +116,29 @@ if [ "$NO_PULL" -eq 0 ]; then
     trap restore_desktop_env EXIT
   fi
 
-  echo "==> 拉取 $REF ..."
-  git fetch --prune origin
-  git checkout "$REF"
-  # --ff-only：线上只做快进，禁止自动生成合并提交，便于事后用 git log 回溯部署内容
-  git pull --ff-only origin "$REF"
+  if [ -n "$BUNDLE_PATH" ]; then
+    [ -f "$BUNDLE_PATH" ] || {
+      echo "错误：找不到提交 bundle：$BUNDLE_PATH" >&2
+      exit 1
+    }
+    echo "==> 使用已校验提交 bundle 更新 $REF ..."
+    git fetch --prune "$BUNDLE_PATH" "$REF"
+    git checkout "$REF"
+    # bundle 来自 CI 已通过的提交；仍只允许快进，避免覆盖线上意外提交。
+    git merge --ff-only FETCH_HEAD
+  else
+    echo "==> 拉取 $REF ..."
+    git fetch --prune origin
+    git checkout "$REF"
+    # --ff-only：线上只做快进，禁止自动生成合并提交，便于事后用 git log 回溯部署内容
+    git pull --ff-only origin "$REF"
+  fi
   restore_desktop_env
   trap - EXIT
 fi
 
 HEAD_SHA="$(git rev-parse HEAD)"
-echo "==> 线上 HEAD：$HEAD_SHA（$REF）"
+echo "==> 线上 HEAD：${HEAD_SHA}（${REF}）"
 
 if [ -n "$EXPECT_COMMIT" ] && [ "$HEAD_SHA" != "$EXPECT_COMMIT" ]; then
   echo "错误：线上 HEAD ($HEAD_SHA) 与本次 CI 校验的提交 ($EXPECT_COMMIT) 不一致。" >&2
@@ -157,13 +177,13 @@ elif [ -z "$PREV_SHA" ]; then
 fi
 
 need_ci_dirs=()
-declare -A need_ci_dir_seen=()
 add_need_ci_dir() {
   local dir="$1"
-  if [ -z "${need_ci_dir_seen[$dir]+x}" ]; then
-    need_ci_dirs+=("$dir")
-    need_ci_dir_seen["$dir"]=1
-  fi
+  local existing
+  for existing in "${need_ci_dirs[@]-}"; do
+    [ "$existing" = "$dir" ] && return
+  done
+  need_ci_dirs+=("$dir")
 }
 if [ -n "$deps_changed" ]; then
   echo "==> 检测到依赖清单变化，需重装依赖："
@@ -184,7 +204,7 @@ done
 
 if [ "${#need_ci_dirs[@]}" -gt 0 ]; then
   for dir in "${need_ci_dirs[@]}"; do
-    echo "==> 安装依赖：$dir（npm ci）..."
+    echo "==> 安装依赖：${dir}（npm ci）..."
     (cd "$ROOT_DIR/$dir" && npm ci)
   done
 else
