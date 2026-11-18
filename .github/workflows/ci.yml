@@ -274,13 +274,28 @@ jobs:
             "encoded_clean_url='${encoded_clean_url}'; clean_url=\$(printf '%s' \"\$encoded_clean_url\" | base64 -d); cd /opt/mao && git remote set-url origin \"\$clean_url\""
 
       - name: 上传已校验提交 bundle
+        id: upload_bundle
         run: |
           set -euo pipefail
           bundle_path="$RUNNER_TEMP/mao-${GITHUB_SHA}.bundle"
-          git bundle create "$bundle_path" main
-          scp -q -o BatchMode=yes -o StrictHostKeyChecking=yes \
-            "$bundle_path" \
-            "ubuntu@43.142.86.132:/tmp/mao-${GITHUB_SHA}.bundle"
+          remote_sha="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            ubuntu@43.142.86.132 'cd /opt/mao && git rev-parse HEAD')"
+          if [ "$remote_sha" = "$GITHUB_SHA" ]; then
+            echo "线上已经是本次校验提交，跳过 bundle 上传。"
+            echo "use_bundle=false" >> "$GITHUB_OUTPUT"
+          else
+            if git merge-base --is-ancestor "$remote_sha" "$GITHUB_SHA"; then
+              # 只打包线上旧提交之后的增量对象，避免上传完整仓库历史。
+              git bundle create "$bundle_path" main "^$remote_sha"
+            else
+              # 线上分支异常偏离时回退到完整 bundle，仍由 remote-deploy 的快进检查拦截。
+              git bundle create "$bundle_path" main
+            fi
+            scp -q -o BatchMode=yes -o StrictHostKeyChecking=yes \
+              "$bundle_path" \
+              "ubuntu@43.142.86.132:/tmp/mao-${GITHUB_SHA}.bundle"
+            echo "use_bundle=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: 部署到服务器
         run: |
@@ -289,9 +304,15 @@ jobs:
           # 避免推送后又有新提交、把未经验证的代码带到线上。
           # 远程命令用双引号包裹以便展开 CI 侧的 $GITHUB_SHA（单引号会把 $0 留在远端展开，
           # 拿到的是远端 shell 自身而不是提交号）。
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
-            ubuntu@43.142.86.132 \
-            "bash /tmp/mao-remote-deploy.sh --ref main --expect-commit '${GITHUB_SHA}' --bundle '/tmp/mao-${GITHUB_SHA}.bundle'"
+          if [ "${{ steps.upload_bundle.outputs.use_bundle }}" = "true" ]; then
+            ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+              ubuntu@43.142.86.132 \
+              "bash /tmp/mao-remote-deploy.sh --ref main --expect-commit '${GITHUB_SHA}' --bundle '/tmp/mao-${GITHUB_SHA}.bundle'"
+          else
+            ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+              ubuntu@43.142.86.132 \
+              "bash /tmp/mao-remote-deploy.sh --ref main --expect-commit '${GITHUB_SHA}' --no-pull"
+          fi
 
       - name: 部署后健康检查
         run: |
