@@ -74,6 +74,24 @@
           <span class="index-error-text">任务列表加载失败</span>
           <button type="button" class="index-error-retry" @click="emit('retry')">重试</button>
         </div>
+        <button
+          v-if="mobile"
+          type="button"
+          class="history-section-toggle"
+          :aria-expanded="historyOpen"
+          aria-controls="mobile-history-list"
+          @click="historyOpen = !historyOpen"
+        >
+          <span class="history-section-label">
+            <el-icon :size="14"><Clock /></el-icon>
+            <span>历史会话</span>
+          </span>
+          <el-icon :size="14" class="history-section-chevron">
+            <ArrowDown v-if="historyOpen" />
+            <ArrowRight v-else />
+          </el-icon>
+        </button>
+        <div id="mobile-history-list" :class="{ 'history-list-collapsed': mobile && !historyOpen }">
         <template v-if="listMode === 'standard'">
           <TaskSessionGroupList
             :loading="loading"
@@ -197,6 +215,7 @@
           :start-edit="startEdit"
           :start-delete="startDelete"
         />
+        </div>
       </div>
     </template>
     <div
@@ -228,7 +247,7 @@
 
 <script setup lang="ts">
 import { computed, ref, reactive, watch, nextTick, onMounted, onUnmounted } from 'vue'
-import { Refresh, Bell, BellFilled, Check, ChatLineRound, Close } from '@element-plus/icons-vue'
+import { Refresh, Bell, BellFilled, Check, ChatLineRound, Close, ArrowDown, ArrowRight, Clock } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { useSessionStore, ACTIVE_PHASES, type Session, type TaskPhase } from '../../stores/session'
@@ -279,6 +298,8 @@ const EXPAND_STEP = 20
 const FOCUS_DEFAULT_VISIBLE = 20
 const FOCUS_EXPAND_STEP = 20
 const HISTORY_DAYS = 3
+// iOS/移动端抽屉采用 ChatGPT 式「历史会话」总折叠，桌面端保持原有分组折叠。
+const historyOpen = ref(true)
 
 const loading = computed(() => sessionStore.loading)
 const focusLoading = computed(() => sessionStore.focusLoading)

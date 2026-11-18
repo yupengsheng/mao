@@ -1021,6 +1021,52 @@ html.ios-capacitor .task-index-panel.mobile-drawer {
   overscroll-behavior: contain;
 }
 
+/* iOS 抽屉内的历史入口：参考 ChatGPT 的清晰分区与可逆折叠。 */
+.task-index-panel .history-section-toggle {
+  display: none;
+}
+
+.task-index-panel.mobile-drawer .history-section-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 12px;
+  margin: 0 0 4px;
+  border: 0;
+  border-radius: var(--aw-radius-sm);
+  background: transparent;
+  color: var(--aw-ink-muted-48);
+  font-size: var(--aw-text-caption);
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.task-index-panel.mobile-drawer .history-section-toggle:hover,
+.task-index-panel.mobile-drawer .history-section-toggle:focus-visible {
+  background: var(--aw-surface-hover);
+  color: var(--aw-ink);
+  outline: none;
+}
+
+.task-index-panel.mobile-drawer .history-section-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.task-index-panel.mobile-drawer .history-section-chevron {
+  flex-shrink: 0;
+  color: var(--aw-ink-muted-48);
+}
+
+.task-index-panel.mobile-drawer .history-list-collapsed {
+  display: none;
+}
+
 /* 分组头与会话行提升到 44px 触控高度，避免拇指误触相邻会话 */
 .task-index-panel.mobile-drawer .group-header {
   min-height: 36px;
