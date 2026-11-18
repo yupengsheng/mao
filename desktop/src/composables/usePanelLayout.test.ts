@@ -9,9 +9,14 @@ function setViewportWidth(width: number) {
   })
 }
 
+function setNativeMobileMarker(enabled: boolean) {
+  document.documentElement.classList.toggle('native-mobile', enabled)
+}
+
 describe('usePanelLayout 移动断点', () => {
   beforeEach(() => {
     vi.resetModules()
+    setNativeMobileMarker(false)
   })
 
   it('桌面宽度默认展开左右面板', async () => {
@@ -26,6 +31,16 @@ describe('usePanelLayout 移动断点', () => {
     setViewportWidth(390)
     const { usePanelLayout } = await import('./usePanelLayout')
     const { leftCollapsed, rightCollapsed } = usePanelLayout()
+    expect(leftCollapsed.value).toBe(true)
+    expect(rightCollapsed.value).toBe(true)
+  })
+
+  it('原生移动壳即使报告桌面宽度也默认收起面板', async () => {
+    setViewportWidth(1024)
+    setNativeMobileMarker(true)
+    const { isMobileDevice, usePanelLayout } = await import('./usePanelLayout')
+    const { leftCollapsed, rightCollapsed } = usePanelLayout()
+    expect(isMobileDevice()).toBe(true)
     expect(leftCollapsed.value).toBe(true)
     expect(rightCollapsed.value).toBe(true)
   })

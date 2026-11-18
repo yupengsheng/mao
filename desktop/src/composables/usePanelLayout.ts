@@ -1,13 +1,22 @@
 import { ref } from 'vue'
 
 export function isMobileDevice(): boolean {
-  return typeof window !== 'undefined' && window.innerWidth <= 768
+  return isMobileViewportNow()
 }
 
 const MOBILE_BREAKPOINT = 768
 
+function isNativeMobileShell(): boolean {
+  if (typeof window === 'undefined') return false
+  const root = typeof document !== 'undefined' ? document.documentElement : null
+  if (root?.classList.contains('native-mobile')) return true
+  // Capacitor can expose a desktop-sized CSS viewport on some iOS WebViews.
+  // The user agent is still mobile there, so keep the drawer layout enabled.
+  return /Android|iPhone|iPad|iPod|IEMobile|Opera Mini/i.test(window.navigator?.userAgent ?? '')
+}
+
 function isMobileViewportNow(): boolean {
-  return typeof window !== 'undefined' && window.innerWidth <= MOBILE_BREAKPOINT
+  return typeof window !== 'undefined' && (window.innerWidth <= MOBILE_BREAKPOINT || isNativeMobileShell())
 }
 
 // 移动端默认收起左右面板：历史会话改成顶栏汉堡打开的抽屉，首屏直接给对话区。
