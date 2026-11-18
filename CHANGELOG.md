@@ -1,5 +1,10 @@
 ## 1.0.20 (2026-11-18)
 
+### iOS 原生
+- **移除远程 WebView 启动链路**：iOS 改为 SwiftUI 原生入口，使用 Keychain 保存登录令牌，直接调用 REST 与 WebSocket；登录、历史会话抽屉折叠、会话切换、消息发送与流式回复不再依赖远程网页布局。
+- **清理 Capacitor 迁移残留**：移除 CocoaPods、Capacitor/Cordova 桥接、旧 Web 资源和旧 storyboard，Xcode 工程改为纯原生 SwiftUI target。
+- **修复原生连接恢复**：按服务端协议发送根级 WebSocket 鉴权字段，完成消息后重新同步历史；网络短暂失败时保留本地登录状态。
+
 ### 前端（桌面 / Web / 安卓 / iOS）
 - **iOS 恢复消息与文件范围引用**：聊天选区、文件查看器和 Diff 查看器不再把 iOS 错误当作 Android 禁用，iOS 可继续引用到对话；Android 保持原有禁用行为。
 - **正文追踪字距统一**：正文改用 `--aw-tracking-body` 令牌并统一为 0，保留标签与代码块的专用字距。

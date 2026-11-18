@@ -169,7 +169,7 @@ mao agent list
 | [桌面 Web](skills/mao-cli/reference/desktop.md) | 日常任务与对话（CLOUD） |
 | [Electron](skills/mao-cli/reference/electron.md) | LOCAL 本机工具、图形审批、LOCAL 附件、托盘 / 系统通知 / 全局快捷键（需自行打包，无官方签名安装包） |
 | [安卓](skills/mao-cli/reference/android.md) | Capacitor 壳远程加载 Web，仅 CLOUD |
-| [iOS](skills/mao-cli/reference/ios.md) | Capacitor 壳远程加载 Web，仅 CLOUD；需 Xcode / Apple 签名，分发走 TestFlight / App Store / Ad Hoc |
+| [iOS](skills/mao-cli/reference/ios.md) | SwiftUI 原生客户端，直接访问 REST / WebSocket，仅 CLOUD；需 Xcode / Apple 签名，分发走 TestFlight / App Store / Ad Hoc |
 | [mao-agent](skills/mao-cli/reference/mao-agent.md) | 终端 REPL / CI（`-p`） |
 | [飞书机器人](skills/mao-cli/reference/feishu-bot.md) | 私聊或群里 @ 机器人 |
 | [钉钉机器人](skills/mao-cli/reference/dingtalk-bot.md) | 私聊或群里 @ 机器人 |

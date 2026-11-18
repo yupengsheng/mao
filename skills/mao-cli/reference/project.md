@@ -114,6 +114,7 @@ flowchart TB
 | 前端 | Vue 3 + Vite + Element Plus + Pinia |
 | 桌面 | Electron 28 |
 | 安卓 | Capacitor 7，远程加载生产 Web |
+| iOS | SwiftUI 原生客户端，URLSession REST + WebSocket |
 | API | `/api/v1/`，Swagger `/api/swagger-ui.html` |
 | 流式 | WebSocket `/api/ws/stream`；云端终端 `/api/ws/terminal` |
 
@@ -126,5 +127,6 @@ flowchart TB
 | 桌面 Web | `desktop/dist` | 用户任务与对话（CLOUD） |
 | Electron | 自行 `npm run dist` | LOCAL 工具执行 |
 | 安卓 | `build-apk.sh` | Capacitor 壳 + OTA |
+| iOS | `build-ipa.sh` | SwiftUI 原生客户端，签名后走 TestFlight / App Store / Ad Hoc |
 | mao-agent | 安装脚本 / npm | 终端对话 |
 | mao-cli | 本目录 | 文档 + REST CLI |

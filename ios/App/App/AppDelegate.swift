@@ -1,5 +1,5 @@
 import UIKit
-import Capacitor
+import SwiftUI
 
 @main
 class AppDelegate: UIResponder, UIApplicationDelegate {
@@ -15,7 +15,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         open url: URL,
         options: [UIApplication.OpenURLOptionsKey: Any] = [:]
     ) -> Bool {
-        ApplicationDelegateProxy.shared.application(app, open: url, options: options)
+        NotificationCenter.default.post(name: .maoOpenURL, object: url)
+        return true
     }
 
     func application(
@@ -23,11 +24,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         continue userActivity: NSUserActivity,
         restorationHandler: @escaping ([UIUserActivityRestoring]?) -> Void
     ) -> Bool {
-        ApplicationDelegateProxy.shared.application(
-            application,
-            continue: userActivity,
-            restorationHandler: restorationHandler
-        )
+        NotificationCenter.default.post(name: .maoContinueUserActivity, object: userActivity)
+        restorationHandler(nil)
+        return true
     }
 }
 
@@ -39,7 +38,14 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         willConnectTo session: UISceneSession,
         options connectionOptions: UIScene.ConnectionOptions
     ) {
-        guard scene is UIWindowScene else { return }
+        guard let windowScene = scene as? UIWindowScene else { return }
+
+        // The iOS app is a native SwiftUI client. Install the hosting controller
+        // directly so the app starts in the native login/chat flow.
+        let window = UIWindow(windowScene: windowScene)
+        window.rootViewController = UIHostingController(rootView: NativeRootView())
+        self.window = window
+        window.makeKeyAndVisible()
 
         if let urlContext = connectionOptions.urlContexts.first {
             open(urlContext)
@@ -69,18 +75,19 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
             options[.sourceApplication] = sourceApplication
         }
 
-        _ = ApplicationDelegateProxy.shared.application(
-            UIApplication.shared,
-            open: urlContext.url,
-            options: options
-        )
+        _ = options
+        NotificationCenter.default.post(name: .maoOpenURL, object: urlContext.url)
     }
 
     private func continueActivity(_ userActivity: NSUserActivity) {
-        _ = ApplicationDelegateProxy.shared.application(
-            UIApplication.shared,
-            continue: userActivity,
-            restorationHandler: { _ in }
+        NotificationCenter.default.post(
+            name: .maoContinueUserActivity,
+            object: userActivity
         )
     }
+}
+
+extension Notification.Name {
+    static let maoContinueUserActivity = Notification.Name("mao.continueUserActivity")
+    static let maoOpenURL = Notification.Name("mao.openURL")
 }
