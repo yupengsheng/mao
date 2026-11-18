@@ -77,6 +77,23 @@ if ! mkdir -p "$ROOT_DIR/.remote-deploy-probe" 2>/dev/null; then
 fi
 rmdir "$ROOT_DIR/.remote-deploy-probe"
 
+# ---- 前置检查：Docker 权限与运行时目录可写 ----
+# 这两项原本只在后端阶段才用到，失败时 desktop/admin 已经发布，会留下
+# 「前端新、后端旧」的混合版本。统一提前到拉取之前校验。
+if ! docker info >/dev/null 2>&1; then
+  echo "错误：当前用户（$(id -un)）无权访问 Docker，运行时镜像对齐与蓝绿重启无法执行。" >&2
+  echo "     请执行 sudo usermod -aG docker $(id -un) 后重新登录（组权限需新会话生效），" >&2
+  echo "     或为 /var/run/docker.sock 配置 ACL 后重试。" >&2
+  exit 1
+fi
+
+RUNTIME_DIR="${MAO_RUNTIME_DIR:-/opt/mao-data/runtime}"
+if ! mkdir -p "$RUNTIME_DIR" 2>/dev/null || [ ! -w "$RUNTIME_DIR" ]; then
+  echo "错误：运行时目录 $RUNTIME_DIR 对 $(id -un) 不可写，蓝绿重启无法创建部署锁。" >&2
+  echo "     请执行 sudo chown $(id -un) $RUNTIME_DIR（只需该目录，勿递归改动 channels/workspace）。" >&2
+  exit 1
+fi
+
 if [ ! -d "$ROOT_DIR/.git" ]; then
   if [ "${NO_PULL}" -eq 1 ]; then
     echo "错误：$ROOT_DIR 不是 git 检出，且指定了 --no-pull，无法部署" >&2

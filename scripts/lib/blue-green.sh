@@ -321,6 +321,16 @@ bg_deploy() {
   bg_clear_stale_deploy_lock
 
   local flock_file="${MAO_RUNTIME_DIR}/deploy.flock"
+  if [ ! -e "$flock_file" ] && [ ! -w "$MAO_RUNTIME_DIR" ]; then
+    echo "错误：运行时目录 ${MAO_RUNTIME_DIR} 对 $(id -un) 不可写，无法创建 ${flock_file}。" >&2
+    echo "     请执行 sudo chown $(id -un) ${MAO_RUNTIME_DIR} 后重试（勿递归改动 channels/workspace）。" >&2
+    exit 1
+  fi
+  if [ -e "$flock_file" ] && [ ! -w "$flock_file" ]; then
+    echo "错误：部署锁 ${flock_file} 对 $(id -un) 不可写。" >&2
+    echo "     请执行 sudo rm -f ${flock_file} 后重试（确认没有进行中的 restart.sh）。" >&2
+    exit 1
+  fi
   # Short-lived mutex only — must release before starting Node (FD inheritance bug).
   exec 9>"$flock_file"
   if ! flock -n 9; then

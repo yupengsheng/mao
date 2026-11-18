@@ -355,6 +355,20 @@ Flyway 在启动时自动迁移；升级期间勿多实例并发启动后端。�
 
 **服务器侧准备**：把 `MAO_DEPLOY_SSH_KEY` 对应的**公钥**加入 `ubuntu@43.142.86.132` 的 `~/.ssh/authorized_keys`。若该用户对 `/opt/mao` 无写权限，需把它加入 `/opt/mao` 属主/属组，或配置**免密 sudo**（`remote-deploy.sh` 检测到无写权限时会自动用 `sudo -n` 重跑自身）。
 
+部署用户还必须满足两项权限，`remote-deploy.sh` 会在拉取代码前统一校验并直接报错退出：
+
+```bash
+# 1) 能访问 Docker（运行时镜像对齐 + 蓝绿重启）
+sudo usermod -aG docker ubuntu      # 组权限需重新登录才生效
+ssh ubuntu@43.142.86.132 'docker info >/dev/null && echo docker-ok'
+
+# 2) 能写运行时目录（蓝绿部署锁 / 端口文件 / 排水脚本）
+ls -ld /opt/mao-data/runtime
+sudo chown ubuntu:ubuntu /opt/mao-data/runtime   # 只需该目录，勿递归改动 channels/workspace
+```
+
+漏配时的典型报错：`permission denied ... unix:///var/run/docker.sock` 与 `/opt/mao-data/runtime/deploy.flock: Permission denied`。
+
 ### 行为说明
 
 - **首次部署**：`/opt/mao` 尚无检出时，workflow 用 Actions 自带的 `GITHUB_TOKEN` 克隆仓库，随后把带 token 的临时 URL 换成 `MAO_DEPLOY_GIT_URL`，避免凭据留在线上 git config。
