@@ -93,5 +93,6 @@ IPA 必须签名；未签名产物只能用于归档检查，无法安装到真�
 | `xcode-select` 指向 CommandLineTools | 切到完整 Xcode 后重试 |
 | `pod: command not found` | 安装 CocoaPods |
 | 签名失败 | 确认 Team ID、App ID、设备已登记；或在 Xcode 打开 `App.xcworkspace` 手动修复签名 |
+| 更新后仍显示旧三栏布局 | 从后台彻底结束 Mao 后重开；仍未更新时删除 App 并重新安装，远程入口文档需由 Nginx 返回 `Cache-Control: no-cache` |
 | 打开后白屏 | 检查 `https://mao.yupengsheng.cn` 是否可访问、证书是否有效；远程站点需允许 WKWebView 加载 |
 | 外链点击无反应 | 检查链接协议是否在 `OpenUrlPlugin` 白名单内 |
