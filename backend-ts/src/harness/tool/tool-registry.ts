@@ -33,7 +33,7 @@ import { WriteFileTool } from './impl/write-file-tool.js';
 import { EditFileTool } from './impl/edit-file-tool.js';
 import { GlobSearchTool } from './impl/glob-search-tool.js';
 import { GrepSearchTool } from './impl/grep-search-tool.js';
-import { ShellSessionTool, type ShellEcpInjector, type ShellLarkUatInjector, type ShellTokenIssuer, type ShellUserLookup } from './impl/shell-session-tool.js';
+import { ShellSessionTool, type ShellBaseUrlProvider, type ShellEcpInjector, type ShellLarkUatInjector, type ShellTokenIssuer, type ShellUserLookup } from './impl/shell-session-tool.js';
 import { WebSearchTool } from './impl/web-search-tool.js';
 import { OpenWebPageTool } from './impl/open-web-page-tool.js';
 import { DumpUserMessagesTool } from './impl/dump-user-messages-tool.js';
@@ -79,6 +79,7 @@ export interface DefaultToolRegistryDeps {
   shellUserLookup?: ShellUserLookup | null;
   shellEcpInjector?: ShellEcpInjector | null;
   shellLarkUatInjector?: ShellLarkUatInjector | null;
+  shellBaseUrlProvider?: ShellBaseUrlProvider | null;
   webSearch: () => Promise<WebSearchConfig>;
   webPage: WebPageConfig;
   runtimeDataResolver: RuntimeDataResolver;
@@ -148,7 +149,7 @@ export function createDefaultToolRegistry(deps: DefaultToolRegistryDeps): ToolRe
       deps.pathSandbox, deps.shellSessionManager, deps.outputManager,
       deps.backgroundTaskManager, deps.gitTokenResolver,
       deps.jwtService, deps.shellUserLookup, deps.shellEcpInjector,
-      deps.shellLarkUatInjector,
+      deps.shellLarkUatInjector, deps.shellBaseUrlProvider,
     ),
     new WebSearchTool(deps.webSearch),
     new OpenWebPageTool(

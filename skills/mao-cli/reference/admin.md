@@ -117,7 +117,7 @@ CLI：全局目录 `mao skill-docs`；发给指定用户 `mao skill-docs assign 
 
 列表「用户名」列与用户详情抽屉展示用户头像：用户自行在桌面端「设置 → 个人信息」上传的 `avatar_url`（含飞书 / ECP / 公司 SSO 首次登录同步的头像），以 `/uploads/` 相对路径存储，后台按当前站点解析；未设置头像时回落显示名称或用户名的首字符。后台只展示、不编辑头像（头像由用户本人在桌面端维护）。
 
-用户详情抽屉里的会话、定时任务、快捷指令、个人技能、Git 凭证、环境变量与 MCP 服务器均按页加载（每页 10 条），打开抽屉时回到第一页。
+用户详情抽屉里的会话、定时任务、快捷指令、个人技能、Git 凭证、环境变量与 MCP 服务器均按页加载（每页 10 条），打开抽屉时回到第一页。支持 `/users?detail=<用户 ID>&tab=memory` 直接打开记忆 Tab；没有 `memory:read` 权限时安全回落到会话 Tab。
 
 有 `analytics:read` 时，用户详情抽屉额外提供「用量」页签：展示该用户所选周期的总 Token / 成本 / 调用次数 / 平均解码速度、Token 与调用次数趋势，以及按模型 / 场景 / Agent 的分布。周期支持今日 / 昨日 / 本周 / 上周 / 本月 / 上月 / 近 7 天 / 近 30 天与自定义区间（最长 365 天）；「查看调用流水」「查看会话」分别带上该用户与当前统计窗口深链到对应页面。REST：`GET /v1/admin/users/:id/usage/summary`、`GET /v1/admin/users/:id/usage/trends`（均需 `analytics:read`，支持 `range`、`granularity`、`startDate`、`endDate`）。
 

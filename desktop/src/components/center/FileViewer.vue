@@ -124,7 +124,7 @@ import { ref, computed, onMounted, onUnmounted, watch, toRef, inject } from 'vue
 import { useMonacoViewer } from '../../composables/useMonacoViewer'
 import { attachMonacoQuote } from '../../composables/useMonacoQuote'
 import type { FileRangeQuotePayload } from '../../utils/selection-quote'
-import { isNativeCapacitor } from '../../utils/capacitor'
+import { isAndroidCapacitor } from '../../utils/capacitor'
 import MarkdownContent from '../common/MarkdownContent.vue'
 import PdfViewer from './PdfViewer.vue'
 import CsvTableView from './CsvTableView.vue'
@@ -221,7 +221,7 @@ useMonacoViewer({
   onEditor(editor) {
     detachQuote?.()
     detachQuote = null
-    if (!editor || !quoteFileRangeToChat || isNativeCapacitor()) return
+    if (!editor || !quoteFileRangeToChat || isAndroidCapacitor()) return
     detachQuote = attachMonacoQuote({
       editor,
       getFilePath: () => props.filePath,
@@ -622,7 +622,7 @@ onUnmounted(() => {
   margin: 0;
   font-size: var(--aw-text-caption);
   line-height: 2;
-  letter-spacing: -0.374px;
+  letter-spacing: var(--aw-tracking-body);
 }
 
 .markdown-body :deep(a) {
@@ -702,7 +702,7 @@ onUnmounted(() => {
 .markdown-body :deep(li) {
   font-size: var(--aw-text-caption);
   line-height: 2;
-  letter-spacing: -0.374px;
+  letter-spacing: var(--aw-tracking-body);
 }
 
 .markdown-body :deep(blockquote) {

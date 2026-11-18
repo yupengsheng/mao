@@ -300,7 +300,7 @@ export async function cmdChat(ctx: ChatContext): Promise<number> {
 
     /**
      * 切换到已有会话（供 REPL `/resume` 调用）：只换会话、不关进程。
-     * 任一步失败都保持当前会话不变（runner.switchTo 内部负责回挂）。
+     * 挂载失败由 runner.switchTo 回挂原会话；回挂也失败则同步为未挂载状态。
      */
     const switchSession = async (id: number): Promise<SessionVO> => {
       // 1. 本进程忙 → 拒绝（REPL 层已先拦一道，这里兜底）
@@ -337,7 +337,13 @@ export async function cmdChat(ctx: ChatContext): Promise<number> {
       }
 
       // 7. 真正切换（旧会话退订 + 标记已读；失败回挂）
-      await runner.switchTo(next);
+      try {
+        await runner.switchTo(next);
+      } catch (err) {
+        // 回挂也失败时 runner 已解除挂载，同步状态以允许后续重试挂载缓存会话。
+        if (!runner.getSession()) attached = false;
+        throw err;
+      }
       // 新建态下先 /resume 切到已有会话：此后首条消息必须沿用该会话，不能再走延迟创建。
       createdSession = next;
       attached = true;

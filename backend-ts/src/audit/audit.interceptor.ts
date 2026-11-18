@@ -29,6 +29,10 @@ export function shouldAudit(path: string | null | undefined, method?: string): b
   if (path == null || path.startsWith('/v1/auth') || path.startsWith('/v1/audit/logs')) {
     return false;
   }
+  // 菜单可见性是后台首屏读取，只豁免精确匹配的 GET；写入及其他设置读取仍审计。
+  if (method === 'GET' && path === '/v1/system-settings/menu-visibility') {
+    return false;
+  }
   if (AUDITED_PREFIXES.some((prefix) => path.startsWith(prefix))) {
     return true;
   }

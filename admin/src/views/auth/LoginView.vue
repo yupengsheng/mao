@@ -165,8 +165,9 @@ async function checkFeishuStatus() {
   if (!feishuState) return
   try {
     const { data } = await api.get('/auth/ecp/feishu/status', { params: { state: feishuState }, skipErrorToast: true })
-    if (data.status === 'PENDING') {
-      feishuStatusText.value = '等待飞书确认'
+    // PROCESSING 是回调换票中，不能停轮询，否则授权完成后页面一直停在失败文案。
+    if (data.status === 'PENDING' || data.status === 'PROCESSING') {
+      feishuStatusText.value = data.status === 'PROCESSING' ? '正在完成登录…' : '等待飞书确认'
       return
     }
     clearPollTimer()

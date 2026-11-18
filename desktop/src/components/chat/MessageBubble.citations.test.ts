@@ -115,6 +115,15 @@ describe('MessageBubble citation source area (template structure)', () => {
     expect(body).toContain('stripCitationMarkers(stripInternalMarkers(')
   })
 
+  it('聊天正文选区引用仅在 Android Capacitor 壳中禁用', () => {
+    const start = source.indexOf('function captureQuoteSelection')
+    expect(start).toBeGreaterThanOrEqual(0)
+    const body = source.slice(start, source.indexOf('\n}', start))
+    expect(body).toContain('isAndroidCapacitor()')
+    expect(body).not.toContain('isNativeCapacitor()')
+    expect(source).toContain("import { isAndroidCapacitor, openExternalUrl } from '../../utils/capacitor'")
+  })
+
   it('来源条目外跳走统一 openExternalUrl（安卓壳 window.open 无响应）', () => {
     const start = source.indexOf('function openCitation')
     expect(start).toBeGreaterThanOrEqual(0)

@@ -133,6 +133,46 @@ describe('LocalToolSessionRegistry', () => {
     expect(await offline.future).toContain('本地执行端未连接');
   });
 
+  it.each(['memory', 'db'])('routesSubagentOnlyToInheritedDeviceWithoutOfflineBroadcastFallback (%s)', async (source) => {
+    const wsRegistry = {
+      // 即使该用户的其它设备在线，也不得向它们广播子代理请求。
+      hasLocalClientConnection: vi.fn(() => true),
+      hasDeviceConnection: vi.fn(() => true),
+      sendToLocalClients: vi.fn(),
+      sendToDevice: vi.fn(() => ({ targetCount: 1, successCount: 1, failureCount: 0 })),
+    };
+    const child = {
+      id: 42, userId: 7, sessionType: 'SUBAGENT', parentSessionId: 10,
+      executionMode: 'LOCAL', targetDeviceId: 'dev-parent', targetDeviceName: '父会话桌面端',
+    };
+    const sessionMapper = { selectById: vi.fn().mockResolvedValue(child) };
+    const registry = new LocalToolSessionRegistry(wsRegistry as unknown as StreamingWsRegistry, sessionMapper as unknown as SessionMapper);
+    registry.setTargetForSession(10, 7, 'dev-parent');
+    if (source === 'memory') registry.setTargetForSession(child.id, child.userId, child.targetDeviceId);
+
+    expect(await registry.resolveTarget(child.id)).toEqual({ userId: 7, deviceId: 'dev-parent' });
+    expect(await registry.isConnected(child.id)).toBe(true);
+    const pending = await registry.sendToolRequest(child.id, 'read_file', '{}', '/repo', false, null);
+    expect(pending.requestId).not.toBeNull();
+    expect(wsRegistry.sendToDevice).toHaveBeenCalledExactlyOnceWith(7, 'dev-parent', expect.objectContaining({
+      type: 'tool_execute', sessionId: child.id,
+    }));
+    registry.completeToolRequest(child.id, pending.requestId!, '{"ok":true}');
+    expect(await pending.future).toBe('{"ok":true}');
+
+    wsRegistry.hasDeviceConnection.mockReturnValue(false);
+    expect(await registry.isConnected(child.id)).toBe(false);
+    const offline = await registry.sendToolRequest(child.id, 'shell', '{}', '/repo', false, null);
+    expect(offline.requestId).toBeNull();
+    expect(await offline.future).toContain('本地执行端未连接');
+    expect(wsRegistry.hasDeviceConnection).toHaveBeenLastCalledWith(7, 'dev-parent');
+    expect(wsRegistry.sendToDevice).toHaveBeenCalledTimes(1);
+    expect(wsRegistry.hasLocalClientConnection).not.toHaveBeenCalled();
+    expect(wsRegistry.sendToLocalClients).not.toHaveBeenCalled();
+    if (source === 'memory') expect(sessionMapper.selectById).not.toHaveBeenCalled();
+    else expect(sessionMapper.selectById).toHaveBeenCalledWith(child.id);
+  });
+
   it('keepsExistingDeviceBindingWhenTargetIsRefreshedWithNull', async () => {
     const wsRegistry = {
       hasLocalClientConnection: vi.fn(() => true),
@@ -236,6 +276,7 @@ describe('LocalToolSessionRegistry', () => {
     // requestId 必须为 null：调用方据此跳过审批登记，不会留下孤儿审批
     expect(pending.requestId).toBeNull();
     expect(await pending.future).toContain('本地执行端未连接');
+    expect(wsRegistry.sendToLocalClients).not.toHaveBeenCalled();
     // pending 表不得残留：否则后续 failAllForSocket 会二次 resolve 同一条
     expect((registry as unknown as { pendingRequests: Map<number, Map<string, unknown>> }).pendingRequests.get(30)?.size ?? 0).toBe(0);
   });

@@ -47,6 +47,9 @@ export class SubagentInvocationService {
         // 运行身份继承（技术方案 2026-11-04 §5.8）：子代理跟随父会话「本次执行身份」，
         // 缺失回落父会话归属；buildSubContext 按该身份构建子会话上下文（不回落 owner）。
         lastRuntimeUserId: parent.lastRuntimeUserId ?? parent.userId ?? null,
+        // 子代理继承父会话执行端绑定，LOCAL 子会话保持定向投递。
+        targetDeviceId: parent.targetDeviceId,
+        targetDeviceName: parent.targetDeviceName,
       };
       child.id = await tx.insert('session', child);
       const execution: SubagentExecution = {

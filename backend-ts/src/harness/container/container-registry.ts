@@ -1099,6 +1099,8 @@ export class ContainerRegistry {
       '-e', `MAO_WORKSPACE_ROOT=${this.opts.workspaceRoot}`,
       '-e', `MAO_RUNTIME_DIR=${this.opts.runtimeDir}`,
       '-e', `MAO_USER_HOME_DIR=${this.opts.userHomeDir}`,
+      // 脚本探针在容器内复核 deps 前缀时用；与挂载清单同一路径（hostPath = containerPath）
+      '-e', `MAO_DEPS_DIR=${c.depsDir}`,
       // HOME 对齐用户数据目录（与宿主机模式一致）：npm/.npmrc、pip 缓存、git/.m2 等用户级
       // 配置直接读持久挂载；Java 的 user.home 由 runtime-agent 启动时同步 /etc/passwd 兜住
       '-e', `HOME=${userHomeMount?.containerPath ?? path.posix.join(this.opts.userHomeDir, String(userId))}`,

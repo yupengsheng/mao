@@ -417,6 +417,27 @@ export class SystemSettingService {
     return upload === '' ? null : upload;
   }
 
+  /**
+   * mao / mao-agent API 连接地址。仅接受明确配置的站点根或 API 前缀，
+   * 不复用可能指向 OSS/CDN 的 upload.baseUrl，避免把 MAO_TOKEN 发往非 Mao 主机。
+   */
+  async getMaoBaseUrl(): Promise<string | null> {
+    const raw = (await this.getText(SITE_BASE_URL_KEY)).trim();
+    if (raw === '') return null;
+    try {
+      const url = new URL(raw);
+      if ((url.protocol !== 'http:' && url.protocol !== 'https:')
+        || url.username !== '' || url.password !== '' || url.search !== '' || url.hash !== '') {
+        return null;
+      }
+      const pathname = url.pathname.replace(/\/+$/, '');
+      if (pathname !== '' && pathname !== '/api' && pathname !== '/api/v1') return null;
+      return url.origin + pathname;
+    } catch {
+      return null;
+    }
+  }
+
   async getTavilyConfig(): Promise<TavilySettings> {
     const apiKey = await this.getSecret(TAVILY_API_KEY_KEY);
     return {

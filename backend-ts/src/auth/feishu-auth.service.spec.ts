@@ -1,3 +1,4 @@
+import { runInNewContext } from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
 import { BusinessException } from '../common/business-exception.js';
 import { JwtService } from '../crypto/jwt.service.js';
@@ -24,7 +25,7 @@ function cfg(overrides: Record<string, unknown> = {}) {
   }) as never;
 }
 
-function makeService(http?: FeishuHttp) {
+function makeService(http?: FeishuHttp, onUserAuthenticated?: ConstructorParameters<typeof FeishuAuthService>[6]) {
   const userRepo = {
     insert: vi.fn(async (u: { id?: number }) => { u.id = 8; return 8; }),
     updateById: vi.fn(),
@@ -48,6 +49,7 @@ function makeService(http?: FeishuHttp) {
     jwt,
     cfg(),
     http ?? { postJson: vi.fn(), getJson: vi.fn() },
+    onUserAuthenticated,
   );
   return { service, userRepo, userRoleRepo, stateRepo };
 }
@@ -143,5 +145,63 @@ describe('FeishuAuthService', () => {
     vi.mocked(stateRepo.findByState).mockResolvedValue(null);
     const html = await service.renderCallbackPage('missing', 'code');
     expect(html).toContain('登录失败');
+    expect(html).toContain('飞书登录二维码不存在');
+    expect(html).not.toContain('window.close');
+    expect(html).not.toContain('<script>');
+  });
+
+  it.each([undefined, 9])('renderCallbackPageClosesOnlyAfterAuthenticationHookCompletes (target=%s)', async (targetUserId) => {
+    let finishAuthentication!: () => void;
+    const onUserAuthenticated = vi.fn(() => new Promise<void>((resolve) => { finishAuthentication = resolve; }));
+    const { service, stateRepo } = makeService(undefined, onUserAuthenticated);
+    const user = { id: 8, username: 'li', status: 1 };
+    vi.spyOn(service, 'completeStateWithCode').mockResolvedValue(user);
+    vi.mocked(stateRepo.findByState).mockResolvedValue({
+      state: 'st', status: FEISHU_SUCCESS, userId: targetUserId ?? user.id, expiresAt: '2099-01-01 00:00:00',
+    });
+
+    let rendered = false;
+    const page = service.renderCallbackPage('st', 'code').then((html) => {
+      rendered = true;
+      return html;
+    });
+    await vi.waitFor(() => expect(onUserAuthenticated).toHaveBeenCalledWith(user, targetUserId, 'st'));
+    expect(rendered).toBe(false);
+    finishAuthentication();
+
+    const html = await page;
+    expect(html).toContain('登录成功');
+    expect(html).toContain('飞书授权已完成，请回到 Mao 客户端。');
+    const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+    expect(script).toContain('window.close()');
+    const close = vi.fn();
+    runInNewContext(script!, { window: { close } });
+    expect(close).toHaveBeenCalledTimes(1);
+    // 非弹窗或受限浏览器拒绝关闭时不抛错，HTML 仍保留可读提示。
+    expect(() => runInNewContext(script!, { window: { close: () => { throw new Error('blocked'); } } })).not.toThrow();
+  });
+
+  it('renderCallbackPageEscapesFailureMessageWithoutClosing', async () => {
+    const { service } = makeService();
+    const message = '<script>window.close()</script> & "授权失败" \'重试\'';
+    vi.spyOn(service, 'completeStateWithCode').mockRejectedValue(new BusinessException(5002, message));
+
+    const html = await service.renderCallbackPage('st', 'code');
+    expect(html).toContain('登录失败');
+    expect(html).toContain('&lt;script&gt;window.close()&lt;/script&gt; &amp; &quot;授权失败&quot; &#39;重试&#39;');
+    expect(html).not.toContain('<script>');
+    expect(html).not.toContain(message);
+  });
+
+  it('renderCallbackPageDoesNotCloseOrLeakDetailsWhenAuthenticationHookFails', async () => {
+    const { service } = makeService(undefined, async () => { throw new Error('secret hook failure'); });
+    vi.spyOn(service, 'completeStateWithCode').mockResolvedValue({ id: 8, username: 'li', status: 1 });
+
+    const html = await service.renderCallbackPage('st', 'code');
+    expect(html).toContain('登录失败');
+    expect(html).toContain('飞书登录失败');
+    expect(html).not.toContain('secret hook failure');
+    expect(html).not.toContain('window.close');
+    expect(html).not.toContain('<script>');
   });
 });

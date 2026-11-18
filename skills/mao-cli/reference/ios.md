@@ -76,6 +76,7 @@ IPA 必须签名；未签名产物只能用于归档检查，无法安装到真�
 - **外链**：`ios/App/App/OpenUrlPlugin.swift` 提供与安卓同名的 `OpenUrl` 插件，仅放行 `http` / `https` / `mailto`，由系统浏览器打开。
 - **相册**：`Info.plist` 已声明 `NSPhotoLibraryUsageDescription`，用于选择并上传图片或文件。
 - **安全区**：`ios.contentInset` 为 `never`，由 CSS 显式避让状态栏与 Home Indicator；顶部导航高度会自动加上 `safe-area-inset-top`。
+- **更新**：页面资源随 Web 部署更新；**没有 APK 式 OTA**。原生壳更新必须重新签名并走 TestFlight / App Store / Ad Hoc。
 - **对话引用**：iOS 保留聊天文本选区、文件查看器行区间和 Diff 行区间引用能力；Android 因系统交互限制继续禁用这些引用入口。引用内容仍通过 Web 前端发送，不涉及原生壳 OTA。
 
 ## 移动端交互

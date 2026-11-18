@@ -24,6 +24,7 @@ function envelopeOf(
   sessionId = 11,
   depsEnv: Record<string, string> = {},
   envVars: Record<string, string> = {},
+  maoBaseUrl: string | null = null,
 ): RuntimeEnvelope {
   return {
     userId: USER_ID,
@@ -33,6 +34,7 @@ function envelopeOf(
     runtimeDir: '/tmp/rt',
     gitTokens: {},
     maoToken: null,
+    maoBaseUrl,
     ecpToken: null,
     larkUat: null,
     depsEnv,
@@ -403,6 +405,28 @@ describe('container tool executor', () => {
       shareDir: join(base, 'share') }), USER_ID);
     const read = await executor.handleToolCall('read_file', JSON.stringify({ path: 'leak.txt' }), envelopeOf(userWorkspace));
     expect(JSON.parse(read).error).toBeDefined();
+  });
+
+  it('injects MAO_BASE_URL from the envelope into shell sessions', async () => {
+    const base = useTmpDir('mao-exec-base-url-');
+    const workspaceRoot = join(base, 'workspace');
+    const userWorkspace = join(workspaceRoot, '7');
+    mkdirSync(userWorkspace, { recursive: true });
+    const executor = new ContainerToolExecutor(withShareTrees({
+      workspaceRoot,
+      runtimeDir: join(base, 'runtime'),
+      userHomeDir: join(base, 'users'),
+      userSkillsDir: join(base, 'userskills'),
+      skillViewsDir: join(base, 'skill-views'),
+      uploadDir: join(base, 'uploads'),
+      shareDir: join(base, 'share'),
+    }), USER_ID);
+    const result = await executor.handleToolCall('shell', JSON.stringify({
+      action: 'exec', command: 'printf "<$MAO_BASE_URL>"', yield_time_ms: 8000,
+    }), envelopeOf(userWorkspace, 11, {}, {}, 'https://mao.example.com'));
+    const parsed = JSON.parse(result);
+    expect(parsed.error).toBeUndefined();
+    expect(parsed.output).toContain('<https://mao.example.com>');
   });
 
   it('injectsDepsEnvIntoShellSessions', async () => {

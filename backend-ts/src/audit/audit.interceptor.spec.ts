@@ -14,6 +14,27 @@ describe('audit interceptor', () => {
     expect(shouldAudit(null)).toBe(false);
   });
 
+  it('仅豁免菜单可见性的 GET 读取', () => {
+    expect(shouldAudit('/v1/system-settings/menu-visibility', 'GET')).toBe(false);
+  });
+
+  it.each(['POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS', undefined])(
+    '菜单可见性的非 GET 方法 %s 仍审计',
+    (method) => {
+      expect(shouldAudit('/v1/system-settings/menu-visibility', method)).toBe(true);
+    },
+  );
+
+  it.each([
+    '/v1/system-settings',
+    '/v1/system-settings/audit-log-retention-days',
+    '/v1/system-settings/menu-visibility/extra',
+    '/v1/system-settings/menu-visibility-extra',
+    '/v1/system-settings/menu-visibility/',
+  ])('其他设置或相似路径的 GET 仍审计：%s', (path) => {
+    expect(shouldAudit(path, 'GET')).toBe(true);
+  });
+
   it('只审计定时任务的变更方法，预览接口不写日志', () => {
     expect(shouldAudit('/v1/scheduled-tasks', 'GET')).toBe(false);
     expect(shouldAudit('/v1/scheduled-tasks/all', 'GET')).toBe(false);
@@ -63,6 +84,40 @@ describe('audit interceptor', () => {
       status: 500,
       errorMessage: 'boom',
     })).resolves.toBeUndefined();
+  });
+
+  it.each([200, 500])('recordAudit 不记录菜单可见性 GET（HTTP %s）', async (status) => {
+    const record = vi.fn();
+    const service = { record } as unknown as AuditLogService;
+    await recordAudit(service, {
+      path: '/v1/system-settings/menu-visibility',
+      method: 'GET',
+      status,
+    });
+    expect(record).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { path: '/v1/system-settings/menu-visibility', method: 'PUT', action: 'UPDATE' },
+    { path: '/v1/system-settings/audit-log-retention-days', method: 'GET', action: 'READ' },
+  ])('recordAudit 保留 $method $path 的失败记录', async ({ path, method, action }) => {
+    const record = vi.fn();
+    const service = { record } as unknown as AuditLogService;
+    await recordAudit(service, {
+      path,
+      method,
+      status: 200,
+      errorMessage: '业务失败',
+    });
+    expect(record).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      path,
+      method,
+      action,
+      objectType: 'system-settings',
+      status: 200,
+      success: 0,
+      errorMessage: '业务失败',
+    }));
   });
 
   it('recordAuditSkipsUnauditedPaths', async () => {

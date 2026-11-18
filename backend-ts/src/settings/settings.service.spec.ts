@@ -439,6 +439,27 @@ describe('SystemSettingService', () => {
     await expect(service().getSiteBaseUrl()).resolves.toBeNull();
   });
 
+  it('getMaoBaseUrlUsesOnlyExplicitSiteSetting', async () => {
+    vi.mocked(mapper.findByKey).mockImplementation(async (key: string) => (
+      key === 'upload.baseUrl'
+        ? { id: 1, settingKey: key, category: '集成配置', value: 'https://cdn.example.com/assets', editable: 1 }
+        : null
+    ));
+    await expect(service().getMaoBaseUrl()).resolves.toBeNull();
+  });
+
+  it('getMaoBaseUrlAcceptsOnlyRootOrApiPrefix', async () => {
+    vi.mocked(mapper.findByKey).mockImplementation(async (key: string) => (
+      key === 'site.baseUrl'
+        ? { id: 1, settingKey: key, category: '集成配置', value: 'https://mao.example.com/api/v1/', editable: 1 }
+        : null
+    ));
+    await expect(service().getMaoBaseUrl()).resolves.toBe('https://mao.example.com/api/v1');
+
+    vi.mocked(mapper.findByKey).mockResolvedValue({ id: 1, settingKey: 'site.baseUrl', category: '集成配置', value: 'https://mao.example.com/admin', editable: 1 });
+    await expect(service().getMaoBaseUrl()).resolves.toBeNull();
+  });
+
   it('updateRejectsSiteBaseUrlWithoutScheme', async () => {
     vi.mocked(mapper.findByKey).mockResolvedValue(setting('site.baseUrl', '集成配置', 1));
     await expect(service().update('site.baseUrl', 'mao.example.com')).rejects.toThrow(/http/);

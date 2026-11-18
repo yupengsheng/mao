@@ -401,7 +401,10 @@ function readTotalCount(headers: unknown): number {
 }
 
 function handleOpen() {
-  activeTab.value = props.initialTab === 'usage' && canViewUsage.value ? 'usage' : 'sessions'
+  // 深链可指定 initialTab；目标 Tab 无权限（如 usage 未授 analytics:read / memory 未授 memory:read）时回落会话
+  activeTab.value = props.initialTab === 'usage' && canViewUsage.value ? 'usage'
+    : props.initialTab === 'memory' && canViewMemory.value ? 'memory'
+      : 'sessions'
   sessionsPage.value = 1
   tasksPage.value = 1
   commandsPage.value = 1

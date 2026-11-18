@@ -71,6 +71,42 @@ describe('SubagentInvocationService 来源继承', () => {
   });
 });
 
+describe('SubagentInvocationService 执行设备继承', () => {
+  it('LOCAL 子代理继承父会话目标设备 ID 和名称并持久化', async () => {
+    const { service, connection } = setup();
+    const parentWithDevice: Session = {
+      ...parent, executionMode: 'LOCAL', targetDeviceId: 'dev-parent', targetDeviceName: '父会话桌面端',
+    };
+    const result = await service.createBackground(parentWithDevice, 'worker', 'task', '子任务', 'tc-device');
+    expect(result.child.targetDeviceId).toBe('dev-parent');
+    expect(result.child.targetDeviceName).toBe('父会话桌面端');
+    const insert = connection.execute.mock.calls.find(([sql]) => sql.startsWith('INSERT INTO `session`'));
+    expect(insert).toBeTruthy();
+    const [sql, params] = insert!;
+    const cols = sql.slice(sql.indexOf('(') + 1, sql.indexOf(')')).split(', ').map((c: string) => c.replace(/`/g, ''));
+    expect(params[cols.indexOf('target_device_id')]).toBe('dev-parent');
+    expect(params[cols.indexOf('target_device_name')]).toBe('父会话桌面端');
+  });
+
+  it.each([null, undefined])('父会话未绑定设备时子代理保持空值（%s）', async (empty) => {
+    const { service, connection } = setup();
+    const result = await service.createBackground({
+      ...parent, executionMode: 'LOCAL', targetDeviceId: empty, targetDeviceName: empty,
+    }, 'worker', 'task', '子任务', 'tc-no-device');
+    expect(result.child.targetDeviceId).toBe(empty);
+    expect(result.child.targetDeviceName).toBe(empty);
+    const insert = connection.execute.mock.calls.find(([sql]) => sql.startsWith('INSERT INTO `session`'));
+    expect(insert).toBeTruthy();
+    const [sql, params] = insert!;
+    const cols = sql.slice(sql.indexOf('(') + 1, sql.indexOf(')')).split(', ').map((c: string) => c.replace(/`/g, ''));
+    for (const col of ['target_device_id', 'target_device_name']) {
+      // undefined 可省略写入；显式 null 必须原样写入，不得生成默认设备。
+      if (empty === null) expect(params[cols.indexOf(col)]).toBeNull();
+      else expect(cols).not.toContain(col);
+    }
+  });
+});
+
 describe('SubagentInvocationService followup todos', () => {
   it.each([undefined, '上一轮已中断，按新要求执行'])('clears only child todos within the new-round transaction (%s)', async (notice) => {
     const { connection, service } = setup();

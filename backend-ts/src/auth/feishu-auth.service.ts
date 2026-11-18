@@ -433,6 +433,9 @@ function uuidName(input: string): string {
 
 function htmlPage(title: string, message: string, success: boolean): string {
   const color = success ? '#16a34a' : '#dc2626';
+  // 成功后关闭 window.open 打开的授权页；浏览器不允许关闭时仍保留回到客户端的提示。
+  // 失败页不关闭，便于用户查看原因；脚本不插入任何授权参数或错误信息。
+  const closeScript = success ? '<script>try { window.close(); } catch {}</script>' : '';
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -446,7 +449,7 @@ function htmlPage(title: string, message: string, success: boolean): string {
     p { margin: 0; line-height: 1.7; }
   </style>
 </head>
-<body><main><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p></main></body>
+<body><main><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p></main>${closeScript}</body>
 </html>`;
 }
 

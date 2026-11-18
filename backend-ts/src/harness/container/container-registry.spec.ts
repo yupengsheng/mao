@@ -145,6 +145,9 @@ describe('container registry', () => {
     expect(runArgs).toContain(`-e MAO_WORKSPACE_ROOT=${join(base, 'workspace')}`);
     expect(runArgs).toContain(`-e MAO_RUNTIME_DIR=${join(base, 'runtime')}`);
     expect(runArgs).toContain(`-e MAO_USER_HOME_DIR=${join(base, 'users')}`);
+    // 脚本探针依赖宿主依赖根；值必须与 deps 挂载根一致，不能退化为未配置的 undefined
+    expect(runArgs).toContain(`-e MAO_DEPS_DIR=${join(base, 'deps')}`);
+    expect(runArgs).not.toContain('MAO_DEPS_DIR=undefined');
     // HOME 对齐用户数据目录：容器内 HOME 与宿主机模式一致，用户级 .npmrc/.m2/.gitconfig 生效
     expect(runArgs).toContain(`-e HOME=${join(base, 'users', '7')}`);
     // locale 统一 C.UTF-8：未注入时容器内回落到 POSIX/C，多字节工具行为与宿主机不一致

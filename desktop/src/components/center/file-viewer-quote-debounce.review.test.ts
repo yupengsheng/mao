@@ -111,6 +111,7 @@ describe('文件预览去抖期间的引用', () => {
     harness.host?.remove()
     harness.host = null
     harness.refreshSelection = null
+    delete (window as Window & { Capacitor?: unknown }).Capacitor
   })
 
   it('重载还没开始时，引用不能把新修订号配到仍显示的旧内容上', async () => {
@@ -142,5 +143,31 @@ describe('文件预览去抖期间的引用', () => {
     expect(mounted.quoted[0].snippet).toBe('print("old")')
     // 屏幕上仍是旧内容。修订号应当还是这一版对应的 0，而不是已经加过的 1。
     expect(mounted.quoted[0].capturedChangeCount).toBe(0)
+  })
+
+  it('iOS 壳保留文件行区间引用，Android 壳继续禁用', async () => {
+    harness.host = document.createElement('div')
+    Object.defineProperty(harness.host, 'clientHeight', { value: 400 })
+    document.body.appendChild(harness.host)
+
+    Object.defineProperty(window, 'Capacitor', {
+      configurable: true,
+      value: { isNativePlatform: () => true, getPlatform: () => 'ios' },
+    })
+    mounted = mountViewer()
+    await nextTick()
+    harness.refreshSelection?.()
+    expect(harness.host.querySelector('.monaco-quote-btn')).toBeTruthy()
+    mounted.destroy()
+    mounted = null
+
+    Object.defineProperty(window, 'Capacitor', {
+      configurable: true,
+      value: { isNativePlatform: () => true, getPlatform: () => 'android' },
+    })
+    mounted = mountViewer()
+    await nextTick()
+    harness.refreshSelection?.()
+    expect(harness.host.querySelector('.monaco-quote-btn')).toBeNull()
   })
 })

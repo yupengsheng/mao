@@ -4,7 +4,7 @@ import { PathSandbox } from '../safety/path-sandbox.js';
 import { RuntimeDataResolver } from '../runtime/runtime-data-resolver.js';
 import { ShellSessionManager, OutputManager } from '../shell/shell-session-manager.js';
 import { BackgroundTaskManager } from '../core/background-task-manager.js';
-import { ShellSessionTool, type ShellEcpInjector, type ShellLarkUatInjector, type ShellTokenIssuer, type ShellUserLookup } from '../tool/impl/shell-session-tool.js';
+import { ShellSessionTool, type ShellBaseUrlProvider, type ShellEcpInjector, type ShellLarkUatInjector, type ShellTokenIssuer, type ShellUserLookup } from '../tool/impl/shell-session-tool.js';
 import { ReadFileTool } from '../tool/impl/read-file-tool.js';
 import { WriteFileTool } from '../tool/impl/write-file-tool.js';
 import { EditFileTool } from '../tool/impl/edit-file-tool.js';
@@ -129,6 +129,7 @@ export class ContainerToolExecutor {
       this.envelopeUserLookup(),
       this.envelopeEcpInjector(),
       this.envelopeLarkUatInjector(),
+      this.envelopeBaseUrlProvider(),
     );
     for (const tool of [
       shellTool,
@@ -241,6 +242,12 @@ export class ContainerToolExecutor {
   private envelopeLarkUatInjector(): ShellLarkUatInjector {
     return {
       injectForUser: async (_userId: number) => this.currentEnvelope?.larkUat ?? null,
+    };
+  }
+
+  private envelopeBaseUrlProvider(): ShellBaseUrlProvider {
+    return {
+      getSiteBaseUrl: async () => this.currentEnvelope?.maoBaseUrl ?? null,
     };
   }
 }

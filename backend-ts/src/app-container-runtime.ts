@@ -154,6 +154,7 @@ export async function assembleContainerRuntime(deps: ContainerRuntimeDeps): Prom
     ecpInjector,
     larkUatInjector,
     envVariableService,
+    siteBaseUrlProvider: { getSiteBaseUrl: () => settingService.getMaoBaseUrl() },
   }, cloudRuntimeCfg.container.depsDir);
   const dockerRouter = new DockerToolRouter({
     containerRegistry,

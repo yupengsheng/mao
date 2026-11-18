@@ -141,7 +141,10 @@ describe('ShellSessionTool', () => {
 });
 
 describe('ShellSessionTool marker and environment handling', () => {
-  function harness(readResult: Partial<{ output: string; truncated: boolean; completed: boolean; exitCode: number | null; matched: string | null }> = {}) {
+  function harness(
+    readResult: Partial<{ output: string; truncated: boolean; completed: boolean; exitCode: number | null; matched: string | null }> = {},
+    baseUrlProvider?: { getSiteBaseUrl: () => Promise<string | null> },
+  ) {
     const shellSession = {
       sessionId: 'sh-1',
       conversationId: 11,
@@ -185,6 +188,9 @@ describe('ShellSessionTool marker and environment handling', () => {
       null,
       { generateShellToken: vi.fn(() => 'jwt-to"ken') },
       { findById: vi.fn(async () => ({ username: 'alice' })) },
+      null,
+      null,
+      baseUrlProvider,
     );
     const written = () => shellSession.writeStdin.mock.calls.map((c) => String(c[0])).join('');
     return { tool, shellSession, sessionManager, outputManager, written };
@@ -270,6 +276,20 @@ describe('ShellSessionTool marker and environment handling', () => {
     const script = written();
     expect(script).toContain(`export MAO_TOKEN='jwt-to"ken'`);
     expect(script.indexOf('export MAO_TOKEN')).toBeLessThan(script.indexOf('mao-admin-cli'));
+  });
+
+  it('exports MAO_BASE_URL before the command when the site address is configured', async () => {
+    const { tool, written } = harness({}, { getSiteBaseUrl: vi.fn(async () => 'https://mao.example.com') });
+    await tool.execute(JSON.stringify({ command: 'mao auth me' }), 11, 7, '/tmp');
+    const script = written();
+    expect(script).toContain("export MAO_BASE_URL='https://mao.example.com'");
+    expect(script.indexOf('export MAO_BASE_URL')).toBeLessThan(script.indexOf('mao auth me'));
+  });
+
+  it('does not export MAO_BASE_URL when the site address is missing', async () => {
+    const { tool, written } = harness({}, { getSiteBaseUrl: vi.fn(async () => null) });
+    await tool.execute(JSON.stringify({ command: 'echo hi' }), 11, 7, '/tmp');
+    expect(written()).not.toContain('MAO_BASE_URL');
   });
 
   it('exports ECP_TOKEN when user has an active ECP session', async () => {
