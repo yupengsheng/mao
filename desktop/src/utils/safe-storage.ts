@@ -18,3 +18,12 @@ export function safeRemoveItem(key: string): void {
     /* 存储不可用时静默降级 */
   }
 }
+
+/** 读取兜底：存储被禁用时 getItem 同样会抛 SecurityError，调用方按「无值」处理。 */
+export function safeGetItem(key: string): string | null {
+  try {
+    return localStorage.getItem(key)
+  } catch {
+    return null
+  }
+}

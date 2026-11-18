@@ -1,4 +1,4 @@
-import { safeRemoveItem, safeSetItem } from './safe-storage'
+import { safeGetItem, safeRemoveItem, safeSetItem } from './safe-storage'
 
 /**
  * Auth token storage.
@@ -44,8 +44,8 @@ export async function initAuthStorage(): Promise<void> {
     return
   }
 
-  tokenCache = localStorage.getItem('token')
-  refreshTokenCache = localStorage.getItem('refreshToken')
+  tokenCache = safeGetItem('token')
+  refreshTokenCache = safeGetItem('refreshToken')
 }
 
 export function getToken(): string | null {

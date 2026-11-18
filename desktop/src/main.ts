@@ -22,6 +22,7 @@ import { useTheme } from './utils/theme'
 import { useAppearance } from './utils/appearance'
 import { initAuthStorage } from './utils/auth-storage'
 import { useForegroundRecovery } from './composables/useForegroundRecovery'
+import { renderBootFailure } from './utils/boot-failure'
 import './style.css'
 import 'monaco-editor/min/vs/editor/editor.main.css'
 
@@ -81,4 +82,4 @@ async function bootstrap() {
   useForegroundRecovery().init()
 }
 
-bootstrap()
+bootstrap().catch(renderBootFailure)
