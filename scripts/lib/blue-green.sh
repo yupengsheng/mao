@@ -368,6 +368,18 @@ bg_deploy() {
   if bg_port_in_use "$current_port"; then
     echo "Current active port: ${current_port}"
     echo "Deploying new instance on port: ${new_port}"
+    # 空闲端口上若还有遗留进程（上次部署排水未完成或孤儿），必须先停掉：
+    # bg_start_port 遇到存活 pid 会直接返回，health 检查会被旧进程的 200 骗过，
+    # 结果把流量切到运行旧代码的实例，CI 全绿但线上接口仍是旧版本。
+    if bg_port_in_use "$new_port"; then
+      echo "Stale instance detected on idle port ${new_port}; stopping before start"
+      bg_stop_port "$app_dir" "$new_port"
+      if bg_port_in_use "$new_port"; then
+        echo "错误：空闲端口 ${new_port} 仍被占用，终止部署以免切到旧实例。" >&2
+        bg_write_deploy_lock "$started_at" "$current_port" "$new_port" "failed"
+        exit 1
+      fi
+    fi
     bg_start_port "$app_dir" "$new_port" "$log_dir"
     if ! bg_wait_healthy "$new_port"; then
       bg_stop_port "$app_dir" "$new_port"
