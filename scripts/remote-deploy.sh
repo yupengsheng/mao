@@ -194,10 +194,11 @@ if [ -n "$deps_changed" ]; then
     esac
   done
 fi
-# 兜底：node_modules 缺失时（首次部署或被清理）必须安装
+# 兜底：node_modules 缺失或依赖树不完整时（例如手工清理过单个包）必须安装。
+# 仅判断目录存在不够：旧目录可能缺少新加入的直接依赖，导致 vue-tsc 在构建阶段才失败。
 for dir in backend-ts admin desktop; do
-  if [ ! -d "$ROOT_DIR/$dir/node_modules" ]; then
-    echo "==> $dir 缺少 node_modules，需安装依赖"
+  if [ ! -d "$ROOT_DIR/$dir/node_modules" ] || ! (cd "$ROOT_DIR/$dir" && npm ls --depth=0 >/dev/null 2>&1); then
+    echo "==> $dir 的 node_modules 缺失或依赖树不完整，需安装依赖"
     add_need_ci_dir "$dir"
   fi
 done
