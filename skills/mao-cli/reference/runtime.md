@@ -35,6 +35,17 @@ mao runtime sessions --page 1 --size 20
 mao runtime sessions --phase RUNNING --execution-mode LOCAL
 ```
 
+## 命令：runtime host
+
+无参数。`GET /statistics/host`（需 `analytics:read`）。返回后端进程所在主机的当前快照，不含远程数据库。Docker 不可用仍是成功响应，`data.containers.available=false` 且 `reason` 说明原因；主机状态页的 CPU/内存 trend 由页面单独轻量采样，CLI 不轮询该接口。
+
+```bash
+mao runtime host
+mao runtime host --raw
+```
+
+快照包含 CPU 利用率和负载、内存（Linux 优先 `/proc/meminfo`）、磁盘容量、后端进程资源、磁盘吞吐和 mao 运行时容器统计。磁盘和 Docker 采集只发生在整页快照请求中，不会被 trend 请求触发。
+
 ## 执行环境注入
 
 云端 shell、Web 终端、容器 shell 与容器 MCP 会从系统设置的站点根地址注入 `MAO_BASE_URL`，供 `mao` / `mao-agent` 等客户端明确连接当前站点；未配置站点地址时不会注入。容器脚本探针还会收到 `MAO_DEPS_DIR`，用于校验 npm / pip 依赖路径必须位于当前用户的依赖根下。

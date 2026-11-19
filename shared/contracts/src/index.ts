@@ -52,7 +52,7 @@ export type { OnboardingState, ReadinessVO, OnboardingCompleteInput } from './re
 export type { BudgetScope, BudgetLimitType, BudgetAction, BudgetStatus, MyBudgetItemVO, MyBudgetsVO } from './budget';
 export type { AuditLog, AuditListFilter } from './audit';
 export type { MessageSearchGroup, MessageSearchHit, MessageSearchResult, SessionSource } from './session';
-export type { OnlineDeviceConnection, OnlineDeviceDeviceInfo, OnlineDevicesVo } from './statistics';
+export type { OnlineDeviceConnection, OnlineDeviceDeviceInfo, OnlineDevicesVo, HostCpuSnapshot, HostMemorySnapshot, HostDiskSnapshot, HostDiskIoSnapshot, HostProcessSnapshot, HostDockerDiskSnapshot, HostContainerSnapshot, HostTrendSample, HostStatusVo } from './statistics';
 export type { TaskStage, TaskSource, TaskWaitKind, TaskWaitStatus, TaskWaitReleaseReason, TaskWaitVO, AgentTaskVO, TaskExecutionVO, TaskTriggerVO, TaskListQuery, TaskPageVO, TaskDetailVO } from './task';
 export type { WorkspaceKind, WorkspaceChannel, WorkspaceChatType } from './workspace';
 export type {

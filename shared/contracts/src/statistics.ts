@@ -39,3 +39,109 @@ export interface OnlineDevicesVo {
     connections: OnlineDeviceConnection[];
   }>;
 }
+
+/** CPU 快照（GET /v1/statistics/host）。usagePercent 为相邻两次采样的利用率；首次尚无差值时为 null。 */
+export interface HostCpuSnapshot {
+  cores: number;
+  usagePercent: number | null;
+  /** 采样间隔内花在等待磁盘上的时间占比。读不到 /proc/stat 时为 null */
+  iowaitPercent: number | null;
+  /** 1 / 5 / 15 分钟负载 */
+  load1: number;
+  load5: number;
+  load15: number;
+}
+
+/** 内存快照。proc 来源的 available 是 MemAvailable；os 来源是操作系统报告的空闲内存。 */
+export interface HostMemorySnapshot {
+  totalBytes: number;
+  availableBytes: number;
+  usedBytes: number;
+  /** 0–100，一位小数 */
+  usagePercent: number;
+  /** 无交换区时为 null */
+  swapTotalBytes: number | null;
+  swapUsedBytes: number | null;
+}
+
+/** 一块已挂载磁盘。同一挂载点只出现一次。 */
+export interface HostDiskSnapshot {
+  /** 系统盘 / 工作区 / 上传目录 / 运行时目录 / 用户目录 / Docker 数据 */
+  label: string;
+  /** 采样路径 */
+  path: string;
+  /** df 报告的挂载点 */
+  mount: string;
+  totalBytes: number;
+  usedBytes: number;
+  availableBytes: number;
+  usagePercent: number;
+  /** inode 读不到时为 null（部分文件系统不提供） */
+  inodeTotal: number | null;
+  inodeUsed: number | null;
+  inodeUsagePercent: number | null;
+}
+
+/** 整机磁盘吞吐（整盘合计，不含分区，避免和整盘重复计算）。读不到 /proc/diskstats 时为 null。 */
+export interface HostDiskIoSnapshot {
+  readBytesPerSec: number | null;
+  writeBytesPerSec: number | null;
+}
+
+/** 后端进程自身。文件描述符在非 Linux 上可能为 null。 */
+export interface HostProcessSnapshot {
+  uptimeSeconds: number;
+  rssBytes: number;
+  heapUsedBytes: number;
+  heapTotalBytes: number;
+  eventLoopDelayMs: number | null;
+  openFds: number | null;
+  fdLimit: number | null;
+}
+
+/** Docker 镜像 / 卷 / 构建缓存占用的磁盘。available=false 时各字节字段为 null。 */
+export interface HostDockerDiskSnapshot {
+  available: boolean;
+  reason: string | null;
+  imagesBytes: number | null;
+  imagesReclaimableBytes: number | null;
+  volumesBytes: number | null;
+  volumesReclaimableBytes: number | null;
+  buildCacheBytes: number | null;
+  buildCacheReclaimableBytes: number | null;
+}
+
+/** mao 运行时容器计数；available=false 时计数为 0，不表示没有容器。 */
+export interface HostContainerSnapshot {
+  available: boolean;
+  reason: string | null;
+  running: number;
+  stopped: number;
+  untracked: number;
+  busy: number;
+  total: number;
+}
+
+/** GET /v1/statistics/host/trend 的一个采样点；只含 CPU 与内存，不落库。 */
+export interface HostTrendSample {
+  sampledAt: number;
+  memorySource: 'proc' | 'os';
+  cpu: HostCpuSnapshot;
+  memory: HostMemorySnapshot;
+}
+
+/** GET /v1/statistics/host 响应 data，描述后端进程所在主机。 */
+export interface HostStatusVo {
+  hostname: string;
+  platform: string;
+  uptimeSeconds: number;
+  sampledAt: number;
+  memorySource: 'proc' | 'os';
+  cpu: HostCpuSnapshot;
+  memory: HostMemorySnapshot;
+  disks: HostDiskSnapshot[];
+  diskIo: HostDiskIoSnapshot;
+  process: HostProcessSnapshot;
+  containers: HostContainerSnapshot;
+  dockerDisk: HostDockerDiskSnapshot;
+}
