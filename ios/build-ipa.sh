@@ -2,16 +2,19 @@
 # =============================================================================
 # build-ipa.sh — 构建 Mao iOS 归档并导出 IPA
 #
-# iOS 使用 SwiftUI 原生界面，直接访问生产 API / WebSocket；原生代码变化时需要重新出包。
+# iOS 壳远程加载 https://mao.yupengsheng.cn，前端改动部署 Web 即可；只有原生壳
+# （Info.plist / Swift 插件 / 图标 / Capacitor 配置）变化时才需要重新出包。
 #
 # 用法：
 #   ./build-ipa.sh                              # 从根 CHANGELOG.md 取版本
-#   ./build-ipa.sh --version 1.0.20             # 指定市场版本号
-#   ./build-ipa.sh --export-method ad-hoc       # app-store(默认)/development/ad-hoc/enterprise
+#   ./build-ipa.sh --version 1.0.18             # 指定市场版本号
+#   ./build-ipa.sh --export-method ad-hoc       # development(默认)/ad-hoc/app-store/enterprise
 #   ./build-ipa.sh --dry-run                    # 只做依赖准备与配置检查，不归档
 #
 # 环境要求：
 #   - 完整 Xcode（不是 Command Line Tools），xcodebuild 可用
+#   - CocoaPods（pod）
+#   - Node.js / npm
 #   - Apple Developer Team ID：MAO_IOS_TEAM_ID
 #   - 可选：MAO_IOS_BUNDLE_ID（默认 cn.yupengsheng.mao.app）
 #   - 可选：MAO_IOS_PROVISIONING_PROFILE（手动描述文件名称；默认自动签名）
@@ -33,7 +36,7 @@ CHANGELOG_FILE="$PROJECT_ROOT/CHANGELOG.md"
 
 DRY_RUN=false
 CUSTOM_VERSION=""
-EXPORT_METHOD="${MAO_IOS_EXPORT_METHOD:-app-store}"
+EXPORT_METHOD="${MAO_IOS_EXPORT_METHOD:-development}"
 BUNDLE_ID="${MAO_IOS_BUNDLE_ID:-cn.yupengsheng.mao.app}"
 
 while [[ $# -gt 0 ]]; do
@@ -46,10 +49,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$EXPORT_METHOD" in
-  app-store-connect) EXPORT_METHOD="app-store" ;;
   development|ad-hoc|app-store|enterprise) ;;
-  *) echo "错误：--export-method 仅支持 development / ad-hoc / app-store(app-store-connect) / enterprise"; exit 1 ;;
+  *) echo "错误：--export-method 仅支持 development / ad-hoc / app-store / enterprise"; exit 1 ;;
 esac
+
+if ! command -v npx >/dev/null 2>&1; then
+  echo "错误：未找到 npx，请先安装 Node.js"; exit 1
+fi
 
 XCODE_PATH="$(xcode-select -p 2>/dev/null || true)"
 if ! command -v xcodebuild >/dev/null 2>&1 || [[ "$XCODE_PATH" != *"Xcode.app/Contents/Developer"* ]]; then
@@ -59,6 +65,16 @@ if ! command -v xcodebuild >/dev/null 2>&1 || [[ "$XCODE_PATH" != *"Xcode.app/Co
     echo "错误：归档 IPA 需要完整 Xcode，当前 xcode-select 指向 ${XCODE_PATH}"
     echo "     请执行：sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
     exit 1
+  fi
+fi
+
+HAS_POD=true
+if ! command -v pod >/dev/null 2>&1; then
+  HAS_POD=false
+  if [ "$DRY_RUN" = true ]; then
+    echo "警告：未找到 CocoaPods，dry-run 跳过 pod install"
+  else
+    echo "错误：未找到 CocoaPods，请先执行 sudo gem install cocoapods"; exit 1
   fi
 fi
 
@@ -85,24 +101,37 @@ echo "  Mao iOS IPA 构建"
 echo "=========================================="
 echo "  版本: $VERSION_NAME ($BUILD_NUMBER)"
 echo "  Bundle ID: $BUNDLE_ID"
-echo "  API:   https://mao.yupengsheng.cn/api/v1"
+echo "  远程: https://mao.yupengsheng.cn"
 echo "  导出方式: $EXPORT_METHOD"
 echo "  签名 Team: ${MAO_IOS_TEAM_ID:-<dry-run 未设置>}"
 echo "=========================================="
 echo ""
 
-echo "[1/2] 检查纯原生工程..."
+echo "[1/4] 准备 Capacitor 依赖..."
 cd "$IOS_DIR"
+if [ -f package-lock.json ]; then
+  npm ci
+else
+  npm install
+fi
+npx cap copy ios
+
+if [ "$HAS_POD" = true ]; then
+  echo "[2/4] 安装 CocoaPods 依赖..."
+  (cd "$IOS_DIR/App" && pod install)
+else
+  echo "[2/4] 跳过 CocoaPods（dry-run）"
+fi
 
 if $DRY_RUN; then
   echo ""
   echo "=========================================="
-  echo "  DRY-RUN：原生工程检查完成，未归档、未签名"
+  echo "  DRY-RUN：依赖与配置就绪，未归档、未签名"
   echo "=========================================="
   exit 0
 fi
 
-echo "[1/2] Xcode archive..."
+echo "[3/4] Xcode archive..."
 rm -rf "$ARCHIVE_PATH" "$EXPORT_DIR"
 mkdir -p "$EXPORT_DIR"
 
@@ -111,21 +140,13 @@ SIGN_ARGS=(
   "PRODUCT_BUNDLE_IDENTIFIER=$BUNDLE_ID"
   "MARKETING_VERSION=$VERSION_NAME"
   "CURRENT_PROJECT_VERSION=$BUILD_NUMBER"
-  "CODE_SIGN_STYLE=Automatic"
 )
 if [ -n "${MAO_IOS_PROVISIONING_PROFILE:-}" ]; then
-  SIGN_ARGS+=("CODE_SIGN_STYLE=Manual" "PROVISIONING_PROFILE_SPECIFIER=$MAO_IOS_PROVISIONING_PROFILE")
-elif [[ "$EXPORT_METHOD" != "app-store" ]]; then
-  cat >&2 <<'EOF'
-错误：当前 Release 配置使用 App Store Distribution 描述文件。
-development / ad-hoc / enterprise 导出请设置对应的 MAO_IOS_PROVISIONING_PROFILE，
-或在 Xcode 中把 Release 签名改为自动签名后重试。
-EOF
-  exit 1
+  SIGN_ARGS+=("PROVISIONING_PROFILE_SPECIFIER=$MAO_IOS_PROVISIONING_PROFILE")
 fi
 
 xcodebuild archive \
-  -project "$IOS_DIR/App/App.xcodeproj" \
+  -workspace "$IOS_DIR/App/App.xcworkspace" \
   -scheme App \
   -configuration Release \
   -destination 'generic/platform=iOS' \
@@ -137,11 +158,6 @@ if [ ! -d "$ARCHIVE_PATH" ]; then
   echo "错误：archive 产物不存在: $ARCHIVE_PATH"; exit 1
 fi
 
-EXPORT_SIGNING_STYLE="automatic"
-if [ -n "${MAO_IOS_PROVISIONING_PROFILE:-}" ]; then
-  EXPORT_SIGNING_STYLE="manual"
-fi
-
 cat > "$EXPORT_OPTIONS" <<ENDPLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -150,7 +166,7 @@ cat > "$EXPORT_OPTIONS" <<ENDPLIST
   <key>method</key>
   <string>$EXPORT_METHOD</string>
   <key>signingStyle</key>
-  <string>$EXPORT_SIGNING_STYLE</string>
+  <string>automatic</string>
   <key>teamID</key>
   <string>$MAO_IOS_TEAM_ID</string>
   <key>destination</key>
@@ -159,19 +175,11 @@ cat > "$EXPORT_OPTIONS" <<ENDPLIST
   <true/>
   <key>compileBitcode</key>
   <false/>
-$(if [ -n "${MAO_IOS_PROVISIONING_PROFILE:-}" ]; then cat <<PROFILE_ENTRY
-  <key>provisioningProfiles</key>
-  <dict>
-    <key>$BUNDLE_ID</key>
-    <string>$MAO_IOS_PROVISIONING_PROFILE</string>
-  </dict>
-PROFILE_ENTRY
-fi)
 </dict>
 </plist>
 ENDPLIST
 
-echo "[2/2] 导出 IPA..."
+echo "[4/4] 导出 IPA..."
 xcodebuild -exportArchive \
   -archivePath "$ARCHIVE_PATH" \
   -exportPath "$EXPORT_DIR" \

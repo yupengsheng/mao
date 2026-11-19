@@ -24,6 +24,8 @@
 	<true/>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
+	<key>UIMainStoryboardFile</key>
+	<string>Main</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>用于选择并上传图片或文件到 Mao。</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
@@ -58,6 +60,8 @@
 					<string>$(PRODUCT_MODULE_NAME).SceneDelegate</string>
 					<key>UISceneConfigurationName</key>
 					<string>Default Configuration</string>
+					<key>UISceneStoryboardFile</key>
+					<string>Main</string>
 				</dict>
 			</array>
 		</dict>

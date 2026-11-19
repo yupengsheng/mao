@@ -22,7 +22,7 @@ mao-agent：`cd agent-cli && npm ci && npm run build && npm test`；`bash script
 CI：backend-ts build+test、admin/desktop build、agent-cli build+test；不跑 Playwright。
 
 ## 架构
-六端：backend-ts（NestJS+Fastify :9080 `/api/v1/`，`Result<T>` code=0）+ admin + desktop（Electron/Web）+ android（Capacitor 远程加载 https://mao.yupengsheng.cn，仅 CLOUD）+ ios（SwiftUI 原生客户端，仅 CLOUD，IPA 需 Apple 签名）+ agent-cli（mao-agent）。生产单域：桌面 `/`、管理后台 `/admin/`、API `/api/`、上传 `/uploads/`；desktop 路由勿占用这些前缀。
+六端：backend-ts（NestJS+Fastify :9080 `/api/v1/`，`Result<T>` code=0）+ admin + desktop（Electron/Web）+ android（Capacitor 远程加载 https://mao.yupengsheng.cn，仅 CLOUD）+ ios（Capacitor 远程加载，仅 CLOUD，IPA 需 Apple 签名）+ agent-cli（mao-agent）。生产单域：桌面 `/`、管理后台 `/admin/`、API `/api/`、上传 `/uploads/`；desktop 路由勿占用这些前缀。
 领域：`src/<domain>/*.{routes,service,repository,spec}.ts`。引擎 `backend-ts/src/harness/`：AgentLoop、PromptEngine、ContextManager/CompactionService、ToolDispatcher→ToolRegistry（内置 `harness/tool/impl/`）、LlmAdapter、LocalToolExecutor（WS 委托桌面）、HarnessService、delegate/、skill/。CLOUD 服务端执行 / LOCAL Electron 执行。WS `/api/ws/stream` StreamingWsHandler。拦截器 Audit+Permission，`/v1/**` 排除 auth/ws。DB：MySQL8 + Flyway `backend-ts/db/migration/`，TS 启动执行（FLYWAY_ENABLED）。
 admin：router `admin/src/router/index.ts`，视图 `views/`。desktop：useStreamWS、useChat、stores/auth|agent|session、electron/{main,preload}.cjs。Side Task：HarnessService + StreamingWsHandler + useCenterTabs/CenterTabBar。
 
@@ -33,7 +33,7 @@ admin：router `admin/src/router/index.ts`，视图 `views/`。desktop：useStre
 新增或重命名内置工具时，同步补齐 `backend-ts/src/session/util/tool-result-summarizer.ts` 的结果摘要、`desktop/src/utils/toolDisplay.ts` 的中文名称与参数预览，并添加成功/失败及缺失参数的回归测试，勿只注册工具而遗漏展示。工具结果含随机 id / 图片附件 / 传输字段时，还必须同步 `backend-ts/src/harness/core/no-progress-notice.ts` 的按工具归一化与 `VOLATILE_RESULT_KEYS`（漏补→漏报，误删语义字段→误杀），并补用例。
 新增 LLM 调用场景时三处同改：`shared/contracts/src/usage.ts` 加 `LlmCallScene` 联合成员、`backend-ts/src/usage/llm-call-context.ts` 的 `LLM_CALL_SCENES` 加映射、desktop/admin `src/utils/llmCallLabels.ts` 的 `Record<LlmCallScene,string>` 加中文。漏改任一端 tsc 即报错（汉化表靠 Record 穷尽、后端靠 `as const satisfies`），勿绕过硬改类型。
 跨端枚举一律走 `@mao/contracts`：类型下沉契约，前端汉化表用 `Record<契约联合, 文案>` 声明以吃编译期穷尽；禁止在前端 api 层内联手写联合类型与后端并行。已收口：`LlmCallScene`（usage.ts）、`SignalCompareMode`/`SignalWatcherStatus`（signal.ts）。
-安卓 Java 在 `android/android/app/`，iOS SwiftUI 在 `ios/App/App/`；安卓专用 UI/路由/OTA 写 desktop 并用 `android-capacitor` / `native-mobile` / `Capacitor.isNativePlatform()` 守卫，iOS 聊天界面由原生 SwiftUI 实现，勿影响 Web/Electron。不做 LOCAL、工具审批、系统推送、移动端布局重构、上架商店、改后端/admin。keystore 严禁入 git（`MAO_KEYSTORE_*` 或 `/opt/mao/keystore/keystore-credentials.env`）。前端发版=部署 desktop/dist（刷新/`version.json`）；仅原生壳变更才 `build-apk.sh` / `ios/build-ipa.sh`。
+安卓 Java 在 `android/android/app/`，iOS Swift 在 `ios/App/App/`；专用 UI/路由/OTA 写 desktop 并用 `android-capacitor` / `ios-capacitor` / `native-mobile` / `Capacitor.isNativePlatform()` 守卫，勿影响 Web/Electron。不做 LOCAL、工具审批、系统推送、移动端布局重构、上架商店、改后端/admin。keystore 严禁入 git（`MAO_KEYSTORE_*` 或 `/opt/mao/keystore/keystore-credentials.env`）。前端发版=部署 desktop/dist（刷新/`version.json`）；仅原生壳变更才 `build-apk.sh` / `ios/build-ipa.sh`。
 
 ## 改哪
 REST `backend-ts/src/<domain>/`；迁移 `backend-ts/db/migration/V0xx__*.sql`；内置工具 `harness/tool/impl/`；技能 `harness/skill/`（外部默认 `/opt/mao/data/skills`）；循环 `harness/core/`；流 StreamingWsHandler + useStreamWS；权限 `@RequirePermission`；admin 页 views+router；desktop UI components/views；安卓壳 MainActivity.java、capacitor.config.json；OTA AppUpdatePlugin.java + useVersionCheck.ts；mao-agent `agent-cli/`；mao-cli `skills/mao-cli/`。

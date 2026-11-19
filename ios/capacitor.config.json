@@ -1,0 +1,13 @@
+{
+  "appId": "cn.yupengsheng.mao.app",
+  "appName": "Mao",
+  "webDir": "web-stub",
+  "server": {
+    "url": "https://mao.yupengsheng.cn"
+  },
+  "ios": {
+    "path": ".",
+    "allowsLinkPreview": false,
+    "contentInset": "never"
+  }
+}

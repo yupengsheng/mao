@@ -1,26 +1,28 @@
 # iOS APP
 
-Mao iOS 客户端使用 **SwiftUI 原生界面**，Bundle ID `cn.yupengsheng.mao.app`，显示名 `Mao`。核心聊天页面不再加载远程 WKWebView，直接通过原生 URLSession 调用生产 API 与 WebSocket。当前原生版本覆盖登录、Keychain 令牌、历史会话抽屉与折叠、会话切换、智能体与模型切换、CLOUD 工作区选择、ChatGPT 式输入区快捷配置、消息历史、发送消息和流式回复，统一使用 CLOUD 会话。
+基于 **Capacitor 7** 的 WKWebView 壳，Bundle ID `cn.yupengsheng.mao.app`，显示名 `Mao`。**仅 CLOUD 模式**（无 `electronAPI`，自动禁用 LOCAL）。
+
+与安卓一致，App **远程加载**生产 Web（默认 `https://mao.yupengsheng.cn`）。前端 UI 改动只需部署 Web，不需要重新出 IPA；只有原生壳（Swift 插件、Info.plist、图标、`ios/capacitor.config.json`）变化时才重新构建。
 
 ## 目录
 
 | 路径 | 用途 |
 |------|------|
-| `ios/App/App/NativeRootView.swift` | SwiftUI 原生登录、抽屉、聊天与输入界面 |
-| `ios/App/App/NativeAPI.swift` | REST API、令牌刷新与 Keychain 存储 |
-| `ios/App/App/NativeStore.swift` | 会话状态、WebSocket 流式消息与连接恢复 |
-| `ios/App/App.xcodeproj` | 纯原生 Xcode 工程，不依赖 CocoaPods 或 Capacitor |
-| `ios/App/App.xcworkspace` | 兼容原有打开路径的 Xcode 工作区，仅包含原生工程 |
-| `ios/App/App/` | Swift 源码、Info.plist、LaunchScreen、图标 |
+| `ios/capacitor.config.json` | App ID、远程 URL、iOS 安全区策略 |
+| `ios/App/App.xcworkspace` | Xcode 工作区（先 `pod install`） |
+| `ios/App/App/` | Swift 源码、Info.plist、Storyboard、图标 |
+| `ios/web-stub/` | 远程站点不可达时的占位页，同时满足 Capacitor `webDir` |
 | `ios/build-ipa.sh` | 归档并导出 IPA |
 
 ## 前置条件
 
-- iOS 部署目标为 **15.0**
+- iOS 部署目标为 **15.0**（Xcode 26 起不再支持 14.0，Podfile 与工程已统一）
 - 完整 **Xcode**（不是 Command Line Tools），并执行：
   ```bash
   sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
   ```
+- **CocoaPods**：`sudo gem install cocoapods`
+- **Node.js / npm**
 - Apple Developer 账号与 **Team ID**
 - 在 Xcode 登录开发者账号，并为 `cn.yupengsheng.mao.app` 创建 App ID
 
@@ -29,14 +31,14 @@ Mao iOS 客户端使用 **SwiftUI 原生界面**，Bundle ID `cn.yupengsheng.mao
 ```bash
 cd ios
 export MAO_IOS_TEAM_ID=你的TeamID
-bash build-ipa.sh --version 1.0.22 --export-method app-store
+bash build-ipa.sh --version 1.0.18 --export-method development
 ```
 
 可选参数：
 
 - `--version`：市场版本号；缺省从根 `CHANGELOG.md` 首条提取
-- `--export-method`：`app-store`（默认）/ `development` / `ad-hoc` / `enterprise`；`app-store-connect` 是 `app-store` 的兼容别名。导出 development、ad-hoc 或 enterprise 时设置对应的 `MAO_IOS_PROVISIONING_PROFILE`。
-- `--dry-run`：只检查原生工程，不归档；缺完整 Xcode 时告警并跳过归档，便于在 CI 或纯前端机器上校验工程
+- `--export-method`：`development`（默认）/ `ad-hoc` / `app-store` / `enterprise`
+- `--dry-run`：只安装依赖、执行 `cap copy` 并检查配置，不归档；缺完整 Xcode / CocoaPods 时告警并跳过对应步骤，便于在 CI 或纯前端机器上校验工程
 
 脚本产出：
 
@@ -67,22 +69,33 @@ iOS **不能**像 Android APK 一样在 App 内下载后直接安装：
 
 IPA 必须签名；未签名产物只能用于归档检查，无法安装到真机。
 
-> 当前聊天主链路已是 SwiftUI 原生界面，公开分发仍需按 App Store 的登录、隐私和账号权限要求准备审核材料。
+> App Store 审核对「纯远程 WebView 壳」较严格（常见 4.2 最低功能、2.5.2 远程代码风险）。团队内部分发优先 TestFlight / Ad Hoc / Enterprise；若要公开上架，需要补充原生能力或走审核沟通。
 
 ## 原生能力
 
-- **认证**：登录与刷新令牌写入 Keychain，网络请求遇到 401 会自动刷新并重试。
-- **聊天流**：原生客户端使用 URLSessionWebSocketTask 连接 `/api/ws/stream`，等待 WebSocket 握手完成后发送根级 `auth` 首帧，接收 `content_delta`、`message_end`、`session_status` 与错误事件；连接断开时显示失败原因并自动重连。
-- **会话来源**：服务端当前没有 `ios` 来源值，原生 iOS 创建的 CLOUD 会话暂使用通用 `web` 来源，避免伪装成安卓客户端。
-- **历史会话**：原生抽屉按服务端分组展示会话，支持「历史会话」总折叠、会话切换和新建会话。顶栏配置按钮可切换智能体、模型；新建 CLOUD 会话可新建工作区、复用已有云项目或使用 Git 地址。
-- **更新**：原生代码变化必须重新签名并走 TestFlight / App Store / Ad Hoc；服务端 API 与聊天协议变化可在下次原生版本中同步。
-- **纯原生工程**：启动入口、聊天 UI、REST、WebSocket 和令牌存储均由 Swift/SwiftUI 实现，工程不再编译 Capacitor、Cordova、WKWebView 或旧 Web 资源。
+- **外链**：`ios/App/App/OpenUrlPlugin.swift` 提供与安卓同名的 `OpenUrl` 插件，仅放行 `http` / `https` / `mailto`，由系统浏览器打开。
+- **相册**：`Info.plist` 已声明 `NSPhotoLibraryUsageDescription`，用于选择并上传图片或文件。
+- **安全区**：`ios.contentInset` 为 `never`，由 CSS 显式避让状态栏与 Home Indicator；顶部导航高度会自动加上 `safe-area-inset-top`。
+- **更新**：页面资源随 Web 部署更新；**没有 APK 式 OTA**。原生壳更新必须重新签名并走 TestFlight / App Store / Ad Hoc。
+- **对话引用**：iOS 保留聊天文本选区、文件查看器行区间和 Diff 行区间引用能力；Android 因系统交互限制继续禁用这些引用入口。引用内容仍通过 Web 前端发送，不涉及原生壳 OTA。
+
+## 移动端交互
+
+安卓与 iOS 共用同一套 Web 前端：
+
+- 窄屏顶栏左侧为汉堡按钮，打开覆盖式历史会话抽屉。
+- 抽屉支持遮罩点击、关闭按钮、Esc 收起；选中会话和新建任务后自动关闭。
+- 抽屉内保留分组、聚焦模式与「历史」折叠区。
+- iOS WebView 偶尔会报告桌面级 CSS 宽度；前端同时按原生移动 UA / `native-mobile` 标记识别，仍会进入移动抽屉布局。
+- 原生壳共享样式由 `native-mobile` 标记，iOS 专属安全区由 `ios-capacitor` 标记。
 
 ## 排障
 
 | 现象 | 处理 |
 |------|------|
 | `xcode-select` 指向 CommandLineTools | 切到完整 Xcode 后重试 |
-| 签名失败 | 确认 Team ID、App ID、设备已登记；或在 Xcode 打开 `App.xcworkspace`（或 `App.xcodeproj`）手动修复签名 |
-| 更新后仍显示旧 WebView 界面 | 删除旧版 Mao 后重新安装原生 IPA，并确认安装的是本次构建产物；原生入口不读取远程网页缓存 |
-| 打开后白屏 | 检查 Xcode 控制台是否有原生启动错误，并确认 API 地址可访问；原生入口不依赖 WKWebView 页面 |
+| `pod: command not found` | 安装 CocoaPods |
+| 签名失败 | 确认 Team ID、App ID、设备已登记；或在 Xcode 打开 `App.xcworkspace` 手动修复签名 |
+| 更新后仍显示旧三栏布局 | 从后台彻底结束 Mao 后重开；仍未更新时删除 App 并重新安装，远程入口文档需由 Nginx 返回 `Cache-Control: no-cache` |
+| 打开后白屏 | 检查 `https://mao.yupengsheng.cn` 是否可访问、证书是否有效；远程站点需允许 WKWebView 加载 |
+| 外链点击无反应 | 检查链接协议是否在 `OpenUrlPlugin` 白名单内 |
