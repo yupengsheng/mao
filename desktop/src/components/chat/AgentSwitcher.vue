@@ -2,8 +2,10 @@
   <el-popover
     ref="popoverRef"
     trigger="click"
-    :width="300"
+    width="auto"
     placement="left-start"
+    popper-class="agent-switch-popper"
+    :popper-style="popperStyle"
     @before-enter="ensureAgents"
   >
     <template #reference>
@@ -29,7 +31,7 @@
             class="row-avatar"
           />
           <span v-else class="row-avatar row-avatar-fallback">{{ agent.name?.charAt(0) }}</span>
-          <span class="agent-row-name">{{ agent.name }}</span>
+          <span class="agent-row-name" v-overflow-title="agent.name">{{ agent.name }}</span>
         </button>
         <div v-if="filteredAgents.length === 0" class="agent-empty">暂无可用智能体</div>
       </div>
@@ -53,6 +55,46 @@ const emit = defineEmits<{
 const popoverRef = ref()
 const agentStore = useAgentStore()
 const filter = ref('')
+
+// 外壳按内容收缩，同时保留窄视口下的可用宽度。
+const popperStyle = {
+  width: 'max-content',
+  minWidth: 'min(206px, calc(100vw - 16px))',
+  maxWidth: 'min(346px, calc(100vw - 16px))',
+}
+
+const overflowTitleValues = new WeakMap<HTMLElement, string>()
+const overflowTitleObservers = new WeakMap<HTMLElement, ResizeObserver>()
+
+function updateOverflowTitle(el: HTMLElement, value?: string) {
+  const name = value ?? ''
+  overflowTitleValues.set(el, name)
+  if (name && el.scrollWidth > el.clientWidth) {
+    el.title = name
+  } else {
+    el.removeAttribute('title')
+  }
+}
+
+const vOverflowTitle = {
+  mounted(el: HTMLElement, binding: { value?: string }) {
+    updateOverflowTitle(el, binding.value)
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(() => {
+      updateOverflowTitle(el, overflowTitleValues.get(el))
+    })
+    observer.observe(el)
+    overflowTitleObservers.set(el, observer)
+  },
+  updated(el: HTMLElement, binding: { value?: string }) {
+    updateOverflowTitle(el, binding.value)
+  },
+  unmounted(el: HTMLElement) {
+    overflowTitleObservers.get(el)?.disconnect()
+    overflowTitleObservers.delete(el)
+    overflowTitleValues.delete(el)
+  },
+}
 
 const filteredAgents = computed(() => {
   const q = filter.value.trim().toLowerCase()
@@ -102,16 +144,24 @@ function handleSelect(agent: Agent) {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  /* 宽度跟着最长名称走。搜索框 width:0 + min-width:100%，不参与撑宽 */
+  width: max-content;
+  min-width: min(180px, 100%);
+  max-width: 100%;
 }
 
 .agent-filter {
   flex-shrink: 0;
+  width: 0;
+  min-width: 100%;
 }
 
 .agent-list {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  width: 100%;
+  min-width: 0;
   max-height: 280px;
   overflow-y: auto;
 }
@@ -121,6 +171,8 @@ function handleSelect(agent: Agent) {
   align-items: center;
   gap: 10px;
   width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   padding: 6px 10px;
   border: none;
   border-radius: var(--aw-radius-sm);
@@ -157,8 +209,12 @@ function handleSelect(agent: Agent) {
 }
 
 .agent-row-name {
+  min-width: 0;
+  overflow: hidden;
   font-size: var(--aw-text-caption);
   color: var(--aw-body);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .agent-empty {

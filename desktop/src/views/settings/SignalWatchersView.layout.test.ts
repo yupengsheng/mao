@@ -90,6 +90,20 @@ describe('信号哨兵轮询记录抽屉移动端布局', () => {
   })
 })
 
+describe('信号哨兵删除确认', () => {
+  it('第一次点击删除就弹出确认框，不再要求先点一次进入确认态', () => {
+    expect(src).toContain('@click="confirmDelete(watcher)"')
+    expect(src).not.toContain('confirmDeleteId')
+    expect(src).toMatch(/async function confirmDelete\(watcher: SignalWatcherView\): Promise<void> \{\s*try \{\s*await ElMessageBox\.confirm\(/)
+  })
+
+  it('删除图标按钮提供明确的 aria-label', () => {
+    const button = src.match(/<button\b[^>]*@click="confirmDelete\(watcher\)"[^>]*>/)?.[0]
+    expect(button).toBeDefined()
+    expect(button).toContain('aria-label="删除哨兵"')
+  })
+})
+
 // ── 触发方式 + 复制（D8 模型 B / D9）─────────────────────────────────
 // 这几点都会直接改变用户可感知的行为：20 个上限取消、复用自己的会话、复制继承敏感字段，
 // 且「复用会话」指针是服务端维护的（用户不选会话），所以一并锁在源码级断言里。

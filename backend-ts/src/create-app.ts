@@ -110,6 +110,7 @@ import { SkillLoader } from './harness/skill/skill-loader.js';
 import { ScheduledTaskDbStore } from './schedule/scheduled-task.store.js';
 import { AnalyticsDbStore, AnalyticsService } from './analytics/analytics.service.js';
 import { StatisticsDbStore, StatisticsService } from './statistics/statistics.service.js';
+import { createHostIo, HostStatusService, hostDiskProbes } from './statistics/host-status.service.js';
 import { FEISHU_DISLIKE_SOURCE, FeedbackRepository } from './feedback/feedback.repository.js';
 import { FeedbackDbLookup, FeedbackService } from './feedback/feedback.service.js';
 import { AdminAnalyticsDbStore, AdminAnalyticsService } from './admin/admin-analytics.service.js';
@@ -1067,6 +1068,13 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     pushFinalReply: (sessionId: number) => scheduledService.pushFinalReplyIfApplicable(sessionId),
   });
 
+  const hostStatus = new HostStatusService(createHostIo(() => containerRegistry.listEntries()), hostDiskProbes({
+    workspaceRoot: cfg.app.harness.workspaceRoot,
+    uploadDir: cfg.app.file.uploadDir,
+    runtimeDir: cfg.app.harness.runtimeDir,
+    userHomeDir: cfg.app.harness.userHomeDir,
+  }));
+
   await registerAllRoutes({
     app, db, cfg, apiPrefix, jwt, agentRuntimeCfg,
     authService, feishu, ecpAuth, userService, userRepo, permissionService,
@@ -1095,7 +1103,7 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     openRunService, apiTokenService, webhookTriggerService, outboundSubscriptionService,
     openApiRateLimiter, callLogService,
     watcherService, signalWatcherRepo,
-    analyticsService, statisticsService, adminAnalytics,
+    analyticsService, statisticsService, hostStatus, adminAnalytics,
     feedbackService,
     memoryService,
     approvalRuleService,
