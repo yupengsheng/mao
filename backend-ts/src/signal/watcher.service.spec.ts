@@ -11,6 +11,7 @@ import {
   WATCHER_DISABLE_AFTER_FAILURES,
   WATCHER_MAX_TRIGGERS_PER_HOUR,
   WatcherService,
+  toConfiguredViewPath,
   type WatcherDisableNotifier,
   type WatcherInput,
   type WatcherSessionLookup,
@@ -254,6 +255,11 @@ const baseInput: WatcherInput = {
 };
 
 describe('WatcherService CRUD', () => {
+  it('restores a configured workspace path after realpath validation', () => {
+    expect(toConfiguredViewPath('/opt/mao-data/projects/7', '/data/mao-data/projects/7', '/data/mao-data/projects/7/scripts/check.sh'))
+      .toBe('/opt/mao-data/projects/7/scripts/check.sh');
+  });
+
   it('creates a watcher and returns a masked view', async () => {
     const h = harness();
     const view = await h.service.create(7, { ...baseInput, headers: { Authorization: 'Bearer t', Accept: 'application/json' } });

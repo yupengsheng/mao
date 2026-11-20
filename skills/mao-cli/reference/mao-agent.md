@@ -39,6 +39,8 @@ cd agent-cli && npm ci && npm run build && npm link
 
 `mao-agent` 不再内置默认站点地址，首次使用必须先设置。首次 `mao-agent login` 时若发现未配置（`--base-url` / `MAO_BASE_URL` / 项目配置 / 用户配置都没有），会在交互终端要求输入：需以 `https://` 或 `http://` 开头，只填站点根（可带 `/api`、`/api/v1`），校验通过后保存到 `~/.mao/agent-cli/config.json` 再继续登录。非交互场景（CI / 管道）与其它需要连接服务器的命令（`ls` / `resume` / chat）未配置时直接报错并给出设置方式；`logout` 不受影响（跳过服务端调用、仅本地清理），`status` 显示「(未设置)」，`update` 不依赖站点、不受影响。登录成功时若地址仅来自 `--base-url` / `MAO_BASE_URL`，会自动写入用户配置（已有用户配置不覆盖），下次可直接使用。云端 shell / 终端与桌面 LOCAL shell 由平台自动注入 `MAO_BASE_URL`（见 [config.md](config.md#站点域名)），本地手动安装时按上述方式设置。
 
+交互终端运行 `mao-agent ls`、`resume` 或 `chat` 时，如果本地 access / refresh token 都已失效，会提示重新输入账号密码并在成功后继续原命令；同一时间并发请求只会发起一次重新登录。`--token`、`MAO_TOKEN` 和非交互场景不会代替凭据自动登录，而是保留明确的 `mao-agent login` 提示。
+
 ## 基本用法
 
 ```bash

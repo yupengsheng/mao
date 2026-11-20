@@ -2,7 +2,9 @@
 
 桌面端是普通用户主入口：选 Agent、建任务、对话、工作区、定时任务、通知与设置。开发默认 `http://localhost:5201`；生产多为 `https://mao.example.com/`（管理后台在同域 `/admin/`）。
 
-LOCAL 本机工具需 Electron，见 [electron.md](electron.md)。对话执行也可用 [mao-agent.md](mao-agent.md)。
+LOCAL 本机工具需 Electron，见 [electron.md](electron.md)。对话执行也可用 [mao-agent.md](mao-agent.md)。工作区文件上传过程中可在进度条点击「取消」；取消会中止当前请求，组件关闭或重新发起上传时也会清理旧请求，不会在覆盖确认后偷偷重传。
+
+顶栏登录后会显示主题图标，按「浅色 → 深色 → 跟随系统」循环切换；悬浮提示会说明当前模式和下一次切换。设置 → 个人信息中的主题单选项与顶栏使用同一偏好，任一处修改都会立即同步。
 
 ## 进入方式
 

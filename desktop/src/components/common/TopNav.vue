@@ -109,6 +109,20 @@
             <el-icon :size="16"><Setting /></el-icon>
           </div>
         </el-tooltip>
+        <el-tooltip :content="themeTooltip" :show-after="100" placement="bottom" :disabled="isMobileDevice()">
+          <div
+            class="theme-toggle theme-mode-toggle"
+            role="button"
+            :aria-label="themeTooltip"
+            @click="toggleTheme"
+          >
+            <el-icon :size="16">
+              <Sunrise v-if="theme === 'auto'" />
+              <Moon v-else-if="theme === 'light'" />
+              <Sunny v-else />
+            </el-icon>
+          </div>
+        </el-tooltip>
         <el-dropdown @command="handleCommand" trigger="click">
           <div class="nav-user" role="button" aria-label="用户菜单">
             <el-avatar :size="24" :src="authStore.user?.avatarUrl || undefined">
@@ -147,7 +161,7 @@
     <ShortcutHelpDialog ref="shortcutHelpRef" />
   </nav>
 </template><script setup lang="ts">
-import { ArrowLeft, ChatLineSquare, Clock, FolderOpened, Reading, Refresh, Setting, SwitchButton, User } from '@element-plus/icons-vue'
+import { ArrowLeft, ChatLineSquare, Clock, FolderOpened, Moon, Reading, Refresh, Setting, Sunrise, Sunny, SwitchButton, User } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -159,6 +173,7 @@ import { useVersionCheck } from '../../composables/useVersionCheck'
 import { readScreenFillingWindow, reserveMacTrafficLightInset as shouldReserveMacTrafficLightInset } from '../../utils/macTrafficLightInset'
 import { isElectronClient } from '../../utils/platform'
 import { goBackToWorkbench } from '../../utils/workbench-nav'
+import { useTheme } from '../../utils/theme'
 import { openWorkspaceOverviewTabFor, useCenterTabs } from '../../composables/useCenterTabs'
 import SessionSearchPopover from '../search/SessionSearchPopover.vue'
 import UsageBell from '../usage/UsageBell.vue'
@@ -210,6 +225,12 @@ const commandHost: CommandHostActions = {
 
 const sessionStore = useSessionStore()
 const authStore = useAuthStore()
+const { theme, toggleTheme } = useTheme()
+const themeTooltip = computed(() => {
+  if (theme.value === 'auto') return '跟随系统（点击切换浅色）'
+  if (theme.value === 'light') return '浅色（点击切换深色）'
+  return '深色（点击跟随系统）'
+})
 // useCenterTabs 内部会注册 watch，必须放在 setup 顶层创建并随 TopNav 生命周期存活。
 const paletteCenterTabs = useCenterTabs(computed(() => sessionStore.activeSessionId))
 const { isOpen: terminalOpen, togglePanel } = useTerminal()

@@ -1,5 +1,5 @@
 import { accessSync, realpathSync, statSync } from 'node:fs';
-import { isAbsolute, resolve } from 'node:path';
+import { isAbsolute, relative, resolve } from 'node:path';
 import { BusinessException } from '../common/business-exception.js';
 import { ErrorCode } from '../common/error-code.js';
 import { formatDateTime } from '../common/json.js';
@@ -50,6 +50,10 @@ export const SCRIPT_PROBE_MAX_TIMEOUT_SECONDS = 300;
 export const SCRIPT_PROBE_MIN_INTERVAL_MINUTES = 5;
 /** 脚本文件大小上限（保存与执行双侧校验）。 */
 export const SCRIPT_PROBE_MAX_FILE_BYTES = 256 * 1024;
+
+export function toConfiguredViewPath(root: string, realRoot: string, realFull: string): string {
+  return resolve(root, relative(realRoot, realFull));
+}
 
 /** 哨兵停用通知（收件箱 WATCHER_DISABLED kind），装配层适配 InboxService。 */
 export interface WatcherDisableNotifier {
@@ -909,7 +913,9 @@ export class WatcherService {
     if (!isUnder(realFull, realRoot)) {
       throw new BusinessException(ErrorCode.PARAM_INVALID, `脚本路径越出项目工作区：${scriptPath}`);
     }
-    return realFull;
+    // 安全校验使用 realpath，执行时仍必须返回配置视角路径；存储根可能是
+    // Docker 挂载使用的软链，直接传 realFull 会让容器内找不到同一脚本。
+    return toConfiguredViewPath(root, realRoot, realFull);
   }
 
   /**
