@@ -350,6 +350,14 @@ html.ios-capacitor.keyboard-open .layout {
   height: var(--app-viewport-height, 100dvh);
 }
 
+/*
+ * 键盘是 250ms 左右滑上来的，容器高度若直接跳变，输入框/消息区会「闪一下」。
+ * 让高度跟着键盘的节奏过渡，开关键盘时都不再突然弹动。
+ */
+html.ios-capacitor .layout {
+  transition: height 0.25s cubic-bezier(0.25, 0.72, 0.25, 1);
+}
+
 /* ============================================
    Dark Mode
    底色接近原来的炭黑，不往纯黑压。长文主文字用 #d0d0d4（卡片上约 10:1），
