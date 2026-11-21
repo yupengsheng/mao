@@ -341,6 +341,15 @@ html.ios-capacitor {
   -webkit-text-size-adjust: 100%;
 }
 
+/*
+ * iOS 软键盘：键盘弹出后把应用容器夹到键盘上方的可视区域（高度由
+ * utils/ios-keyboard-viewport.ts 写入），输入框不被遮挡，
+ * WebKit 就不会为了让光标可见而放大整页。
+ */
+html.ios-capacitor.keyboard-open .layout {
+  height: var(--app-viewport-height, 100dvh);
+}
+
 /* ============================================
    Dark Mode
    底色接近原来的炭黑，不往纯黑压。长文主文字用 #d0d0d4（卡片上约 10:1），

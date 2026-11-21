@@ -23,6 +23,7 @@ import { useAppearance } from './utils/appearance'
 import { initAuthStorage } from './utils/auth-storage'
 import { useForegroundRecovery } from './composables/useForegroundRecovery'
 import { renderBootFailure } from './utils/boot-failure'
+import { installIosKeyboardViewport } from './utils/ios-keyboard-viewport'
 import './style.css'
 import 'monaco-editor/min/vs/editor/editor.main.css'
 
@@ -45,6 +46,7 @@ function markNativeCapacitor() {
 
 async function bootstrap() {
   markNativeCapacitor()
+  installIosKeyboardViewport()
   await initAuthStorage()
 
   const app = createApp(App)
