@@ -76,6 +76,7 @@ IPA 必须签名；未签名产物只能用于归档检查，无法安装到真�
 - **外链**：`ios/App/App/OpenUrlPlugin.swift` 提供与安卓同名的 `OpenUrl` 插件，仅放行 `http` / `https` / `mailto`，由系统浏览器打开。
 - **相册**：`Info.plist` 已声明 `NSPhotoLibraryUsageDescription`，用于选择并上传图片或文件。
 - **安全区**：`ios.contentInset` 为 `never`，由 CSS 显式避让状态栏与 Home Indicator；顶部导航高度会自动加上 `safe-area-inset-top`。
+- **缩放锁定**：iOS 26/27 的 WKWebView 聚焦输入框时会放大整页且不还原，页面侧 16px 字号与 viewport 缩放限制都拦不住；`MaoBridgeViewController` 禁用双指缩放并监听 `scrollView.zoomScale` / `pageZoom`，一旦被放大立即复位。属于原生壳改动，需重新打包 IPA。
 - **更新**：页面资源随 Web 部署更新；**没有 APK 式 OTA**。原生壳更新必须重新签名并走 TestFlight / App Store / Ad Hoc。
 - **对话引用**：iOS 保留聊天文本选区、文件查看器行区间和 Diff 行区间引用能力；Android 因系统交互限制继续禁用这些引用入口。引用内容仍通过 Web 前端发送，不涉及原生壳 OTA。
 
@@ -98,5 +99,5 @@ IPA 必须签名；未签名产物只能用于归档检查，无法安装到真�
 | 签名失败 | 确认 Team ID、App ID、设备已登记；或在 Xcode 打开 `App.xcworkspace` 手动修复签名 |
 | 更新后仍显示旧三栏布局 | 从后台彻底结束 Mao 后重开；仍未更新时删除 App 并重新安装，远程入口文档需由 Nginx 返回 `Cache-Control: no-cache` |
 | 打开后白屏 | 检查 `https://mao.yupengsheng.cn` 是否可访问、证书是否有效；远程站点需允许 WKWebView 加载 |
-| 点开输入框后整页变宽变高 | 三层防护：`style.css` 在 `html.ios-capacitor` 下把输入框、文本域、`[contenteditable]` 统一为 16px；`index.html` 内联脚本锁定 viewport（`maximum-scale=1, user-scalable=no`）；`utils/ios-keyboard-viewport.ts` 在键盘弹出时把 `.layout` 夹到 `visualViewport` 上方，避免键盘盖住输入框触发 WebKit 放大整页。新增输入控件勿在原生壳内降到 16px 以下；仍复现时确认 iOS 加载到最新 `desktop/dist` |
+| 点开输入框后整页变宽变高 | 四层防护：`style.css` 在 `html.ios-capacitor` 下把输入框、文本域、`[contenteditable]` 统一为 16px；`index.html` 内联脚本锁定 viewport（`maximum-scale=1, user-scalable=no`）；`utils/ios-keyboard-viewport.ts` 在键盘弹出时把 `.layout` 夹到 `visualViewport` 上方；`MaoBridgeViewController` 在原生侧把 `zoomScale`/`pageZoom` 复位。前两层随 Web 部署生效，原生侧改动需重新打包 IPA；仍复现时确认 iOS 加载到最新 `desktop/dist` 与最新 IPA |
 | 外链点击无反应 | 检查链接协议是否在 `OpenUrlPlugin` 白名单内 |
