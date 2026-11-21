@@ -77,6 +77,7 @@ IPA 必须签名；未签名产物只能用于归档检查，无法安装到真�
 - **相册**：`Info.plist` 已声明 `NSPhotoLibraryUsageDescription`，用于选择并上传图片或文件。
 - **安全区**：`ios.contentInset` 为 `never`，由 CSS 显式避让状态栏与 Home Indicator；顶部导航高度会自动加上 `safe-area-inset-top`。
 - **缩放锁定**：iOS 26/27 的 WKWebView 聚焦输入框时会放大整页且不还原；页面侧将可编辑控件统一为 16px、关闭 `-webkit-text-size-adjust`，并在入口脚本与 `main.ts` 双阶段锁定 `minimum-scale=1` / `maximum-scale=1`。`MaoBridgeViewController` 在远程页面加载前禁用双指缩放并监听 `scrollView.zoomScale` / `pageZoom`，一旦被放大立即复位。原生侧改动需重新打包 IPA。
+- **键盘表单工具行**：WebKit 会在键盘上方加一行 `‹ › ✓` 的 `inputAccessoryView`，页面侧（CSS / JS / `inputmode`）无法隐藏；`MaoBridgeViewController` 沿用 `@capacitor/keyboard` 的 `hideFormAccessoryBar` 做法，把 `UIResponder` / `WKContentView` 的 `inputAccessoryView` 实现改成返回 `nil`。属原生壳改动，需重新打包 IPA。
 - **更新**：页面资源随 Web 部署更新；**没有 APK 式 OTA**。原生壳更新必须重新签名并走 TestFlight / App Store / Ad Hoc。
 - **对话引用**：iOS 保留聊天文本选区、文件查看器行区间和 Diff 行区间引用能力；Android 因系统交互限制继续禁用这些引用入口。引用内容仍通过 Web 前端发送，不涉及原生壳 OTA。
 
@@ -101,4 +102,5 @@ IPA 必须签名；未签名产物只能用于归档检查，无法安装到真�
 | 点开输入框后背景继续抖动 | 消息列表已关闭 WebKit 滚动锚定，键盘避让仍由 `visualViewport` 调整 `.layout` 高度；若仍复现，确认 iOS 加载到最新 `desktop/dist`，并从 Xcode 重新构建原生壳后重试 |
 | 打开后白屏 | 检查 `https://mao.yupengsheng.cn` 是否可访问、证书是否有效；远程站点需允许 WKWebView 加载 |
 | 点开输入框后整页变宽变高或背景跳动 | iOS 缩放问题由五层防护处理：`style.css` 在 `html.ios-capacitor` 下把输入框、文本域、`[contenteditable]` 统一为 16px 并关闭自动字号调整；`index.html` 与 `main.ts` 双阶段锁定 viewport（`minimum-scale=1, maximum-scale=1, user-scalable=no`）；`utils/ios-keyboard-viewport.ts` 在键盘弹出时把 `.layout` 夹到 `visualViewport` 上方；`MaoBridgeViewController` 在远程页面加载前安装缩放监听并把 `zoomScale`/`pageZoom` 复位。聊天中心态保持原有居中排列，程序化聚焦关闭额外滚动，避免键盘避让与输入框滚动叠加。页面改动随 Web 部署生效，原生侧改动需重新打包 IPA；仍复现时确认 iOS 加载到最新 `desktop/dist` 与包含本修复的最新 IPA。 |
+| 键盘上方多出 `‹ › ✓` 一行 | 这是 WebKit 的 `inputAccessoryView`，CSS / JS / `inputmode` 都去不掉；`MaoBridgeViewController` 已在原生侧把 `UIResponder` / `WKContentView` 的 `inputAccessoryView` 置空（同 `@capacitor/keyboard` 的 `hideFormAccessoryBar`），需重新打包 IPA |
 | 外链点击无反应 | 检查链接协议是否在 `OpenUrlPlugin` 白名单内 |
