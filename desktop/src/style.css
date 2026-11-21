@@ -322,6 +322,25 @@ html.ios-capacitor .layout {
   height: calc(100dvh - env(safe-area-inset-bottom, 0px));
 }
 
+/*
+ * iOS 聚焦自动缩放：WKWebView 在可编辑控件 font-size < 16px 时会把整页放大，
+ * 键盘收起后也不还原，表现为「刚打开正常，点开输入框写几个字后页面变宽变高」，
+ * 并伴随横向滚动、聊天区被顶出可视区。桌面端字号 13~15px，必然触发。
+ * 原生壳内把可编辑控件统一到 16px，从根上避免缩放；xterm 的隐藏输入框
+ * 靠字号定位输入法候选窗，排除在外。
+ */
+html.ios-capacitor input:not([type='checkbox']):not([type='radio']):not([type='range']),
+html.ios-capacitor textarea:not(.xterm-helper-textarea),
+html.ios-capacitor select,
+html.ios-capacitor [contenteditable='true'] {
+  font-size: 16px !important;
+}
+
+/* 旋转/横屏时禁止 WKWebView 自作主张放大字号。 */
+html.ios-capacitor {
+  -webkit-text-size-adjust: 100%;
+}
+
 /* ============================================
    Dark Mode
    底色接近原来的炭黑，不往纯黑压。长文主文字用 #d0d0d4（卡片上约 10:1），
