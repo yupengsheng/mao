@@ -15,6 +15,9 @@ final class MaoBridgeViewController: CAPBridgeViewController {
 
     override func capacitorDidLoad() {
         bridge?.registerPluginInstance(OpenUrlPlugin())
+        // CAPBridgeViewController 在这里已经创建 WebView、但尚未开始加载远程入口；
+        // 提前锁定缩放，避免首个输入框聚焦发生在 viewDidAppear 监听安装之前。
+        lockdownZoom()
     }
 
     override func viewDidAppear(_ animated: Bool) {

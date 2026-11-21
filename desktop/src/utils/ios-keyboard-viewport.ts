@@ -8,6 +8,9 @@
  */
 const OCCLUSION_THRESHOLD = 80
 
+export const IOS_VIEWPORT_CONTENT =
+  'width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover'
+
 interface ViewportLike {
   height: number
   offsetTop: number
@@ -22,6 +25,20 @@ export interface IosKeyboardViewportOptions {
   root: HTMLElement
   viewport: VisualViewportLike
   innerHeight: () => number
+}
+
+/**
+ * 锁定 iOS 原生壳的文档缩放比。
+ *
+ * index.html 会在首屏尽早执行同样的设置，但 Capacitor bridge 在部分 WKWebView
+ * 生命周期中稍晚才注入；这里由 main.ts 再补一次，避免只加上 ios-capacitor 标记却
+ * 漏掉 viewport 锁，导致聚焦 contenteditable 时 WebKit 仍按默认比例放大页面。
+ */
+export function lockIosViewportMeta(documentLike: Pick<Document, 'querySelector'>): boolean {
+  const viewport = documentLike.querySelector('meta[name="viewport"]')
+  if (!viewport) return false
+  viewport.setAttribute('content', IOS_VIEWPORT_CONTENT)
+  return true
 }
 
 /** 键盘遮挡高度（px）：布局视口高度减去可视视口占据的上边界与高度。 */

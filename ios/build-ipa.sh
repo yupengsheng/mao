@@ -137,10 +137,20 @@ mkdir -p "$EXPORT_DIR"
 
 SIGN_ARGS=(
   "DEVELOPMENT_TEAM=$MAO_IOS_TEAM_ID"
-  "PRODUCT_BUNDLE_IDENTIFIER=$BUNDLE_ID"
   "MARKETING_VERSION=$VERSION_NAME"
   "CURRENT_PROJECT_VERSION=$BUILD_NUMBER"
 )
+
+# Do not pass PRODUCT_BUNDLE_IDENTIFIER as a global xcodebuild override.
+# xcodebuild applies command-line build settings to every target in the
+# workspace, which would give Capacitor/Cordova frameworks the app's bundle ID
+# and make App Store Connect reject the IPA for duplicate identifiers. The App
+# target already owns the bundle ID in project.pbxproj; keep this check visible
+# so a custom value cannot silently produce an incorrectly identified build.
+if [[ "$BUNDLE_ID" != "cn.yupengsheng.mao.app" ]]; then
+  echo "错误：自定义 Bundle ID 需要先写入 ios/App/App.xcodeproj 的 App target 配置：$BUNDLE_ID"
+  exit 1
+fi
 if [ -n "${MAO_IOS_PROVISIONING_PROFILE:-}" ]; then
   SIGN_ARGS+=("PROVISIONING_PROFILE_SPECIFIER=$MAO_IOS_PROVISIONING_PROFILE")
 fi

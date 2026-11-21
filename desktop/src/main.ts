@@ -23,7 +23,7 @@ import { useAppearance } from './utils/appearance'
 import { initAuthStorage } from './utils/auth-storage'
 import { useForegroundRecovery } from './composables/useForegroundRecovery'
 import { renderBootFailure } from './utils/boot-failure'
-import { installIosKeyboardViewport } from './utils/ios-keyboard-viewport'
+import { installIosKeyboardViewport, lockIosViewportMeta } from './utils/ios-keyboard-viewport'
 import './style.css'
 import 'monaco-editor/min/vs/editor/editor.main.css'
 
@@ -33,6 +33,7 @@ function markNativeCapacitor() {
     const platform = capacitor?.isNativePlatform?.() ? capacitor.getPlatform?.() : null
     if (platform === 'android' || platform === 'ios') {
       document.documentElement.classList.add(`${platform}-capacitor`, 'native-mobile')
+      if (platform === 'ios') lockIosViewportMeta(document)
       return
     }
     const host = window.location.hostname

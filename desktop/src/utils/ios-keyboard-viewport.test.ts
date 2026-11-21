@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { applyIosKeyboardViewport, keyboardOcclusion, type VisualViewportLike } from './ios-keyboard-viewport'
+import {
+  applyIosKeyboardViewport,
+  IOS_VIEWPORT_CONTENT,
+  keyboardOcclusion,
+  lockIosViewportMeta,
+  type VisualViewportLike,
+} from './ios-keyboard-viewport'
 
 function fakeRoot() {
   const vars = new Map<string, string>()
@@ -36,6 +42,21 @@ function fakeViewport(height: number, offsetTop = 0): VisualViewportLike {
 }
 
 describe('ios-keyboard-viewport', () => {
+  it('锁定 iOS 原生壳 viewport，防止 Capacitor bridge 延迟时漏锁', () => {
+    let content = ''
+    const meta = {
+      setAttribute: (_name: string, value: string) => {
+        content = value
+      },
+    }
+
+    expect(lockIosViewportMeta({ querySelector: () => meta } as unknown as Document)).toBe(true)
+    expect(content).toBe(IOS_VIEWPORT_CONTENT)
+    expect(content).toContain('minimum-scale=1.0')
+    expect(content).toContain('maximum-scale=1.0')
+    expect(content).toContain('user-scalable=no')
+  })
+
   it('没有键盘时遮挡高度为 0', () => {
     expect(keyboardOcclusion(844, fakeViewport(844))).toBe(0)
   })

@@ -338,7 +338,7 @@ html.ios-capacitor [contenteditable='true'] {
 
 /* 旋转/横屏时禁止 WKWebView 自作主张放大字号。 */
 html.ios-capacitor {
-  -webkit-text-size-adjust: 100%;
+  -webkit-text-size-adjust: none;
 }
 
 /*
