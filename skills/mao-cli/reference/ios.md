@@ -99,5 +99,5 @@ IPA 必须签名；未签名产物只能用于归档检查，无法安装到真�
 | 签名失败 | 确认 Team ID、App ID、设备已登记；或在 Xcode 打开 `App.xcworkspace` 手动修复签名 |
 | 更新后仍显示旧三栏布局 | 从后台彻底结束 Mao 后重开；仍未更新时删除 App 并重新安装，远程入口文档需由 Nginx 返回 `Cache-Control: no-cache` |
 | 打开后白屏 | 检查 `https://mao.yupengsheng.cn` 是否可访问、证书是否有效；远程站点需允许 WKWebView 加载 |
-| 点开输入框后整页变宽变高 | 五层防护：`style.css` 在 `html.ios-capacitor` 下把输入框、文本域、`[contenteditable]` 统一为 16px 并关闭自动字号调整；`index.html` 与 `main.ts` 双阶段锁定 viewport（`minimum-scale=1, maximum-scale=1, user-scalable=no`）；`utils/ios-keyboard-viewport.ts` 在键盘弹出时把 `.layout` 夹到 `visualViewport` 上方；`MaoBridgeViewController` 在远程页面加载前安装缩放监听并把 `zoomScale`/`pageZoom` 复位。页面改动随 Web 部署生效，原生侧改动需重新打包 IPA；仍复现时确认 iOS 加载到最新 `desktop/dist` 与包含本修复的最新 IPA。 |
+| 点开输入框后整页变宽变高或背景跳动 | iOS 缩放问题由五层防护处理：`style.css` 在 `html.ios-capacitor` 下把输入框、文本域、`[contenteditable]` 统一为 16px 并关闭自动字号调整；`index.html` 与 `main.ts` 双阶段锁定 viewport（`minimum-scale=1, maximum-scale=1, user-scalable=no`）；`utils/ios-keyboard-viewport.ts` 在键盘弹出时把 `.layout` 夹到 `visualViewport` 上方；`MaoBridgeViewController` 在远程页面加载前安装缩放监听并把 `zoomScale`/`pageZoom` 复位。聊天中心态保持原有居中排列，程序化聚焦关闭额外滚动，避免键盘避让与输入框滚动叠加。页面改动随 Web 部署生效，原生侧改动需重新打包 IPA；仍复现时确认 iOS 加载到最新 `desktop/dist` 与包含本修复的最新 IPA。 |
 | 外链点击无反应 | 检查链接协议是否在 `OpenUrlPlugin` 白名单内 |

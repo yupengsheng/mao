@@ -38,6 +38,24 @@ describe('聊天可达性回归（键盘/焦点/命中区）', () => {
     expect(focusAt, 'emit(send) 之后未紧跟 focusInput()').toBeGreaterThan(emitAt)
   })
 
+  it('程序化聚焦不改写移动端滚动位置：focusInput 关闭 Tiptap scrollIntoView', () => {
+    const focusAt = chatInputSrc.indexOf('function focusInput')
+    expect(focusAt, '未找到 focusInput').toBeGreaterThan(-1)
+    const nextFunctionAt = chatInputSrc.indexOf('\n}\n\n/** 快捷起步', focusAt)
+    const focusSource = chatInputSrc.slice(focusAt, nextFunctionAt)
+    expect(focusSource).toContain('commands.focus(undefined, { scrollIntoView: false })')
+  })
+
+  it('新建会话键盘避让保持居中排列，避免背景跳到顶部', () => {
+    const mediaAt = chatPanelSrc.indexOf('@media (max-width: 768px)')
+    expect(mediaAt, '未找到移动端 ChatPanel 样式').toBeGreaterThan(-1)
+    const media = chatPanelSrc.slice(mediaAt)
+    expect(media).not.toContain('justify-content: flex-start')
+    const stageAt = chatPanelSrc.indexOf('.center-stage {')
+    const stageRule = chatPanelSrc.slice(stageAt, chatPanelSrc.indexOf('}', stageAt) + 1)
+    expect(stageRule).toContain('justify-content: safe center')
+  })
+
   it('步骤折叠块键盘可达：steps-summary 为 button 且带 aria-expanded，样式含 :focus-visible', () => {
     const tagAt = chatRoundListSrc.indexOf('<button type="button" class="steps-summary"')
     expect(tagAt, 'steps-summary 未改为 button').toBeGreaterThan(-1)

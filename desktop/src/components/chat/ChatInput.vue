@@ -948,7 +948,10 @@ function focusInput() {
   // 搜索跳转焦点交接：跳转在途或焦点停驻在搜索触发按钮上时，
   // 目标视图「会话切换/面板挂载自动聚焦」的联动在此让位。
   if (shouldDeferFocusToSearchJump()) return
-  nextTick(() => editor.value?.commands.focus())
+  // 输入框本身已在当前视口内时，不要让 ProseMirror 再滚动祖先容器。
+  // 移动端聚焦期间 visualViewport 会变化，默认 scrollIntoView 会与键盘避让
+  // 同时改写中心态滚动位置，表现为背景被额外推一下。
+  nextTick(() => editor.value?.commands.focus(undefined, { scrollIntoView: false }))
 }
 
 /** 快捷起步：把文案填入编辑器（追加到现有内容后），不自动发送。 */
@@ -958,9 +961,9 @@ function insertText(text: string) {
   const current = ed.getText({ blockSeparator: '\n' }).trim()
   if (current) {
     const endPos = ed.state.doc.content.size
-    ed.chain().focus('end').insertContentAt(endPos, `\n${text}`).run()
+    ed.chain().focus('end', { scrollIntoView: false }).insertContentAt(endPos, `\n${text}`).run()
   } else {
-    ed.chain().focus().insertContent(text).run()
+    ed.chain().focus(undefined, { scrollIntoView: false }).insertContent(text).run()
   }
   editorContent.value = ed.getText({ blockSeparator: '\n' })
 }
@@ -973,7 +976,9 @@ watch(() => props.disabled, (disabled) => {
 })
 
 watch(() => props.isNewTask, (val) => {
-  if (val && !props.disabled) nextTick(() => editor.value?.commands.focus())
+  if (val && !props.disabled) {
+    nextTick(() => editor.value?.commands.focus(undefined, { scrollIntoView: false }))
+  }
 })
 
 // Auto-fill/clear suggestion text when workspace mode or git URL changes
@@ -1058,7 +1063,7 @@ function insertFileNode(attrs: Record<string, unknown>) {
   tr = tr.insert(pos + node.nodeSize, space)
   tr = tr.setSelection(TextSelection.near(tr.doc.resolve(pos + node.nodeSize + 1)))
   dispatch(tr)
-  ed.commands.focus()
+  ed.commands.focus(undefined, { scrollIntoView: false })
 }
 
 function refreshFileQuoteStale() {

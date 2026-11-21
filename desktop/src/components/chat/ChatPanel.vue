@@ -1,11 +1,7 @@
 <template>
   <div class="chat-panel" :class="{ 'is-center-composer': showCenterComposer }">
-    <!-- 新建会话中心态：默认垂直居中；移动软键盘弹出时切上锚定 -->
-    <div
-      v-if="showCenterComposer"
-      class="center-stage"
-      :class="{ 'is-keyboard-open': keyboardOpen }"
-    >
+    <!-- 新建会话中心态：保持垂直居中，空间不足时由 safe center 自然退让 -->
+    <div v-if="showCenterComposer" class="center-stage">
       <div class="center-brand" aria-hidden="true">
         <img :src="appIcon" alt="" class="brand-mark" />
       </div>
@@ -388,19 +384,6 @@ function syncMobileViewport() {
 /** 当前 Electron 设备 id（浏览器为 null）：LOCAL 会话执行端提示条据此在「本机即执行端」时隐藏 */
 const { deviceId: currentDeviceId } = useCurrentDevice()
 
-/** 软键盘弹出（visualViewport 明显矮于布局视口）时关闭几何居中，避免发送键被遮挡 */
-const keyboardOpen = ref(false)
-function syncKeyboardOpen() {
-  if (typeof window === 'undefined') return
-  const vv = window.visualViewport
-  if (!vv) {
-    keyboardOpen.value = false
-    return
-  }
-  // 预留 120px：浏览器工具栏/轻微缩放不误判
-  keyboardOpen.value = window.innerHeight - vv.height > 120
-}
-
 function handleStarterSelect(text: string) {
   chatInputRef.value?.insertText?.(text)
   nextTick(() => chatInputRef.value?.focusInput())
@@ -631,8 +614,6 @@ onMounted(async () => {
   window.addEventListener('mao:markdown-rendered', handleMarkdownRendered)
   window.addEventListener('budget_blocked', handleBudgetBlocked)
   window.addEventListener('resize', syncMobileViewport, { passive: true })
-  window.visualViewport?.addEventListener('resize', syncKeyboardOpen, { passive: true })
-  syncKeyboardOpen()
 
   // 任务执行中进入设置页再返回工作台时，TaskView/ChatPanel 整体卸载重建，
   // 而 store 的 activeSessionId 未变化，watcher 不会触发 → 新实例的
@@ -660,7 +641,6 @@ onUnmounted(() => {
   window.removeEventListener('mao:markdown-rendered', handleMarkdownRendered)
   window.removeEventListener('budget_blocked', handleBudgetBlocked)
   window.removeEventListener('resize', syncMobileViewport)
-  window.visualViewport?.removeEventListener('resize', syncKeyboardOpen)
   disposeScroll()
   restoreGeneration++
 })
@@ -946,10 +926,13 @@ function handleNewTaskAgentChange(id: string | null) {
   flex-direction: column;
   align-items: center;
   justify-content: center;
+  justify-content: safe center;
   min-height: 0;
   overflow-y: auto;
   padding: 24px 0 32px;
   scrollbar-width: none;
+  /* 键盘改变可视高度时，禁止滚动锚点再把背景推移一次。 */
+  overflow-anchor: none;
 }
 
 .center-stage::-webkit-scrollbar {
@@ -1004,7 +987,7 @@ function handleNewTaskAgentChange(id: string | null) {
   }
 }
 
-/* ≤768：默认仍垂直居中；软键盘弹出时（.is-keyboard-open）改上锚定 */
+/* ≤768：保持同一排列方式，让可视高度变化自然抬升内容，避免整块跳到顶部。 */
 @media (max-width: 768px) {
   .chat-panel {
     padding: 0 12px;
@@ -1014,11 +997,6 @@ function handleNewTaskAgentChange(id: string | null) {
     justify-content: center;
     padding: 16px 0 24px;
     overflow-y: auto;
-  }
-
-  .center-stage.is-keyboard-open {
-    justify-content: flex-start;
-    padding: 8px 0 16px;
   }
 
   .center-brand {
