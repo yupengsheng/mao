@@ -16,6 +16,18 @@
           : ''
         if (platform === 'android' || platform === 'ios') {
           document.documentElement.classList.add(platform + '-capacitor', 'native-mobile')
+          if (platform === 'ios') {
+            // WKWebView 会缩放固定布局的整页：聚焦输入框（字号不足 16px 时）和双指缩放
+            // 都会把界面放大，键盘收起也不还原，表现为「输入后整页变宽变高」。
+            // 原生壳是应用界面而非文档，字号由设置页三档控制，这里直接锁死缩放比。
+            var viewport = document.querySelector('meta[name="viewport"]')
+            if (viewport) {
+              viewport.setAttribute(
+                'content',
+                'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover',
+              )
+            }
+          }
           return
         }
         var ua = navigator.userAgent || ''
