@@ -27,6 +27,52 @@ export const FEISHU_DISLIKE_BUTTON = {
   disliked: '👎 已点踩 · 再点取消',
 } as const;
 
+const MAX_CARD_TABLES = 5;
+
+export function limitMarkdownTables(content: string, max = MAX_CARD_TABLES): string {
+  const lines = content.split('\n');
+  const out: string[] = [];
+  let tables = 0;
+  let inFence = false;
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (isFenceLine(line)) {
+      inFence = !inFence;
+      out.push(line);
+      i += 1;
+      continue;
+    }
+    if (!inFence && isTableRow(line) && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
+      const block = [line, lines[i + 1]];
+      i += 2;
+      while (i < lines.length && isTableRow(lines[i])) {
+        block.push(lines[i]);
+        i += 1;
+      }
+      tables += 1;
+      if (tables <= max) out.push(...block);
+      else out.push('```', ...block, '```');
+      continue;
+    }
+    out.push(line);
+    i += 1;
+  }
+  return out.join('\n');
+}
+
+function isFenceLine(line: string): boolean {
+  return /^\s{0,3}(```|~~~)/.test(line);
+}
+
+function isTableRow(line: string): boolean {
+  return line.includes('|') && line.trim() !== '';
+}
+
+function isTableSeparator(line: string): boolean {
+  return /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(line);
+}
+
 const STATUS_TITLES: Record<FeishuCardStatus, string> = {
   RUNNING: '正在处理',
   COMPLETED: '处理完成',
@@ -123,7 +169,7 @@ export function buildFeishuProgressCard(
   if (waiting) {
     sections.push({ tag: 'markdown', content: waitingHint(pendingAsks.length), text_align: 'left', text_size: 'normal_v2' });
   }
-  if (content.trim() !== '') sections.push({ tag: 'markdown', content: content.slice(0, 6000), text_align: 'left', text_size: 'normal_v2' });
+  if (content.trim() !== '') sections.push({ tag: 'markdown', content: limitMarkdownTables(content.slice(0, 6000)), text_align: 'left', text_size: 'normal_v2' });
   if (status === 'RUNNING') {
     const subagentText = subagentSection(subagents);
     if (subagentText != null) {

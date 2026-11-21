@@ -1,8 +1,10 @@
-import { realpathSync, statSync } from 'node:fs';
+import { mkdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { executeScriptProbe, type ScriptProbeResult } from '../../signal/script-probe.js';
+import { ASKPASS, gitTokenEnvKey } from '../../common/git-askpass.js';
+import { isReservedEnvKey } from '../../common/sensitive-env.js';
 import { isUnder } from '../safety/path-sandbox.js';
-import type { ScriptProbeFrameDeps, ScriptProbeFrameEnv } from './runtime-channel-protocol.js';
+import type { ScriptProbeFrameCredentials, ScriptProbeFrameDeps, ScriptProbeFrameEnv } from './runtime-channel-protocol.js';
 
 /**
  * 容器内执行脚本探针（docs/plan/2026-11-10-script-probe-container-isolation-technical-design.md §4 步骤 2）。
@@ -19,6 +21,7 @@ export interface ScriptProbeDispatchRequest {
   timeoutSeconds: number;
   env: Partial<ScriptProbeFrameEnv> | null | undefined;
   deps: Partial<ScriptProbeFrameDeps> | null | undefined;
+  credentials?: Partial<ScriptProbeFrameCredentials> | null | undefined;
 }
 
 export interface ScriptProbeDispatchResult {
@@ -54,7 +57,7 @@ export async function dispatchScriptProbe(req: ScriptProbeDispatchRequest): Prom
     return scriptFailure(`脚本文件不存在：${req.scriptPath}`);
   }
 
-  const env = buildChildEnv(userId, watcherId, watcherName, req.env, req.deps);
+  const env = buildChildEnv(userId, watcherId, watcherName, req.env, req.deps, req.credentials);
   const result = await executeScriptProbe({ scriptPath: scriptReal, timeoutSeconds: req.timeoutSeconds, env });
   return fromScriptResult(result);
 }
@@ -65,6 +68,7 @@ function buildChildEnv(
   watcherName: string,
   frameEnv: Partial<ScriptProbeFrameEnv> | null | undefined,
   deps: Partial<ScriptProbeFrameDeps> | null | undefined,
+  credentials: Partial<ScriptProbeFrameCredentials> | null | undefined,
 ): Record<string, string> {
   const env: Record<string, string> = {
     PATH: containerPath(userId, deps),
@@ -88,7 +92,62 @@ function buildChildEnv(
     if (pip != null) env.PIP_TARGET = pip;
     if (readString(deps, 'PIP_BREAK_SYSTEM_PACKAGES') === '1') env.PIP_BREAK_SYSTEM_PACKAGES = '1';
   }
+  applyScriptCredentials(userId, env, credentials);
   return env;
+}
+
+/** 将凭据帧合入白名单子进程环境；宿主已过滤，容器侧再过滤一次保留键。 */
+function applyScriptCredentials(
+  userId: number,
+  env: Record<string, string>,
+  credentials: Partial<ScriptProbeFrameCredentials> | null | undefined,
+): void {
+  if (credentials == null) return;
+  if (credentials.gitTokens != null && typeof credentials.gitTokens === 'object') {
+    let count = 0;
+    for (const [domain, token] of Object.entries(credentials.gitTokens)) {
+      if (domain === '' || typeof token !== 'string' || token === '') continue;
+      env[gitTokenEnvKey(domain)] = token;
+      count += 1;
+    }
+    if (count > 0) {
+      const askpass = writeContainerAskpass(userId);
+      if (askpass != null) {
+        env.GIT_ASKPASS = askpass;
+        env.GIT_TERMINAL_PROMPT = '0';
+      }
+    }
+  }
+  if (isNonEmptyString(credentials.maoToken)) env.MAO_TOKEN = credentials.maoToken;
+  if (isNonEmptyString(credentials.ecpToken)) env.ECP_TOKEN = credentials.ecpToken;
+  if (isNonEmptyString(credentials.maoBaseUrl)) env.MAO_BASE_URL = credentials.maoBaseUrl;
+  if (credentials.larkUat != null && typeof credentials.larkUat === 'object') {
+    if (isNonEmptyString(credentials.larkUat.uat)) env.LARKSUITE_CLI_USER_ACCESS_TOKEN = credentials.larkUat.uat;
+    if (isNonEmptyString(credentials.larkUat.appId)) env.LARKSUITE_CLI_APP_ID = credentials.larkUat.appId;
+  }
+  if (credentials.envVars != null && typeof credentials.envVars === 'object') {
+    for (const [key, value] of Object.entries(credentials.envVars)) {
+      if (key === '' || typeof value !== 'string' || isReservedEnvKey(key)) continue;
+      env[key] = value;
+    }
+  }
+}
+
+/** 容器侧 askpass 私有落点，失败时仅禁用 askpass，不阻断探针。 */
+function writeContainerAskpass(userId: number): string | null {
+  try {
+    const dir = path.join('/tmp', `askpass-${userId}`);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const script = path.join(dir, 'watcher-askpass.sh');
+    writeFileSync(script, ASKPASS, { mode: 0o700 });
+    return script;
+  } catch {
+    return null;
+  }
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value !== '';
 }
 
 function containerPath(userId: number, deps: Partial<ScriptProbeFrameDeps> | null | undefined): string {

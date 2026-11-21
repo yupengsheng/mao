@@ -17,6 +17,7 @@ import {
 } from './git-commit-message.service.js';
 import type { GitChangedFileDTO, GitStatusDTO, WorkspaceGitService } from './workspace-git.service.js';
 import { sanitizeCredentialUrl } from './workspace-git.service.js';
+import { ASKPASS, gitTokenEnvKey } from '../common/git-askpass.js';
 
 const TIMEOUT_SECONDS = 60;
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
@@ -37,28 +38,8 @@ function gitTimeoutMs(): number {
   return Number.isFinite(override) && override >= 1000 ? override : TIMEOUT_SECONDS * 1000;
 }
 
-export const ASKPASS = `#!/bin/bash
-PROMPT="$1"
-if echo "$PROMPT" | grep -qi 'username'; then
-  echo "oauth2"
-  exit 0
-fi
-URL=$(echo "$PROMPT" | sed -n "s/.*'https:\\/\\/\\([^']*\\)'.*/\\1/p")
-if [ -z "$URL" ]; then
-  URL=$(echo "$PROMPT" | sed -n "s/.*'http:\\/\\/\\([^']*\\)'.*/\\1/p")
-fi
-if [ -z "$URL" ]; then
-  exit 1
-fi
-HOST="\${URL##*@}"
-HOST="\${HOST%%/*}"
-VARNAME="GIT_TOKEN_$(echo "$HOST" | tr '.-' '__')"
-VALUE="\${!VARNAME}"
-if [ -n "$VALUE" ]; then
-  echo "$VALUE"
-fi
-`;
-
+// askpass 模板与域名变量名规则下沉到 common/git-askpass.ts；此处 re-export 保持既有引用不变。
+export { ASKPASS };
 export interface GitOperationResult {
   success: boolean;
   operation: string;
@@ -85,7 +66,7 @@ export interface LocalGitActivity {
 }
 
 export function envVarNameForDomain(domain: string): string {
-  return `GIT_TOKEN_${domain.replace(/\./g, '_').replace(/-/g, '_')}`;
+  return gitTokenEnvKey(domain);
 }
 
 export class GitWriteOperationService {

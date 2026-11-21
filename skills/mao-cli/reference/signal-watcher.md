@@ -25,6 +25,7 @@
 | 保留天数 | 轮询记录保留 `signal.checkRetentionDays` 天（默认 90，管理后台可改） |
 | 敏感数据 | 请求头与请求体整体 AES-GCM 加密（密钥 `APP_SIGNAL_SECRET`），列表 / 详情回显时敏感请求头打码为 `******`，body 只回长度 |
 | 凭据占位符 | 请求头值支持 `{{MAO_TOKEN}}` / `{{ECP_TOKEN}}`（桌面端表单有「插入凭据」按钮）：**落库的是占位符本身**（随 headers 加密、不含明文），**每次探针执行时由后端替换为当时有效的 token，并随请求自动发往上面配置的 URL**——MAO_TOKEN 为短效 shell JWT（每次现签发，等同该用户 CLOUD shell 凭据），ECP_TOKEN 为 ECP 登录态（12 小时自动续期）。配置前请确认目标服务可信。占位符精确匹配（大小写敏感、内部不能有空格），出现未识别的 `{{XXX}}` 保存时直接拒绝。解析失败（MAO 用户异常 / ECP 票过期未重新登录）时**跳过该请求头继续探针**：不计连败、不停用，目标服务的 401 本身就是有效信号。值只由占位符组成的敏感头回显不打码（能看到自己配了什么）；`Bearer {{MAO_TOKEN}}` 这类混合值仍打码、留空保存即沿用 |
+| 脚本探针环境 | host 与 Docker 每次执行前现取 Shell 同款凭据：`MAO_TOKEN`、`ECP_TOKEN`、`MAO_BASE_URL`、Lark UAT、Agent 允许域对应的 `GIT_TOKEN_*` 以及三级环境变量。环境变量按白名单和保留键过滤；单项解析失败只告警并跳过。Git token 同时启用 `GIT_ASKPASS`，Docker 写入容器私有 `/tmp` 路径；旧运行时没有 `credentials` 字段时按无凭据方式继续执行。 |
 
 ## 端点
 
@@ -131,7 +132,7 @@ update 为部分更新：未传的字段保持原值；`--headers '{}'`、`--bod
 
 - **执行模型**：以 `bash <脚本绝对路径>` 执行（不要求可执行位）。哨兵属主的有效运行模式为 Docker 时，在该用户该 Agent 的 `mao-runtime` 容器内执行，可见范围与该容器里的 Shell 一致；为 host 时在后端宿主执行。容器起不来、运行时版本未对齐或通道断开时本轮记失败并顺延到下个轮询间隔，不回退宿主，也不计入连续五次停用。cwd 为脚本所在目录；stdin 关闭（脚本读 stdin 得 EOF）；执行「当前内容生效」，改脚本即改哨兵行为，删除脚本 → 探针失败走退避。
 - **脚本契约**：stdout 是判定值（HASH=全文哈希，JSON_FIELD=按提取路径取值）；exit code 0=成功，非 0 记一次失败（error 取 stderr 尾部 200 字符）；超时按进程组 SIGKILL 判失败（含脚本派生的全部子进程）。后台常驻子进程会在脚本退出后被整组回收，脚本不要依赖子进程存活。
-- **环境变量**：白名单注入 `PATH` / `HOME`（属主运行时目录）/ `TZ` / `MAO_WATCHER_ID` / `MAO_WATCHER_NAME`，**不继承后端进程全量 env**（`APP_SIGNAL_SECRET` 等对脚本不可见）；凭据占位符机制对脚本不生效，需要凭据的脚本自行从工作区文件读取。
+- **环境变量**：基础白名单注入 `PATH` / `HOME`（属主运行时目录）/ `TZ` / `MAO_WATCHER_ID` / `MAO_WATCHER_NAME`，**不继承后端进程全量 env**（`APP_SIGNAL_SECRET` 等对脚本不可见）。脚本探针每次运行现取并注入与 Agent Shell 同源的 `MAO_TOKEN`、`ECP_TOKEN`、`GIT_TOKEN_*` + `GIT_ASKPASS`、`MAO_BASE_URL`、Lark CLI 凭据和三级环境变量；用户环境变量不能覆盖 `PATH`、`HOME`、`MAO_*`、`GIT_TOKEN_*` 等保留键。Docker 模式通过 `script_probe` 帧下发凭据，容器侧再次按白名单合并；旧运行时缺少凭据字段时按无凭据兼容执行。凭据单项解析失败只记录告警并跳过，不阻断探针。
 - **安全姿态**：脚本探针与同一运行模式下的云端 Agent Shell 同层级。Docker 模式的脚本只看见该容器的挂载和网络；host 模式仍在后端宿主执行，与云端 Agent Shell 一样可以访问服务器可达的网络。脚本是无人值守的定时执行。host 模式建议对 mao-backend 服务配置 ulimit 约束进程数。
 
 ## 常见排障

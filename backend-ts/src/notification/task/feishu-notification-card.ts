@@ -1,5 +1,6 @@
 import { formatDateTime } from '../../common/json.js';
 import { hasText } from '../../common/case.js';
+import { limitMarkdownTables } from '../../feishu/progress-card.js';
 
 /** 通知相位：终态 COMPLETED / FAILED，等待作答 ASK_USER，或等待本地审批 APPROVAL。 */
 export type TaskNotificationPhase = 'COMPLETED' | 'FAILED' | 'ASK_USER' | 'APPROVAL';
@@ -128,7 +129,7 @@ export function buildWeixinFallbackCard(input: { reply: string; now?: Date }): R
   const elements: Array<Record<string, unknown>> = [
     markdownElement('回复已生成，但无法送达微信。以下为完整内容：'),
     { tag: 'hr' },
-    markdownElement(input.reply),
+    markdownElement(limitMarkdownTables(input.reply)),
     { tag: 'hr' },
     // 同 buildTaskNotificationCard：note 是 1.0 独有元素，2.0 会整体拒绝。
     markdownElement(`<font color='grey'>时间：${formatDateTime(input.now ?? new Date())}</font>`),

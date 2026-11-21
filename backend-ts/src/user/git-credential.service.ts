@@ -2,6 +2,7 @@ import { BusinessException } from '../common/business-exception.js';
 import { ErrorCode } from '../common/error-code.js';
 import { hasText } from '../common/case.js';
 import { normalizeAndValidateGitDomain } from '../common/git-domain.js';
+import { envVarNameForDomain } from '../common/git-askpass.js';
 import { decryptAesCbc, encryptAesCbc } from '../crypto/aes-cbc.js';
 import type { Db } from '../db/db.js';
 
@@ -182,7 +183,7 @@ export class GitCredentialService {
   }
 
   static envVarNameForDomain(domain: string): string {
-    return `GIT_TOKEN_${domain.replace(/[.-]/g, '_')}`;
+    return envVarNameForDomain(domain);
   }
 
   private async findByUserAndDomain(userId: number, domain: string): Promise<GitCredential | null> {

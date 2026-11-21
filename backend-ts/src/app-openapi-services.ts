@@ -32,6 +32,9 @@ import { WebhookTriggerService, type WebhookTriggerDeps } from './openapi/webhoo
 import { SignalSecretCipher } from './signal/signal-cipher.js';
 import { MysqlSignalWatcherRepository, MysqlSignalCheckRepository } from './signal/signal.repository.js';
 import { WatcherService } from './signal/watcher.service.js';
+import type { GitTokenResolver } from './session/types.js';
+import type { EnvVariableService } from './env/env-variable.service.js';
+import type { LarkUatInjector } from './auth/lark-uat-injector.js';
 import type { RuntimeDataResolver } from './harness/runtime/runtime-data-resolver.js';
 import type { ContainerScriptProbe } from './harness/container/container-script-probe.js';
 import { createWatcherCredentialResolver } from './signal/watcher-credential-resolver.js';
@@ -67,6 +70,10 @@ export interface OpenApiServicesDeps {
   jwt: JwtService;
   userRepo: MysqlUserRepository;
   ecpSessionRepo: MysqlEcpSessionRepository;
+  /** 脚本探针每次运行现取的 Shell 同款凭据依赖。 */
+  gitTokenResolver: GitTokenResolver;
+  envVariableService: EnvVariableService;
+  larkUatInjector: LarkUatInjector;
   runtimeDataResolver: RuntimeDataResolver;
   containerScriptProbe: ContainerScriptProbe;
 }
@@ -86,7 +93,7 @@ export interface OpenApiServicesResult {
 }
 
 export function assembleOpenApiServices(deps: OpenApiServicesDeps): OpenApiServicesResult {
-  const { db, cfg, sessionService, messageQueueService, taskTerminal, taskService, agentRepo, wsHandler, budgetService, apiTokenService, inboxService, settingService, openApiRateLimiter, notifCipher, outboundSubscriptionService, holder, agentExecutor, openCallLogHolder, openTriggerSettle, openCallSettle, jwt, userRepo, ecpSessionRepo, runtimeDataResolver, containerScriptProbe } = deps;
+  const { db, cfg, sessionService, messageQueueService, taskTerminal, taskService, agentRepo, wsHandler, budgetService, apiTokenService, inboxService, settingService, openApiRateLimiter, notifCipher, outboundSubscriptionService, holder, agentExecutor, openCallLogHolder, openTriggerSettle, openCallSettle, jwt, userRepo, ecpSessionRepo, gitTokenResolver, envVariableService, larkUatInjector, runtimeDataResolver, containerScriptProbe } = deps;
 
   // 准入与管理接口共用同一仓储实例：绑定校验读到的行与用户可见配置同源。
   const webhookTriggerRepo = new MysqlWebhookTriggerRepository(db);
@@ -175,6 +182,10 @@ export function assembleOpenApiServices(deps: OpenApiServicesDeps): OpenApiServi
       },
     },
     credentialResolver: watcherCredentialResolver,
+    gitTokenProvider: (userId, agentId) => gitTokenResolver.resolveForAgent(userId, agentId),
+    envVarsProvider: (userId, workspaceKey) => envVariableService.resolveForSession(userId, workspaceKey),
+    larkUatProvider: (userId) => larkUatInjector.injectForUser(userId),
+    baseUrlProvider: () => settingService.getMaoBaseUrl(),
   });
   const watcherScheduler = new WatcherScheduler({
     watcherRepo: signalWatcherRepo,

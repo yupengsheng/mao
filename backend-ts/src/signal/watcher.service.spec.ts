@@ -1,4 +1,7 @@
 import { createHash } from 'node:crypto';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { BusinessException } from '../common/business-exception.js';
 import { ErrorCode } from '../common/error-code.js';
@@ -6,6 +9,7 @@ import type { SignalWatcher, SignalWatcherCheck } from './types.js';
 import type { MysqlSignalCheckRepository, MysqlSignalWatcherRepository } from './signal.repository.js';
 import { SignalSecretCipher } from './signal-cipher.js';
 import type { ProbeResult } from './probe-client.js';
+import type { ScriptProbeResult } from './script-probe.js';
 import type { WatcherCredentialResolver } from './watcher-credential-resolver.js';
 import {
   WATCHER_DISABLE_AFTER_FAILURES,
@@ -75,6 +79,7 @@ interface Harness {
   sessions: Map<number, WatcherSessionLookup>;
   checks: SignalWatcherCheck[];
   probeExecute: ReturnType<typeof vi.fn>;
+  scriptProbeExecute: ReturnType<typeof vi.fn>;
   openRun: { run: ReturnType<typeof vi.fn> };
   notify: ReturnType<typeof vi.fn>;
   markChecked: ReturnType<typeof vi.fn>;
@@ -86,11 +91,15 @@ interface Harness {
 function harness(options: {
   watcher?: SignalWatcher;
   probe?: () => Promise<ProbeResult> | ProbeResult;
-  /** 复用指针预检可见的会话；缺省给一条「本人 + CLOUD + agent 3」的可用会话（id=42）。 */
+  scriptProbe?: () => Promise<ScriptProbeResult> | ScriptProbeResult;
+  scriptProjectsRoot?: string;
+  scriptUserHome?: string | null;
+  gitTokenProvider?: (userId: number, agentId: number | null) => Promise<Record<string, string>>;
+  envVarsProvider?: (userId: number, workspaceKey: string | null) => Promise<Record<string, string>>;
+  larkUatProvider?: (userId: number) => Promise<{ appId: string; uat: string } | null>;
+  baseUrlProvider?: () => Promise<string | null>;
   sessions?: WatcherSessionLookup[];
-  /** 覆盖 getSession 行为，用于复刻生产 wiring（行不存在时抛 SESSION_NOT_FOUND）。 */
   getSession?: (id: number) => Promise<WatcherSessionLookup | null>;
-  /** 凭据占位符 resolver（缺省不传 = 未装配路径）。 */
   credentialResolver?: WatcherCredentialResolver | null;
 } = {}): Harness {
   const watchers = new Map<number, SignalWatcher>();
@@ -104,6 +113,9 @@ function harness(options: {
   const nextCheckId = { value: 100 };
 
   const probeExecute = vi.fn(async () => (options.probe ? options.probe() : probeResult()));
+  const scriptProbeExecute = vi.fn(async () => (options.scriptProbe
+    ? options.scriptProbe()
+    : { ok: true, exitCode: 0, stdout: 'body', stdoutBytes: Buffer.from('body', 'utf8'), error: null, durationMs: 5 }));
   const openRun = { run: vi.fn(async () => ({ sessionId: 42, messageId: 1, queued: false, terminalPhase: 'COMPLETED' as const })) };
   // 复用指针预检：读不到返回 null（等同会话已删）
   const getSession = options.getSession
@@ -233,12 +245,21 @@ function harness(options: {
     cipher: makeCipher(),
     openRun: openRun as never,
     probe: { execute: probeExecute as never },
+    scriptProbe: { execute: scriptProbeExecute as never },
+    scriptProjectsRoot: options.scriptProjectsRoot != null
+      ? (userId: number) => join(options.scriptProjectsRoot!, String(userId), 'projects')
+      : undefined,
+    scriptUserHome: options.scriptUserHome !== undefined ? () => options.scriptUserHome! : undefined,
     disableNotifier: { notifyWatcherDisabled: notify } satisfies WatcherDisableNotifier,
     getSession,
     credentialResolver: options.credentialResolver,
+    gitTokenProvider: options.gitTokenProvider,
+    envVarsProvider: options.envVarsProvider,
+    larkUatProvider: options.larkUatProvider,
+    baseUrlProvider: options.baseUrlProvider,
   });
 
-  return { service, watchers, sessions, checks, probeExecute, openRun, notify, markChecked, recordFailure, getSession, nextCheckId };
+  return { service, watchers, sessions, checks, probeExecute, scriptProbeExecute, openRun, notify, markChecked, recordFailure, getSession, nextCheckId };
 }
 
 const baseInput: WatcherInput = {
@@ -380,6 +401,45 @@ describe('WatcherService CRUD', () => {
 });
 
 describe('WatcherService.runCheck', () => {
+  it('host 脚本探针注入每次现取的凭据，并过滤三级变量保留键', async () => {
+    const projectsRoot = mkdtempSync(join(tmpdir(), 'mao-signal-projects-'));
+    const home = mkdtempSync(join(tmpdir(), 'mao-signal-home-'));
+    try {
+      const scriptPath = join(projectsRoot, '7', 'projects', 'check.sh');
+      mkdirSync(join(projectsRoot, '7', 'projects'), { recursive: true });
+      writeFileSync(scriptPath, 'printf body\\n');
+      const h = harness({
+        watcher: watcher({ probeType: 'SCRIPT', scriptPath: 'check.sh', compareMode: 'HASH', intervalMinutes: 5 }),
+        scriptProjectsRoot: projectsRoot,
+        scriptUserHome: home,
+        credentialResolver: {
+          resolve: vi.fn(async (_userId, kind) => kind === 'MAO_TOKEN' ? 'mao-token' : 'ecp-token'),
+        },
+        gitTokenProvider: vi.fn(async () => ({ 'github.com': 'git-token' })),
+        larkUatProvider: vi.fn(async () => ({ appId: 'cli_app', uat: 'lark-uat' })),
+        baseUrlProvider: vi.fn(async () => 'https://mao.example'),
+        envVarsProvider: vi.fn(async () => ({ CUSTOM_VAR: 'custom', MAO_TOKEN: 'must-not-win', PATH: '/evil' })),
+      });
+      await h.service.runCheck(1);
+      expect(h.scriptProbeExecute).toHaveBeenCalledTimes(1);
+      const input = h.scriptProbeExecute.mock.calls[0]![0]!;
+      expect(input.env).toMatchObject({
+        MAO_TOKEN: 'mao-token',
+        ECP_TOKEN: 'ecp-token',
+        GIT_TOKEN_github_com: 'git-token',
+        MAO_BASE_URL: 'https://mao.example',
+        LARKSUITE_CLI_USER_ACCESS_TOKEN: 'lark-uat',
+        LARKSUITE_CLI_APP_ID: 'cli_app',
+        CUSTOM_VAR: 'custom',
+      });
+      expect(input.env.PATH).not.toBe('/evil');
+      expect(input.env.GIT_ASKPASS).toBe(join(home, 'git-askpass.sh'));
+    } finally {
+      rmSync(projectsRoot, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('establishes the baseline on the first poll without triggering', async () => {
     const h = harness();
     await h.service.runCheck(1);
@@ -1682,4 +1742,5 @@ describe('存量 {{...}} 字面量头的兼容', () => {
     expect(h.probeExecute).toHaveBeenCalledTimes(1);
     expect(h.probeExecute.mock.calls[0]![0].headers).toEqual({ 'X-Tpl': '{{EVIL}}', Accept: 'json' });
   });
+
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildFeishuProgressCard, createSessionDetailUrlResolver, feishuSessionDetailUrl, formatFeishuDuration, type FeishuSubagentSummary } from './progress-card.js';
+import { buildFeishuProgressCard, createSessionDetailUrlResolver, feishuSessionDetailUrl, formatFeishuDuration, limitMarkdownTables, type FeishuSubagentSummary } from './progress-card.js';
 
 type CardElement = {
   tag?: string;
@@ -434,5 +434,23 @@ describe('飞书进度卡片运行中子代理', () => {
     expect(line).toBe('- 审查 · 审查 卡片 代码');
     expect(line).not.toContain('*');
     expect(line).not.toContain('`');
+  });
+});
+
+describe('limitMarkdownTables', () => {
+  const table = (n: number): string => `| 列A | 列B |\n|---|---|\n| 值${n} | ${n} |`;
+  const cards = (n: number): string => Array.from({ length: n }, (_, i) => table(i + 1)).join('\n\n');
+
+  it('keeps up to five tables and fences later tables', () => {
+    const out = limitMarkdownTables(cards(7));
+    expect(out.match(/^```$/gm)?.length).toBe(4);
+    for (let i = 1; i <= 5; i++) expect(out).toContain(`| 值${i} | ${i} |`);
+    expect(out).toContain('```\n| 列A | 列B |');
+  });
+
+  it('does not count tables inside code fences or ordinary pipe text', () => {
+    const inFence = ['```markdown', ...[1, 2, 3, 4, 5, 6, 7].map(table), '```'].join('\n');
+    const content = `${inFence}\n\n${table(99)}\n\n普通正文，含 a|b 但不是表格。`;
+    expect(limitMarkdownTables(content)).toBe(content);
   });
 });

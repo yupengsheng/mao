@@ -1,5 +1,7 @@
-import { accessSync, realpathSync, statSync } from 'node:fs';
+import { accessSync, mkdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { isAbsolute, relative, resolve } from 'node:path';
+import { ASKPASS, gitTokenEnvKey } from '../common/git-askpass.js';
+import { isReservedEnvKey } from '../common/sensitive-env.js';
 import { BusinessException } from '../common/business-exception.js';
 import { ErrorCode } from '../common/error-code.js';
 import { formatDateTime } from '../common/json.js';
@@ -12,6 +14,7 @@ import { assertProbeHeaders, assertProbeUrl, isSensitiveProbeHeader, maskProbeHe
 import { executeProbe, type ProbeResult } from './probe-client.js';
 import { executeScriptProbe, type ScriptProbeResult } from './script-probe.js';
 import { ContainerScriptProbe, ScriptProbeInfrastructureError } from '../harness/container/container-script-probe.js';
+import type { ScriptProbeFrameCredentials } from '../harness/container/runtime-channel-protocol.js';
 import { resolveProbeHeaders, type WatcherCredentialResolver } from './watcher-credential-resolver.js';
 import { isUnder } from '../harness/safety/path-sandbox.js';
 import { harnessLog } from '../harness/log.js';
@@ -117,6 +120,11 @@ export interface WatcherServiceDeps {
    * 字面量直发——装配遗漏不能静默，resolveProbeHeaders 会在确有占位符时打告警。
    */
   credentialResolver?: WatcherCredentialResolver | null;
+  /** 脚本探针的 Shell 同款凭据，全部可选；单项解析失败由执行路径告警并跳过。 */
+  gitTokenProvider?: (userId: number, agentId: number | null) => Promise<Record<string, string>>;
+  envVarsProvider?: (userId: number, workspaceKey: string | null) => Promise<Record<string, string>>;
+  larkUatProvider?: (userId: number) => Promise<{ appId: string; uat: string } | null>;
+  baseUrlProvider?: () => Promise<string | null>;
 }
 
 /** 新建 / 编辑的入参（请求头与 body 为明文，服务层负责加密）。 */
@@ -745,10 +753,11 @@ export class WatcherService {
    * 容器侧基础设施失败抛 ScriptProbeInfrastructureError，调用方不得改走宿主。
    */
   private async executeOwnedScript(watcher: SignalWatcher, absolute: string): Promise<ScriptProbeResult> {
+    const { env, credentials } = await this.buildScriptProbeEnv(watcher);
     const request = {
       scriptPath: absolute,
       timeoutSeconds: watcher.scriptTimeoutSeconds ?? SCRIPT_PROBE_DEFAULT_TIMEOUT_SECONDS,
-      env: this.scriptProbeEnv(watcher),
+      env,
     };
     const bridge = this.deps.containerScriptProbe;
     if (bridge != null) {
@@ -759,7 +768,7 @@ export class WatcherService {
         throw new ScriptProbeInfrastructureError(`运行模式判定失败：${errorMessage(e)}`);
       }
       if (docker) {
-        return bridge.execute({ userId: watcher.userId, agentId: watcher.agentId, ...request });
+        return bridge.execute({ userId: watcher.userId, agentId: watcher.agentId, ...request, credentials });
       }
     }
     return (this.deps.scriptProbe ?? { execute: executeScriptProbe }).execute(request);
@@ -919,12 +928,10 @@ export class WatcherService {
   }
 
   /**
-   * 脚本执行环境变量（V213）：白名单构造全新 env，绝不继承后端进程全量 env——
-   * 后端 env 含 APP_SIGNAL_SECRET / 数据库密码等，整包下发即泄露（技术方案 §6 R6）。
-   * HOME 指向属主运行时目录（shell-session-manager configureUserHome 同款）；凭据
-   * 占位符机制不扩展到脚本（非目标），只注入只读标识 MAO_WATCHER_ID / MAO_WATCHER_NAME。
+   * 构造脚本探针环境：基础白名单加上每次现取的 Shell 同款凭据。
+   * 每项解析独立容错，失败告警但不阻断脚本；容器模式额外返回不落宿主 env 的凭据帧。
    */
-  private scriptProbeEnv(watcher: SignalWatcher): Record<string, string> {
+  private async buildScriptProbeEnv(watcher: SignalWatcher): Promise<{ env: Record<string, string>; credentials: ScriptProbeFrameCredentials }> {
     const env: Record<string, string> = {
       PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',
     };
@@ -933,7 +940,85 @@ export class WatcherService {
     if (home != null && home !== '') env.HOME = home;
     if (watcher.id != null) env.MAO_WATCHER_ID = String(watcher.id);
     env.MAO_WATCHER_NAME = watcher.name;
-    return env;
+
+    const userId = watcher.userId;
+    const [maoToken, ecpToken, gitTokens, larkUat, baseUrl, envVars] = await Promise.all([
+      this.safeScriptCredential('MAO_TOKEN', userId, async () => (await this.deps.credentialResolver?.resolve(userId, 'MAO_TOKEN')) ?? null),
+      this.safeScriptCredential('ECP_TOKEN', userId, async () => (await this.deps.credentialResolver?.resolve(userId, 'ECP_TOKEN')) ?? null),
+      this.safeScriptCredential('GIT_TOKEN', userId, async () => (await this.deps.gitTokenProvider?.(userId, watcher.agentId)) ?? {}),
+      this.safeScriptCredential('LARK_UAT', userId, async () => (await this.deps.larkUatProvider?.(userId)) ?? null),
+      this.safeScriptCredential('MAO_BASE_URL', userId, async () => (await this.deps.baseUrlProvider?.()) ?? null),
+      this.safeScriptCredential('ENV_VARS', userId, async () => (await this.deps.envVarsProvider?.(userId, this.scriptWorkspaceKey(watcher))) ?? {}),
+    ]);
+
+    const credentials: ScriptProbeFrameCredentials = {};
+    if (maoToken) {
+      env.MAO_TOKEN = maoToken;
+      credentials.maoToken = maoToken;
+    }
+    if (ecpToken) {
+      env.ECP_TOKEN = ecpToken;
+      credentials.ecpToken = ecpToken;
+    }
+    if (baseUrl) {
+      env.MAO_BASE_URL = baseUrl;
+      credentials.maoBaseUrl = baseUrl;
+    }
+    if (larkUat != null && typeof larkUat.appId === 'string' && larkUat.appId !== ''
+      && typeof larkUat.uat === 'string' && larkUat.uat !== '') {
+      env.LARKSUITE_CLI_USER_ACCESS_TOKEN = larkUat.uat;
+      env.LARKSUITE_CLI_APP_ID = larkUat.appId;
+      credentials.larkUat = { appId: larkUat.appId, uat: larkUat.uat };
+    }
+    const domainTokenMap: Record<string, string> = {};
+    for (const [domain, token] of Object.entries(gitTokens ?? {})) {
+      if (domain === '' || typeof token !== 'string' || token === '') continue;
+      domainTokenMap[domain] = token;
+      env[gitTokenEnvKey(domain)] = token;
+    }
+    if (Object.keys(domainTokenMap).length > 0) {
+      credentials.gitTokens = domainTokenMap;
+      const askpass = this.writeScriptAskpass(userId, home);
+      if (askpass != null) {
+        env.GIT_ASKPASS = askpass;
+        env.GIT_TERMINAL_PROMPT = '0';
+      }
+    }
+    const safeEnvVars: Record<string, string> = {};
+    for (const [key, value] of Object.entries(envVars ?? {})) {
+      if (typeof value !== 'string' || isReservedEnvKey(key)) continue;
+      safeEnvVars[key] = value;
+      env[key] = value;
+    }
+    if (Object.keys(safeEnvVars).length > 0) credentials.envVars = safeEnvVars;
+    return { env, credentials };
+  }
+
+  private scriptWorkspaceKey(watcher: SignalWatcher): string | null {
+    return this.deps.scriptProjectsRoot?.(watcher.userId) ?? null;
+  }
+
+  private async safeScriptCredential<T>(name: string, userId: number, fn: () => Promise<T | null>): Promise<T | null> {
+    try {
+      return await fn();
+    } catch (e) {
+      harnessLog('warn', `[signal] script probe credential ${name} resolve failed, skip and probe continues, userId=${userId}: ${(e as Error).message}`);
+      return null;
+    }
+  }
+
+  /** host 模式 askpass 每次探针前重写；写失败只禁用 askpass，不阻断脚本。 */
+  private writeScriptAskpass(userId: number, home: string | null | undefined): string | null {
+    if (home == null || home === '') return null;
+    try {
+      mkdirSync(home, { recursive: true });
+      const script = resolve(home, 'git-askpass.sh');
+      writeFileSync(script, ASKPASS, { mode: 0o700 });
+      return script;
+    } catch (e) {
+      harnessLog('warn', `[signal] write script probe askpass failed, git askpass disabled, userId=${userId}: ${(e as Error).message}`);
+      return null;
+    }
   }
 
   private normalizeInput(input: WatcherInput, legacyHeaderValues?: ReadonlySet<string>): {

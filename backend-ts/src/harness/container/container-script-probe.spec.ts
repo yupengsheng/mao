@@ -78,11 +78,61 @@ describe('ContainerScriptProbe', () => {
       MAO_WATCHER_NAME: '磁盘',
     });
     expect(frame.deps).toEqual(DEPS);
+    expect(frame.credentials).toBeNull();
     expect(frame.scriptPath).toBe(input.scriptPath);
     expect(timeouts[0]).toBe(25_000);
     expect(result.ok).toBe(true);
     expect(result.stdoutBytes).toEqual(Buffer.from([0x61, 0xff]));
     expect(result.durationMs).toBe(12);
+  });
+
+  it('转发可选 credentials，旧调用不传时仍发送兼容空值', async () => {
+    const { bridge, frames } = probe();
+    await bridge.execute({
+      ...input,
+      credentials: {
+        gitTokens: { 'github.com': 'ghp-probe' },
+        maoToken: 'mao-probe',
+        ecpToken: 'ecp-probe',
+        maoBaseUrl: 'https://mao.example.com',
+        larkUat: { appId: 'app-probe', uat: 'uat-probe' },
+        envVars: { CUSTOM_ENV: 'custom-probe' },
+      },
+    });
+    const frame = frames[0];
+    expect(frame?.type).toBe('script_probe');
+    if (frame?.type !== 'script_probe') return;
+    expect(frame.credentials).toEqual({
+      gitTokens: { 'github.com': 'ghp-probe' },
+      maoToken: 'mao-probe',
+      ecpToken: 'ecp-probe',
+      maoBaseUrl: 'https://mao.example.com',
+      larkUat: { appId: 'app-probe', uat: 'uat-probe' },
+      envVars: { CUSTOM_ENV: 'custom-probe' },
+    });
+  });
+
+  it('credentials 原样透传进帧，且不进入 env 白名单', async () => {
+    const { bridge, frames } = probe();
+    const credentials = {
+      gitTokens: { 'github.com': 'gh-tok' },
+      maoToken: 'mao-jwt',
+      ecpToken: 'ecp-tok',
+      maoBaseUrl: 'https://mao.example.com',
+      larkUat: { appId: 'cli_x', uat: 'uat-1' },
+      envVars: { CUSTOM_VAR: 'v1' },
+    };
+    await bridge.execute({ ...input, credentials });
+    const frame = frames[0]!;
+    expect(frame.type).toBe('script_probe');
+    if (frame.type !== 'script_probe') return;
+    expect(frame.credentials).toEqual(credentials);
+    expect(frame.env).toEqual({
+      HOME: '/data/users/7',
+      TZ: 'Asia/Shanghai',
+      MAO_WATCHER_ID: '9',
+      MAO_WATCHER_NAME: '磁盘',
+    });
   });
 
   it('版本不一致、容器起不来、通道缺失或超时都不发到宿主执行', async () => {
