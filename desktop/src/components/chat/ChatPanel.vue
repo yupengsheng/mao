@@ -1026,6 +1026,8 @@ function handleNewTaskAgentChange(id: string | null) {
 .messages {
   flex: 1;
   overflow-y: auto;
+  /* 键盘改变布局高度时，禁止 WebKit 滚动锚定把消息背景再推移一次。 */
+  overflow-anchor: none;
   padding-top: 16px;
   margin-bottom: 10px;
 }

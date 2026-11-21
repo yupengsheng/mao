@@ -56,6 +56,13 @@ describe('聊天可达性回归（键盘/焦点/命中区）', () => {
     expect(stageRule).toContain('justify-content: safe center')
   })
 
+  it('已有会话键盘避让关闭消息列表滚动锚定，避免背景二次跳动', () => {
+    const messagesAt = chatPanelSrc.indexOf('.messages {')
+    expect(messagesAt, '未找到消息滚动容器样式').toBeGreaterThan(-1)
+    const messagesRule = chatPanelSrc.slice(messagesAt, chatPanelSrc.indexOf('}', messagesAt) + 1)
+    expect(messagesRule).toContain('overflow-anchor: none')
+  })
+
   it('步骤折叠块键盘可达：steps-summary 为 button 且带 aria-expanded，样式含 :focus-visible', () => {
     const tagAt = chatRoundListSrc.indexOf('<button type="button" class="steps-summary"')
     expect(tagAt, 'steps-summary 未改为 button').toBeGreaterThan(-1)
