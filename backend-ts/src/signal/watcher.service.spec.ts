@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -7,6 +7,7 @@ import { BusinessException } from '../common/business-exception.js';
 import { ErrorCode } from '../common/error-code.js';
 import type { SignalWatcher, SignalWatcherCheck } from './types.js';
 import type { MysqlSignalCheckRepository, MysqlSignalWatcherRepository } from './signal.repository.js';
+import type { ContainerScriptProbe } from '../harness/container/container-script-probe.js';
 import { SignalSecretCipher } from './signal-cipher.js';
 import type { ProbeResult } from './probe-client.js';
 import type { ScriptProbeResult } from './script-probe.js';
@@ -92,6 +93,7 @@ function harness(options: {
   watcher?: SignalWatcher;
   probe?: () => Promise<ProbeResult> | ProbeResult;
   scriptProbe?: () => Promise<ScriptProbeResult> | ScriptProbeResult;
+  containerScriptProbe?: ContainerScriptProbe;
   scriptProjectsRoot?: string;
   scriptUserHome?: string | null;
   gitTokenProvider?: (userId: number, agentId: number | null) => Promise<Record<string, string>>;
@@ -246,6 +248,7 @@ function harness(options: {
     openRun: openRun as never,
     probe: { execute: probeExecute as never },
     scriptProbe: { execute: scriptProbeExecute as never },
+    containerScriptProbe: options.containerScriptProbe,
     scriptProjectsRoot: options.scriptProjectsRoot != null
       ? (userId: number) => join(options.scriptProjectsRoot!, String(userId), 'projects')
       : undefined,
@@ -423,6 +426,7 @@ describe('WatcherService.runCheck', () => {
       await h.service.runCheck(1);
       expect(h.scriptProbeExecute).toHaveBeenCalledTimes(1);
       const input = h.scriptProbeExecute.mock.calls[0]![0]!;
+      expect(input.scriptPath).toBe(join(projectsRoot, '7', 'projects', 'check.sh'));
       expect(input.env).toMatchObject({
         MAO_TOKEN: 'mao-token',
         ECP_TOKEN: 'ecp-token',
@@ -437,6 +441,63 @@ describe('WatcherService.runCheck', () => {
     } finally {
       rmSync(projectsRoot, { recursive: true, force: true });
       rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('runCheck：存储根为软链时 host 执行器收到配置视角路径', async () => {
+    const projectsRoot = mkdtempSync(join(tmpdir(), 'mao-signal-projects-real-'));
+    const linkRoot = join(tmpdir(), `mao-signal-projects-link-${process.pid}-${Date.now()}`);
+    symlinkSync(projectsRoot, linkRoot);
+    try {
+      mkdirSync(join(projectsRoot, '7', 'projects'), { recursive: true });
+      writeFileSync(join(projectsRoot, '7', 'projects', 'check.sh'), 'printf body\\n');
+      const h = harness({
+        watcher: watcher({ probeType: 'SCRIPT', scriptPath: 'check.sh', compareMode: 'HASH', intervalMinutes: 5 }),
+        scriptProjectsRoot: linkRoot,
+      });
+      await h.service.runCheck(1);
+      expect(h.scriptProbeExecute).toHaveBeenCalledTimes(1);
+      expect(h.scriptProbeExecute.mock.calls[0]![0]!.scriptPath)
+        .toBe(join(linkRoot, '7', 'projects', 'check.sh'));
+      expect(h.watchers.get(1)!.lastValueHash).toBe(sha256('body'));
+    } finally {
+      rmSync(linkRoot, { force: true });
+      rmSync(projectsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('runCheck：存储根为软链时 Docker 执行器收到配置视角路径', async () => {
+    const projectsRoot = mkdtempSync(join(tmpdir(), 'mao-signal-projects-real-'));
+    const linkRoot = join(tmpdir(), `mao-signal-projects-link-${process.pid}-${Date.now()}`);
+    symlinkSync(projectsRoot, linkRoot);
+    try {
+      mkdirSync(join(projectsRoot, '7', 'projects'), { recursive: true });
+      writeFileSync(join(projectsRoot, '7', 'projects', 'check.sh'), 'printf body\\n');
+      const execute = vi.fn(async () => ({
+        ok: true,
+        exitCode: 0,
+        stdout: 'body',
+        stdoutBytes: Buffer.from('body', 'utf8'),
+        error: null,
+        durationMs: 5,
+      } satisfies ScriptProbeResult));
+      const h = harness({
+        watcher: watcher({ probeType: 'SCRIPT', scriptPath: 'check.sh', compareMode: 'HASH', intervalMinutes: 5 }),
+        scriptProjectsRoot: linkRoot,
+        containerScriptProbe: {
+          enabledFor: vi.fn(async () => true),
+          execute,
+        } as unknown as ContainerScriptProbe,
+      });
+      await h.service.runCheck(1);
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(h.scriptProbeExecute).not.toHaveBeenCalled();
+      expect(execute.mock.calls[0]![0]!.scriptPath)
+        .toBe(join(linkRoot, '7', 'projects', 'check.sh'));
+      expect(h.watchers.get(1)!.lastValueHash).toBe(sha256('body'));
+    } finally {
+      rmSync(linkRoot, { force: true });
+      rmSync(projectsRoot, { recursive: true, force: true });
     }
   });
 

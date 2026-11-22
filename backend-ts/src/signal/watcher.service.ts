@@ -1,5 +1,5 @@
 import { accessSync, mkdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
-import { isAbsolute, relative, resolve } from 'node:path';
+import { isAbsolute, resolve, sep } from 'node:path';
 import { ASKPASS, gitTokenEnvKey } from '../common/git-askpass.js';
 import { isReservedEnvKey } from '../common/sensitive-env.js';
 import { BusinessException } from '../common/business-exception.js';
@@ -54,8 +54,16 @@ export const SCRIPT_PROBE_MIN_INTERVAL_MINUTES = 5;
 /** 脚本文件大小上限（保存与执行双侧校验）。 */
 export const SCRIPT_PROBE_MAX_FILE_BYTES = 256 * 1024;
 
+/**
+ * 把通过 realpath 安全校验的宿主路径恢复为配置视角路径。
+ * 存储根是挂载软链时，宿主真实路径不能直接下发到容器；子路径保持原样。
+ */
 export function toConfiguredViewPath(root: string, realRoot: string, realFull: string): string {
-  return resolve(root, relative(realRoot, realFull));
+  if (realRoot === root) return realFull;
+  if (realFull === realRoot) return root;
+  const prefix = realRoot.endsWith(sep) ? realRoot : `${realRoot}${sep}`;
+  if (!realFull.startsWith(prefix)) return realFull;
+  return `${root}${realFull.slice(realRoot.length)}`;
 }
 
 /** 哨兵停用通知（收件箱 WATCHER_DISABLED kind），装配层适配 InboxService。 */
@@ -897,6 +905,9 @@ export class WatcherService {
   /**
    * 相对路径 → 属主项目工作区内的绝对路径（双侧共用）：
    * 格式（非绝对、无 `..` 段）→ resolve → realpath（解析软链）→ isUnder(projectsRoot) 双验。
+   *
+   * 安全判定使用 realpath，返回执行器的路径则恢复为配置视角 root；存储根可能是
+   * Docker 挂载使用的软链，直接传宿主真实路径会让容器内找不到同一脚本。
    */
   private resolveScriptPathWithinProjectsRoot(userId: number, scriptPath: string | null): string {
     const rootResolver = this.deps.scriptProjectsRoot;

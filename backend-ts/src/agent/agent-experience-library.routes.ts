@@ -216,7 +216,7 @@ export function registerAgentExperienceLibraryRoutes(app: FastifyInstance, deps:
     const { agentDir, enabled } = await requireAgentDir(pathId(request));
     const query = request.query as Record<string, unknown>;
     // 无分页参数保持旧弹窗协议（全量 docs + indexContent），避免旧客户端收到新形状。
-    const hasPagination = ['page', 'size', 'sort', 'order', 'groupBy', 'keyword', 'tag',
+    const hasPagination = ['page', 'size', 'sort', 'order', 'groupBy', 'keyword', 'tag', 'tagSearch',
       'verifiedFrom', 'verifiedTo', 'updatedFrom', 'updatedTo', 'abnormal']
       .some((key) => query[key] != null && query[key] !== '');
     if (!hasPagination) {
@@ -233,21 +233,28 @@ export function registerAgentExperienceLibraryRoutes(app: FastifyInstance, deps:
     const abnormal = requireEnumParam(query.abnormal, 'abnormal', ABNORMAL, '');
     const keyword = requireSearchParam(query.keyword, 'keyword', 200);
     const tag = requireSearchParam(query.tag, 'tag', 60);
+    // tagSearch 只收窄下拉候选（facets），不参与文档过滤——否则「输入即筛列表」会与候选搜索互相打架
+    const tagSearch = requireSearchParam(query.tagSearch, 'tagSearch', 60);
     const verifiedFrom = requireDateParam(query.verifiedFrom, 'verifiedFrom');
     const verifiedTo = requireDateParam(query.verifiedTo, 'verifiedTo');
     const updatedFrom = requireDateParam(query.updatedFrom, 'updatedFrom');
     const updatedTo = requireDateParam(query.updatedTo, 'updatedTo');
     const all = experienceIndexService.listDocs(agentDir);
 
-    // facets 的 keywords 始终按全库统计，不受其他筛选和分页影响。
+    // facets 的 keywords 始终按全库统计，不受其他筛选和分页影响；tagSearch 只按子串收窄候选，计数仍是全库篇数。
     const tagCounts = new Map<string, number>();
     for (const doc of all) {
       for (const item of splitKeywords(doc.keywords)) tagCounts.set(item, (tagCounts.get(item) ?? 0) + 1);
     }
-    const keywords = [...tagCounts.entries()]
+    const tagSearchLower = tagSearch.trim().toLowerCase();
+    const matchedTags = [...tagCounts.entries()].filter(
+      ([item]) => tagSearchLower === '' || item.toLowerCase().includes(tagSearchLower),
+    );
+    const keywords = matchedTags
       .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
       .slice(0, KEYWORD_FACET_LIMIT)
       .map(([item, count]) => ({ tag: item, count }));
+    const keywordsTotal = matchedTags.length;
 
     let filtered = all;
     const keywordLower = keyword.trim().toLowerCase();
@@ -284,7 +291,7 @@ export function registerAgentExperienceLibraryRoutes(app: FastifyInstance, deps:
       }
       groupCounts = sortGroupCounts([...counts.entries()].map(([key, count]) => ({ key, count })), groupBy);
     }
-    return sendOk(reply, { enabled, total, page, size, docs, groupCounts, keywords });
+    return sendOk(reply, { enabled, total, page, size, docs, groupCounts, keywords, keywordsTotal });
   });
 
   app.get('/v1/agents/:id/experience-library/index', async (request, reply) => {

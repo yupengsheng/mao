@@ -191,13 +191,22 @@ describe('agent experience library routes', () => {
         { tag: 'beta', count: 2 },
         { tag: 'alpha', count: 1 },
       ]);
+      expect(data.keywordsTotal).toBe(2);
+
+      const tagSearch = await app.inject({
+        method: 'GET',
+        url: '/v1/agents/1/experience-library/docs?page=1&size=20&tagSearch=ALP',
+      });
+      expect(tagSearch.json().data).toMatchObject({ total: 3, keywordsTotal: 1 });
+      expect(tagSearch.json().data.keywords).toEqual([{ tag: 'alpha', count: 1 }]);
+      expect(tagSearch.json().data.docs).toHaveLength(3);
 
       const abnormal = await app.inject({
         method: 'GET', url: '/v1/agents/1/experience-library/docs?page=1&size=20&abnormal=no-frontmatter',
       });
       expect(abnormal.json().data.docs).toEqual([expect.objectContaining({ fileName: 'legacy.md' })]);
 
-      for (const query of ['page=0', 'size=101', 'sort=unknown', 'order=sideways', 'verifiedFrom=2026-2-1', 'abnormal=unknown']) {
+      for (const query of ['page=0', 'size=101', 'sort=unknown', 'order=sideways', 'verifiedFrom=2026-2-1', 'abnormal=unknown', `tagSearch=${'k'.repeat(61)}`]) {
         const response = await app.inject({ method: 'GET', url: `/v1/agents/1/experience-library/docs?${query}` });
         expect(response.json().code).not.toBe(0);
       }

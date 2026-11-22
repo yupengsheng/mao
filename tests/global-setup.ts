@@ -106,7 +106,7 @@ export default async function globalSetup(): Promise<void> {
     process.execPath,
     ['--import', 'tsx', 'src/main.ts'],
     join(ROOT, 'backend-ts'),
-    { ...loadE2EEnv(), FLYWAY_ENABLED: 'false' }, // 建库迁移由 e2e-setup.sh 负责，后端只校验
+    { ...loadE2EEnv(), FLYWAY_ENABLED: 'false', LOGIN_MAX_FAILURES: '0' }, // 建库迁移由 e2e-setup.sh 负责，后端只校验
     `${apiBase}/api/v1/auth/admin/login`,
   )
   await startIfFree(5200, 'admin', 'npx', ['vite'], join(ROOT, 'admin'), { MAO_API_PROXY: apiBase }, 'http://localhost:5200/admin/login')

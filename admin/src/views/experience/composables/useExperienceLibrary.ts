@@ -32,6 +32,8 @@ export interface DocListResponse {
   docs: ExperienceDoc[]
   groupCounts: GroupCount[]
   keywords: KeywordFacet[]
+  /** 当前库（或 tagSearch 命中）的不同 tag 总数：候选被截到 50 条时 UI 用来提示。 */
+  keywordsTotal: number
 }
 export type SortField = 'fileName' | 'title' | 'updatedAt' | 'sizeBytes' | 'lastVerified'
 export type SortOrder = 'asc' | 'desc'
@@ -107,6 +109,14 @@ export function useExperienceLibrary() {
   const total = ref(0)
   const groupCounts = ref<GroupCount[]>([])
   const keywordFacets = ref<KeywordFacet[]>([])
+  /** 当前库不同 tag 总数（未收窄口径）；keywords 只返回前 50 条，提示用。 */
+  const keywordFacetsTotal = ref(0)
+  /** tag 远程搜索结果：null = 未在搜，展示 keywordFacets。 */
+  const tagSearchFacets = ref<KeywordFacet[] | null>(null)
+  const tagSearchTotal = ref(0)
+  const tagSearching = ref(false)
+  /** 远程搜索请求序号：慢请求回来时丢弃旧结果，避免候选被覆盖成上一次输入的内容。 */
+  let tagSearchSeq = 0
   const listLoading = ref(false)
   const viewer = ref<ViewerPayload | null>(null)
   const viewerLoading = ref(false)
@@ -127,6 +137,8 @@ export function useExperienceLibrary() {
     total.value = 0
     groupCounts.value = []
     keywordFacets.value = []
+    keywordFacetsTotal.value = 0
+    tagSearchFacets.value = null
   }
   async function loadOverview(): Promise<void> {
     overviewLoading.value = true
@@ -172,6 +184,9 @@ export function useExperienceLibrary() {
       total.value = data.total
       groupCounts.value = data.groupCounts
       keywordFacets.value = data.keywords
+      keywordFacetsTotal.value = data.keywordsTotal
+      // 列表刷新（换库/筛选/保存后）回退到全库候选，避免残留上一次的搜索片段
+      tagSearchFacets.value = null
       // 删除最后一页最后一篇后返回有效页，避免空页卡住。
       const lastPage = Math.max(1, Math.ceil(data.total / PAGE_SIZE))
       if (state.page > lastPage) patchState({ page: lastPage })
@@ -181,6 +196,37 @@ export function useExperienceLibrary() {
       if (version === listVersion) listLoading.value = false
     }
   }
+  /**
+   * 关键词下拉的远程搜索：输入即按子串收窄候选（只取 facets，size=1 即可）。
+   * 请求序号用于丢弃过期响应——快速连打时后到的旧结果不能覆盖新候选。
+   */
+  async function searchTags(text: string): Promise<void> {
+    if (state.agentId == null) return
+    const query = text.trim()
+    if (query === '') {
+      tagSearchSeq += 1
+      tagSearchFacets.value = null
+      tagSearching.value = false
+      return
+    }
+    const seq = ++tagSearchSeq
+    tagSearching.value = true
+    const agentId = state.agentId
+    try {
+      const { data } = await api.get<DocListResponse>(
+        `/agents/${agentId}/experience-library/docs`,
+        { params: { page: 1, size: 1, tagSearch: query } },
+      )
+      if (seq !== tagSearchSeq || agentId !== state.agentId) return
+      tagSearchFacets.value = data.keywords
+      tagSearchTotal.value = data.keywordsTotal
+    } catch {
+      // 拦截器已弹错误提示；保留上一次候选
+    } finally {
+      if (seq === tagSearchSeq) tagSearching.value = false
+    }
+  }
+
   async function openDocContent(fileName: string): Promise<void> {
     const agentId = state.agentId
     if (agentId == null) return
@@ -253,7 +299,8 @@ export function useExperienceLibrary() {
   })
 
   const store = reactive({
-    overviewLoading, libraries, orphans, enabled, docs, total, groupCounts, keywordFacets, listLoading,
+    overviewLoading, libraries, orphans, enabled, docs, total, groupCounts, keywordFacets, keywordFacetsTotal,
+    tagSearchFacets, tagSearchTotal, tagSearching, listLoading,
     viewer, viewerLoading, rebuilding, toggling, pageSize: PAGE_SIZE,
     get selectedAgentId() { return state.agentId },
     get page() { return state.page },
@@ -271,7 +318,12 @@ export function useExperienceLibrary() {
     },
     selectAgent(agentId: number) { patchState({ agentId, page: 1, file: '' }) },
     search(keyword: string) { patchState({ keyword, page: 1 }) },
-    setTag(tag: string) { patchState({ tag, page: 1 }) },
+    setTag(tag: string) {
+      // 选中/清空后收起远程搜索态：下次展开从全库候选重新开始
+      tagSearchFacets.value = null
+      patchState({ tag, page: 1 })
+    },
+    searchTags,
     setVerifiedRange(range: [string, string] | null) {
       patchState({ verifiedFrom: range?.[0] ?? '', verifiedTo: range?.[1] ?? '', page: 1 })
     },
