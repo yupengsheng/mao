@@ -75,14 +75,26 @@ export function installIosKeyboardViewport(): () => void {
     viewport,
     innerHeight: () => window.innerHeight,
   }
+
+  // iOS 键盘动画期间 resize/scroll 会成对触发；合并到同一帧，避免连续重排与
+  // WebKit 自己的键盘避让互相追赶，导致输入框或消息背景出现一次回弹。
+  let pendingFrame: number | null = null
   const sync = () => {
-    applyIosKeyboardViewport(options)
+    if (pendingFrame !== null) return
+    pendingFrame = window.requestAnimationFrame(() => {
+      pendingFrame = null
+      applyIosKeyboardViewport(options)
+    })
   }
-  sync()
+  applyIosKeyboardViewport(options)
   viewport.addEventListener('resize', sync, { passive: true })
   viewport.addEventListener('scroll', sync, { passive: true })
   return () => {
     viewport.removeEventListener('resize', sync)
     viewport.removeEventListener('scroll', sync)
+    if (pendingFrame !== null) {
+      window.cancelAnimationFrame(pendingFrame)
+      pendingFrame = null
+    }
   }
 }

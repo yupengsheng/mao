@@ -19,6 +19,8 @@ const chatInputSrc = read('./ChatInput.vue')
 const searchPopoverSrc = read('../search/SessionSearchPopover.vue')
 const queuePanelSrc = read('./QueuePanel.vue')
 const chatPanelSrc = read('./ChatPanel.vue')
+const globalStyleSrc = read('../../style.css')
+const viewportSrc = read('../../utils/ios-keyboard-viewport.ts')
 
 /** 取从 `startMarker` 起到函数体闭合（行首 `}`）为止的源码片段。 */
 function functionBody(src: string, startMarker: string): string {
@@ -61,6 +63,13 @@ describe('聊天可达性回归（键盘/焦点/命中区）', () => {
     expect(messagesAt, '未找到消息滚动容器样式').toBeGreaterThan(-1)
     const messagesRule = chatPanelSrc.slice(messagesAt, chatPanelSrc.indexOf('}', messagesAt) + 1)
     expect(messagesRule).toContain('overflow-anchor: none')
+  })
+
+  it('iOS 键盘视口更新合并到动画帧，且布局高度不做二次过渡', () => {
+    expect(viewportSrc).toContain('window.requestAnimationFrame')
+    expect(viewportSrc).toContain('window.cancelAnimationFrame')
+    expect(globalStyleSrc).toContain('html.ios-capacitor .layout {\n  transition: none;')
+    expect(globalStyleSrc).not.toContain('transition: height')
   })
 
   it('步骤折叠块键盘可达：steps-summary 为 button 且带 aria-expanded，样式含 :focus-visible', () => {
