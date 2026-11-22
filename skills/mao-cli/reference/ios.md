@@ -99,8 +99,8 @@ IPA 必须签名；未签名产物只能用于归档检查，无法安装到真�
 | `pod: command not found` | 安装 CocoaPods |
 | 签名失败 | 确认 Team ID、App ID、设备已登记；或在 Xcode 打开 `App.xcworkspace` 手动修复签名 |
 | 更新后仍显示旧三栏布局 | 从后台彻底结束 Mao 后重开；仍未更新时删除 App 并重新安装，远程入口文档需由 Nginx 返回 `Cache-Control: no-cache` |
-| 点开输入框后背景继续抖动 | iOS 原生壳已将 `html/body/#app` 锁定为不可滚动的固定应用画布；消息列表关闭 WebKit 滚动锚定，键盘期间 `visualViewport` 事件合并到渲染帧，`.layout` 高度不再叠加 CSS 过渡。若仍复现，确认 iOS 加载到最新 `desktop/dist`，并从 Xcode 重新构建原生壳后重试 |
+| 点开输入框后背景继续抖动 | 页面侧将 `html/body/#app` 锁定为固定不可滚动画布，消息列表关闭 WebKit 滚动锚定，键盘期间 `visualViewport` 事件合并到渲染帧，`.layout` 高度不再叠加 CSS 过渡；原生壳另外锁住 `WKWebView` 外层 `UIScrollView` 的 `contentOffset`，防止系统键盘避让把顶栏推出视口。需重新构建包含原生修复的 IPA；网页内部消息列表仍可滚动 |
 | 打开后白屏 | 检查 `https://mao.yupengsheng.cn` 是否可访问、证书是否有效；远程站点需允许 WKWebView 加载 |
-| 点开输入框后整页变宽变高或背景跳动 | iOS 缩放与根滚动问题由多层防护处理：`style.css` 在 `html.ios-capacitor` 下把输入框、文本域、`[contenteditable]` 统一为 16px、关闭自动字号调整，并将 `html/body/#app` 锁为固定不可滚动画布；`index.html` 与 `main.ts` 双阶段锁定 viewport（`minimum-scale=1, maximum-scale=1, user-scalable=no`）；`utils/ios-keyboard-viewport.ts` 在键盘弹出时把 `.layout` 夹到 `visualViewport` 上方；`MaoBridgeViewController` 在远程页面加载前安装缩放监听并把 `zoomScale`/`pageZoom` 复位。聊天中心态保持原有居中排列，程序化聚焦关闭额外滚动，避免键盘避让与输入框滚动叠加。页面改动随 Web 部署生效，原生侧改动需重新打包 IPA；仍复现时确认 iOS 加载到最新 `desktop/dist` 与包含本修复的最新 IPA。 |
+| 点开输入框后整页变宽变高或背景跳动 | iOS 缩放与根滚动问题由多层防护处理：`style.css` 在 `html.ios-capacitor` 下把输入框、文本域、`[contenteditable]` 统一为 16px、关闭自动字号调整，并将 `html/body/#app` 锁为固定不可滚动画布；`index.html` 与 `main.ts` 双阶段锁定 viewport（`minimum-scale=1, maximum-scale=1, user-scalable=no`）；`utils/ios-keyboard-viewport.ts` 在键盘弹出时把 `.layout` 夹到 `visualViewport` 上方；`MaoBridgeViewController` 在远程页面加载前锁住 WebView 外层滚动、监听 `contentOffset`，并安装缩放监听把 `zoomScale`/`pageZoom` 复位。聊天中心态保持原有居中排列，程序化聚焦关闭额外滚动，避免键盘避让与输入框滚动叠加。页面改动随 Web 部署生效，原生侧改动需重新打包 IPA；仍复现时确认 iOS 加载到最新 `desktop/dist` 与包含本修复的最新 IPA。 |
 | 键盘上方多出 `‹ › ✓` 一行 | 这是 WebKit 的 `inputAccessoryView`，CSS / JS / `inputmode` 都去不掉；`MaoBridgeViewController` 已在原生侧把 `UIResponder` / `WKContentView` 的 `inputAccessoryView` 置空（同 `@capacitor/keyboard` 的 `hideFormAccessoryBar`），需重新打包 IPA |
 | 外链点击无反应 | 检查链接协议是否在 `OpenUrlPlugin` 白名单内 |
