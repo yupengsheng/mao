@@ -52,6 +52,29 @@
         background: #f5f5f7;
       }
 
+      /*
+       * iOS 原生壳的页面是固定应用画布，不允许 WebKit 在键盘避让时滚动
+       * 整个文档。滚动只交给消息列表、弹窗等内部容器，否则顶栏会先被推出
+       * 视口，visualViewport 更新后再回到原位，表现为背景跳一下。
+       * 这里放在入口内联样式中，确保远程页面首屏加载阶段也立即生效。
+       */
+      html.ios-capacitor,
+      html.ios-capacitor body {
+        overflow: hidden;
+        overscroll-behavior: none;
+      }
+
+      html.ios-capacitor body {
+        position: fixed;
+        inset: 0;
+        width: 100%;
+      }
+
+      html.ios-capacitor #app {
+        height: 100%;
+        overflow: hidden;
+      }
+
       html.dark body {
         background: #1d1d1f;
       }

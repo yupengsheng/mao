@@ -72,6 +72,18 @@ describe('聊天可达性回归（键盘/焦点/命中区）', () => {
     expect(globalStyleSrc).not.toContain('transition: height')
   })
 
+  it('iOS 原生壳锁住文档根滚动，避免 WebKit 键盘避让把整页推走后回弹', () => {
+    const rootLockAt = globalStyleSrc.indexOf('html.ios-capacitor,\nhtml.ios-capacitor body {')
+    expect(rootLockAt, '未找到 iOS 文档根滚动锁').toBeGreaterThan(-1)
+    const rootLock = globalStyleSrc.slice(rootLockAt, rootLockAt + 900)
+    expect(rootLock).toContain('overflow: hidden')
+    expect(rootLock).toContain('overscroll-behavior: none')
+    expect(rootLock).toContain('html.ios-capacitor body {')
+    expect(rootLock).toContain('position: fixed')
+    expect(rootLock).toContain('html.ios-capacitor #app {')
+    expect(rootLock).toContain('height: 100%')
+  })
+
   it('步骤折叠块键盘可达：steps-summary 为 button 且带 aria-expanded，样式含 :focus-visible', () => {
     const tagAt = chatRoundListSrc.indexOf('<button type="button" class="steps-summary"')
     expect(tagAt, 'steps-summary 未改为 button').toBeGreaterThan(-1)

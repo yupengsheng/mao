@@ -227,6 +227,28 @@ html.native-mobile #splash {
 }
 
 /*
+ * iOS 原生壳使用固定应用画布：键盘弹出时禁止 WebKit 滚动 html/body，
+ * 避免整个页面先上移、再在 visualViewport 更新后回到原位而产生一次回弹。
+ * 消息列表、弹窗等内部滚动容器不受影响。
+ */
+html.ios-capacitor,
+html.ios-capacitor body {
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+html.ios-capacitor body {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+}
+
+html.ios-capacitor #app {
+  height: 100%;
+  overflow: hidden;
+}
+
+/*
  * Capacitor 原生壳顶部导航：必须显示（0.0.7 曾 display:none 导致操作栏消失）。
  * 去掉 macOS 红绿灯预留的 78px 左缩进，改为紧凑单行。
  * 系统状态栏 / 手势条由原生 WebView WindowInsets padding 避让（勿再给 body 加同值 padding，会双倍）。
