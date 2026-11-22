@@ -47,18 +47,13 @@ export function keyboardOcclusion(innerHeight: number, viewport: ViewportLike): 
 }
 
 /**
- * 应用一次可视视口状态：键盘遮挡超过阈值时把容器夹到键盘上方，返回键盘是否打开。
- * 阈值用于过滤地址栏收缩、轻微缩放这类噪声。
+ * 应用一次可视视口状态：始终同步稳定的视口高度，键盘遮挡超过阈值时再标记键盘状态。
+ * 阈值只用于过滤地址栏收缩、轻微缩放这类噪声，不再控制高度变量的写入时机。
  */
 export function applyIosKeyboardViewport({ root, viewport, innerHeight }: IosKeyboardViewportOptions): boolean {
   const keyboardOpen = keyboardOcclusion(innerHeight(), viewport) > OCCLUSION_THRESHOLD
-  if (keyboardOpen) {
-    root.style.setProperty('--app-viewport-height', `${Math.round(viewport.height)}px`)
-    root.classList.add('keyboard-open')
-  } else {
-    root.style.removeProperty('--app-viewport-height')
-    root.classList.remove('keyboard-open')
-  }
+  root.style.setProperty('--app-viewport-height', `${Math.round(viewport.height)}px`)
+  root.classList.toggle('keyboard-open', keyboardOpen)
   return keyboardOpen
 }
 
@@ -76,8 +71,9 @@ export function installIosKeyboardViewport(): () => void {
     innerHeight: () => window.innerHeight,
   }
 
-  // iOS 键盘动画期间 resize/scroll 会成对触发；合并到同一帧，避免连续重排与
-  // WebKit 自己的键盘避让互相追赶，导致输入框或消息背景出现一次回弹。
+  // iOS 键盘动画期间 visualViewport 还会派发 scroll：那代表 WebKit 正在临时
+  // 平移可视区域让光标可见，不是键盘高度变化。响应它会和原生滚动锁、布局
+  // 高度更新互相追赶，造成一帧背景回弹，所以这里只跟踪 resize。
   let pendingFrame: number | null = null
   const sync = () => {
     if (pendingFrame !== null) return
@@ -88,10 +84,8 @@ export function installIosKeyboardViewport(): () => void {
   }
   applyIosKeyboardViewport(options)
   viewport.addEventListener('resize', sync, { passive: true })
-  viewport.addEventListener('scroll', sync, { passive: true })
   return () => {
     viewport.removeEventListener('resize', sync)
-    viewport.removeEventListener('scroll', sync)
     if (pendingFrame !== null) {
       window.cancelAnimationFrame(pendingFrame)
       pendingFrame = null

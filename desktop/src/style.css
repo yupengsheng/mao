@@ -364,11 +364,11 @@ html.ios-capacitor {
 }
 
 /*
- * iOS 软键盘：键盘弹出后把应用容器夹到键盘上方的可视区域（高度由
- * utils/ios-keyboard-viewport.ts 写入），输入框不被遮挡，
- * WebKit 就不会为了让光标可见而放大整页。
+ * iOS 软键盘：应用容器始终使用 visualViewport 的高度（由
+ * utils/ios-keyboard-viewport.ts 写入）。只响应视口 resize，不响应 WebKit
+ * 为了让光标可见而触发的临时 viewport scroll，避免键盘弹出时背景先抖一帧。
  */
-html.ios-capacitor.keyboard-open .layout {
+html.ios-capacitor .layout {
   height: var(--app-viewport-height, 100dvh);
 }
 

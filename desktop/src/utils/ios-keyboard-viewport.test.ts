@@ -1,7 +1,8 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   applyIosKeyboardViewport,
   IOS_VIEWPORT_CONTENT,
+  installIosKeyboardViewport,
   keyboardOcclusion,
   lockIosViewportMeta,
   type VisualViewportLike,
@@ -27,6 +28,13 @@ function fakeRoot() {
         remove: (name: string) => {
           classes.delete(name)
         },
+        toggle: (name: string, force?: boolean) => {
+          const next = force ?? !classes.has(name)
+          if (next) classes.add(name)
+          else classes.delete(name)
+          return next
+        },
+        contains: (name: string) => classes.has(name),
       },
     } as unknown as HTMLElement,
   }
@@ -70,13 +78,13 @@ describe('ios-keyboard-viewport', () => {
     expect(classes.has('keyboard-open')).toBe(true)
   })
 
-  it('键盘收起后清除变量与标记', () => {
+  it('键盘收起后恢复完整视口高度并清除键盘标记', () => {
     const { root, vars, classes } = fakeRoot()
     applyIosKeyboardViewport({ root, viewport: fakeViewport(520), innerHeight: () => 844 })
     const open = applyIosKeyboardViewport({ root, viewport: fakeViewport(844), innerHeight: () => 844 })
 
     expect(open).toBe(false)
-    expect(vars.has('--app-viewport-height')).toBe(false)
+    expect(vars.get('--app-viewport-height')).toBe('844px')
     expect(classes.has('keyboard-open')).toBe(false)
   })
 
@@ -90,5 +98,32 @@ describe('ios-keyboard-viewport', () => {
 
   it('页面被平移时按可见区域上边界计算遮挡', () => {
     expect(keyboardOcclusion(844, fakeViewport(520, 100))).toBe(224)
+  })
+
+  it('只监听 visualViewport resize，不把临时 scroll 当作布局变化', () => {
+    const { root } = fakeRoot()
+    root.classList.add('ios-capacitor')
+    const listeners = new Map<string, () => void>()
+    const viewport: VisualViewportLike = {
+      height: 844,
+      offsetTop: 0,
+      addEventListener: (type, listener) => listeners.set(type, listener),
+      removeEventListener: (type) => listeners.delete(type),
+    }
+    vi.stubGlobal('window', {
+      visualViewport: viewport,
+      innerHeight: 844,
+      requestAnimationFrame: () => 1,
+      cancelAnimationFrame: () => {},
+    })
+    vi.stubGlobal('document', { documentElement: root })
+
+    const dispose = installIosKeyboardViewport()
+
+    expect(listeners.has('resize')).toBe(true)
+    expect(listeners.has('scroll')).toBe(false)
+    dispose()
+    expect(listeners.size).toBe(0)
+    vi.unstubAllGlobals()
   })
 })
