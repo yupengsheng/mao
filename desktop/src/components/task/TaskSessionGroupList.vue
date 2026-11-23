@@ -108,7 +108,10 @@
           'confirming-delete': confirmingDeleteId === session.id,
           editing: editingSessionId === session.id
         }"
-        @click="selecting ? toggleSelect(session) : selectSession(session)"
+        @click="rowTap.onClick(session)"
+        @touchstart.passive="rowTap.onTouchStart"
+        @touchend="rowTap.onTouchEnd($event, session)"
+        @touchcancel="rowTap.reset()"
         @contextmenu.prevent="openContextMenu($event, session, 'standard')"
       >
         <div class="session-item-main">
@@ -203,6 +206,7 @@ import type { Session } from '../../stores/session'
 import { useReadinessStore } from '../../stores/readiness'
 import { groupIconKind } from '../../utils/cloud-project'
 import { isMobileDevice } from '../../utils/user-agent'
+import { useTouchTap } from '../../composables/useTouchTap'
 import feishuLogo from '../../assets/feishu-logo.svg'
 import dingtalkLogo from '../../assets/dingtalk-logo.svg'
 import weixinLogo from '../../assets/weixin-logo.png'
@@ -281,6 +285,16 @@ const props = defineProps<{
   onGroupDrop: (e: DragEvent, toIndex: number) => void
   onGroupDragEnd: () => void
 }>()
+
+/**
+ * 会话行激活：触屏走 touchend、鼠标走 click。
+ * iOS 抽屉里第一次轻点的合成 click 偶发不派发，只监听 click 就是「点两次才进会话」，
+ * 具体成因与去重规则见 useTouchTap。
+ */
+const rowTap = useTouchTap<Session>((session) => {
+  if (props.selecting) props.toggleSelect(session)
+  else props.selectSession(session)
+})
 
 const renamingValue = defineModel<string>('renamingValue', { default: '' })
 const editingTitle = defineModel<string>('editingTitle', { default: '' })

@@ -33,7 +33,10 @@
           'confirming-delete': confirmingDeleteId === session.id,
           editing: editingSessionId === session.id
         }"
-        @click="selectSession(session)"
+        @click="rowTap.onClick(session)"
+        @touchstart.passive="rowTap.onTouchStart"
+        @touchend="rowTap.onTouchEnd($event, session)"
+        @touchcancel="rowTap.reset()"
         @contextmenu.prevent="openContextMenu($event, session, 'archived')"
       >
         <div class="session-item-main">
@@ -80,8 +83,9 @@
 <script setup lang="ts">
 import { Refresh, Loading, Delete, Check, Close, Folder, FolderOpened, EditPen, ArrowDown, ArrowRight, RefreshLeft } from '@element-plus/icons-vue'
 import type { Session } from '../../stores/session'
+import { useTouchTap } from '../../composables/useTouchTap'
 
-defineProps<{
+const props = defineProps<{
   archiveCollapsed: boolean
   archivedCount: number
   archivedLoading: boolean
@@ -107,6 +111,8 @@ defineProps<{
   startEdit: (e: MouseEvent, session: Session) => void
   startDelete: (e: MouseEvent, sessionId: string) => void
 }>()
+
+const rowTap = useTouchTap<Session>((session) => props.selectSession(session))
 
 const editingTitle = defineModel<string>('editingTitle', { default: '' })
 </script>

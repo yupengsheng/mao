@@ -1020,7 +1020,8 @@ html.ios-capacitor .task-index-panel.mobile-drawer {
 
 .task-index-panel.mobile-drawer .panel-content {
   padding: 0 10px 12px;
-  -webkit-overflow-scrolling: touch;
+  /* 不再写 -webkit-overflow-scrolling: touch：iOS 13 起原生滚动已是惯性滚动，这个遗留属性
+     只会在「transform 滑入的 fixed 面板」里制造合成滚动层，首次点击常被吞掉。 */
   overscroll-behavior: contain;
 }
 
@@ -1079,6 +1080,18 @@ html.ios-capacitor .task-index-panel.mobile-drawer {
 .task-index-panel.mobile-drawer .session-item {
   min-height: 44px;
   padding: 10px 12px;
+  /* 触屏行：去掉双击缩放判定延迟，并禁用长按选字/呼出菜单——
+     两者都会让 WebKit 把第一次轻点当成「选区/缩放准备」而不派发 click。 */
+  touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* 行内重命名输入框要能正常选字，不被上面的 user-select: none 连带 */
+.task-index-panel.mobile-drawer .session-item .session-title-input {
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 .task-index-panel.mobile-drawer .group-toggle {

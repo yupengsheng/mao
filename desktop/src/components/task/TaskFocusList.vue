@@ -20,7 +20,10 @@
         'confirming-delete': confirmingDeleteId === session.id,
         editing: editingSessionId === session.id
       }"
-      @click="selectSession(session)"
+      @click="rowTap.onClick(session)"
+      @touchstart.passive="rowTap.onTouchStart"
+      @touchend="rowTap.onTouchEnd($event, session)"
+      @touchcancel="rowTap.reset()"
       @contextmenu.prevent="openContextMenu($event, session, 'standard')"
     >
       <div class="session-item-main focus-item-content">
@@ -96,7 +99,10 @@
             'confirming-delete': confirmingDeleteId === session.id,
             editing: editingSessionId === session.id
           }"
-          @click="selectSession(session)"
+          @click="rowTap.onClick(session)"
+          @touchstart.passive="rowTap.onTouchStart"
+          @touchend="rowTap.onTouchEnd($event, session)"
+          @touchcancel="rowTap.reset()"
           @contextmenu.prevent="openContextMenu($event, session, 'standard')"
         >
           <div class="session-item-main">
@@ -146,8 +152,9 @@
 <script setup lang="ts">
 import { Loading, Delete, Check, Close, EditPen, ArrowDown, ArrowRight, FolderChecked, Clock } from '@element-plus/icons-vue'
 import type { Session } from '../../stores/session'
+import { useTouchTap } from '../../composables/useTouchTap'
 
-defineProps<{
+const props = defineProps<{
   focusLoading: boolean
   focusError: boolean
   focusedSessions: Session[]
@@ -179,6 +186,8 @@ defineProps<{
   startDelete: (e: MouseEvent, sessionId: string) => void
   formatElapsed: (session: Session) => string
 }>()
+
+const rowTap = useTouchTap<Session>((session) => props.selectSession(session))
 
 const focusVisibleCount = defineModel<number>('focusVisibleCount', { default: 0 })
 const historyCollapsed = defineModel<boolean>('historyCollapsed', { default: true })

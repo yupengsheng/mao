@@ -168,6 +168,14 @@ const rowEl = (host: HTMLElement, id: string) => host.querySelector(`[data-sessi
 const menuItem = (text: string) =>
   Array.from(document.querySelectorAll('.task-context-menu .context-menu-item'))
     .find(el => el.textContent?.trim() === text) as HTMLElement | undefined
+/** jsdom 没有 TouchEvent：手搓带 touches / changedTouches 的事件 */
+function touchEvent(type: 'touchstart' | 'touchend', x: number, y: number) {
+  const ev = new Event(type, { bubbles: true, cancelable: true })
+  const touch = { clientX: x, clientY: y }
+  Object.defineProperty(ev, 'touches', { value: type === 'touchend' ? [] : [touch] })
+  Object.defineProperty(ev, 'changedTouches', { value: [touch] })
+  return ev as unknown as TouchEvent
+}
 
 beforeEach(() => {
   document.body.innerHTML = ''
@@ -736,6 +744,53 @@ describe('TaskIndexPanel 触屏拖拽', () => {
     const { host, app } = mountPanel()
     await tick()
     expect(host.querySelector('.session-group')?.getAttribute('draggable')).toBe('true')
+    app.unmount()
+  })
+})
+
+describe('TaskIndexPanel 移动端历史会话轻点', () => {
+  it('只有 touchend（合成 click 被 iOS 吞掉）也能一次打开会话，且随后的 click 不重复触发', async () => {
+    store.sessions = [row('1')]
+    const onClose = vi.fn()
+    const { host, app } = mountPanel('standard', { mobile: true, drawerOpen: true, onClose })
+    await tick()
+    const el = rowEl(host, '1')
+    el.dispatchEvent(touchEvent('touchstart', 10, 10))
+    el.dispatchEvent(touchEvent('touchend', 12, 11))
+    await tick()
+    expect(onClose).toHaveBeenCalledTimes(1)
+    expect(routerPush).toHaveBeenCalledTimes(1)
+    expect(routerPush).toHaveBeenCalledWith('/tasks/1')
+
+    // iOS 随后补发的合成 click 落在同一个去重窗口内，不应再打开一次
+    el.click()
+    await tick()
+    expect(routerPush).toHaveBeenCalledTimes(1)
+    app.unmount()
+  })
+
+  it('在会话行上滑动滚动列表不会打开会话', async () => {
+    store.sessions = [row('1')]
+    const { host, app } = mountPanel('standard', { mobile: true, drawerOpen: true })
+    await tick()
+    const el = rowEl(host, '1')
+    el.dispatchEvent(touchEvent('touchstart', 10, 10))
+    el.dispatchEvent(touchEvent('touchend', 10, 80))
+    await tick()
+    expect(routerPush).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('点行内「删除」按钮不会顺带打开会话', async () => {
+    store.sessions = [row('1')]
+    const { host, app } = mountPanel('standard', { mobile: true, drawerOpen: true })
+    await tick()
+    const btn = rowEl(host, '1').querySelector('.action-delete') as HTMLElement
+    expect(btn).toBeTruthy()
+    btn.dispatchEvent(touchEvent('touchstart', 5, 5))
+    btn.dispatchEvent(touchEvent('touchend', 5, 5))
+    await tick()
+    expect(routerPush).not.toHaveBeenCalled()
     app.unmount()
   })
 })
