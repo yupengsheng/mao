@@ -116,6 +116,12 @@
           {{ authStore.features.passwordEnabled ? '返回密码登录' : '返回登录' }}
         </el-button>
       </div>
+
+      <!-- 原生壳（安卓 / iOS）才显示：Web 端地址由当前域名决定，没有可换的对象 -->
+      <div v-if="nativeServerUrl" class="login-server">
+        <span class="login-server-url" :title="nativeServerDisplay">{{ nativeServerDisplay }}</span>
+        <button type="button" class="login-server-change" @click="openNativeServerSettings">更换服务器</button>
+      </div>
     </div>
   </div>
 </template>
@@ -132,6 +138,7 @@ import appIcon from '../../assets/app-icon-small.png'
 import { useTheme } from '../../utils/theme'
 import { readRedirectQuery, safeRedirect } from '../../utils/login-redirect'
 import { isNativeCapacitor, openExternalUrl } from '../../utils/capacitor'
+import { changeNativeServer, getNativeServer, hasNativeServerPlugin } from '../../utils/nativeServer'
 import { feishuPollPhase, openFeishuAuthPopup } from '../../utils/feishu-login-poll'
 import { safeRemoveItem, safeSetItem } from '../../utils/safe-storage'
 
@@ -162,6 +169,9 @@ const form = ref({
   username: localStorage.getItem('rememberedUsername') ?? '',
   password: ''
 })
+/** 原生壳里配置的服务器地址；空串 = 非原生壳 / 老版本壳，不显示入口 */
+const nativeServerUrl = ref('')
+const nativeServerDisplay = computed(() => nativeServerUrl.value.replace(/^https?:\/\//, ''))
 
 const formRules: FormRules = {
   username: [{ required: true, message: '请输入用户名', trigger: 'blur' }],
@@ -183,6 +193,19 @@ onMounted(() => {
     authStore.features.ecpEnabled = false
   })
 })
+
+onMounted(async () => {
+  // 老版本原生壳没有 MaoServer 插件，连额度都不用查：登录页保持原样
+  if (!hasNativeServerPlugin()) return
+  const server = await getNativeServer()
+  if (server) nativeServerUrl.value = server.url
+})
+
+/** 交给原生弹窗改地址；确认后壳会重建，本页面随即被销毁 */
+async function openNativeServerSettings() {
+  const opened = await changeNativeServer()
+  if (!opened) ElMessage.error('当前 App 版本不支持修改服务器地址，请升级到最新版本')
+}
 
 onMounted(() => {
   document.title = 'Mao'
@@ -622,5 +645,43 @@ onBeforeUnmount(() => {
 
 .password-entry {
   padding: 0;
+}
+
+/* 原生壳：当前服务器地址 + 更换入口（低对比度，不抢登录 CTA） */
+.login-server {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--aw-divider);
+  font-size: var(--aw-text-fine);
+  color: var(--aw-muted);
+}
+
+.login-server-url {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.login-server-change {
+  padding: 4px 8px;
+  border: none;
+  border-radius: var(--aw-radius-xs);
+  background: transparent;
+  color: var(--aw-primary);
+  font-size: var(--aw-text-fine);
+  cursor: pointer;
+}
+
+.login-server-change:hover {
+  background: rgba(0, 0, 0, 0.04);
+}
+
+[data-theme="dark"] .login-server-change:hover {
+  background: rgba(255, 255, 255, 0.08);
 }
 </style>

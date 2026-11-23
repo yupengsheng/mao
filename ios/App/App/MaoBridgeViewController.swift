@@ -20,13 +20,31 @@ final class MaoBridgeViewController: CAPBridgeViewController {
     private var resettingZoom = false
     private var resettingOuterScroll = false
     private var hidFormAccessoryBar = false
+    /// 首次启动只弹一次地址输入框（重建控制器后由新实例重新判断）
+    private var promptedServerSetup = false
+    /// 首屏加载看门狗：地址不可达时 estimatedProgress 永远到不了 1
+    private var progressObservation: NSKeyValueObservation?
+    private var loadWatchdog: DispatchWorkItem?
+    private var loadWatchdogPresented = false
+    /// 超过该时间仍未加载完成就提示「重试 / 更换服务器」（自建服务器挂了时不必杀进程）
+    private static let loadWatchdogDelay: TimeInterval = 12
+
+    /// 服务器地址由原生侧决定（见 MaoServerAddress）：这个壳远程加载整站，登录页也在远端，
+    /// 所以只能在 bridge 创建前把存储的地址塞进 InstanceDescriptor（server.url 的唯一入口）。
+    override func instanceDescriptor() -> InstanceDescriptor {
+        let descriptor = super.instanceDescriptor()
+        descriptor.serverURL = MaoServerAddress.effective
+        return descriptor
+    }
 
     override func capacitorDidLoad() {
         bridge?.registerPluginInstance(OpenUrlPlugin())
+        bridge?.registerPluginInstance(MaoServerPlugin())
         // CAPBridgeViewController 在这里已经创建 WebView、但尚未开始加载远程入口；
         // 提前锁定缩放，避免首个输入框聚焦发生在 viewDidAppear 监听安装之前。
         lockdownZoom()
         lockdownOuterScroll()
+        watchInitialLoad()
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -34,11 +52,101 @@ final class MaoBridgeViewController: CAPBridgeViewController {
         lockdownZoom()
         lockdownOuterScroll()
         hideFormAccessoryBar()
+        promptServerSetupIfNeeded()
+    }
+
+    /// 首次启动（还没存过地址）先问地址：存下后改用新地址重建整个壳。
+    /// 未配置时 WebView 已按默认地址起加载，弹窗盖在上面，用户确认完立刻切过去。
+    private func promptServerSetupIfNeeded() {
+        guard view.window != nil, MaoServerAddress.saved == nil, !promptedServerSetup else { return }
+        promptedServerSetup = true
+        MaoServerAddress.present(from: self, firstRun: true) {
+            MaoServerAddress.reloadShell()
+        }
+    }
+
+    /// 首屏加载看门狗：preferred server 不可达时 estimatedProgress 卡在 1 以下，
+    /// 页面没有任何东西可点，只能由原生给「重试 / 更换服务器」。
+    private func watchInitialLoad() {
+        guard let webView = webView, progressObservation == nil else { return }
+        progressObservation = webView.observe(\.estimatedProgress, options: [.new]) { [weak self] webView, _ in
+            guard let self else { return }
+            if webView.estimatedProgress >= 1 {
+                // 文档加载完成；是否真正渲染由页面自己负责，这里只管「连不上」
+                self.cancelLoadWatchdog()
+            } else {
+                self.armLoadWatchdog()
+            }
+        }
+        if webView.estimatedProgress < 1 {
+            armLoadWatchdog()
+        }
+    }
+
+    private func armLoadWatchdog() {
+        guard loadWatchdog == nil, !loadWatchdogPresented else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.loadWatchdog = nil
+            guard self.view.window != nil else { return }
+            guard UIApplication.shared.applicationState == .active else {
+                // 后台不弹窗，回前台后重新计时
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                    self?.armLoadWatchdog()
+                }
+                return
+            }
+            if self.presentedViewController != nil {
+                // 地址输入框等原生弹窗还开着，稍后再判断，别和它抢着 present
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                    self?.armLoadWatchdog()
+                }
+                return
+            }
+            self.loadWatchdogPresented = true
+            self.presentLoadFailure()
+        }
+        loadWatchdog = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.loadWatchdogDelay, execute: work)
+    }
+
+    private func cancelLoadWatchdog() {
+        loadWatchdog?.cancel()
+        loadWatchdog = nil
+    }
+
+    private func presentLoadFailure() {
+        let alert = UIAlertController(
+            title: "无法连接服务器",
+            message: "加载 \(MaoServerAddress.effective) 失败，可以重试或更换服务器地址。",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "重试", style: .default) { [weak self] _ in
+            guard let self else { return }
+            self.loadWatchdogPresented = false
+            self.webView?.reload()
+            self.armLoadWatchdog()
+        })
+        alert.addAction(UIAlertAction(title: "更换服务器", style: .default) { [weak self] _ in
+            guard let self else { return }
+            self.loadWatchdogPresented = false
+            MaoServerAddress.present(from: self, firstRun: false, onSaved: {
+                MaoServerAddress.reloadShell()
+            }, onCancel: { [weak self] in
+                self?.armLoadWatchdog()
+            })
+        })
+        alert.addAction(UIAlertAction(title: "稍后再说", style: .cancel) { [weak self] _ in
+            self?.loadWatchdogPresented = false
+        })
+        present(alert, animated: true)
     }
 
     deinit {
         zoomObservation?.invalidate()
         outerScrollObservation?.invalidate()
+        progressObservation?.invalidate()
+        loadWatchdog?.cancel()
         keyboardObservers.forEach { NotificationCenter.default.removeObserver($0) }
     }
 

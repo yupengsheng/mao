@@ -17,6 +17,8 @@
 		578CC17712F54D9A80C5D8F9 /* MaoBridgeViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = E26680A3A4C947BAA1B3A7D6 /* MaoBridgeViewController.swift */; };
 		A084ECDBA7D38E1E42DFC39D /* Pods_App.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AF277DCFFFF123FFC6DF26C7 /* Pods_App.framework */; };
 		CBF06513BD0C489AB24B9139 /* OpenUrlPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8F24B97F0D24F4D8E4F95D0 /* OpenUrlPlugin.swift */; };
+		D1A2B3C4E5F60718293A4B52 /* MaoServerAddress.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A2B3C4E5F60718293A4B51 /* MaoServerAddress.swift */; };
+		D1A2B3C4E5F60718293A4B54 /* MaoServerPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A2B3C4E5F60718293A4B53 /* MaoServerPlugin.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -33,6 +35,8 @@
 		AF51FD2D460BCFE21FA515B2 /* Pods-App.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-App.release.xcconfig"; path = "Pods/Target Support Files/Pods-App/Pods-App.release.xcconfig"; sourceTree = "<group>"; };
 		E26680A3A4C947BAA1B3A7D6 /* MaoBridgeViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaoBridgeViewController.swift; sourceTree = "<group>"; };
 		F8F24B97F0D24F4D8E4F95D0 /* OpenUrlPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenUrlPlugin.swift; sourceTree = "<group>"; };
+		D1A2B3C4E5F60718293A4B51 /* MaoServerAddress.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaoServerAddress.swift; sourceTree = "<group>"; };
+		D1A2B3C4E5F60718293A4B53 /* MaoServerPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaoServerPlugin.swift; sourceTree = "<group>"; };
 		FC68EB0AF532CFC21C3344DD /* Pods-App.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-App.debug.xcconfig"; path = "Pods/Target Support Files/Pods-App/Pods-App.debug.xcconfig"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -81,6 +85,8 @@
 				504EC3071FED79650016851F /* AppDelegate.swift */,
 				E26680A3A4C947BAA1B3A7D6 /* MaoBridgeViewController.swift */,
 				F8F24B97F0D24F4D8E4F95D0 /* OpenUrlPlugin.swift */,
+				D1A2B3C4E5F60718293A4B51 /* MaoServerAddress.swift */,
+				D1A2B3C4E5F60718293A4B53 /* MaoServerPlugin.swift */,
 				504EC30B1FED79650016851F /* Main.storyboard */,
 				504EC30E1FED79650016851F /* Assets.xcassets */,
 				504EC3101FED79650016851F /* LaunchScreen.storyboard */,
@@ -218,6 +224,8 @@
 				504EC3081FED79650016851F /* AppDelegate.swift in Sources */,
 				578CC17712F54D9A80C5D8F9 /* MaoBridgeViewController.swift in Sources */,
 				CBF06513BD0C489AB24B9139 /* OpenUrlPlugin.swift in Sources */,
+				D1A2B3C4E5F60718293A4B52 /* MaoServerAddress.swift in Sources */,
+				D1A2B3C4E5F60718293A4B54 /* MaoServerPlugin.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

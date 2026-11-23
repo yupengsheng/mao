@@ -6,6 +6,7 @@ import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.InputType;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
@@ -14,12 +15,14 @@ import android.view.Window;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 
 import androidx.appcompat.app.ActionBar;
+import androidx.appcompat.app.AlertDialog;
 import androidx.core.graphics.Insets;
 import androidx.core.splashscreen.SplashScreen;
 import androidx.core.view.ViewCompat;
@@ -31,7 +34,8 @@ import com.getcapacitor.BridgeActivity;
 
 /**
  * 主 Activity（Capacitor 壳）：
- * - 远程加载 https://mao.yupengsheng.cn，AppUpdatePlugin OTA 升级
+ * - 远程加载服务器地址（默认 https://mao.yupengsheng.cn，可在首启/登录页改成自建实例，
+ *   见 MaoServerAddress），AppUpdatePlugin OTA 升级
  * - OpenUrlPlugin 用 ACTION_VIEW 把外链交给系统浏览器（WebView 不开多窗口，
  *   页面里 target="_blank" 的 window.open 会失败，见 utils/externalLink.ts）
  * - 首屏加载走标准 HTTP 缓存（弱网复用已缓存资源），完成判定以「Vue 真正渲染」为准，
@@ -73,8 +77,13 @@ public class MainActivity extends BridgeActivity {
     private TextView loadingMessage;
     private ProgressBar loadingProgress;
     private Button loadingRetryButton;
+    private Button loadingServerButton;
     private boolean firstPageLoaded = false;
     private int loadingAttempt = 0;
+    /** 服务器地址对话框代际：探活是异步的，旧对话框的回调不能落盘 */
+    private int serverDialogGeneration = 0;
+    /** 当前展示的地址对话框：重复触发「更换服务器」时先关旧的，避免弹框叠罗汉 */
+    private AlertDialog serverDialog;
 
     /** 强制显示 TopNav、移除 HTML splash，覆盖升级后可能残留的旧 CSS 缓存。 */
     private static final String FORCE_TOP_NAV_JS =
@@ -112,6 +121,7 @@ public class MainActivity extends BridgeActivity {
 
         registerPlugin(AppUpdatePlugin.class);
         registerPlugin(OpenUrlPlugin.class);
+        registerPlugin(MaoServerPlugin.class);
         super.onCreate(savedInstanceState);
 
         // BridgeActivity 会 setTheme(NoActionBar)；再显式藏掉 ActionBar，杜绝标题「Mao」。
@@ -120,6 +130,137 @@ public class MainActivity extends BridgeActivity {
         configureWebView();
         showLoadingOverlay();
         firstStartAt = System.currentTimeMillis();
+    }
+
+    /**
+     * 首启拦截：没有保存过服务器地址时先问地址，拿到之前不创建 bridge（不加载任何远端页面）。
+     * 地址保存在 SharedPreferences，之后每次启动直接用它构造 CapConfig。
+     */
+    @Override
+    protected void load() {
+        String saved = MaoServerAddress.get(this);
+        if (saved == null) {
+            // load() 由 BridgeActivity.onCreate 调用，此时本 Activity 尚未完成 onCreate：
+            // 对话框排到消息队列，等窗口就绪再弹。
+            new Handler(Looper.getMainLooper()).post(() -> showServerDialog(true, null));
+            return;
+        }
+        config = MaoServerAddress.buildConfig(this, saved);
+        super.load();
+    }
+
+    /** Web 侧「更换服务器」入口（MaoServer.open）落到这里；对话框关闭时 resolve 插件调用。 */
+    void promptServerChange(Runnable onClosed) {
+        if (isFinishing() || isDestroyed()) {
+            // Activity 已经在销毁：弹不出对话框，也要把 JS Promise 收尾
+            if (onClosed != null) onClosed.run();
+            return;
+        }
+        showServerDialog(false, onClosed);
+    }
+
+    /**
+     * 原生服务器地址对话框。
+     *
+     * @param firstRun 首次启动：不可取消，且额外提供「使用默认地址」
+     * @param onClosed 对话框关闭（保存或取消）时回调，插件用它收尾 JS Promise
+     */
+    private void showServerDialog(boolean firstRun, Runnable onClosed) {
+        if (isFinishing() || isDestroyed()) return;
+        // 探活在 IO 线程跑，只有仍是当前这轮对话框才允许落盘（防止点「取消」后回调仍然重建）
+        final int generation = ++serverDialogGeneration;
+        if (serverDialog != null && serverDialog.isShowing()) {
+            // 关旧框会先走它的 onDismiss，把上一轮插件调用 resolve 掉
+            serverDialog.dismiss();
+        }
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(20), dp(8), dp(20), 0);
+
+        TextView hint = new TextView(this);
+        hint.setText("Mao 服务器地址，仅支持 https，只填根地址（不要带路径）。");
+        hint.setTextSize(13);
+        hint.setTextColor(Color.parseColor("#6b7280"));
+        box.addView(hint);
+
+        EditText input = new EditText(this);
+        input.setSingleLine(true);
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        input.setHint(MaoServerAddress.DEFAULT_URL);
+        String current = MaoServerAddress.get(this);
+        input.setText(current != null ? current : MaoServerAddress.DEFAULT_URL);
+        input.setSelection(input.getText().length());
+        LinearLayout.LayoutParams inputParams =
+                new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        inputParams.topMargin = dp(8);
+        box.addView(input, inputParams);
+
+        TextView error = new TextView(this);
+        error.setTextColor(Color.parseColor("#dc2626"));
+        error.setTextSize(12);
+        error.setVisibility(View.GONE);
+        box.addView(error);
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle(firstRun ? "连接服务器" : "更换服务器")
+                .setView(box)
+                .setPositiveButton("连接", null)
+                .setNegativeButton(firstRun ? "使用默认地址" : "取消", null)
+                .setCancelable(!firstRun)
+                .create();
+        dialog.setOnDismissListener(d -> {
+            if (serverDialog == dialog) serverDialog = null;
+            // 保存 / 取消 / 返回键都会走到这里：插件调用必须收尾，否则前端 Promise 永挂
+            if (onClosed != null) onClosed.run();
+        });
+        serverDialog = dialog;
+        dialog.show();
+
+        Button positive = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+        Button negative = dialog.getButton(AlertDialog.BUTTON_NEGATIVE);
+        positive.setOnClickListener(view -> {
+            String normalized = MaoServerAddress.normalize(input.getText().toString());
+            if (normalized == null) {
+                error.setText("请输入有效的 https 地址（只填根地址，不带路径），例如 https://mao.example.com");
+                error.setVisibility(View.VISIBLE);
+                return;
+            }
+            error.setVisibility(View.GONE);
+            positive.setEnabled(false);
+            negative.setEnabled(false);
+            positive.setText("连接中…");
+            MaoServerAddress.validate(normalized, ok -> {
+                // 对话框已被取消 / 被新一轮对话框替换：丢弃这次结果，不能保存后重建
+                if (generation != serverDialogGeneration || !dialog.isShowing()
+                        || isFinishing() || isDestroyed()) return;
+                if (!ok) {
+                    positive.setEnabled(true);
+                    negative.setEnabled(true);
+                    positive.setText("连接");
+                    error.setText("无法连接该地址，请检查网络或地址是否正确");
+                    error.setVisibility(View.VISIBLE);
+                    return;
+                }
+                finishServerSelection(dialog, normalized);
+            });
+        });
+
+        negative.setOnClickListener(view -> {
+            if (!firstRun) {
+                dialog.dismiss();
+                return;
+            }
+            // 离线也要能进默认服务器：这里不做探活，连不上由页面自己的错误态处理
+            finishServerSelection(dialog, MaoServerAddress.DEFAULT_URL);
+        });
+    }
+
+    /** 保存地址 → 关框（dismiss 监听里收尾插件回调）→ 重建 Activity（load() 用新地址启动 bridge）。 */
+    private void finishServerSelection(AlertDialog dialog, String serverUrl) {
+        MaoServerAddress.save(this, serverUrl);
+        dialog.dismiss();
+        recreate();
     }
 
     /** 回前台：延迟探测 WebView 响应性，无响应则自动 reload（WebView 卡死时无需用户退出重开）。 */
@@ -295,6 +436,21 @@ public class MainActivity extends BridgeActivity {
             retryParams.topMargin = dp(24);
             content.addView(loadingRetryButton, retryParams);
 
+            // 地址填错 / 自建服务器挂了时，重试只会继续失败：给一个直接改地址的入口
+            loadingServerButton = new Button(this);
+            loadingServerButton.setText("更换服务器");
+            loadingServerButton.setAllCaps(false);
+            loadingServerButton.setTextColor(Color.parseColor("#2563eb"));
+            loadingServerButton.setTextSize(14);
+            loadingServerButton.setBackgroundColor(Color.TRANSPARENT);
+            loadingServerButton.setPadding(dp(12), 0, dp(12), 0);
+            loadingServerButton.setVisibility(View.GONE);
+            loadingServerButton.setOnClickListener(v -> showServerDialog(false, null));
+            LinearLayout.LayoutParams serverParams = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, dp(40));
+            serverParams.topMargin = dp(4);
+            content.addView(loadingServerButton, serverParams);
+
             loadingOverlay.addView(content, new FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT,
@@ -313,6 +469,7 @@ public class MainActivity extends BridgeActivity {
         loadingMessage.setText("网络较慢时可能需要多等一会儿");
         loadingProgress.setVisibility(View.VISIBLE);
         loadingRetryButton.setVisibility(View.GONE);
+        if (loadingServerButton != null) loadingServerButton.setVisibility(View.GONE);
         loadingAttempt++;
         scheduleLoadingTimeout(webView, loadingAttempt);
         watchInitialPageLoad(webView, loadingAttempt);
@@ -362,6 +519,7 @@ public class MainActivity extends BridgeActivity {
             loadingMessage.setText("请检查网络后重试，或继续等待页面加载");
             loadingProgress.setVisibility(View.GONE);
             loadingRetryButton.setVisibility(View.VISIBLE);
+            if (loadingServerButton != null) loadingServerButton.setVisibility(View.VISIBLE);
         }, LOADING_TIMEOUT_MS);
     }
 

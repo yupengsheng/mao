@@ -4,6 +4,15 @@
 
 与安卓一致，App **远程加载**生产 Web（默认 `https://mao.yupengsheng.cn`）。前端 UI 改动只需部署 Web，不需要重新出 IPA；只有原生壳（Swift 插件、Info.plist、图标、`ios/capacitor.config.json`）变化时才重新构建。
 
+## 服务器地址
+
+首次启动会弹原生输入框填写服务器地址（仅 `https` 根地址，缺协议自动补、带路径会被拒），确认前请求 `<地址>/api/v1/health` 并校验响应体 `code == 0`（绕开缓存，只认真 Mao 后端），不通过则原地报错；保存进 UserDefaults 后用新地址**重建整个壳**。登录页底部显示当前地址，并提供「更换服务器」入口；首屏 12s 未加载完成时弹「重试 / 更换服务器」，自建服务器挂掉或无响应时仍能改地址。
+
+- 地址在 bridge 创建前注入：`MaoBridgeViewController.instanceDescriptor()` 覆盖 `serverURL`——这是 `server.url` 的唯一入口，改地址只能换一个控制器。
+- 未配置时仍按默认地址 `https://mao.yupengsheng.cn` 起加载，输入框盖在上面；离线可点「使用默认地址」跳过探活。
+- 「更换服务器」走自研 `MaoServer` 插件（`get` / `open`），保存后 `MaoServerAddress.reloadShell()` 从 storyboard（标识 `MaoBridge`）重建根控制器。
+- 相关文件：`ios/App/App/MaoServerAddress.swift`、`ios/App/App/MaoServerPlugin.swift`；前端入口 `desktop/src/utils/nativeServer.ts` + `LoginView.vue`。
+
 ## 目录
 
 | 路径 | 用途 |

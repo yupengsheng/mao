@@ -12,8 +12,15 @@
 | 原生壳（MainActivity、OTA 插件、Capacitor 配置） | 更新发版说明后 `build-apk.sh` |
 
 安卓专用 UI 在 `desktop/` 中用 `android-capacitor` / `Capacitor.isNativePlatform()` 守卫；安卓与 iOS 共享的移动样式用 `native-mobile`。
-
 移动端（安卓 / iOS）历史会话为顶栏汉堡打开的覆盖式抽屉：点击遮罩、关闭按钮或 Esc 收起，选中会话与新建任务后自动关闭。抽屉内的分组、聚焦模式与历史折叠和桌面端同源，仅原生壳样式由 `native-mobile` 统一接管。
+
+## 服务器地址
+
+首次启动弹原生对话框填写服务器地址（仅 `https` 根地址，缺协议自动补、带路径会被拒），确认前请求 `<地址>/api/v1/health` 并校验响应体 `code == 0`（只认真 Mao 后端，静态站点不算），失败原地报错；保存进 SharedPreferences（`mao_server`）后用新地址重建 Activity。登录页底部显示当前地址，并提供「更换服务器」入口；首屏加载超过 8s 时遮罩上除「重新连接」外也给出「更换服务器」，地址填错不必重装 APK。
+
+- `MainActivity` 覆盖 `BridgeActivity.load()`：有地址就用「复制 assets 配置、只替换 `server.url` 的 `CapConfig`」启动 bridge；没有地址先弹框、**不创建 bridge**（不加载任何远端页面）。
+- 「更换服务器」走自研 `MaoServer` 插件（`get` / `open`）→ `promptServerChange()` → `recreate()`，重建后 `load()` 自然读到新地址。
+- 相关文件：`MaoServerAddress.java`、`MaoServerPlugin.java`、`MainActivity` 的 `load()` / `showServerDialog()`；前端入口 `desktop/src/utils/nativeServer.ts` + `LoginView.vue`。
 
 ## 外链打开
 
