@@ -1,5 +1,6 @@
 import { mkdirSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import type { FastifyInstance } from 'fastify';
 import { decryptAesGcm } from '../crypto/aes-gcm.js';
@@ -29,7 +30,7 @@ import { persistDingtalkCancelIfIdle, persistDingtalkCancelIfActive } from './ca
 import { DingtalkCardActionService } from './card-action.service.js';
 import { progressCardParams, queueCardParams } from './card-body.js';
 import { createAndDeliverCard, updateCard } from './card-client.js';
-import { DingtalkInboundProcessor } from './inbound-processor.js';
+import { DingtalkInboundProcessor, NO_LOGIN_METHOD_TEXT } from './inbound-processor.js';
 import { DingtalkInboundQueueRepository } from './inbound-queue.repository.js';
 import { DingtalkTaskQueueService } from './inbound-queue.service.js';
 import { downloadBytes, exchangeDownloadUrl, uploadMedia } from './media.js';
@@ -43,6 +44,7 @@ import { DINGTALK_DISLIKE_SOURCE } from '../feedback/feedback.repository.js';
 import { MysqlDingtalkProgressCardRepository } from './progress-card.repository.js';
 import { bindingCardParam, fileMessageParam, imageMessageParam, sendDingtalkMarkdown, sendDingtalkMessage, type DingtalkSendTarget as OutboundTarget } from './send.service.js';
 import { DingtalkTokenCache } from './token.js';
+import { PASSWORD_BIND_LINK_TTL_MS } from '../channel-bind/bind-flow.js';
 import type { DingtalkBot, DingtalkInboundContext, DingtalkNormalizedMessage } from './types.js';
 import { groupProjectKey, privateProjectKey, resolveDingtalkWorkspace } from './workspace.js';
 import { deliverScheduledDingtalkReply } from './scheduled-result.js';
@@ -94,9 +96,10 @@ export function createDingtalkRuntime(deps: {
   wsRegistry: { send(userId: number, event: unknown): void };
   agentService: AgentService;
   modelService: ModelService;
-  userRepo: { findById(id: number): Promise<{ id?: number } | null> };
+  userRepo: { findById(id: number): Promise<{ id?: number; username?: string | null; status?: number | null } | null> };
   settingService: {
     getSiteBaseUrl(): Promise<string | null>;
+    passwordLoginEnabled(): Promise<boolean>;
     getDingtalkOauthConfig(): Promise<DingtalkOauthConfig>;
   };
   taskTerminal: {
@@ -420,9 +423,30 @@ export function createDingtalkRuntime(deps: {
 
   handlerBox.current = handler;
 
+  const sendBindingCardMessage = async (
+    accountId: string,
+    event: DingtalkNormalizedMessage,
+    card: ReturnType<typeof bindingCardParam>,
+    privateOnly = false,
+  ): Promise<void> => {
+    const cred = await credentialsOf(Number(accountId));
+    if (cred == null) throw new Error('钉钉机器人不可用');
+    const target: OutboundTarget = !privateOnly && event.chatType === 'group'
+      ? { chatType: 'group', robotCode: cred.bot.robotCode, conversationId: event.conversationId }
+      : { chatType: 'p2p', robotCode: cred.bot.robotCode, userId: event.senderUserid ?? '' };
+    const result = await sendDingtalkMessage({ token: () => tokens.getAccessToken(cred.bot.clientId, cred.secret), fetchImpl }, target, card);
+    if (!result.ok) throw new Error(result.reason);
+  };
+
   const processor = new DingtalkInboundProcessor(handler, {
     messageService,
     mergeWindowMs: deps.config.mergeWindowMs,
+    passwordBindMissingText: async () => {
+      const passwordOn = await deps.settingService.passwordLoginEnabled().catch(() => false);
+      const siteBase = (await deps.settingService.getSiteBaseUrl() ?? '').trim();
+      if (passwordOn && siteBase === '') return '请联系管理员在管理后台配置站点地址（site.baseUrl）后重试';
+      return NO_LOGIN_METHOD_TEXT;
+    },
     oauthConfigured: async () => oauthConfigured(await oauthConfig()),
     resolveUserId: ( _accountId, event) => binding.findUserId(event.senderUserid, event.senderUnionId),
     rememberMember: async (accountId, event, userId) => {
@@ -438,22 +462,31 @@ export function createDingtalkRuntime(deps: {
       const state = await oauthStates.create(null, 3 * 60 * 1000);
       await pending.insert({ state, botId: Number(accountId), event }, new Date(Date.now() + 3 * 60 * 1000));
       try {
-        const cred = await credentialsOf(Number(accountId));
-        if (cred == null) throw new Error('钉钉机器人不可用');
-        const card = bindingCardParam(`${origin}/api/v1/dingtalk/bind/${state}`);
-        const target: OutboundTarget = event.chatType === 'group'
-          ? { chatType: 'group', robotCode: cred.bot.robotCode, conversationId: event.conversationId }
-          : { chatType: 'p2p', robotCode: cred.bot.robotCode, userId: event.senderUserid ?? '' };
-        const result = await sendDingtalkMessage({
-          token: () => tokens.getAccessToken(cred.bot.clientId, cred.secret),
-          fetchImpl,
-        }, target, card);
-        if (!result.ok) throw new Error(result.reason);
+        await sendBindingCardMessage(accountId, event, bindingCardParam(`${origin}/api/v1/dingtalk/bind/${state}`));
         await pending.markSent(state);
         return true;
       } catch (error) {
         await pending.fail(state);
         console.error(`钉钉绑定卡片发送失败, bot=${accountId}`, error);
+        return false;
+      }
+    },
+    sendPasswordBindCard: async (accountId, event) => {
+      if (!(await deps.settingService.passwordLoginEnabled().catch(() => false))) return false;
+      const siteBase = (await deps.settingService.getSiteBaseUrl() ?? '').trim().replace(/\/+$/, '');
+      if (siteBase === '') return false;
+      const state = randomUUID();
+      await pending.insert({ state, botId: Number(accountId), event, bindingMethod: 'PASSWORD' }, new Date(Date.now() + PASSWORD_BIND_LINK_TTL_MS));
+      try {
+        await sendBindingCardMessage(accountId, event, bindingCardParam(`${siteBase}/dingtalk/bind-pwd/${state}`, {
+          text: '已私发绑定卡片，请在 Mao 中核对信息并确认绑定，即可继续刚才的消息（15 分钟内有效）。',
+          button: '登录 Mao 并绑定',
+        }), true);
+        await pending.markSent(state);
+        return true;
+      } catch (error) {
+        await pending.fail(state);
+        console.error(`钉钉密码绑定卡片发送失败, bot=${accountId}`, error);
         return false;
       }
     },
@@ -568,6 +601,14 @@ export function createDingtalkRuntime(deps: {
         repository: binding,
         oauthStates,
         oauth: oauthConfig,
+        pending,
+        currentUser: async (userId) => {
+          const user = await deps.userRepo.findById(userId).catch(() => null);
+          return user == null ? null : { id: userId, username: user.username ?? null, disabled: user.status != null && user.status === 0 };
+        },
+        replayPending: async (pendingRow) => {
+          await processor.process(String(pendingRow.botId), pendingRow.event, true, { bypassWindow: true });
+        },
         onCallback: async (state, userId, code) => {
           const oauth = await oauthConfig();
           const userToken = await exchangeUserAccessToken(fetchImpl, oauth, code);

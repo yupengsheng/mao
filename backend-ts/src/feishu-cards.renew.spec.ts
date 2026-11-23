@@ -54,6 +54,7 @@ describe('createRenewAuthLinkHelper', () => {
       appId: 3,
       messageId: 'om_in',
       event: expect.objectContaining({ senderId: 'ou_1' }),
+      bindingMethod: 'OAUTH',
       cardMessageId: 'cm_1',
     });
     expect(pendingBindingMessages.setCardMessageId).toHaveBeenCalledWith('s2', 'cm_1');

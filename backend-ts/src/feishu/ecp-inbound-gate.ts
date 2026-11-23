@@ -20,11 +20,17 @@ export const FEISHU_ECP_IDENTITY_MISMATCH_TEXT =
 export async function startFeishuChannelAuthLink(options: {
   ecpEnabled: boolean;
   feishuEnabled: boolean;
+  passwordEnabled?: boolean;
+  getSiteBaseUrl?: () => string | null;
   startEcp: () => Promise<FeishuChannelAuthLink>;
   startFeishu: () => Promise<FeishuChannelAuthLink>;
+  startPassword?: () => Promise<FeishuChannelAuthLink> | FeishuChannelAuthLink;
 }): Promise<FeishuChannelAuthLink | null> {
   if (options.ecpEnabled) return options.startEcp();
   if (options.feishuEnabled) return options.startFeishu();
+  if (options.passwordEnabled && options.startPassword != null && (options.getSiteBaseUrl?.() ?? '').trim() !== '') {
+    return options.startPassword();
+  }
   return null;
 }
 
@@ -109,12 +115,21 @@ export async function persistFeishuPendingAuth(insert: () => Promise<void>, stat
   }
 }
 
-export function feishuUnauthorizedGuide(ecpEnabled: boolean, chatType: FeishuChatType): FeishuUnauthorizedGuide {
+export function feishuUnauthorizedGuide(ecpEnabled: boolean, chatType: FeishuChatType, passwordEnabled = false): FeishuUnauthorizedGuide {
   if (ecpEnabled) {
     return {
       title: '新用户绑定',
       body: '请先点击下方按钮完成用户绑定（3分钟内有效）。',
       buttonLabel: '点我绑定',
+    };
+  }
+  if (passwordEnabled) {
+    return {
+      title: '新用户绑定',
+      body: chatType === 'group'
+        ? '请先登录 Mao 账号并确认绑定，获得群内使用权限后再试（15 分钟内有效）。'
+        : '登录 Mao 账号后核对信息并确认绑定，即可继续刚才的消息（15 分钟内有效）。',
+      buttonLabel: '登录 Mao 并绑定',
     };
   }
   return {

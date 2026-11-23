@@ -1,3 +1,4 @@
+import { ChannelBindIdentityConflictError } from '../channel-bind/bind-flow.js';
 import { BusinessException } from '../common/business-exception.js';
 import { ErrorCode } from '../common/error-code.js';
 import type { Db } from '../db/db.js';
@@ -25,13 +26,13 @@ export class MysqlFeishuBindingRepository implements FeishuBindingRepository {
     if (unionId.trim() === '') throw new BusinessException(ErrorCode.PARAM_INVALID, 'union_id不能为空');
     await this.db.transaction(async (tx) => {
       const previous = await tx.queryOne<{ userId?: number | null }>(
-        'SELECT user_id FROM feishu_binding WHERE union_id = ? AND deleted = 0 LIMIT 1', [unionId],
+        'SELECT user_id FROM feishu_binding WHERE union_id = ? AND deleted = 0 LIMIT 1 FOR UPDATE', [unionId],
       );
+      if (previous?.userId != null && previous.userId !== userId) {
+        throw new ChannelBindIdentityConflictError();
+      }
       await tx.execute('UPDATE feishu_binding SET deleted = 1 WHERE user_id = ? AND deleted = 0', [userId]);
       await tx.execute('UPDATE feishu_binding SET deleted = 1 WHERE union_id = ? AND deleted = 0', [unionId]);
-      if (previous?.userId != null && previous.userId !== userId) {
-        await tx.execute('UPDATE `user` SET feishu_user_id = NULL WHERE id = ?', [previous.userId]);
-      }
       await tx.execute(
         'INSERT INTO feishu_binding (user_id, union_id, deleted) VALUES (?, ?, 0)', [userId, unionId],
       );

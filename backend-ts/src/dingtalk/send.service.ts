@@ -41,13 +41,16 @@ export function isContentTooLong(status: number, body: string): boolean {
   return /过长|too long|exceed|length|msgParam/i.test(body);
 }
 
-export function bindingCardParam(url: string): { msgKey: 'sampleActionCard'; msgParam: string } {
+export function bindingCardParam(
+  url: string,
+  copy: { text: string; button: string } = { text: '请先点击下方按钮完成账号绑定（3分钟内有效）。', button: '点我绑定' },
+): { msgKey: 'sampleActionCard'; msgParam: string } {
   return {
     msgKey: 'sampleActionCard',
     msgParam: JSON.stringify({
       title: '绑定 Mao',
-      text: '请先点击下方按钮完成账号绑定（3分钟内有效）。',
-      singleTitle: '点我绑定',
+      text: copy.text,
+      singleTitle: copy.button,
       singleURL: url,
     }),
   };

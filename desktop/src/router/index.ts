@@ -44,6 +44,18 @@ const routes: RouteRecordRaw[] = [
         component: () => import('../views/settings/DingtalkBindRedirect.vue')
       },
       {
+        path: 'feishu/bind/:state',
+        name: 'FeishuBindConfirm',
+        component: () => import('../views/auth/ChannelBindConfirmView.vue'),
+        meta: { channel: 'feishu' }
+      },
+      {
+        path: 'dingtalk/bind-pwd/:state',
+        name: 'DingtalkBindPwdConfirm',
+        component: () => import('../views/auth/ChannelBindConfirmView.vue'),
+        meta: { channel: 'dingtalk' }
+      },
+      {
         path: 'execution-records',
         name: 'ExecutionRecords',
         component: () => import('../views/task/ExecutionRecordsView.vue')

@@ -20,9 +20,12 @@ import {
   feishuUnauthorizedFallbackText,
   persistFeishuPendingAuth,
   startFeishuChannelAuthLink,
+  withFeishuAuthLink,
   type FeishuUnauthorizedGuide,
 } from './feishu/ecp-inbound-gate.js';
 import { parseSqlTimeMs } from './app-utils.js';
+import { randomUUID } from 'node:crypto';
+import { channelBindLink } from './channel-bind/bind-flow.js';
 
 // ========== 排队卡片 ==========
 
@@ -279,25 +282,35 @@ export interface SendUnauthorizedCardDeps {
   ecpAuth: EcpAuthService;
   feishu: FeishuAuthService;
   pendingBindingMessages: MysqlFeishuPendingBindingRepository;
+  passwordEnabled?: () => Promise<boolean>;
+  getSiteBaseUrl?: () => Promise<string | null>;
 }
 
 export function createSendUnauthorizedCardHelper(deps: SendUnauthorizedCardDeps) {
-  const { getFeishuClient, ecpAuth, feishu, pendingBindingMessages } = deps;
+  const { getFeishuClient, ecpAuth, feishu, pendingBindingMessages, passwordEnabled, getSiteBaseUrl } = deps;
 
   return async (accountId: string, event: FeishuNormalizedMessage): Promise<boolean> => {
     const client = await getFeishuClient(Number(accountId));
     if (client == null || event.messageId == null) return false;
     if (event.chatType === 'group' && event.chatId == null) return false;
     if (event.chatType === 'p2p' && event.senderId == null) return false;
+    const ecpEnabled = await ecpAuth.isEnabled();
+    const feishuEnabled = await feishu.isEnabled();
+    const siteBaseUrl = (await getSiteBaseUrl?.() ?? '').trim();
+    const passwordOn = !ecpEnabled && !feishuEnabled && (await passwordEnabled?.() ?? false) && siteBaseUrl !== '';
     let auth: { authUrl: string; state: string } | null = null;
     try {
       auth = await startFeishuChannelAuthLink({
-        ecpEnabled: await ecpAuth.isEnabled(),
-        feishuEnabled: await feishu.isEnabled(),
-        // 飞书通道用 channel 回调：外网用户点卡片也能落到公网可访问的服务端渲染页；
-        // 未配置 channelCallbackUrl 时自动回落到 desktopCallbackUrl，行为与旧版一致。
+        ecpEnabled,
+        feishuEnabled,
+        passwordEnabled: passwordOn,
+        getSiteBaseUrl: () => siteBaseUrl,
         startEcp: () => ecpAuth.startFeishuLogin('channel'),
         startFeishu: () => feishu.getQrCodeUrl(),
+        startPassword: () => {
+          const state = randomUUID();
+          return { authUrl: channelBindLink(siteBaseUrl, 'feishu/bind', state), state };
+        },
       });
     } catch (error) {
       console.error('飞书未授权引导获取登录链接失败', error);
@@ -306,21 +319,35 @@ export function createSendUnauthorizedCardHelper(deps: SendUnauthorizedCardDeps)
     if (auth == null || auth.authUrl.trim() === '') return false;
     const inboundMessageId = event.messageId;
     const persisted = await persistFeishuPendingAuth(
-      () => pendingBindingMessages.insert({ state: auth.state, appId: Number(accountId), messageId: inboundMessageId, event }),
+      () => pendingBindingMessages.insert({
+        state: auth.state,
+        appId: Number(accountId),
+        messageId: inboundMessageId,
+        event,
+        bindingMethod: passwordOn ? 'PASSWORD' : 'OAUTH',
+      }),
       auth.state,
     );
-    const ecpEnabled = await ecpAuth.isEnabled();
-    const guide = feishuUnauthorizedGuide(ecpEnabled, event.chatType);
-    const card = buildFeishuAuthGuideCard(guide, auth.authUrl, event.senderId != null ? { sender: event.senderId } : undefined);
+    const guide = feishuUnauthorizedGuide(ecpEnabled, event.chatType, passwordOn);
+    const card = buildFeishuAuthGuideCard(
+      guide,
+      auth.authUrl,
+      event.senderId != null && !passwordOn ? { sender: event.senderId } : undefined,
+    );
     const data = { msg_type: 'interactive' as const, content: JSON.stringify(card) };
     let response;
     try {
-      response = await (event.chatType === 'group'
-        ? client.im.v1.message.reply({ path: { message_id: inboundMessageId }, data })
-        : client.im.v1.message.create({
+      response = passwordOn && event.chatType === 'group'
+        ? await client.im.v1.message.create({
             params: { receive_id_type: 'open_id' },
             data: { ...data, receive_id: event.senderId! },
-          }));
+          })
+        : await (event.chatType === 'group'
+          ? client.im.v1.message.reply({ path: { message_id: inboundMessageId }, data })
+          : client.im.v1.message.create({
+              params: { receive_id_type: 'open_id' },
+              data: { ...data, receive_id: event.senderId! },
+            }));
     } catch (error) {
       if (persisted) await pendingBindingMessages.fail(auth.state);
       throw error;
@@ -347,6 +374,8 @@ export interface RenewAuthLinkDeps {
   ecpAuth: EcpAuthService;
   feishu: FeishuAuthService;
   pendingBindingMessages: MysqlFeishuPendingBindingRepository;
+  passwordEnabled?: () => Promise<boolean>;
+  getSiteBaseUrl?: () => Promise<string | null>;
 }
 
 export interface RenewAuthLinkResult {
@@ -361,7 +390,7 @@ export interface RenewAuthLinkResult {
  * 沿用原卡片记录里的入站消息（state → appId/messageId/event），换链接后原消息仍会被重放。
  */
 export function createRenewAuthLinkHelper(deps: RenewAuthLinkDeps) {
-  const { ecpAuth, feishu, pendingBindingMessages } = deps;
+  const { ecpAuth, feishu, pendingBindingMessages, passwordEnabled, getSiteBaseUrl } = deps;
   return async (params: { botId: number; cardMessageId: string; sender: string }): Promise<RenewAuthLinkResult> => {
     const pending = await pendingBindingMessages.findByCardMessageId(params.cardMessageId);
     if (pending == null) {
@@ -371,13 +400,26 @@ export function createRenewAuthLinkHelper(deps: RenewAuthLinkDeps) {
     if (pendingSender !== '' && pendingSender !== params.sender) {
       return { ok: false, message: '仅消息发送者可操作' };
     }
+    const ecpEnabled = await ecpAuth.isEnabled();
+    const feishuEnabled = await feishu.isEnabled();
+    const siteBaseUrl = (await getSiteBaseUrl?.() ?? '').trim();
+    const passwordOn = !ecpEnabled && !feishuEnabled && (await passwordEnabled?.() ?? false) && siteBaseUrl !== '';
+    if (passwordOn && pending.event.chatType === 'group') {
+      return { ok: false, message: '当前登录方式已切换，请私聊机器人获取绑定卡片' };
+    }
     let link: { authUrl: string; state: string } | null = null;
     try {
       link = await startFeishuChannelAuthLink({
-        ecpEnabled: await ecpAuth.isEnabled(),
-        feishuEnabled: await feishu.isEnabled(),
+        ecpEnabled,
+        feishuEnabled,
+        passwordEnabled: passwordOn,
+        getSiteBaseUrl: () => siteBaseUrl,
         startEcp: () => ecpAuth.startFeishuLogin('channel'),
         startFeishu: () => feishu.getQrCodeUrl(),
+        startPassword: () => {
+          const state = randomUUID();
+          return { authUrl: channelBindLink(siteBaseUrl, 'feishu/bind', state), state };
+        },
       });
     } catch (error) {
       console.error('飞书绑定卡重新获取授权链接失败', error);
@@ -392,11 +434,12 @@ export function createRenewAuthLinkHelper(deps: RenewAuthLinkDeps) {
       appId: pending.appId,
       messageId: pending.messageId,
       event: pending.event,
+      bindingMethod: passwordOn ? 'PASSWORD' : 'OAUTH',
       cardMessageId: params.cardMessageId,
     });
     await pendingBindingMessages.setCardMessageId(link.state, params.cardMessageId);
     await pendingBindingMessages.failOthersForCard(params.cardMessageId, link.state);
-    const guide = feishuUnauthorizedGuide(await ecpAuth.isEnabled(), pending.event.chatType);
+    const guide = feishuUnauthorizedGuide(ecpEnabled, pending.event.chatType, passwordOn);
     return { ok: true, authUrl: link.authUrl, guide };
   };
 }
@@ -405,13 +448,40 @@ export function createRenewAuthLinkHelper(deps: RenewAuthLinkDeps) {
 
 export interface UnauthorizedTextDeps {
   ecpAuth: EcpAuthService;
+  feishu?: FeishuAuthService;
+  passwordEnabled?: () => Promise<boolean>;
+  getSiteBaseUrl?: () => Promise<string | null>;
+  pendingBindingMessages?: MysqlFeishuPendingBindingRepository;
 }
 
 export function createUnauthorizedTextHelper(deps: UnauthorizedTextDeps) {
-  const { ecpAuth } = deps;
+  const { ecpAuth, feishu, passwordEnabled, getSiteBaseUrl, pendingBindingMessages } = deps;
 
-  return async (_accountId: string, event: FeishuNormalizedMessage): Promise<string> => {
+  return async (accountId: string, event: FeishuNormalizedMessage): Promise<string> => {
     const ecpEnabled = await ecpAuth.isEnabled();
-    return feishuUnauthorizedFallbackText(feishuUnauthorizedGuide(ecpEnabled, event.chatType));
+    const feishuEnabled = await feishu?.isEnabled() ?? false;
+    const siteBaseUrl = (await getSiteBaseUrl?.() ?? '').trim();
+    const passwordWanted = !ecpEnabled && !feishuEnabled && (await passwordEnabled?.() ?? false);
+    const passwordOn = passwordWanted && siteBaseUrl !== '';
+    const guide = feishuUnauthorizedGuide(ecpEnabled, event.chatType, passwordOn);
+    const fallback = feishuUnauthorizedFallbackText(guide);
+    if (passwordWanted && siteBaseUrl === '') {
+      return `${fallback}\n请联系管理员在管理后台配置站点地址（site.baseUrl）后重试。`;
+    }
+    if (!passwordOn || event.messageId == null || pendingBindingMessages == null) return fallback;
+    if (event.chatType === 'group') return `${fallback}\n请私聊机器人获取绑定卡片。`;
+    const state = randomUUID();
+    const persisted = await persistFeishuPendingAuth(
+      () => pendingBindingMessages.insert({
+        state,
+        appId: Number(accountId),
+        messageId: event.messageId!,
+        event,
+        bindingMethod: 'PASSWORD',
+        status: 'SENT',
+      }),
+      state,
+    );
+    return persisted ? withFeishuAuthLink(fallback, channelBindLink(siteBaseUrl, 'feishu/bind', state), '登录') : fallback;
   };
 }

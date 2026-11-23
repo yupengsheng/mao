@@ -166,11 +166,10 @@ import { RecordingLlmChatClient } from './usage/recording-llm-chat-client.js';
 import { MysqlFeishuBindingRepository } from './feishu/binding.repository.js';
 import { FeishuInboundProcessor } from './feishu/inbound-processor.js';
 import { MysqlFeishuPendingBindingRepository } from './feishu/pending-binding.repository.js';
+import type { FeishuPendingBindingMessage } from './feishu/pending-binding.repository.js';
 import { replayFeishuPendingMessage } from './feishu/pending-replay.js';
-import {
-  completeFeishuPendingAfterEcp,
-  FEISHU_ECP_IDENTITY_MISMATCH_TEXT,
-} from './feishu/ecp-inbound-gate.js';
+import { completePendingAfterBind, feishuUnionIdOf } from './channel-bind/bind-flow.js';
+import { registerFeishuBindingRoutes, registerFeishuPendingBindingRoutes } from './feishu/binding.routes.js';
 import { feishuSendTargetOf, sendFeishuFile, sendFeishuImage } from './feishu/media-sender.js';
 import type { DingtalkMediaSendSupport } from './harness/tool/impl/dingtalk-tools.js';
 import { buildFeishuProgressCard, feishuSessionDetailUrl } from './feishu/progress-card.js';
@@ -345,16 +344,25 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
         await earlyFeishuBinding.bind(targetUserId ?? user.id, user.feishuUserId);
       }
       if (state != null && ctx.pendingBindingProcessor != null) {
-        const pending = await pendingBindingMessages.claim(state);
-        if (pending != null) {
-          try {
+        await completePendingAfterBind<FeishuPendingBindingMessage>({
+          state,
+          bindUserId: targetUserId ?? user.id!,
+          claim: (value) => pendingBindingMessages.claim(value),
+          unionIdOf: feishuUnionIdOf,
+          findUserIdByUnionId: (unionId) => earlyFeishuBinding.findUserIdByUnionId(unionId),
+          bind: (userId, unionId) => earlyFeishuBinding.bind(userId, unionId),
+          replay: async (pending) => {
+            if (ctx.pendingBindingProcessor == null) throw new Error('飞书入站处理器未就绪');
             await replayFeishuPendingMessage(ctx.pendingBindingProcessor, pending);
-            await pendingBindingMessages.complete(state!);
-          } catch (error) {
-            await pendingBindingMessages.release(state!);
-            console.error(`恢复飞书待绑定消息失败, state=${state}`, error);
-          }
-        }
+          },
+          complete: (value) => pendingBindingMessages.complete(value),
+          markReplayed: (value) => pendingBindingMessages.markReplayed(value),
+          release: (value) => pendingBindingMessages.release(value),
+          failClaimed: (value) => pendingBindingMessages.failClaimed(value),
+          notifyMismatch: async (pending) => {
+            await ctx.notifyFeishuPendingMismatch?.(pending);
+          },
+        });
       }
     },
   );
@@ -373,25 +381,47 @@ export async function createMaoApp(cfg: AppConfig = loadConfig(), existing?: Fas
     async (user, state) => {
       if (user.id == null) return;
       // 返回值透出重放结局：通道绑定回调据此分档渲染（不得把「重放失败」报成绑定成功）
-      return completeFeishuPendingAfterEcp({
+      const outcome = await completePendingAfterBind<FeishuPendingBindingMessage>({
         state,
-        ecpUserId: user.id,
-        claim: (s) => pendingBindingMessages.claim(s),
+        bindUserId: user.id,
+        claim: (value) => pendingBindingMessages.claim(value),
+        unionIdOf: feishuUnionIdOf,
         findUserIdByUnionId: (unionId) => earlyFeishuBinding.findUserIdByUnionId(unionId),
-        bind: (userId, unionId) => earlyFeishuBinding.bind(userId, unionId),
+        bind: (userId, unionId, pending) => earlyFeishuBinding.bind(userId, unionId),
         replay: async (pending) => {
           if (ctx.pendingBindingProcessor == null) throw new Error('飞书入站处理器未就绪');
           await replayFeishuPendingMessage(ctx.pendingBindingProcessor, pending);
         },
-        complete: (s) => pendingBindingMessages.complete(s),
-        release: (s) => pendingBindingMessages.release(s),
-        failClaimed: (s) => pendingBindingMessages.failClaimed(s),
+        complete: (value) => pendingBindingMessages.complete(value),
+        markReplayed: (value) => pendingBindingMessages.markReplayed(value),
+        release: (value) => pendingBindingMessages.release(value),
+        failClaimed: (value) => pendingBindingMessages.failClaimed(value),
         notifyMismatch: async (pending) => {
           await ctx.notifyFeishuPendingMismatch?.(pending);
         },
       });
+      return outcome === 'replayed' ? 'replayed' : outcome === 'identity-mismatch' ? 'identity-mismatch' : 'replay-failed';
     },
   );
+  await app.register(async (api) => {
+    registerFeishuPendingBindingRoutes(api, {
+      jwt,
+      repository: earlyFeishuBinding,
+      pending: pendingBindingMessages,
+      currentUser: async (userId) => {
+        const user = await userRepo.findById(userId).catch(() => null);
+        return user == null ? null : { id: userId, username: user.username ?? null, disabled: user.status != null && user.status === 0 };
+      },
+      replayPending: async (pending) => {
+        if (ctx.pendingBindingProcessor == null) throw new Error('飞书入站处理器未就绪');
+        await replayFeishuPendingMessage(ctx.pendingBindingProcessor, pending);
+      },
+      notifyMismatch: async (pending) => {
+        await ctx.notifyFeishuPendingMismatch?.(pending);
+      },
+    });
+  }, { prefix: apiPrefix });
+
   const gitCredentials = new GitCredentialService(db, cfg.app.gitCredential.secretKey);
   // 管理员维护的系统默认凭据与用户凭据共用 APP_GIT_CREDENTIAL_SECRET；空表为 no-op。
   const systemGitCredentials = new SystemGitCredentialService(db, cfg.app.gitCredential.secretKey);

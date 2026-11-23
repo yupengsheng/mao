@@ -246,11 +246,28 @@ export function assembleLifecycle(deps: LifecycleDeps): LifecycleResult {
       if (ctx.pendingBindingProcessor == null) return;
       const claimed = await d.pendingBindingMessages.claim(message.state);
       if (claimed == null) continue;
+      if (claimed.replayedAt != null) {
+        await d.pendingBindingMessages.complete(claimed.state).catch((error: unknown) => {
+          console.error(`恢复飞书待绑定消息终态写入失败, state=${claimed.state}`, error);
+        });
+        continue;
+      }
+      let replayFinished = false;
+      let replayMarked = false;
       try {
         await replayFeishuPendingMessage(ctx.pendingBindingProcessor, claimed);
+        replayFinished = true;
+        await d.pendingBindingMessages.markReplayed(claimed.state);
+        replayMarked = true;
         await d.pendingBindingMessages.complete(claimed.state);
       } catch (error) {
-        await d.pendingBindingMessages.release(claimed.state);
+        if (replayFinished) {
+          // 原消息已执行，不能释放为 SENT；失败时置 FAILED，避免恢复扫描再次执行。
+          if (!replayMarked) await d.pendingBindingMessages.failClaimed(claimed.state).catch(() => undefined);
+          else await d.pendingBindingMessages.complete(claimed.state).catch(() => undefined);
+        } else {
+          await d.pendingBindingMessages.release(claimed.state).catch(() => undefined);
+        }
         console.error(`恢复飞书待绑定消息失败, state=${claimed.state}`, error);
       }
     }

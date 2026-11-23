@@ -1,10 +1,14 @@
 import type { Db } from '../db/db.js';
 import type { DingtalkNormalizedMessage } from './types.js';
 
+export type DingtalkPendingBindingMethod = 'OAUTH' | 'PASSWORD';
+
 export interface DingtalkPendingBindingMessage {
   state: string;
   botId: number;
   event: DingtalkNormalizedMessage;
+  expiresAt?: string | Date | null;
+  bindingMethod?: DingtalkPendingBindingMethod;
   status?: string;
 }
 
@@ -17,6 +21,7 @@ export class MysqlDingtalkPendingBindingRepository {
       botId: row.botId,
       payload: JSON.stringify(row.event),
       status: row.status ?? 'PENDING',
+      bindingMethod: row.bindingMethod ?? 'OAUTH',
       expiresAt,
     });
   }
@@ -49,6 +54,24 @@ export class MysqlDingtalkPendingBindingRepository {
     );
   }
 
+  async findByState(state: string): Promise<DingtalkPendingBindingMessage | null> {
+    const row = await this.db.queryOne<Record<string, unknown>>(
+      "SELECT * FROM dingtalk_pending_binding_message WHERE state = ? AND status = 'SENT' AND expires_at > CURRENT_TIMESTAMP LIMIT 1",
+      [state],
+    );
+    if (row == null) return null;
+    return {
+      state: String(row.state),
+      botId: Number(row.botId),
+      event: JSON.parse(String(row.payload)) as DingtalkNormalizedMessage,
+      expiresAt: row.expiresAt == null ? (row.expires_at == null ? null : String(row.expires_at)) : row.expiresAt as string | Date,
+      bindingMethod: row.bindingMethod == null
+        ? (row.binding_method == null ? 'OAUTH' : String(row.binding_method) as DingtalkPendingBindingMethod)
+        : String(row.bindingMethod) as DingtalkPendingBindingMethod,
+      status: String(row.status),
+    };
+  }
+
   async claim(state: string): Promise<DingtalkPendingBindingMessage | null> {
     const row = await this.db.queryOne<Record<string, unknown>>(
       "SELECT * FROM dingtalk_pending_binding_message WHERE state = ? AND status = 'SENT' AND expires_at > CURRENT_TIMESTAMP LIMIT 1",
@@ -64,6 +87,10 @@ export class MysqlDingtalkPendingBindingRepository {
       state: String(row.state),
       botId: Number(row.botId),
       event: JSON.parse(String(row.payload)) as DingtalkNormalizedMessage,
+      expiresAt: row.expiresAt == null ? (row.expires_at == null ? null : String(row.expires_at)) : row.expiresAt as string | Date,
+      bindingMethod: row.bindingMethod == null
+        ? (row.binding_method == null ? 'OAUTH' : String(row.binding_method) as DingtalkPendingBindingMethod)
+        : String(row.bindingMethod) as DingtalkPendingBindingMethod,
       status: 'CLAIMED',
     };
   }

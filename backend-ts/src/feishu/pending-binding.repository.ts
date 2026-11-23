@@ -1,6 +1,8 @@
 import type { Db } from '../db/db.js';
 import type { FeishuNormalizedMessage } from './types.js';
 
+export type FeishuPendingBindingMethod = 'OAUTH' | 'PASSWORD';
+
 export interface FeishuPendingBindingMessage {
   id?: number;
   state: string;
@@ -8,6 +10,8 @@ export interface FeishuPendingBindingMessage {
   messageId: string;
   cardMessageId?: string | null;
   event: FeishuNormalizedMessage;
+  bindingMethod?: FeishuPendingBindingMethod;
+  replayedAt?: string | Date | null;
   status?: string;
 }
 
@@ -21,6 +25,7 @@ export class MysqlFeishuPendingBindingRepository {
       messageId: row.messageId,
       cardMessageId: row.cardMessageId ?? null,
       eventJson: JSON.stringify(row.event),
+      bindingMethod: row.bindingMethod ?? 'OAUTH',
       status: row.status ?? 'PENDING',
     });
   }
@@ -61,6 +66,13 @@ export class MysqlFeishuPendingBindingRepository {
     );
   }
 
+  async markReplayed(state: string): Promise<void> {
+    await this.db.execute(
+      "UPDATE feishu_pending_binding_message SET replayed_at = CURRENT_TIMESTAMP WHERE state = ? AND status = 'CLAIMED' AND replayed_at IS NULL",
+      [state],
+    );
+  }
+
   async listRecoverable(): Promise<FeishuPendingBindingMessage[]> {
     const rows = await this.db.query<Record<string, unknown>>(
       "SELECT * FROM feishu_pending_binding_message WHERE status = 'SENT' OR (status = 'CLAIMED' AND updated_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 10 MINUTE))",
@@ -68,7 +80,12 @@ export class MysqlFeishuPendingBindingRepository {
     return rows.map((row) => ({
       id: Number(row.id), state: String(row.state), appId: Number(row.appId), messageId: String(row.messageId),
       cardMessageId: row.cardMessageId == null ? null : String(row.cardMessageId),
-      event: JSON.parse(String(row.eventJson)) as FeishuNormalizedMessage, status: String(row.status),
+      event: JSON.parse(String(row.eventJson)) as FeishuNormalizedMessage,
+      bindingMethod: row.bindingMethod == null
+        ? (row.binding_method == null ? 'OAUTH' : String(row.binding_method) as FeishuPendingBindingMethod)
+        : String(row.bindingMethod) as FeishuPendingBindingMethod,
+      replayedAt: row.replayedAt == null ? (row.replayed_at == null ? null : String(row.replayed_at)) : row.replayedAt as string | Date,
+      status: String(row.status),
     }));
   }
 
@@ -96,12 +113,45 @@ export class MysqlFeishuPendingBindingRepository {
     return {
       id: Number(row.id), state: String(row.state), appId: Number(row.appId), messageId: String(row.messageId),
       cardMessageId: row.cardMessageId == null ? null : String(row.cardMessageId),
-      event: JSON.parse(String(row.eventJson)) as FeishuNormalizedMessage, status: String(row.status),
+      event: JSON.parse(String(row.eventJson)) as FeishuNormalizedMessage,
+      bindingMethod: row.bindingMethod == null
+        ? (row.binding_method == null ? 'OAUTH' : String(row.binding_method) as FeishuPendingBindingMethod)
+        : String(row.bindingMethod) as FeishuPendingBindingMethod,
+      replayedAt: row.replayedAt == null ? (row.replayed_at == null ? null : String(row.replayed_at)) : row.replayedAt as string | Date,
+      status: String(row.status),
     };
   }
 
-  async claim(state: string): Promise<FeishuPendingBindingMessage | null> {    const row = await this.db.queryOne<Record<string, unknown>>(
-      "SELECT * FROM feishu_pending_binding_message WHERE state = ? AND (status = 'SENT' OR (status = 'CLAIMED' AND updated_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 10 MINUTE))) LIMIT 1", [state],
+  /**
+   * 按 state 读取尚未消费的密码绑定记录；预览不改变状态，消费仍由 claim 原子完成。
+   * 同时兼容 Db 的 camelCase 映射与原始 snake_case 返回值。
+   */
+  async findByState(state: string): Promise<(FeishuPendingBindingMessage & { createdAt?: string | null }) | null> {
+    const row = await this.db.queryOne<Record<string, unknown>>(
+      "SELECT * FROM feishu_pending_binding_message WHERE state = ? AND status = 'SENT' LIMIT 1",
+      [state],
+    );
+    if (row == null) return null;
+    return {
+      id: Number(row.id),
+      state: String(row.state),
+      appId: Number(row.appId),
+      messageId: String(row.messageId),
+      cardMessageId: row.cardMessageId == null ? null : String(row.cardMessageId),
+      event: JSON.parse(String(row.eventJson)) as FeishuNormalizedMessage,
+      bindingMethod: row.bindingMethod == null
+        ? (row.binding_method == null ? 'OAUTH' : String(row.binding_method) as FeishuPendingBindingMethod)
+        : String(row.bindingMethod) as FeishuPendingBindingMethod,
+      replayedAt: row.replayedAt == null ? (row.replayed_at == null ? null : String(row.replayed_at)) : row.replayedAt as string | Date,
+      status: String(row.status),
+      createdAt: row.createdAt == null ? (row.created_at == null ? null : String(row.created_at)) : String(row.createdAt),
+    };
+  }
+
+  async claim(state: string): Promise<FeishuPendingBindingMessage | null> {
+    const row = await this.db.queryOne<Record<string, unknown>>(
+      "SELECT * FROM feishu_pending_binding_message WHERE state = ? AND (status = 'SENT' OR (status = 'CLAIMED' AND updated_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 10 MINUTE))) LIMIT 1",
+      [state],
     );
     if (row == null) return null;
     const result = await this.db.execute(
@@ -111,7 +161,12 @@ export class MysqlFeishuPendingBindingRepository {
     return {
       id: Number(row.id), state: String(row.state), appId: Number(row.appId), messageId: String(row.messageId),
       cardMessageId: row.cardMessageId == null ? null : String(row.cardMessageId),
-      event: JSON.parse(String(row.eventJson)) as FeishuNormalizedMessage, status: 'CLAIMED',
+      event: JSON.parse(String(row.eventJson)) as FeishuNormalizedMessage,
+      bindingMethod: row.bindingMethod == null
+        ? (row.binding_method == null ? 'OAUTH' : String(row.binding_method) as FeishuPendingBindingMethod)
+        : String(row.bindingMethod) as FeishuPendingBindingMethod,
+      replayedAt: row.replayedAt == null ? (row.replayed_at == null ? null : String(row.replayed_at)) : row.replayedAt as string | Date,
+      status: 'CLAIMED',
     };
   }
 

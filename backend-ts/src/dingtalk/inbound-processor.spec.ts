@@ -57,6 +57,22 @@ describe('DingtalkInboundProcessor', () => {
     expect(sendReply).not.toHaveBeenCalled();
   });
 
+  it('uses the password binding card when OAuth is unavailable', async () => {
+    const onMessage = vi.fn();
+    const sendPasswordBindCard = vi.fn(async () => true);
+    const sendBindingCard = vi.fn(async () => true);
+    const sendReply = vi.fn();
+    await processor({ onMessage }, {
+      resolveUserId: async () => null,
+      sendBindingCard,
+      sendPasswordBindCard,
+      sendReply,
+      oauthConfigured: async () => false,
+    }).process('1', event());
+    expect(sendPasswordBindCard).toHaveBeenCalledOnce();
+    expect(sendBindingCard).not.toHaveBeenCalled();
+    expect(sendReply).not.toHaveBeenCalled();
+  });
   it('does not send a binding card when staff id is missing', async () => {
     const sendBindingCard = vi.fn();
     const sendReply = vi.fn();
