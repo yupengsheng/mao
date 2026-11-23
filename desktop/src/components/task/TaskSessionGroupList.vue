@@ -14,7 +14,7 @@
         'drag-over': dragOverIndex === index && dragIndex !== index,
         'dragging': dragIndex === index
       }"
-      draggable="true"
+      :draggable="dragEnabled"
       @dragstart="onGroupDragStart($event, index)"
       @dragover="onGroupDragOver($event, index)"
       @dragleave="onGroupDragLeave"
@@ -202,11 +202,18 @@ import { Loading, Plus, Delete, Check, Close, Cloudy, PartlyCloudy, Folder, Fold
 import type { Session } from '../../stores/session'
 import { useReadinessStore } from '../../stores/readiness'
 import { groupIconKind } from '../../utils/cloud-project'
+import { isMobileDevice } from '../../utils/user-agent'
 import feishuLogo from '../../assets/feishu-logo.svg'
 import dingtalkLogo from '../../assets/dingtalk-logo.svg'
 import weixinLogo from '../../assets/weixin-logo.png'
 
 const readinessStore = useReadinessStore()
+
+/**
+ * 触屏（安卓 / iOS）不启用 HTML5 分组拖拽：移动端没有等价交互，而 iOS 上
+ * draggable 容器会让子元素的第一次点击被拖拽手势吃掉，表现为「要点两次才能打开会话」。
+ */
+const dragEnabled = !isMobileDevice()
 
 
 /** 空态按根因分流（首次成功体验）：数据未拉到时回退默认文案。 */

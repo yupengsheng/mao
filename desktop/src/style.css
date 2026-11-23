@@ -260,6 +260,29 @@ html.native-mobile .top-nav {
   min-height: var(--aw-nav-height) !important;
   padding: 0 8px !important;
   -webkit-app-region: no-drag;
+  /* 手机宽度放不下全部入口时横向滑动查看，而不是继续压缩按钮；
+     抽屉/弹窗都已 teleport 到 body，滚动容器不会裁掉它们。 */
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+}
+
+html.native-mobile .top-nav::-webkit-scrollbar {
+  display: none;
+}
+
+html.native-mobile .top-nav > .nav-left,
+html.native-mobile .top-nav > .nav-right,
+html.native-mobile .nav-left-actions,
+html.native-mobile .nav-right > * {
+  flex-shrink: 0;
+}
+
+/* 宽屏时右侧入口仍贴右；溢出的部分改为可滑动查看 */
+html.native-mobile .nav-right {
+  margin-left: auto;
 }
 
 html.native-mobile .nav-left {

@@ -537,11 +537,14 @@
   padding: 2px 4px;
   border-radius: var(--aw-radius-xs);
   opacity: 0;
+  /* 与分组头一致：隐藏时不吃点击，否则行右侧的「重命名/删除」会拦掉第一次点行 */
+  pointer-events: none;
   transition: opacity 0.15s;
 }
 
 .task-index-panel .session-item:hover .session-item-actions,.task-index-panel .session-item.confirming-delete .session-item-actions,.task-index-panel .session-item.editing .session-item-actions {
   opacity: 1;
+  pointer-events: auto;
 }
 
 .task-index-panel .action-btn {

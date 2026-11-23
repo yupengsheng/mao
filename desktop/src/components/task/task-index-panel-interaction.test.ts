@@ -5,7 +5,7 @@
 // @vitest-environment jsdom
 import { h, reactive, ref } from 'vue'
 import { createPinia } from 'pinia'
-import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { afterEach, describe, expect, it, vi, beforeEach } from 'vitest'
 
 /** 面板有效宽度（px）：宽度相关用例按需改写，beforeEach 复位 */
 let mockPanelWidth = 280
@@ -704,6 +704,38 @@ describe('TaskIndexPanel 移动端历史会话抽屉', () => {
     await tick()
     expect(onClose).toHaveBeenCalledTimes(1)
     expect(routerPush).toHaveBeenCalledWith('/tasks/1')
+    app.unmount()
+  })
+})
+
+describe('TaskIndexPanel 触屏拖拽', () => {
+  const desktopUa = navigator.userAgent
+
+  afterEach(() => {
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: desktopUa })
+  })
+
+  it('iOS 打开抽屉后不挂 HTML5 draggable，第一次点击就能打开会话', async () => {
+    Object.defineProperty(navigator, 'userAgent', {
+      configurable: true,
+      value: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148',
+    })
+    store.sessions = [row('1')]
+    const { host, app } = mountPanel('standard', { mobile: true, drawerOpen: true })
+    await tick()
+    expect(host.querySelector('.session-group')?.getAttribute('draggable')).toBe('false')
+    app.unmount()
+  })
+
+  it('桌面端保留分组拖拽排序', async () => {
+    Object.defineProperty(navigator, 'userAgent', {
+      configurable: true,
+      value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    })
+    store.sessions = [row('1')]
+    const { host, app } = mountPanel()
+    await tick()
+    expect(host.querySelector('.session-group')?.getAttribute('draggable')).toBe('true')
     app.unmount()
   })
 })
