@@ -24,8 +24,17 @@
           </div>
         </div>
       </template>
-      <DocListPanel v-if="store.viewer == null" />
-      <DocViewer v-else :payload="store.viewer" />
+      <DocListPanel />
+      <ResponsiveDialog
+        :model-value="store.viewer != null"
+        :title="dialogTitle"
+        width="960px"
+        top="6vh"
+        class="experience-doc-dialog"
+        @update:model-value="onViewerDialog"
+      >
+        <DocViewer v-if="store.viewer" :payload="store.viewer" />
+      </ResponsiveDialog>
     </el-card>
   </div>
 </template>
@@ -34,14 +43,29 @@
 import { computed, provide } from 'vue'
 import { Refresh } from '@element-plus/icons-vue'
 import { useAuthStore } from '../../stores/auth'
+import ResponsiveDialog from '../../components/ResponsiveDialog.vue'
 import DocListPanel from './components/DocListPanel.vue'
 import DocViewer from './components/DocViewer.vue'
 import { EXPERIENCE_LIBRARY_KEY, useExperienceLibrary } from './composables/useExperienceLibrary'
 
 const store = useExperienceLibrary()
 provide(EXPERIENCE_LIBRARY_KEY, store)
+
 const authStore = useAuthStore()
 const canWrite = computed(() => authStore.hasPermission('agent:write'))
+
+const dialogTitle = computed(() => {
+  const viewer = store.viewer
+  if (viewer == null) return ''
+  if (viewer.kind === 'index') return '索引 INDEX.md（系统自动生成）'
+  if (viewer.kind === 'create') return '新建经验'
+  return viewer.meta?.title || viewer.fileName
+})
+
+function onViewerDialog(open: boolean): void {
+  if (!open && store.viewer != null) store.closeViewer()
+}
+
 function onToggleEnabled(value: string | number | boolean): void {
   void store.toggleEnabled(!!value)
 }
@@ -54,4 +78,25 @@ function onToggleEnabled(value: string | number | boolean): void {
 .card-header { justify-content: space-between; }
 .switch-hint { color: var(--el-text-color-secondary); font-size: 12px; }
 @media (pointer: coarse) { .header-actions :deep(.el-button) { min-width: 32px; min-height: 32px; } }
+</style>
+
+<style>
+.experience-doc-dialog.el-dialog {
+  max-width: calc(100vw - 32px);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 0;
+}
+.experience-doc-dialog .el-dialog__body {
+  min-height: 0;
+  overflow: auto;
+}
+.experience-doc-dialog .el-dialog__title {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding-right: 24px;
+}
 </style>

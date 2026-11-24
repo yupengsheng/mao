@@ -28,7 +28,7 @@
 
 - 存放于 `<MAO_SHARE_DIR>/agent-experience/<agentId>/`（share 已按 Agent 隔离，容器内只挂本 Agent 子路径）：`INDEX.md`（系统自动生成的索引，勿手改）+ 若干 `YYYY-MM-DD-主题.md` 子文档（首部 frontmatter：`title` / `keywords` / `summary` / `applicable` / `last_verified`）。
 - 仅 CLOUD 会话生效：会话创建时工作区自动挂符号链接 `团队经验/`（git 工作区自动加入 `.git/info/exclude`），系统提示注入一小节固定路标——Agent 接手复杂任务先 grep 索引、命中再读子文档；多轮探索解决难题后自行写带日期的新子文档（write_file / edit_file 落盘后索引自动重建）。LOCAL 不挂载、不注入。会话文件管理可只读打开这个目录（预览、搜索、下载）；新建、改名、删除、上传仍拒绝，避免从文件管理改到全体成员共享的库。
-- 管理后台可从侧边栏「能力 → 团队经验库」进入独立页面，按 Agent、关键词、分组与日期筛选文档，列表与 Markdown 阅读整页切换，筛选与打开文档同步到 URL；也保留「Agent 管理 → 经验库」原有弹窗维护入口。支持开关启用、浏览 / 新建 / 编辑 / 删除文档、强制重建索引、查看索引原文。REST（相对 `/api/v1`，读需登录及 `agent:read`、写需 `agent:write`；CLI 暂无子命令）：
+- 管理后台可从侧边栏「能力 → 团队经验库」进入独立页面，按 Agent、关键词、分组与日期筛选文档，列表常驻，Markdown 文档、索引和新建编辑内容在可滚动弹窗中查看与维护，筛选与打开文档同步到 URL；也保留「Agent 管理 → 经验库」原有弹窗维护入口。支持开关启用、浏览 / 新建 / 编辑 / 删除文档、强制重建索引、查看索引原文。REST（相对 `/api/v1`，读需登录及 `agent:read`、写需 `agent:write`；CLI 暂无子命令）：
   - `GET /agents/experience-library/overview`（需 `agent:read`）：返回各 Agent 已存在库的文档数量、总字节数、更新时间及孤儿库统计。
   - `GET /agents/:id/experience-library/docs` 不带查询参数时仍返回完整 `docs` 与 `indexContent`。独立页面可传 `page/size/sort/order/groupBy/keyword/tag/verifiedFrom/verifiedTo/updatedFrom/updatedTo/abnormal`，并可传 `tagSearch` 按大小写不敏感子串收窄关键词候选（不改变文档列表过滤）；返回分页 `docs/total/page/size`、分页前分组计数 `groupCounts`、前 50 条 `keywords` facets 及 `keywordsTotal`（不同 tag 总数）。
   - `GET /agents/:id/experience-library/index`：单独读取索引，返回 `fileName/content/docCount`。
