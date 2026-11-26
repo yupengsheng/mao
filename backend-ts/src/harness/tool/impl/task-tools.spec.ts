@@ -88,6 +88,16 @@ describe('TaskTools', () => {
     expect(mapper.updateFields).not.toHaveBeenCalled();
   });
 
+  it('updateAndDeleteToolsRejectMissingNonArrayAndEmptyItems', async () => {
+    const updateTool = new TaskUpdateTool(mapper);
+    const deleteTool = new TaskDeleteTool(mapper);
+    for (const args of [{}, { items: {} }, { items: '[]' }, { items: [] }, { items: [{ id: 1 }, null] }]) {
+      expect(JSON.parse(await updateTool.execute(JSON.stringify(args), 11, null)).error).toBeTruthy();
+      expect(JSON.parse(await deleteTool.execute(JSON.stringify(args), 11, null)).error).toBeTruthy();
+    }
+    expect(mapper.updateFields).not.toHaveBeenCalled();
+    expect(mapper.delete).not.toHaveBeenCalled();
+  });
   it('deleteAndListToolsReturnProgressAndErrors', async () => {
     mapper.selectBySessionId.mockResolvedValue([
       todo(1, 'done', 'completed'),

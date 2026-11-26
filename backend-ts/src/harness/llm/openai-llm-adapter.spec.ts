@@ -200,6 +200,44 @@ describe('OpenAiLlmAdapter', () => {
     expect(server.bodies[0]).toContain('"temperature":0.2');
   });
 
+  it('chatRetriesGatewayGrpc400ThenSucceeds', async () => {
+    server = new QueueServer();
+    server.enqueueJson('Request was rejected due to reason: rpc error: code = Unavailable desc = upstream unavailable', 400);
+    server.enqueueJson('{"id":"recovered","choices":[]}');
+    await server.start();
+    const response = await adapter(1, 0).chat(request('retry'), configOf(server));
+    expect(response.id).toBe('recovered');
+    expect(server.requestCount).toBe(2);
+  });
+
+  it('chatDoesNotRetryOrdinary400', async () => {
+    server = new QueueServer();
+    server.enqueueJson('invalid request', 400);
+    await server.start();
+    await expect(adapter(1, 0).chat(request('no-retry'), configOf(server))).rejects.toThrow('LLM API returned 400');
+    expect(server.requestCount).toBe(1);
+  });
+
+  it('chatDoesNotRetryPermanentGrpc400', async () => {
+    server = new QueueServer();
+    server.enqueueJson('Request was rejected due to reason: rpc error: code = InvalidArgument desc = invalid request', 400);
+    await server.start();
+    await expect(adapter(1, 0).chat(request('no-retry-grpc'), configOf(server))).rejects.toThrow('LLM API returned 400');
+    expect(server.requestCount).toBe(1);
+  });
+
+  it('streamRetriesGatewayGrpc400ThenSucceeds', async () => {
+    server = new QueueServer();
+    server.enqueueJson('rpc error: code = Unavailable desc = upstream unavailable', 400);
+    server.enqueueSse('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n');
+    await server.start();
+    const callback = new CapturingCallback();
+    await adapter(1, 0).stream(request('retry-stream-grpc'), configOf(server), callback, { get: () => false });
+    expect(callback.error).toBeUndefined();
+    expect(callback.retryStatuses).toEqual([400]);
+    expect(server.requestCount).toBe(2);
+  });
+
   it('injectsCodexHeadersWhenConfigured', async () => {
     server = new QueueServer();
     server.enqueueJson('{"id":"ok","choices":[]}');

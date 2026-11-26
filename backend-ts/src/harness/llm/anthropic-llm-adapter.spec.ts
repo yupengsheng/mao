@@ -248,6 +248,16 @@ describe('AnthropicLlmAdapter - chat (non-stream)', () => {
     expect(server.bodies[1]).not.toContain('cache_control');
   });
 
+  it('chatRetriesGatewayGrpc400ThenSucceeds', async () => {
+    server = new QueueServer();
+    server.enqueueJson('rpc error: code = Unavailable desc = upstream unavailable', 400);
+    server.enqueueJson('{"id":"grpc-ok","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}');
+    await server.start();
+    const response = await adapter(1, 0).chat(request('retry'), configOf(server));
+    expect(response.id).toBe('grpc-ok');
+    expect(server.requestCount).toBe(2);
+  });
+
   it('streamRetriesWithoutCacheControlAfterGatewayRejectsItWith400', async () => {
     resetPromptCacheSupportForTest();
     server = new QueueServer();
@@ -438,6 +448,21 @@ describe('AnthropicLlmAdapter - stream', () => {
 
   afterEach(async () => {
     if (server) await server.close();
+  });
+
+  it('streamRetriesGatewayGrpc400ThenSucceeds', async () => {
+    server = new QueueServer();
+    server.enqueueJson('rpc error: code = Unavailable desc = upstream unavailable', 400);
+    server.enqueueSse(
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+      + 'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\n'
+      + 'data: {"type":"message_stop"}\n\n',
+    );
+    await server.start();
+    const callback = new CapturingCallback();
+    await adapter(1, 0).stream(request('retry-stream'), configOf(server), callback, { get: () => false });
+    expect(callback.error).toBeUndefined();
+    expect(server.requestCount).toBe(2);
   });
 
   it('流式文本：text_delta 聚合为 content、usage 从 message_start/message_delta 归一', async () => {

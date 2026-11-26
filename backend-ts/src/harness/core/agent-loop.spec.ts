@@ -305,6 +305,30 @@ describe('AgentLoop', () => {
     expect(ctx.messages.map((m) => m.role)).toEqual(expect.arrayContaining(['assistant', 'tool', 'assistant']));
   });
 
+  it('does not fall back to a sole provisional call when an indexed target is missing', () => {
+    const provisional: ToolCall = {
+      id: 'call-provisional',
+      index: 0,
+      function: { name: 'read_file', arguments: '{"path":"a"}' },
+    };
+    const existing = [provisional];
+    const provisionalIds = new Set(['call-provisional']);
+    const findMergeTarget = (agentLoop as unknown as {
+      findMergeTarget(calls: ToolCall[], delta: ToolCall, ids: Set<string>): ToolCall | undefined;
+    }).findMergeTarget.bind(agentLoop);
+
+    expect(findMergeTarget(existing, {
+      id: 'call-2',
+      index: 1,
+      function: { name: 'read_file', arguments: '{"path":"b"}' },
+    }, provisionalIds)).toBeUndefined();
+    // 未带 index 的分片仍可使用唯一 provisional 回退，保持无 index 网关的既有兼容行为。
+    expect(findMergeTarget(existing, {
+      id: 'call-1',
+      function: { arguments: '}' },
+    }, provisionalIds)).toBe(provisional);
+  });
+
   it('sniffsBackendTruncationIntoBothMetadataAndLiveMeta', async () => {
     // 技术方案 5.6：结果 JSON 顶层 truncated===true → 落库 metadataJson（历史回放）+ meta 通道（实时事件）双写。
     const ctx = context();

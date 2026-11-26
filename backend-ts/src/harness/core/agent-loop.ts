@@ -897,9 +897,13 @@ export class AgentLoop {
       // 真实 id 首片不带 index（部分网关的参数分片无 index 字段）：byId/byIndex 都落空时，
       // 恰有一条未写回真实 id 的占位调用，它就是归并目标——否则同一调用会被拆成两条
       // 重复派发（占位参数截断 + 无名尾巴），用户命令实际未被完整执行。
+      // 只有分片没有 index 时才能采用这个唯一占位回退；带 index 且按 index 未命中说明
+      // 它可能属于另一条调用，不能因恰有一个占位调用而错误归并。
       // 多条占位时无法判定归属，保持旧行为。
-      const provisional = existing.filter((tc) => tc.id != null && provisionalIds.has(tc.id));
-      if (provisional.length === 1) return provisional[0];
+      if (delta.index == null) {
+        const provisional = existing.filter((tc) => tc.id != null && provisionalIds.has(tc.id));
+        if (provisional.length === 1) return provisional[0];
+      }
       return undefined;
     }
     if (delta.index != null) {

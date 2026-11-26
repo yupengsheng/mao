@@ -359,6 +359,20 @@ describe('ResponsesLlmAdapter - chat（非流式）', () => {
     expect(response.usage?.promptTokensDetails?.cachedTokens).toBe(4);
   });
 
+  it('chatRetriesGatewayGrpc400ThenSucceeds', async () => {
+    server = new QueueServer();
+    server.enqueueJson(JSON.stringify({ error: { message: 'rpc error: code = Unavailable desc = upstream unavailable' } }), 400);
+    server.enqueueJson(JSON.stringify({
+      id: 'grpc-ok', status: 'completed',
+      output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }],
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+    }));
+    await server.start();
+    const response = await adapter(1, 0).chat(request('retry'), configOf(server));
+    expect(response.id).toBe('grpc-ok');
+    expect(server.requestCount).toBe(2);
+  });
+
   it('request.reasoning 序列化为 Responses reasoning 对象（effort 默认 high）', async () => {
     server = new QueueServer();
     server.enqueueJson(JSON.stringify({
@@ -473,6 +487,24 @@ describe('ResponsesLlmAdapter - stream（流式）', () => {
 
   afterEach(async () => {
     if (server) await server.close();
+  });
+
+  it('streamRetriesGatewayGrpc400ThenSucceeds', async () => {
+    server = new QueueServer();
+    server.enqueueJson(JSON.stringify({ error: { message: 'rpc error: code = Unavailable desc = upstream unavailable' } }), 400);
+    server.enqueueSse([
+      'data: {"type":"response.created","response":{"id":"grpc-stream"}}',
+      '',
+      'data: {"type":"response.output_text.delta","item_id":"msg","delta":"ok"}',
+      '',
+      'data: {"type":"response.completed","response":{"id":"grpc-stream","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}',
+      '',
+    ].join('\n'));
+    await server.start();
+    const callback = new CapturingCallback();
+    await adapter(1, 0).stream(request('retry-stream'), configOf(server), callback);
+    expect(callback.error).toBeUndefined();
+    expect(server.requestCount).toBe(2);
   });
 
   it('文本 delta + reasoning summary delta + usage + finishReason', async () => {

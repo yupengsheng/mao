@@ -86,6 +86,8 @@ mao pref task-panel set --group-order running,recent,archived --collapsed-groups
 | `webhookConfigured` | 布尔 | 是否已保存 Webhook |
 | `maskedWebhook` | 字符串/null | 脱敏后的 Webhook |
 
+如果服务端无法用当前 `APP_NOTIFICATION_WEBHOOK_SECRET` 解密历史 Webhook，读取接口会把 `maskedWebhook` 降级为 `null`，但仍返回启用状态和渠道，便于重新填写配置；保存或发送测试通知时仍会明确报告密文解密错误。
+
 ### 示例
 
 ```bash

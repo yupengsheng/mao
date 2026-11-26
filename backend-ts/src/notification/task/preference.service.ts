@@ -37,6 +37,10 @@ export class TaskNotificationPreferenceService {
   ) {}
 
   async get(userId: number): Promise<PreferenceView> {
+    return this.getView(userId, true);
+  }
+
+  private async getView(userId: number, tolerateDecryptFailure: boolean): Promise<PreferenceView> {
     const row = await this.store.findByUserId(userId);
     if (!row) {
       return { enabled: false, channel: null, webhookConfigured: false, maskedWebhook: null };
@@ -44,9 +48,20 @@ export class TaskNotificationPreferenceService {
     let masked: string | null = null;
     const configured = hasText(row.webhookCiphertext);
     if (configured) {
-      const plain = this.cipher.decrypt(row.webhookCiphertext!);
-      // EMAIL 渠道密文存收件邮箱：按邮箱口径掩码（a***@domain.com），不复用 URL 掩码
-      masked = row.channel === 'EMAIL' ? maskEmail(plain) : this.urlValidator.mask(plain);
+      let plain: string;
+      try {
+        plain = this.cipher.decrypt(row.webhookCiphertext!);
+      } catch (e) {
+        if (!tolerateDecryptFailure) {
+          throw e;
+        }
+        console.warn(`读取通知 Webhook 失败，无法解密, userId=${userId}`, e);
+        plain = '';
+      }
+      if (plain !== '') {
+        // EMAIL 渠道密文存收件邮箱：按邮箱口径掩码（a***@domain.com），不复用 URL 掩码
+        masked = row.channel === 'EMAIL' ? maskEmail(plain) : this.urlValidator.mask(plain);
+      }
     }
     return {
       enabled: row.enabled === 1,
@@ -105,7 +120,7 @@ export class TaskNotificationPreferenceService {
       row.webhookCiphertext = ciphertext;
       await this.store.updateById(row);
     }
-    return this.get(userId);
+    return this.getView(userId, false);
   }
 
   async sendTest(userId: number, channelValue: string, webhookUrl: string | null | undefined): Promise<void> {

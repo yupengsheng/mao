@@ -68,6 +68,33 @@ describe('TaskNotificationPreferenceService webhook 渠道（既有行为回归�
     await expect(service.save(7, true, null, null)).rejects.toThrow(/必须选择渠道并配置 Webhook 地址/);
   });
 
+  it('get 解密失败时只告警并返回未掩码地址', async () => {
+    const s = store({ id: 1, userId: 7, enabled: 1, channel: 'DINGTALK', webhookCiphertext: 'broken' });
+    const { registry } = senderRegistry();
+    const badCipher = {
+      ...cipher,
+      decrypt: vi.fn(() => { throw new Error('bad ciphertext'); }),
+    } as unknown as WebhookSecretCipher;
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const service = new TaskNotificationPreferenceService(s.store, badCipher, urlValidator, registry);
+    const view = await service.get(7);
+    expect(view.webhookConfigured).toBe(true);
+    expect(view.maskedWebhook).toBeNull();
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining('无法解密'), expect.any(Error));
+    warning.mockRestore();
+  });
+
+  it('save 和 sendTest 不吞解密异常', async () => {
+    const s = store({ id: 1, userId: 7, enabled: 1, channel: 'DINGTALK', webhookCiphertext: 'broken' });
+    const { registry } = senderRegistry();
+    const badCipher = {
+      ...cipher,
+      decrypt: vi.fn(() => { throw new Error('bad ciphertext'); }),
+    } as unknown as WebhookSecretCipher;
+    const service = new TaskNotificationPreferenceService(s.store, badCipher, urlValidator, registry);
+    await expect(service.save(7, false, null, null)).rejects.toThrow('bad ciphertext');
+    await expect(service.sendTest(7, 'DINGTALK', null)).rejects.toThrow('bad ciphertext');
+  });
   it('sendTest 用入参地址发送，失败透出错误', async () => {
     const s = store();
     const { registry, send } = senderRegistry(vi.fn(async () => ({ success: false, retryable: false, httpStatus: 400, providerCode: null, error: 'bad token' })));

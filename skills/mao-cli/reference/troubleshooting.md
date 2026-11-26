@@ -39,6 +39,7 @@
 - 飞书失败卡没有「重试」按钮 / 点了提示「无法定位原进度卡片」：进度卡映射只在 FAILED 终态保留（供重试定位 bot）。0.0.144 起失败卡带「重试」；升级前已失败的旧卡若映射已被清掉，需重新发送消息触发新任务。
 - 同一会话从 Responses 协议切到 Chat Completions 后 400（`messages[*]: missing field \`type\``）：Responses 流式历史 tool_calls 可能缺 `type`。0.0.128 起流式写入与 Chat Completions 序列化均补齐为 `function`；升级后端后原会话可继续使用。
 - 执行过程突然只剩一个工具调用、刷新后又出现：旧版会在模型流重试时清空整条流式气泡。0.0.111 改为只丢掉本次未完成的生成，已完成步骤保留；未升级前端时可刷新页面从历史恢复。
+- `LLM API returned 400` 且错误详情包含 `rpc error: code =`：部分网关把上游暂时性 gRPC 故障包装成 HTTP 400。1.0.29 起 OpenAI、Anthropic 和 Responses 协议会按有限重试额度退避重试；普通参数校验 400 不会重试，若持续失败仍需检查网关和上游服务状态。
 - 执行异常原样保留模型错误，Agent 不再追加 `LLM call failed:`。若显示 `LLM API returned 400`，应根据后面的字段路径与错误详情排查请求参数；修复重复前缀不会解决上游参数校验失败。
 
 ## LOCAL 模式不可用

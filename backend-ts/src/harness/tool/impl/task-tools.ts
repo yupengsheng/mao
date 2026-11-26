@@ -186,7 +186,22 @@ export class TaskUpdateTool extends BaseTool {
     try {
       const args = parseObject(argumentsJson);
       if (!args) return errorJson('无效的JSON参数');
-      const items = Array.isArray(args.items) ? args.items as Record<string, unknown>[] : [];
+      if (!Array.isArray(args.items)) {
+        return errorJson(`items 必须是数组，收到 ${args.items == null ? String(args.items) : typeof args.items}`);
+      }
+      const items = args.items as Record<string, unknown>[];
+      if (items.length === 0) return errorJson('items 不能为空');
+      for (const item of items) {
+        if (item == null || typeof item !== 'object' || Array.isArray(item)) {
+          return errorJson('items 中每项必须是对象');
+        }
+        const id = asIntStrict(item.id);
+        if (!(id > 0)) return errorJson(`无效的待办事项 ID: ${item.id}`);
+        const status = asText(item.status);
+        if (status != null && status !== '' && !['pending', 'in_progress', 'completed'].includes(status)) {
+          return errorJson(`无效的任务状态: ${status}（只能是 pending / in_progress / completed）`);
+        }
+      }
       let transitionedToCompleted = false;
       const updatedSummaries: string[] = [];
       for (const item of items) {
@@ -289,7 +304,18 @@ export class TaskDeleteTool extends BaseTool {
     try {
       const args = parseObject(argumentsJson);
       if (!args) return errorJson('无效的JSON参数');
-      const items = Array.isArray(args.items) ? args.items as Record<string, unknown>[] : [];
+      if (!Array.isArray(args.items)) {
+        return errorJson(`items 必须是数组，收到 ${args.items == null ? String(args.items) : typeof args.items}`);
+      }
+      const items = args.items as Record<string, unknown>[];
+      if (items.length === 0) return errorJson('items 不能为空');
+      for (const item of items) {
+        if (item == null || typeof item !== 'object' || Array.isArray(item)) {
+          return errorJson('items 中每项必须是对象');
+        }
+        const id = asIntStrict(item.id);
+        if (!(id > 0)) return errorJson(`无效的待办事项 ID: ${item.id}`);
+      }
       // delete 只做逻辑删除且不返回命中行数：「已删除 N 个」若按入参条目计数，不存在的 id
       // 也会被报成删除成功（假计数）。先取当前未删除事项，按会话内真实存在的 id 逐个判定，
       // 命中才 delete + 计数；同一 id 重复入参只计第一次（逻辑删除后第二次命中 0 行）。

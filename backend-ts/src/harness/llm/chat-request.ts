@@ -210,6 +210,16 @@ export function notifyPartialUsage(callback: StreamCallback, usage: ChatUsage): 
   });
 }
 
+/**
+ * 部分网关把上游 gRPC 故障包成 HTTP 400。仅对明确表示瞬时服务端故障的
+ * gRPC 状态码重试，参数、鉴权和权限类错误仍立即失败。
+ */
+export function isRetryableBadRequestDetail(detail: string | null | undefined): boolean {
+  const match = detail?.match(/rpc error: code = ([A-Za-z]+)/);
+  if (match == null) return false;
+  return new Set(['Aborted', 'DeadlineExceeded', 'Internal', 'ResourceExhausted', 'Unavailable']).has(match[1]);
+}
+
 export type ChatCallback = Pick<StreamCallback, 'onWaiting' | 'onRetry'>;
 
 export interface LlmAdapter {
