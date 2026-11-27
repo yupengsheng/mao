@@ -203,7 +203,11 @@ export class SkillSyncService {
       ? this.getSyncState(agent.id, userId, sessionId)
       : new Map<string, number>();
     const archive = archiver('zip', { zlib: { level: 5 } });
+    // 客户端可能在读完响应头就断开（同步请求被 abort / 超时），此时 out 已被销毁：
+    // pipeline 会立刻 reject，而 finalize() 在目的端销毁后可能永不 settle。先挂兜底
+    // catch 并发等待，避免 done 的拒绝进入 unhandledRejection 或 finalize 长时间挂起。
     const done = pipeline(archive, out);
+    done.catch(() => undefined);
     for (const [skillName, sourceFolder] of merged) {
       state.set(skillName, getLastModified(sourceFolder));
       archive.directory(sourceFolder, skillName);
@@ -212,8 +216,8 @@ export class SkillSyncService {
     archive.append(JSON.stringify({ syncedAt: new Date().toISOString(), agentId: agent.id, skills: skillList }, null, 2), {
       name: '.sync-manifest.json',
     });
-    await archive.finalize();
-    await done;
+    const finalizing = archive.finalize();
+    await Promise.all([finalizing, done]);
   }
 
   async zipSkillsForLocal(agent: Agent, userId: number): Promise<Buffer> {

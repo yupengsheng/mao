@@ -142,4 +142,5 @@ mao skill sync-package --session-id 12 --out /tmp/skills.zip
 ## 注意事项
 
 - 同步包依赖会话存在且 Agent 有效
+- 客户端取消或连接超时时，服务端会将技能包传输中断视为客户端 abort，不把它当作后端压缩错误；真实目录读取、压缩和写出错误仍会失败并记录。
 - 本模块不管理系统级 Skill 文档库的管理端上传

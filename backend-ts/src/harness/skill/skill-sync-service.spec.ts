@@ -1,5 +1,6 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { Writable } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import { SkillSyncService } from './skill-sync-service.js';
 import { SkillViewService } from './skill-view.service.js';
@@ -25,6 +26,50 @@ function makeSystemSkill(root: string, body = 'body'): string {
 }
 
 describe('SkillSyncService', () => {
+  it('writes a complete sync zip to a healthy output', async () => {
+    const root = useTmpDir('skills-zip-');
+    const { svc } = makeService(root, makeSystemSkill(root));
+    const chunks: Buffer[] = [];
+    const out = new Writable({ write(chunk, _encoding, callback) { chunks.push(Buffer.from(chunk)); callback(); } });
+
+    await svc.writeSyncZip({ id: 2, name: 'a', systemPrompt: 'p', skillNames: '["java"]' }, 9, out, 7);
+
+    const zip = Buffer.concat(chunks);
+    expect(zip.subarray(0, 4)).toEqual(Buffer.from([0x50, 0x4b, 0x03, 0x04]));
+    expect(zip.includes(Buffer.from('java/SKILL.md'))).toBe(true);
+    expect(zip.includes(Buffer.from('.sync-manifest.json'))).toBe(true);
+    expect(out.writableFinished).toBe(true);
+  });
+
+  it('rejects promptly when the download output was already closed', async () => {
+    const root = useTmpDir('skills-zip-abort-');
+    const { svc } = makeService(root, makeSystemSkill(root));
+    const out = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
+    out.destroy();
+
+    await expect(svc.writeSyncZip({ id: 2, name: 'a', systemPrompt: 'p', skillNames: '["java"]' }, 9, out, 7))
+      .rejects.toMatchObject({ code: 'ERR_STREAM_PREMATURE_CLOSE' });
+  });
+
+  it('rejects when a client closes the output during download', async () => {
+    const root = useTmpDir('skills-zip-disconnect-');
+    const { svc } = makeService(root, makeSystemSkill(root));
+    const out = new Writable({ write(_chunk, _encoding, callback) { this.destroy(); callback(); } });
+
+    await expect(svc.writeSyncZip({ id: 2, name: 'a', systemPrompt: 'p', skillNames: '["java"]' }, 9, out, 7))
+      .rejects.toMatchObject({ code: 'ERR_STREAM_PREMATURE_CLOSE' });
+  });
+
+  it('preserves real output errors rather than treating them as successful downloads', async () => {
+    const root = useTmpDir('skills-zip-error-');
+    const { svc } = makeService(root, makeSystemSkill(root));
+    const error = Object.assign(new Error('output failed'), { code: 'EIO' });
+    const out = new Writable({ write(_chunk, _encoding, callback) { callback(error); } });
+
+    await expect(svc.writeSyncZip({ id: 2, name: 'a', systemPrompt: 'p', skillNames: '["java"]' }, 9, out, 7))
+      .rejects.toBe(error);
+  });
+
   it('syncs system and user skills then lists documents', async () => {
     const root = useTmpDir('skills-');
     const systemFolder = makeSystemSkill(root);

@@ -266,7 +266,16 @@ export function registerSkillSyncRoutes(app: FastifyInstance, deps: Pick<SkillRo
       .type('application/zip')
       .header('Content-Disposition', 'attachment; filename="skills.zip"');
     reply.send(stream);
-    await writing;
+    try {
+      await writing;
+    } catch (e) {
+      // 客户端中途断开不是服务端错误；压缩失败等真实错误照常抛出。
+      if (isClientAbort(e, request)) {
+        request.log.info({ err: e }, 'skill sync package download aborted by client');
+        return;
+      }
+      throw e;
+    }
   });
 }
 
@@ -278,6 +287,12 @@ export function registerSkillRoutes(app: FastifyInstance, deps: SkillRouteDeps):
 }
 
 const MAX_ASSIGN_USERS = 100;
+
+/** 客户端把下载连接断掉（abort / 超时）：错误码是 premature close，或请求流明确已中止。 */
+export function isClientAbort(e: unknown, request: Pick<FastifyRequest, 'raw'>): boolean {
+  const code = (e as NodeJS.ErrnoException | null)?.code;
+  return code === 'ERR_STREAM_PREMATURE_CLOSE' || request.raw.aborted === true || request.raw.readableAborted === true;
+}
 
 function paginate<T>(items: T[], pageNum?: number, pageSize?: number): { records: T[]; total: number } {
   const page = Math.max(1, pageNum ?? 1);

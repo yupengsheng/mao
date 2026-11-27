@@ -6,7 +6,7 @@ import { noSystemSkillNames } from '../testing/system-skill-names.js';
 import { describe, expect, it, vi } from 'vitest';
 import { useTmpDir } from '../testing/tmp-dir.js';
 import { handleError } from '../common/http-error.js';
-import { parseAssignUserIds, registerSkillRoutes } from './skill.routes.js';
+import { parseAssignUserIds, isClientAbort, registerSkillRoutes, registerSkillSyncRoutes } from './skill.routes.js';
 import { UserSkillService } from './user-skill.service.js';
 import { SkillDocService } from './skill-doc.service.js';
 import { SkillLoader } from '../harness/skill/skill-loader.js';
@@ -650,6 +650,58 @@ describe('skill routes', () => {
     expect(res.message).toContain('未写入');
     expect(existsSync(join(skillsDir, 'first'))).toBe(false);
     expect(existsSync(join(skillsDir, 'second'))).toBe(false);
+    await app.close();
+  });
+
+  it('client aborts are not treated as server errors', () => {
+    const request = (raw: { destroyed?: boolean; aborted?: boolean; readableAborted?: boolean }) => ({ raw }) as never;
+    const premature = Object.assign(new Error('Premature close'), { code: 'ERR_STREAM_PREMATURE_CLOSE' });
+    expect(isClientAbort(premature, request({}))).toBe(true);
+    expect(isClientAbort(new Error('zlib error'), request({ destroyed: true }))).toBe(false);
+    expect(isClientAbort(new Error('zlib error'), request({ aborted: true }))).toBe(true);
+    expect(isClientAbort(new Error('zlib error'), request({ readableAborted: true }))).toBe(true);
+  });
+
+  it('does not hide a sync error after a completed POST request', async () => {
+    const app = Fastify();
+    const error = new Error('zlib error');
+    let handled: unknown;
+    let requestState: { destroyed: boolean; aborted: boolean; readableAborted: boolean } | undefined;
+    app.setErrorHandler((caught, _request, reply) => {
+      handled = caught;
+      reply.code(500).send({ code: 500 });
+    });
+    app.addHook('preHandler', (request, _reply, done) => {
+      request.userId = 7;
+      done();
+    });
+    app.addHook('onResponse', (request, _reply, done) => {
+      requestState = {
+        destroyed: request.raw.destroyed,
+        aborted: request.raw.aborted,
+        readableAborted: request.raw.readableAborted,
+      };
+      done();
+    });
+    registerSkillSyncRoutes(app, {
+      skillSyncService: {
+        writeSyncZip: vi.fn(async (_agent, _sessionId, stream) => {
+          stream.end();
+          throw error;
+        }),
+      } as unknown as SkillSyncService,
+      sessionService: {
+        getSession: vi.fn(async () => ({ id: 1, userId: 7, agentId: 9 })),
+      } as unknown as SessionService,
+      agentLookup: {
+        findById: vi.fn(async () => ({ id: 9, name: 'A' })),
+      } as unknown as AgentLookup,
+    });
+
+    const response = await app.inject({ method: 'POST', url: '/v1/skills/sync-package?sessionId=1' });
+    expect(response.statusCode).toBe(500);
+    expect(handled).toBe(error);
+    expect(requestState).toEqual({ destroyed: expect.any(Boolean), aborted: false, readableAborted: false });
     await app.close();
   });
 });

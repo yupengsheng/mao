@@ -247,6 +247,7 @@ describe('TerminalManager', () => {
     expect(pty.options.rows).toBe(40);
     expect(pty.options.env.TERM).toBe('xterm-256color');
     expect(pty.options.env.MAO_TASK_NAME).toBe('重构 登录');
+    expect(pty.options.env.MAO_SESSION_ID).toBe('7');
     expect(pty.options.env.HOME).toBe(join(root, 'users', '3'));
     expect(pty.options.env.MAO_TOKEN).toBe('tok-3-user3');
     expect(pty.options.env.GIT_TOKEN_git_example_com).toBe('tok');
@@ -255,11 +256,22 @@ describe('TerminalManager', () => {
 
     const rcPath = join(root, 'users', '3', '.bashrc');
     expect(existsSync(rcPath)).toBe(true);
-    expect(readFileSync(rcPath, 'utf8')).toContain('MAO_TASK_NAME');
+    const defaultRc = readFileSync(rcPath, 'utf8');
+    expect(defaultRc).toContain('${MAO_SESSION_ID:-session}');
+    expect(defaultRc).toContain("PS1='\\[\\e[36m\\][${MAO_SESSION_ID:-session}]\\[\\e[0m\\] \\w \\$ '");
+    expect(defaultRc).not.toContain('[mao ');
 
     expect(terminal.terminalId).toMatch(/^term-7-\d+-[0-9a-f]{8}$/);
     expect(manager.size()).toBe(1);
     expect(audit.map((a) => a.event)).toEqual(['CREATE']);
+  });
+
+  it('injects each session ID into separate terminal environments', async () => {
+    const { manager, root } = await newManager({ maxSessionsPerTask: 2, maxSessionsGlobal: 2 });
+    await manager.create({ sessionId: 21, userId: 3, workspace: root });
+    await manager.create({ sessionId: 22, userId: 3, workspace: root });
+
+    expect(FakePty.instances.map((pty) => pty.options.env.MAO_SESSION_ID)).toEqual(['21', '22']);
   });
 
   it('applies cols/rows defaults and clamping', async () => {
@@ -293,6 +305,33 @@ describe('TerminalManager', () => {
     await manager.create({ sessionId: 2, userId: 5, workspace: root });
     expect(readFileSync(rcPath, 'utf8')).toBe('# custom');
     expect(original).not.toBe('# custom');
+  });
+
+  it('upgrades only the complete legacy default PS1 line and keeps other rc content', async () => {
+    const { manager, root } = await newManager({ maxSessionsPerTask: 2 });
+    await manager.create({ sessionId: 1, userId: 6, workspace: root });
+    const rcPath = join(root, 'users', '6', '.bashrc');
+    const { writeFileSync } = await import('node:fs');
+    const legacyPs1 = `PS1='\\[\\e[36m\\][mao \${MAO_TASK_NAME:-task}]\\[\\e[0m\\] \\w \\$ '`;
+    writeFileSync(rcPath, `# my rc\n${legacyPs1}\nalias vim='nvim'\n`, 'utf8');
+
+    await manager.create({ sessionId: 2, userId: 6, workspace: root });
+    const upgraded = readFileSync(rcPath, 'utf8');
+    expect(upgraded).toContain("PS1='\\[\\e[36m\\][${MAO_SESSION_ID:-session}]\\[\\e[0m\\] \\w \\$ '");
+    expect(upgraded).not.toContain('[mao ');
+    expect(upgraded).toContain("alias vim='nvim'");
+  });
+
+  it('does not overwrite a customized PS1 containing the old fragment', async () => {
+    const { manager, root } = await newManager({ maxSessionsPerTask: 2 });
+    await manager.create({ sessionId: 1, userId: 7, workspace: root });
+    const rcPath = join(root, 'users', '7', '.bashrc');
+    const { writeFileSync } = await import('node:fs');
+    const custom = "PS1='custom [mao ${MAO_TASK_NAME:-task}] prompt'";
+    writeFileSync(rcPath, `${custom}\nalias custom='true'\n`, 'utf8');
+
+    await manager.create({ sessionId: 2, userId: 7, workspace: root });
+    expect(readFileSync(rcPath, 'utf8')).toBe(`${custom}\nalias custom='true'\n`);
   });
 
   it('enforces the per-task limit', async () => {

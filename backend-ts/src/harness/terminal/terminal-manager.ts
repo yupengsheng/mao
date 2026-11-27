@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, chmodSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, chmodSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { harnessLog } from '../log.js';
@@ -18,7 +18,7 @@ export const MAX_TERMINAL_ROWS = 200;
 
 /** 首次创建终端时写入虚拟 HOME 的默认 rc（已存在则不覆盖）。 */
 export const DEFAULT_BASHRC = `# Mao 云端终端默认配置（首次创建终端时自动生成，可自行修改；删除后会重新生成）
-PS1='\\[\\e[36m\\][mao \${MAO_TASK_NAME:-task}]\\[\\e[0m\\] \\w \\$ '
+PS1='\\[\\e[36m\\][\${MAO_SESSION_ID:-session}]\\[\\e[0m\\] \\w \\$ '
 alias ll='ls -alF'
 alias la='ls -A'
 alias ls='ls --color=auto'
@@ -26,6 +26,12 @@ alias grep='grep --color=auto'
 export HISTSIZE=5000
 export HISTFILESIZE=10000
 `;
+
+const CURRENT_DEFAULT_PS1_LINE = DEFAULT_BASHRC.split('\n')[1];
+const LEGACY_DEFAULT_PS1_LINE = CURRENT_DEFAULT_PS1_LINE.replace(
+  '[${MAO_SESSION_ID:-session}]',
+  '[mao ${MAO_TASK_NAME:-task}]',
+);
 
 export interface TerminalManagerConfig {
   maxSessionsPerTask: number;
@@ -415,6 +421,7 @@ export class TerminalManager {
       COLORTERM: 'truecolor',
       LANG: process.env.LANG ?? 'en_US.UTF-8',
       MAO_TASK_NAME: normalizeTaskName(params.taskName, sessionId),
+      MAO_SESSION_ID: String(sessionId),
     };
     const home = this.configureUserHome(env, userId);
     if (this.deps.depsEnvProvider) {
@@ -505,6 +512,18 @@ export class TerminalManager {
     return userHome;
   }
 
+  private upgradeLegacyPrompt(rcPath: string): void {
+    try {
+      const content = readFileSync(rcPath, 'utf8');
+      const next = content.split('\n').map((line) => (
+        line === LEGACY_DEFAULT_PS1_LINE ? CURRENT_DEFAULT_PS1_LINE : line
+      )).join('\n');
+      if (next !== content) writeFileSync(rcPath, next, 'utf8');
+    } catch (e) {
+      harnessLog('warn', `Failed to upgrade legacy .bashrc at ${rcPath}`, e);
+    }
+  }
+
   /** 与 ShellSessionManager.configureGitCredentials 等价：GIT_TOKEN_* + GIT_ASKPASS。 */
   private configureGitCredentials(
     env: NodeJS.ProcessEnv,
@@ -528,7 +547,10 @@ export class TerminalManager {
   private ensureDefaultRc(home: string): void {
     const rcPath = path.join(home, '.bashrc');
     try {
-      if (existsSync(rcPath)) return;
+      if (existsSync(rcPath)) {
+        this.upgradeLegacyPrompt(rcPath);
+        return;
+      }
       writeFileSync(rcPath, DEFAULT_BASHRC, 'utf8');
       try {
         chmodSync(rcPath, 0o600);
