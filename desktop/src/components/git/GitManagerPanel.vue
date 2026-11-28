@@ -93,14 +93,18 @@
 
     <!-- 视图区 -->
     <div class="git-view-body">
-      <div v-if="selectedRepo?.unavailable" class="git-state">
+      <div v-if="reposError && !reposRequestReady" class="git-state">
+        <p>识别工作区 Git 仓库失败：{{ reposError }}</p>
+        <button class="git-retry" @click="handleRefreshAll">重试</button>
+      </div>
+      <div v-else-if="selectedRepo?.unavailable" class="git-state">
         <p>该仓库 Git 状态不可用</p>
         <button class="git-retry" @click="handleRefreshAll">重试</button>
       </div>
       <GitChangeList
         v-else-if="activeView === 'changes'"
         :files="gitFiles"
-        :loading="gitLoading"
+        :loading="gitLoading || reposLoading"
         :error="gitError"
         :has-remote="gitStatus?.hasRemote"
         :has-head="gitStatus?.hasHead"
@@ -251,6 +255,9 @@ const {
   multiRepoMode,
   selectedRepoPath,
   selectedRepo,
+  requestReady: reposRequestReady,
+  loading: reposLoading,
+  error: reposError,
   refresh: refreshRepos,
   selectRepo,
 } = useGitRepos(gitProviderRef)
@@ -259,6 +266,9 @@ const {
 const statusProviderRef = computed<WorkspaceGitProvider | null>(() => {
   const p = gitProviderRef.value
   if (!p) return null
+  // 仓库身份未就绪（provider 刚换、仓库列表还在扫描或首次扫描失败）：暂停所有按仓库请求，
+  // 避免展开 provider 后因没有 repoPath 误打到多仓库工作区根目录。
+  if (!reposRequestReady.value) return null
   if (multiRepoMode.value && selectedRepoPath.value) {
     const repoPath = selectedRepoPath.value
     return {
@@ -467,6 +477,9 @@ const refreshTitle = computed(() =>
 const refreshDisabledReason = computed(() => {
   if (operation.value) return 'Git 操作进行中'
   if (gitLoading.value) return '正在读取 Git 状态'
+  if (gitProviderRef.value && !reposRequestReady.value) {
+    return reposLoading.value ? '正在识别工作区 Git 仓库' : (reposError.value || '工作区仓库识别失败')
+  }
   if (!gitStatus.value?.isGit) return '当前目录不是 Git 仓库'
   return ''
 })

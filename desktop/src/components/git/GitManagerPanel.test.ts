@@ -18,6 +18,14 @@ const state = vi.hoisted(() => ({
   refreshLoadedViewsCalls: 0,
   isRootGit: false,
   multiRepoMode: false,
+  requestReady: true,
+  reposLoading: false,
+  reposError: '',
+  statusProvider: null as { value: any } | null,
+  managerProvider: null as { value: any } | null,
+  requestReadyRef: null as { value: boolean } | null,
+  reposLoadingRef: null as { value: boolean } | null,
+  reposErrorRef: null as { value: string } | null,
   tooltips: [] as string[],
 }))
 
@@ -35,7 +43,18 @@ vi.mock('element-plus', () => ({
 }))
 
 // ---- mock 子视图（断言只关心状态条按钮）----
-vi.mock('../task/GitChangeList.vue', () => ({ default: { name: 'GitChangeList', render() { return null } } }))
+vi.mock('../task/GitChangeList.vue', async () => {
+  const { h } = await import('vue')
+  return {
+    default: {
+      name: 'GitChangeList',
+      props: { loading: Boolean },
+      setup(props: { loading: boolean }) {
+        return () => h('div', { class: 'git-change-list-stub' }, props.loading ? '加载中' : '')
+      },
+    },
+  }
+})
 vi.mock('./GitHistoryView.vue', () => ({ default: { name: 'GitHistoryView', render() { return null } } }))
 vi.mock('./GitBranchesView.vue', () => ({ default: { name: 'GitBranchesView', render() { return null } } }))
 vi.mock('./GitStashView.vue', () => ({ default: { name: 'GitStashView', render() { return null } } }))
@@ -48,39 +67,55 @@ vi.mock('./GitCompareView.vue', async () => {
 vi.mock('../../composables/useGitRepos', async () => {
   const { ref } = await import('vue')
   return {
-    useGitRepos: () => ({
-      repos: ref([]),
-      isRootGit: ref(state.isRootGit),
-      multiRepoMode: ref(state.multiRepoMode),
-      selectedRepoPath: ref(''),
-      selectedRepo: ref(null),
-      refresh: async () => { state.refreshReposCalls += 1 },
-      selectRepo: () => {},
-    }),
+    useGitRepos: () => {
+      const requestReady = ref(state.requestReady)
+      const loading = ref(state.reposLoading)
+      const error = ref(state.reposError)
+      state.requestReadyRef = requestReady
+      state.reposLoadingRef = loading
+      state.reposErrorRef = error
+      return {
+        repos: ref([]),
+        isRootGit: ref(state.isRootGit),
+        multiRepoMode: ref(state.multiRepoMode),
+        requestReady,
+        loading,
+        error,
+        selectedRepoPath: ref(''),
+        selectedRepo: ref(null),
+        refresh: async () => { state.refreshReposCalls += 1 },
+        selectRepo: () => {},
+      }
+    },
   }
 })
 
 vi.mock('../../composables/useGitStatus', async () => {
   const { ref } = await import('vue')
   return {
-    useGitStatus: () => ({
-      loading: ref(state.loading),
-      error: ref(null),
-      status: ref(state.status),
-      files: ref([]),
-      remoteLoading: ref(false),
-      refreshRemote: async () => { state.refreshRemoteCalls += 1 },
-      refreshWithRemoteConfirmation: async () => { state.refreshRemoteCalls += 1 },
-    }),
+    useGitStatus: (providerRef: { value: any }) => {
+      state.statusProvider = providerRef
+      return {
+        loading: ref(state.loading),
+        error: ref(null),
+        status: ref(state.status),
+        files: ref([]),
+        remoteLoading: ref(false),
+        refreshRemote: async () => { state.refreshRemoteCalls += 1 },
+        refreshWithRemoteConfirmation: async () => { state.refreshRemoteCalls += 1 },
+      }
+    },
   }
 })
 
 vi.mock('../../composables/useGitManager', async () => {
   const { ref } = await import('vue')
   return {
-    useGitManager: () => ({
-      // 真实实现里 activeView 是 ref：子导航点击会赋值，mock 也必须是 ref
-      activeView: ref('changes'),
+    useGitManager: (providerRef: { value: any }) => {
+      state.managerProvider = providerRef
+      return {
+        // 真实实现里 activeView 是 ref：子导航点击会赋值，mock 也必须是 ref
+        activeView: ref('changes'),
       logEntries: [], logLoading: false, logError: '', logExhausted: false,
       expandedCommit: null, commitFiles: [], commitFilesLoading: false,
       loadMoreLog: async () => {}, retryLog: async () => {}, toggleCommit: async () => {},
@@ -89,8 +124,9 @@ vi.mock('../../composables/useGitManager', async () => {
       compareLoading: ref(false), compareError: ref(''), loadCompare: async () => {},
       stashes: [], stashesLoading: false, stashesError: '', loadStashes: async () => {},
       remotes: ref([]), loadRemotes: async () => {},
-      refreshLoadedViews: async () => { state.refreshLoadedViewsCalls += 1 },
-    }),
+        refreshLoadedViews: async () => { state.refreshLoadedViewsCalls += 1 },
+      }
+    },
   }
 })
 
@@ -139,7 +175,44 @@ beforeEach(() => {
   state.refreshLoadedViewsCalls = 0
   state.isRootGit = false
   state.multiRepoMode = false
+  state.requestReady = true
+  state.reposLoading = false
+  state.reposError = ''
+  state.statusProvider = null
+  state.managerProvider = null
+  state.requestReadyRef = null
+  state.reposLoadingRef = null
+  state.reposErrorRef = null
   state.tooltips = []
+})
+
+describe('GitManagerPanel 仓库扫描就绪态', () => {
+  it('未 ready 时将 null provider 传给状态与管理器，显示加载态，成功后恢复 provider', async () => {
+    state.requestReady = false
+    state.reposLoading = true
+    const { host, app } = mountPanel()
+
+    expect(state.statusProvider?.value).toBeNull()
+    expect(state.managerProvider?.value).toBeNull()
+    expect(host.querySelector('.git-change-list-stub')?.textContent).toContain('加载中')
+
+    state.reposLoadingRef!.value = false
+    state.reposErrorRef!.value = '扫描 Git 仓库失败'
+    await nextTick()
+    expect(host.textContent).toContain('识别工作区 Git 仓库失败：扫描 Git 仓库失败')
+    expect(host.querySelector('.git-retry')).not.toBeNull()
+
+    ;(host.querySelector('.git-retry') as HTMLButtonElement).click()
+    await nextTick()
+    expect(state.refreshReposCalls).toBe(1)
+
+    state.reposErrorRef!.value = ''
+    state.requestReadyRef!.value = true
+    await nextTick()
+    expect(state.statusProvider?.value).toBeTruthy()
+    expect(state.managerProvider?.value).toBeTruthy()
+    app.unmount()
+  })
 })
 
 describe('GitManagerPanel 顶部刷新按钮', () => {

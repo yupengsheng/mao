@@ -269,7 +269,14 @@
           </el-option>
         </el-select>
       </div>
-      <div v-if="selectedRepo?.unavailable" class="git-state">
+      <div v-if="reposLoading" class="git-state">
+        <p>正在识别工作区 Git 仓库…</p>
+      </div>
+      <div v-else-if="reposError && !reposRequestReady" class="git-state">
+        <p>识别工作区 Git 仓库失败：{{ reposError }}</p>
+        <button class="git-retry" @click="() => refreshAll()">重试</button>
+      </div>
+      <div v-else-if="selectedRepo?.unavailable" class="git-state">
         <p>该仓库 Git 状态不可用</p>
         <button class="git-retry" @click="() => refreshAll()">重试</button>
       </div>
@@ -522,6 +529,7 @@ const {
   unavailableRepos,
   selectedRepoPath,
   selectedRepo,
+  requestReady: reposRequestReady,
   loading: reposLoading,
   error: reposError,
   refresh: refreshRepos,
@@ -534,6 +542,8 @@ const {
 const statusProviderRef = computed<WorkspaceGitProvider | null>(() => {
   const p = gitProviderRef.value
   if (!p) return null
+  // 仓库身份未就绪时暂停按仓库请求；否则 provider 展开后会落到工作区根目录。
+  if (!reposRequestReady.value) return null
   if (multiRepoMode.value && selectedRepoPath.value) {
     const repoPath = selectedRepoPath.value
     return {
@@ -566,6 +576,8 @@ watch(statusProviderRef, () => {
 
 const showGitTab = computed(() => {
   if (!props.gitProvider) return false
+  // 仓库识别中或识别失败时保留页签，让用户能看到状态并重试，不能因 status 尚未产生而判定为非 Git。
+  if (reposLoading.value || reposError.value || !reposRequestReady.value) return true
   if (multiRepoMode.value) return true
   if (gitStatus.value?.isGit) return true
   // Confirmed non-git: never show, even during a refresh
@@ -593,6 +605,8 @@ const gitSummaryVisible = computed(() => {
   if (!props.gitProvider) return false
   if (multiRepoMode.value) return true
   if (gitStatus.value?.isGit) return true
+  // 仓库识别中：status 尚未读取（statusProviderRef 为 null），不能据此判负
+  if (reposLoading.value) return true
   if (gitLoading.value && gitStatus.value === null) return true
   // 仓库发现 / 状态读取失败时给出可见提示，避免 Git 信息静默消失
   if (reposError.value || gitError.value) return true

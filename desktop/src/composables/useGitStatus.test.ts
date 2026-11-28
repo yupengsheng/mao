@@ -166,4 +166,110 @@ describe('useGitStatus 远端确认', () => {
     await settle()
     expect(calls.refreshStatus).toBe(1)
   })
+
+  it('读取被后发请求作废时不拿旧 status 补远端确认', async () => {
+    let reads = 0
+    let resolveOlder: (value: GitStatusResult) => void = () => {}
+    let resolveNewest: (value: GitStatusResult) => void = () => {}
+    let remoteReads = 0
+    const provider = {
+      getRepos: vi.fn(),
+      getStatus: vi.fn(() => {
+        reads += 1
+        if (reads === 1) return Promise.resolve(status())
+        if (reads === 2) return new Promise<GitStatusResult>(resolve => { resolveOlder = resolve })
+        return new Promise<GitStatusResult>(resolve => { resolveNewest = resolve })
+      }),
+      refreshStatus: vi.fn(async () => {
+        remoteReads += 1
+        return status({ remoteStatusAvailable: true, behindCount: 7 })
+      }),
+    } as unknown as WorkspaceGitProvider
+    const s = useGitStatus(ref(provider), { confirmRemote: ref(true) })
+    await settle()
+    expect(remoteReads).toBe(1)
+
+    // 两次并发读取：先放行最新读取，它应独占一次确认；再放行旧读取，旧读取不得确认。
+    void s.refreshWithRemoteConfirmation()
+    void s.refreshWithRemoteConfirmation()
+    await settle()
+    expect(reads).toBe(3)
+
+    resolveNewest(status({ behindCount: 3 }))
+    await settle()
+    expect(remoteReads).toBe(2)
+    resolveOlder(status({ behindCount: 99 }))
+    await settle()
+    expect(remoteReads).toBe(2)
+    expect(s.status.value?.behindCount).toBe(7)
+  })
+
+  it('读取 reject 时不发远端确认', async () => {
+    const refreshStatus = vi.fn(async () => status({ remoteStatusAvailable: true }))
+    const provider = {
+      getRepos: vi.fn(),
+      getStatus: vi.fn(async () => { throw new Error('读取失败') }),
+      refreshStatus,
+    } as unknown as WorkspaceGitProvider
+    const s = useGitStatus(ref(provider), { confirmRemote: ref(true) })
+    await settle()
+
+    expect(refreshStatus).not.toHaveBeenCalled()
+    expect(s.status.value).toBeNull()
+    expect(s.error.value).toBe('读取失败')
+  })
+
+  it('provider 失效时两条 null 分支都清除 loading，旧请求迟到也不会悬空', async () => {
+    let release: (value: GitStatusResult) => void = () => {}
+    const slow = {
+      getRepos: vi.fn(),
+      getStatus: vi.fn(() => new Promise<GitStatusResult>(resolve => { release = resolve })),
+      refreshStatus: vi.fn(),
+    } as unknown as WorkspaceGitProvider
+    const providerRef = ref<WorkspaceGitProvider | null>(slow)
+    const s = useGitStatus(providerRef)
+    await nextTick()
+    expect(s.loading.value).toBe(true)
+
+    providerRef.value = null
+    await nextTick()
+    expect(s.loading.value).toBe(false)
+
+    // 覆盖 load() 自身的 !provider 分支，而不只验证 provider watcher 分支。
+    await s.refresh()
+    expect(s.loading.value).toBe(false)
+    release(status())
+    await settle()
+    expect(s.loading.value).toBe(false)
+  })
+
+  it('读取途中切换 provider 时旧读取不触发远端确认', async () => {
+    let releaseSlow: (value: GitStatusResult) => void = () => {}
+    const slowRemote = vi.fn(async () => status())
+    const slow = {
+      getRepos: vi.fn(),
+      getStatus: vi.fn(() => new Promise<GitStatusResult>(resolve => { releaseSlow = resolve })),
+      refreshStatus: slowRemote,
+    } as unknown as WorkspaceGitProvider
+    const fastCalls = { refreshStatus: 0 }
+    const fast = {
+      getRepos: vi.fn(),
+      getStatus: vi.fn(async () => status()),
+      refreshStatus: vi.fn(async () => {
+        fastCalls.refreshStatus += 1
+        return status({ remoteStatusAvailable: true })
+      }),
+    } as unknown as WorkspaceGitProvider
+    const providerRef = ref<WorkspaceGitProvider>(slow)
+    useGitStatus(providerRef, { confirmRemote: ref(true) })
+    await settle()
+
+    providerRef.value = fast
+    await settle()
+    releaseSlow(status())
+    await settle()
+
+    expect(slowRemote).not.toHaveBeenCalled()
+    expect(fastCalls.refreshStatus).toBe(1)
+  })
 })

@@ -86,9 +86,10 @@ export interface FeishuMessageRepository {
 
   /** 按飞书消息 ID 查询归属会话 ID；未记录返回 null。 */
   findP2pMessageSession(appId: string, messageId: string): Promise<number | null>;
-  /** 记录话题→会话映射（INSERT IGNORE 防重）。 */
+  /** 记录话题→会话映射；同一话题换了会话时覆盖旧指针。失效映射由读取侧视为未命中，
+   * 新会话重置水位线；同一会话重试保留已有水位线，避免重复注入上下文。 */
   recordThreadSession(params: { appId: string; chatId: string; threadId: string; rootMessageId: string; sessionId: number }): Promise<void>;
-  /** 按话题 ID 查归属会话（含话题水位线）；未记录返回 null。 */
+  /** 按话题 ID 查归属会话（仅返回绑定到存活 session 的映射，含话题水位线）；未记录或已失效返回 null。 */
   findThreadSession(appId: string, threadId: string): Promise<{ sessionId: number; rootMessageId: string; lastContextLogId?: number | null } | null>;
   /** 会话 → 飞书通道绑定（创建时落行、不可变）：session_id 唯一，upsert 幂等；
    *  awaiting_first_message_title 用 GREATEST「只进不清」——指针切换的 upsert(false) 不会清掉 `---` 置上的待命名标志。 */
@@ -351,18 +352,28 @@ export class MysqlFeishuMessageRepository implements FeishuMessageRepository {
     return row?.sessionId ?? null;
   }
 
+  /** 话题映射写入：同一话题换了会话时覆盖旧指针。曾用 INSERT IGNORE，映射指向已删会话后
+   * 无法替换；新会话归零水位线让上下文重新开始，同一会话重试则保留已有水位线。 */
   async recordThreadSession(params: { appId: string; chatId: string; threadId: string; rootMessageId: string; sessionId: number }): Promise<void> {
     if (params.threadId == null || params.threadId === '') return;
     await this.db.execute(
-      'INSERT IGNORE INTO feishu_thread_session (app_id, chat_id, thread_id, root_message_id, session_id) VALUES (?, ?, ?, ?, ?)',
+      `INSERT INTO feishu_thread_session (app_id, chat_id, thread_id, root_message_id, session_id)
+       VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         last_context_log_id = IF(session_id = VALUES(session_id), last_context_log_id, 0),
+         chat_id = VALUES(chat_id), root_message_id = VALUES(root_message_id),
+         session_id = VALUES(session_id)`,
       [params.appId, params.chatId, params.threadId, params.rootMessageId, params.sessionId],
     );
   }
 
+  /** 话题映射读取：与 feishu_chat 同口径只认存活会话，失效映射按「无映射」返回（上层重建并覆盖）。 */
   async findThreadSession(appId: string, threadId: string): Promise<{ sessionId: number; rootMessageId: string; lastContextLogId?: number | null } | null> {
     if (threadId == null || threadId === '') return null;
     const row = await this.db.queryOne<{ sessionId: number; rootMessageId: string; lastContextLogId?: number | null }>(
-      'SELECT session_id, root_message_id, last_context_log_id FROM feishu_thread_session WHERE app_id = ? AND thread_id = ? LIMIT 1',
+      `SELECT t.session_id, t.root_message_id, t.last_context_log_id FROM feishu_thread_session t
+       JOIN \`session\` s ON s.id = t.session_id AND s.deleted = 0
+       WHERE t.app_id = ? AND t.thread_id = ? LIMIT 1`,
       [appId, threadId],
     );
     return row ?? null;

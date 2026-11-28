@@ -424,6 +424,35 @@ describe('FeishuMessageService', () => {
     });
   });
 
+  it('rebuilds an invalid mapping once and then reuses the new root and workspace', async () => {
+    const repository = makeRepo({
+      findThreadSession: vi.fn()
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({ sessionId: 12, rootMessageId: 'om_new_root' }),
+      findGroupConversation: vi.fn(async () => ({
+        id: 1, appId: '1', chatId: 'oc_group', sessionId: 9, ownerUserId: 3, workspace: '/ws/group',
+      })),
+      recordThreadSession: vi.fn(async () => undefined),
+    });
+    const sessionFactory = { create: vi.fn(async () => ({ sessionId: 12, ownerUserId: 3, workspace: '/ws/new' })) };
+    const service = new FeishuMessageService(repository as never, sessionFactory as never, 20, 120);
+
+    const first = await service.getOrCreateThreadSession('1', makeContext({
+      threadId: 'omt_abc', messageId: 'om_new_root', parentId: null,
+    }));
+    const second = await service.getOrCreateThreadSession('1', makeContext({
+      threadId: 'omt_abc', messageId: 'om_reply', parentId: 'om_new_root', rootId: 'om_new_root',
+    }));
+
+    expect(first).toEqual({ sessionId: 12, rootMessageId: 'om_new_root', workspace: '/ws/new' });
+    expect(second).toEqual({ sessionId: 12, rootMessageId: 'om_new_root', workspace: '/ws/group' });
+    expect(sessionFactory.create).toHaveBeenCalledOnce();
+    expect(repository.recordThreadSession).toHaveBeenCalledOnce();
+    expect(repository.recordThreadSession).toHaveBeenCalledWith({
+      appId: '1', chatId: 'oc_group', threadId: 'omt_abc', rootMessageId: 'om_new_root', sessionId: 12,
+    });
+  });
+
   it('getOrCreateThreadSession creates session for @bot reply using rootId as rootMessageId', async () => {
     const repository = makeRepo({
       findThreadSession: vi.fn(async () => null),

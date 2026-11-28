@@ -64,19 +64,47 @@ vi.mock('../../composables/useStreamWS', () => ({
   useStreamWS: () => ({ compactNow: vi.fn(async () => true) }),
 }))
 vi.mock('../../utils/clipboard', () => ({ copyText: vi.fn(async () => true) }))
-vi.mock('../../composables/useGitStatus', () => ({
-  useGitStatus: () => ({
-    loading: ref(false), error: ref(null), status: ref(null), files: ref([]),
-    refresh: vi.fn(), refreshRemote: vi.fn(),
-  }),
+const gitMock = vi.hoisted(() => ({
+  requestReady: true,
+  loading: false,
+  error: '',
+  refreshRepos: vi.fn(async () => undefined),
+  requestReadyRef: null as { value: boolean } | null,
+  loadingRef: null as { value: boolean } | null,
+  errorRef: null as { value: string } | null,
+  statusProvider: null as { value: unknown } | null,
 }))
-vi.mock('../../composables/useGitRepos', () => ({
-  useGitRepos: () => ({
-    repos: ref([]), multiRepoMode: ref(false), changedRepos: ref([]), unavailableRepos: ref([]),
-    selectedRepoPath: ref(null), selectedRepo: ref(null), loading: ref(false), error: ref(null),
-    refresh: vi.fn(), selectRepo: vi.fn(),
-  }),
-}))
+
+vi.mock('../../composables/useGitStatus', async () => {
+  const { ref } = await import('vue')
+  return {
+    useGitStatus: (providerRef: { value: unknown }) => {
+      gitMock.statusProvider = providerRef
+      return {
+        loading: ref(false), error: ref(''), status: ref(null), files: ref([]),
+        refresh: vi.fn(), refreshRemote: vi.fn(),
+      }
+    },
+  }
+})
+vi.mock('../../composables/useGitRepos', async () => {
+  const { ref } = await import('vue')
+  return {
+    useGitRepos: () => {
+      const requestReady = ref(gitMock.requestReady)
+      const loading = ref(gitMock.loading)
+      const error = ref(gitMock.error)
+      gitMock.requestReadyRef = requestReady
+      gitMock.loadingRef = loading
+      gitMock.errorRef = error
+      return {
+        repos: ref([]), multiRepoMode: ref(false), changedRepos: ref([]), unavailableRepos: ref([]),
+        selectedRepoPath: ref(''), selectedRepo: ref(null), requestReady, loading, error,
+        refresh: gitMock.refreshRepos, selectRepo: vi.fn(),
+      }
+    },
+  }
+})
 vi.mock('../../composables/useModelContext', () => ({
   useModelContext: () => ({ maxTokens: ref(200000) }),
 }))
@@ -108,7 +136,14 @@ vi.mock('../chat/EnvVarsDrawer.vue', async () => {
   }
 })
 
-vi.mock('./TodoChecklist.vue', () => ({ default: { render: () => null } }))
+vi.mock('./TodoChecklist.vue', () => ({
+  default: {
+    setup(_: unknown, { expose }: { expose: (exposed: { revealFocus: () => void }) => void }) {
+      expose({ revealFocus: () => {} })
+      return () => null
+    },
+  },
+}))
 vi.mock('./SideTaskList.vue', () => ({ default: { render: () => null } }))
 vi.mock('./SubagentList.vue', () => ({ default: { render: () => null } }))
 vi.mock('./GitChangeList.vue', () => ({ default: { render: () => null } }))
@@ -212,6 +247,7 @@ function mountInspector(
     viewType?: 'chat' | 'side_task' | 'subagent'
     phase?: string
     executionMode?: string
+    gitProvider?: object | null
     /** 覆盖默认水位；传 null 表示该视图没有自身上下文数据 */
     contextWindow?: ContextWindowInfo | null
   } = {},
@@ -234,7 +270,7 @@ function mountInspector(
     render: () => h(ClientInspector as never, {
       title: 'T', phase: opts.phase ?? 'COMPLETED', panelCollapsed: false, fileProvider: null,
       sessionId: sid.value, contextWindow: contextWindow.value,
-      executionMode: opts.executionMode ?? 'CLOUD', workspace: '/ws', gitProvider: null,
+      executionMode: opts.executionMode ?? 'CLOUD', workspace: '/ws', gitProvider: opts.gitProvider ?? null,
       viewType: opts.viewType,
       onOpenTrace: (emittedSid: string) => { traceOpens.value++; traceOpens.sid = emittedSid },
     } as never),
@@ -271,6 +307,8 @@ function mountInspector(
   return {
     sid, memoryIds, traceOpens,
     clickContextBadge: () => clickWhere(el => subtreeText(el).includes('上下文'), 'context badge'),
+    clickGitTab: () => clickWhere(el => subtreeText(el).trim() === 'Git', 'Git tab'),
+    clickGitRetry: () => clickWhere(el => String(el.props.class ?? '').includes('git-retry'), 'Git retry'),
     clickEnvVars: () => clickWhere(el => subtreeText(el).trim() === '环境变量', 'env vars entry'),
     clickStatusBadge: (label = '已完成') => clickWhere(el => subtreeText(el).includes(label), 'status badge'),
     clickSummaryToggle: () => clickWhere(el => String(el.props.class ?? '').includes('ctx-summary-toggle'), 'summary toggle'),
@@ -290,6 +328,45 @@ beforeEach(() => {
   summaryDeferreds.clear()
   memoryDeferreds.length = 0
   memoryCallCount.value = 0
+  gitMock.requestReady = true
+  gitMock.loading = false
+  gitMock.error = ''
+  gitMock.refreshRepos.mockClear()
+  gitMock.requestReadyRef = null
+  gitMock.loadingRef = null
+  gitMock.errorRef = null
+  gitMock.statusProvider = null
+})
+
+describe('TaskInspector Git 仓库识别错误态', () => {
+  it('识别失败时保留 Git 页签，显示错误与重试，成功后恢复 provider', async () => {
+    gitMock.requestReady = false
+    gitMock.loading = true
+    const m = mountInspector([], { gitProvider: {} })
+    await flush()
+
+    expect(m.buttonTexts().some(text => text.trim() === 'Git')).toBe(true)
+    expect(gitMock.statusProvider?.value).toBeNull()
+
+    m.clickGitTab()
+    await flush()
+    expect(m.pageText()).toContain('正在识别工作区 Git 仓库…')
+
+    gitMock.loadingRef!.value = false
+    gitMock.errorRef!.value = '扫描 Git 仓库失败'
+    await flush()
+    expect(m.pageText()).toContain('识别工作区 Git 仓库失败：扫描 Git 仓库失败')
+
+    m.clickGitRetry()
+    await flush()
+    expect(gitMock.refreshRepos).toHaveBeenCalledTimes(1)
+
+    gitMock.errorRef!.value = ''
+    gitMock.requestReadyRef!.value = true
+    await flush()
+    expect(gitMock.statusProvider?.value).toBeTruthy()
+    expect(m.pageText()).not.toContain('识别工作区 Git 仓库失败')
+  })
 })
 
 describe('TaskInspector 上下文详情抽屉：会话切换清理/竞态（round3 复现）', () => {

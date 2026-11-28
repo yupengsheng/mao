@@ -25,7 +25,7 @@ export function useGitStatus(
   let confirmSeq = 0
   let requestSeq = 0
 
-  async function load(remote: boolean) {
+  async function load(remote: boolean): Promise<boolean> {
     const p = provider.value
     if (!p) {
       requestSeq++
@@ -34,8 +34,10 @@ export function useGitStatus(
       files.value = []
       error.value = ''
       remoteLoading.value = false
-      return
-    }    const seq = ++requestSeq
+      loading.value = false
+      return false
+    }
+    const seq = ++requestSeq
     // 新读取接管远端确认态：在途的确认结果会被 confirmSeq 判负丢弃，
     // 若不在这里清零，徽标会永远停在「确认中」。
     remoteLoading.value = false
@@ -44,7 +46,7 @@ export function useGitStatus(
     error.value = ''
     try {
       const result = remote ? await p.refreshStatus() : await p.getStatus()
-      if (seq !== requestSeq) return
+      if (seq !== requestSeq) return false
       status.value = result
       files.value = result.files || []
       if (result.error) {
@@ -52,11 +54,15 @@ export function useGitStatus(
       } else if (!result.isGit) {
         error.value = ''
       }
+      // 只有本次结果真的落到 status 上才算读取生效；被后发请求作废时返回 false，
+      // 调用方不能再拿旧 status 继续做事（远端确认会因此打到错误仓库）。
+      return true
     } catch (e: any) {
-      if (seq !== requestSeq) return
+      if (seq !== requestSeq) return false
       status.value = null
       files.value = []
       error.value = e?.message || '读取 Git 状态失败'
+      return false
     } finally {
       if (seq === requestSeq) {
         loading.value = false
@@ -73,9 +79,11 @@ export function useGitStatus(
    * 确认结果迟到时按序号丢弃：provider 已切换则新仓库有自己的确认请求。
    */
   async function loadWithRemoteConfirmation() {
-    await refresh()
+    const providerBefore = provider.value
+    const applied = await refresh()
     const p = provider.value
-    if (!p || options?.confirmRemote?.value !== true) return
+    if (!applied || !p || p !== providerBefore) return
+    if (options?.confirmRemote?.value !== true) return
     const current = status.value
     if (!current?.isGit) return
     const seq = ++confirmSeq
@@ -103,6 +111,7 @@ export function useGitStatus(
         status.value = null
         files.value = []
         error.value = ''
+        loading.value = false
         remoteLoading.value = false
         return
       }

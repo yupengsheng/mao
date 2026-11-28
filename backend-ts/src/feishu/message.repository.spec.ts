@@ -81,6 +81,55 @@ describe('MysqlFeishuMessageRepository thread mapping', () => {
     const { repo } = setup([]);
     expect(await repo.findThreadRootMessageId(7)).toBeNull();
   });
+
+  it('only returns a topic mapping whose session is still active', async () => {
+    const { repo, query } = setup([{ session_id: 12, root_message_id: 'om_root', last_context_log_id: 3 }]);
+
+    await expect(repo.findThreadSession('1', 'omt_1')).resolves.toEqual({
+      sessionId: 12, rootMessageId: 'om_root', lastContextLogId: 3,
+    });
+    expect(query).toHaveBeenCalledWith(
+      `SELECT t.session_id, t.root_message_id, t.last_context_log_id FROM feishu_thread_session t
+       JOIN \`session\` s ON s.id = t.session_id AND s.deleted = 0
+       WHERE t.app_id = ? AND t.thread_id = ? LIMIT 1`,
+      ['1', 'omt_1'],
+    );
+  });
+
+  it('does not query for an empty thread id', async () => {
+    const { repo, query } = setup([]);
+
+    await expect(repo.findThreadSession('1', '')).resolves.toBeNull();
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it('replaces an old topic mapping and only resets watermark for a new session', async () => {
+    const { repo, execute } = setup([]);
+
+    await repo.recordThreadSession({
+      appId: '1', chatId: 'oc_group', threadId: 'omt_1', rootMessageId: 'om_root', sessionId: 12,
+    });
+    expect(execute).toHaveBeenCalledWith(
+      `INSERT INTO feishu_thread_session (app_id, chat_id, thread_id, root_message_id, session_id)
+       VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         last_context_log_id = IF(session_id = VALUES(session_id), last_context_log_id, 0),
+         chat_id = VALUES(chat_id), root_message_id = VALUES(root_message_id),
+         session_id = VALUES(session_id)`,
+      ['1', 'oc_group', 'omt_1', 'om_root', 12],
+    );
+    const sql = execute.mock.calls[0][0] as string;
+    expect(sql.indexOf('last_context_log_id = IF')).toBeLessThan(sql.indexOf('session_id = VALUES(session_id)'));
+  });
+
+  it('does not write an empty thread mapping', async () => {
+    const { repo, execute } = setup([]);
+
+    await repo.recordThreadSession({
+      appId: '1', chatId: 'oc_group', threadId: '', rootMessageId: 'om_root', sessionId: 12,
+    });
+    expect(execute).not.toHaveBeenCalled();
+  });
 });
 
 describe('MysqlFeishuMessageRepository pending enrichment rows', () => {
